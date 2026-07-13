@@ -90,9 +90,46 @@ def main() -> None:
     print("start_ts=%s (src=%s)  duration_actual=%.3fs  pts_source=%s  monotonic=%s  effective_fps=%.3f"
           % (m2.start_ts.isoformat(), m2.start_ts_source, m2.duration_actual_s,
              m2.pts_source, m2.monotonic, m2.effective_fps))
-    print("\nTELL: in [1], compare 'actual span' to the 180s window. Collapsed/tiny span or"
-          "\n'monotonic NO' => PTS is the culprit -> apply the window_s uniform-clock fix."
-          "\nIf span is ~180s but cycles raw=0 / signal std~0 => baseline/ROI, not PTS.")
+    rule("[4] DECODER SPLIT PROBE  (full-decode vs keyframe-only ROI variance)")
+    import av
+    from liftlab.doors import _crop_gray
+
+    def roi_means(uri, keyonly, limit=150):
+        c = av.open(uri)
+        s = next(x for x in c.streams if x.type == "video")
+        if keyonly:
+            s.codec_context.skip_frame = "NONKEY"
+        else:
+            s.thread_type = "AUTO"
+        vals, dims = [], None
+        for i, fr in enumerate(c.decode(s)):
+            if i >= limit:
+                break
+            dims = (fr.width, fr.height)
+            vals.append(float(_crop_gray(fr, *ROI, 4).mean()))
+        c.close()
+        a = np.asarray(vals, float)
+        stats = (float(a.min()), float(a.max()), float(a.std())) if len(a) else (0.0, 0.0, 0.0)
+        return dims, len(a), stats
+
+    fd_dims, fd_n, fd_s = roi_means(clip, False)
+    kf_dims, kf_n, kf_s = roi_means(clip, True)
+    print("full-decode  : dims=%s frames=%d  ROI-mean min/max/std = %.2f / %.2f / %.3f"
+          % (fd_dims, fd_n, *fd_s))
+    print("keyframe-only: dims=%s frames=%d  ROI-mean min/max/std = %.2f / %.2f / %.3f"
+          % (kf_dims, kf_n, *kf_s))
+    print("READ: full std>0 but keyframe std~0  => keyframe-only (skip_frame=NONKEY) broken on HEVC")
+    print("      both std~0                      => ROI region static (wrong placement/res) -> see [5]")
+    print("      decoded dims != 1280x960        => resolution mismatch; ROI needs rescaling")
+
+    rule("[5] ROI-BOXED FRAMES -> /tmp/ch29diag/roi_*.jpg  (retrieve to eyeball placement)")
+    import subprocess
+    for t in (5, 90, 175):
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", clip, "-frames:v", "1",
+             "-vf", "drawbox=x=%d:y=%d:w=%d:h=%d:color=red:thickness=5" % ROI,
+             str(DIAG_DIR / f"roi_{t}s.jpg")], check=False)
+    print("wrote roi_5s.jpg  roi_90s.jpg  roi_175s.jpg  (ROI drawn red)")
 
 
 if __name__ == "__main__":
