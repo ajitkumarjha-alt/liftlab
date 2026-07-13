@@ -131,6 +131,39 @@ def main() -> None:
              str(DIAG_DIR / f"roi_{t}s.jpg")], check=False)
     print("wrote roi_5s.jpg  roi_90s.jpg  roi_175s.jpg  (ROI drawn red)")
 
+    rule("[6] MOTION MAP  (per-pixel variance across keyframes -> where the door/people are)")
+    c = av.open(clip)
+    s = next(x for x in c.streams if x.type == "video")
+    s.codec_context.skip_frame = "NONKEY"
+    small = []
+    for fr in c.decode(s):
+        g = fr.to_ndarray(format="gray")
+        small.append(g[::8, ::8].astype(np.float32))     # 8x downscale -> ~160x120
+        if len(small) >= 120:
+            break
+    c.close()
+    var = np.stack(small).std(axis=0)                    # per-pixel std across keyframes
+    H8, W8 = var.shape
+    mx = float(var.max()) or 1.0
+    thr = max(float(np.percentile(var, 97)), 3.0)
+    ys, xs = np.where(var >= thr)
+    if len(xs):
+        bx0, by0 = int(xs.min()) * 8, int(ys.min()) * 8
+        bw, bh = (int(xs.max()) - int(xs.min())) * 8, (int(ys.max()) - int(ys.min())) * 8
+        print("peak-motion bbox (full-res): x=%d y=%d w=%d h=%d   max_std=%.1f gray" % (bx0, by0, bw, bh, mx))
+    else:
+        print("no region exceeds motion threshold (max_std=%.1f) — clip may be genuinely static" % mx)
+    rc0, rc1 = int(450 / 1280 * 40), int(1018 / 1280 * 40)
+    print("current ROI x=450..1018 == heatmap cols %d..%d of 40 (| markers):" % (rc0, rc1))
+    chars = " .:-=+*#%@"
+    rows = var[:: max(1, H8 // 15), :: max(1, W8 // 40)]
+    for r in rows:
+        line = "".join(chars[min(len(chars) - 1, int(v / mx * (len(chars) - 1)))] for v in r[:40])
+        line = line[:rc0] + "|" + line[rc0:rc1] + "|" + line[rc1:]
+        print("  " + line)
+    print("(brighter chars = more motion. If the hot band sits OUTSIDE the | | markers,")
+    print(" the door is elsewhere and the ROI must move to the peak-motion bbox above.)")
+
 
 if __name__ == "__main__":
     main()
