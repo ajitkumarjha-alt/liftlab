@@ -172,6 +172,31 @@ def main() -> None:
     print("current ch29 ROI                          : x=450 y=0 w=568 h=900")
     print("(a top row-band that is hot but the rest cold is usually the OSD clock, not the door.)")
 
+    rule("[7] ASCII FRAME  (one keyframe near 90s, brightness) — read the scene layout")
+    c = av.open(clip)
+    s = next(x for x in c.streams if x.type == "video")
+    s.thread_type = "AUTO"
+    target = None
+    for i, fr in enumerate(c.decode(s)):
+        if i >= 2200:
+            target = fr.to_ndarray(format="gray")
+            break
+    c.close()
+    if target is None:
+        print("could not grab a frame")
+    else:
+        ramp = " .:-=+*#%@"
+        Hh, Ww = target.shape
+        cols, rows = 100, 34
+        for ry in range(rows):
+            yy = min(Hh - 1, int((ry + 0.5) / rows * Hh))
+            line = "".join(
+                ramp[min(9, int(target[yy, min(Ww - 1, int((cx + 0.5) / cols * Ww))]) * 10 // 256)]
+                for cx in range(cols))
+            print(line)
+        print("(space=darkest .. @=brightest. current ROI x=450..1018 spans cols %d..%d of 100.)"
+              % (int(450 / 1280 * 100), int(1018 / 1280 * 100)))
+
 
 if __name__ == "__main__":
     main()
