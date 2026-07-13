@@ -124,7 +124,8 @@ def survey_img(gw: str, fn: str):
     p = SURVEY_DIR / gw / fn
     if not p.exists():
         raise HTTPException(404, "not found")
-    return FileResponse(str(p), media_type="image/jpeg")
+    return FileResponse(str(p), media_type="image/jpeg",
+                        headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 # ---------------- Operator: save marking ----------------
@@ -172,7 +173,8 @@ def survey_page(gw: str):
     for ch in channels:
         s, m = sc.get(ch, {}), cm.get(ch, {})
         if s.get("has_image"):
-            img = (f'<img src="/survey/{gw}/img/ch{ch:02d}.jpg" loading="lazy">')
+            img = (f'<img src="/survey/{gw}/img/ch{ch:02d}.jpg?t={int(s.get("surveyed_at") or 0)}"'
+                   f' loading="lazy">')
         else:
             img = f'<div class="noimg">{(s.get("error") or "no image")[:44]}</div>'
         lift = "checked" if m.get("is_lift") else ""
