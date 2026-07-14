@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 DATA_DIR = Path(os.environ.get("LIFTLAB_DATA", "./data"))
 DB_PATH = os.environ.get("GATEWAY_DB", "./gateway.db")
 SURVEY_DIR = DATA_DIR / "survey"
+VALIDATION_DIR = DATA_DIR / "validation"
 GATEWAY_TOKENS = {
     g.split(":", 1)[0]: g.split(":", 1)[1]
     for g in os.environ.get("GATEWAY_TOKENS", "site-A:devtoken").split(",") if ":" in g
@@ -49,6 +50,9 @@ def _db() -> sqlite3.Connection:
       gateway_id TEXT, channel INTEGER, has_image INTEGER DEFAULT 0,
       has_zones INTEGER DEFAULT 0, error TEXT, surveyed_at REAL,
       PRIMARY KEY (gateway_id, channel));
+    CREATE TABLE IF NOT EXISTS validation_frame (
+      gateway_id TEXT, channel INTEGER, requested_start TEXT, fn TEXT, mode TEXT,
+      uploaded_at REAL, PRIMARY KEY (gateway_id, channel, requested_start));
     """)
     # guarded state column on the pre-existing gateway table (idempotent)
     cols = [r[1] for r in db.execute("PRAGMA table_info(gateway)")]
@@ -228,6 +232,86 @@ def survey_page(gw: str):
     }}
     async function del_imgs(){{ await fetch('/survey/{gw}/delete-images',{{method:'POST'}}); location.reload(); }}
     </script>"""
+
+
+# ---------------- Validation frames (keep_validation_frame proof) ----------------
+# One decoded frame (OSD intact) per keep_validation_frame pull/analyze. Same
+# privacy as survey: behind basicauth, deletable, files under DATA_DIR/validation.
+@survey_router.post("/api/gw/{gw}/validation/{ch}")
+async def validation_upload(gw: str, ch: int, request: Request,
+                            requested_start: str = "", mode: str = "",
+                            authorization: str = Header(default="")):
+    _auth(gw, authorization)
+    body = await request.body()
+    if len(body) < 500:
+        raise HTTPException(400, "empty image")
+    safe = re.sub(r"[^0-9A-Za-z]", "", requested_start)[:20] or "na"
+    fn = f"ch{ch:02d}_{safe}.jpg"
+    d = VALIDATION_DIR / gw
+    d.mkdir(parents=True, exist_ok=True)
+    (d / fn).write_bytes(body)
+    db = _db()
+    db.execute(
+        "INSERT INTO validation_frame (gateway_id,channel,requested_start,fn,mode,uploaded_at)"
+        " VALUES (?,?,?,?,?,?) ON CONFLICT(gateway_id,channel,requested_start) DO UPDATE SET"
+        " fn=excluded.fn, mode=excluded.mode, uploaded_at=excluded.uploaded_at",
+        (gw, ch, requested_start, fn, mode, time.time()))
+    db.commit(); db.close()
+    return {"ok": True, "fn": fn}
+
+
+@survey_router.get("/validation/{gw}/img/{fn}")
+def validation_img(gw: str, fn: str):
+    if not re.fullmatch(r"ch\d{2}_[0-9A-Za-z]{1,20}\.jpg", fn):
+        raise HTTPException(404, "not found")
+    p = VALIDATION_DIR / gw / fn
+    if not p.exists():
+        raise HTTPException(404, "not found")
+    return FileResponse(str(p), media_type="image/jpeg",
+                        headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+
+@survey_router.post("/validation/{gw}/delete")
+def validation_delete(gw: str):
+    shutil.rmtree(VALIDATION_DIR / gw, ignore_errors=True)
+    db = _db()
+    db.execute("DELETE FROM validation_frame WHERE gateway_id=?", (gw,))
+    db.commit(); db.close()
+    return {"ok": True}
+
+
+@survey_router.get("/validation/{gw}", response_class=HTMLResponse)
+def validation_page(gw: str):
+    db = _db()
+    rows = [dict(r) for r in db.execute(
+        "SELECT * FROM validation_frame WHERE gateway_id=? ORDER BY channel, requested_start", (gw,))]
+    db.close()
+    tiles = "".join(
+        f'<div class="tile"><img src="/validation/{gw}/img/{r["fn"]}?t={int(r["uploaded_at"] or 0)}">'
+        f'<div class="cap">ch{r["channel"]:02d} · req {r["requested_start"]} · {r.get("mode") or ""}</div></div>'
+        for r in rows)
+    body = tiles or ('<p class="muted">No validation frames yet. Queue a pull/analyze with '
+                     '<code>keep_validation_frame=on</code>.</p>')
+    return f"""<!doctype html><meta charset=utf-8><title>validation · {gw}</title>
+    <style>:root{{--mono:ui-monospace,Consolas,monospace}}
+    body{{background:#0e1417;color:#dbe3e6;font:14px system-ui;max-width:1100px;margin:auto;padding:18px}}
+    h1{{font-size:14px;letter-spacing:.15em;text-transform:uppercase;color:#e3a53f}}
+    .muted{{color:#7a8b93}} a{{color:#63a37e}} code{{color:#e3a53f}}
+    .bar{{display:flex;gap:10px;align-items:center;margin:12px 0}}
+    button{{background:#1b252b;color:#dbe3e6;border:1px solid #26333a;border-radius:5px;padding:7px 12px;cursor:pointer}}
+    button.danger{{border-color:#d0574d;color:#d0574d}}
+    #grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}}
+    .tile{{background:#151d22;border:1px solid #26333a;border-radius:6px;overflow:hidden}}
+    .tile img{{width:100%;display:block;background:#0e1417}}
+    .cap{{font-family:var(--mono);font-size:12px;padding:6px 8px;color:#7a8b93}}</style>
+    <h1>validation · {gw}</h1>
+    <p class=muted>One decoded frame per <code>keep_validation_frame</code> pull/analyze — OSD intact.
+    Read the burned-in clock to confirm the footage is from the REQUESTED window (not live).
+    Commissioning aid; delete after.</p>
+    <div class=bar>
+      <button class=danger onclick="if(confirm('Delete all validation frames for {gw}?'))fetch('/validation/{gw}/delete',{{method:'POST'}}).then(()=>location.reload())">Delete validation frames</button>
+      <a href="/">&larr; fleet</a></div>
+    <div id=grid>{body}</div>"""
 
 
 # Run the migration at import so fleet_status (SELECT *) sees the state column.
