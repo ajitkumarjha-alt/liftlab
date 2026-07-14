@@ -393,6 +393,61 @@ def telemetry_series(gw: str):
     return {"rows": rows, "last_throttle_ts": last_thr, "now": time.time()}
 
 
+@survey_router.get("/pihealth/{gw}", response_class=HTMLResponse)
+def pihealth_graph(gw: str):
+    return """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>pi health · __GW__</title>
+<style>body{background:#0e1417;color:#dbe3e6;font:14px system-ui;max-width:1000px;margin:auto;padding:16px}
+h1{font-size:13px;letter-spacing:.18em;text-transform:uppercase;color:#e3a53f}
+.bar{display:flex;gap:8px;align-items:center;margin:10px 0;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#7a8b93}
+button{background:#1b252b;color:#dbe3e6;border:1px solid #26333a;border-radius:5px;padding:5px 10px;cursor:pointer;font-size:12px}
+button.on{border-color:#e3a53f;color:#e3a53f} a{color:#63a37e} svg{width:100%;background:#151d22;border:1px solid #26333a;border-radius:6px;margin-bottom:8px}
+.k{font-family:ui-monospace,Consolas,monospace;font-size:12px}</style>
+<h1>pi health · __GW__</h1>
+<div class=bar>
+  <span id=badge></span> · peak <span id=peak>–</span> · <span id=count>–</span> pts
+  <span style="flex:1"></span>
+  <button id=b1 onclick="setWin(3600)">last 1h</button>
+  <button id=b48 class=on onclick="setWin(172800)">48h</button>
+  <a href="/">&larr; fleet</a>
+</div>
+<div id=charts></div>
+<script>
+const GW="__GW__"; let WIN=172800;
+function setWin(s){WIN=s;document.getElementById('b1').className=s===3600?'on':'';document.getElementById('b48').className=s===3600?'':'on';draw();}
+function flagged(h){try{return parseInt(h,16)!==0}catch(e){return false}}
+function chart(title,rows,now,val,lo,hi,thr,unit){
+  const W=960,H=150,pad=34;
+  const X=t=>pad+(W-2*pad)*(1-(now-t)/WIN), Y=v=>H-pad-(H-2*pad)*((Math.max(lo,Math.min(hi,v))-lo)/((hi-lo)||1));
+  let bands='';
+  for(const r of rows){ if(flagged(r.throttled)){ bands+='<rect x="'+(X(r.ts)-3).toFixed(0)+'" y="'+pad+'" width="6" height="'+(H-2*pad)+'" fill="#d0574d" opacity=".28"/>'; } }
+  let thrl=''; if(thr!=null){const y=Y(thr).toFixed(0);thrl='<line x1="'+pad+'" y1="'+y+'" x2="'+(W-pad)+'" y2="'+y+'" stroke="#e3a53f" stroke-dasharray="5,4" stroke-width="1"/><text x="'+(W-pad)+'" y="'+(y-4)+'" fill="#e3a53f" font-size="10" text-anchor="end" font-family="monospace">'+thr+unit+'</text>';}
+  const pts=rows.map(r=>X(r.ts).toFixed(1)+','+Y(val(r)).toFixed(1)).join(' ');
+  const last=rows.length?val(rows[rows.length-1]):null;
+  return '<svg viewBox="0 0 '+W+' '+H+'">'+bands+thrl+
+    '<polyline points="'+pts+'" fill="none" stroke="#63a37e" stroke-width="1.5"/>'+
+    '<text x="'+pad+'" y="16" fill="#7a8b93" font-size="11" font-family="monospace">'+title+(last!=null?'  now '+last.toFixed(1)+unit:'')+'</text>'+
+    '<text x="'+pad+'" y="'+(H-6)+'" fill="#4a5960" font-size="9" font-family="monospace">'+(WIN===3600?'-60m':'-48h')+'</text>'+
+    '<text x="'+(W-pad)+'" y="'+(H-6)+'" fill="#4a5960" font-size="9" text-anchor="end" font-family="monospace">now</text></svg>';
+}
+async function draw(){
+  let d; try{ d=await (await fetch('/telemetry/'+GW)).json(); }catch(e){ return; }
+  const now=d.now; let rows=(d.rows||[]).filter(r=>now-r.ts<=WIN);
+  document.getElementById('count').textContent=rows.length;
+  const thr=d.last_throttle_ts;
+  document.getElementById('badge').innerHTML=thr?('<b style="color:#d0574d">\\u26a0 throttled '+Math.round((now-thr)/60)+'m ago</b>'):'<b style="color:#63a37e">throttle clean</b>';
+  const peak=rows.reduce((m,r)=>Math.max(m,r.temp||0),0);
+  document.getElementById('peak').textContent=peak.toFixed(1)+'C';
+  const memtot=rows.length?(rows[rows.length-1].mem_total_mb||4096):4096;
+  document.getElementById('charts').innerHTML=
+    chart('SoC temp (red bands = throttle)',rows,now,r=>r.temp||0,35,90,80,'C')+
+    chart('loadavg (1m)',rows,now,r=>r.load1||0,0,4,null,'')+
+    chart('mem free',rows,now,r=>r.mem_free_mb||0,0,memtot,null,'MB');
+}
+draw(); setInterval(draw,10000);
+</script>""".replace("__GW__", gw)
+
+
 # Run the migration at import so fleet_status (SELECT *) sees the state column.
 try:
     _db().close()
