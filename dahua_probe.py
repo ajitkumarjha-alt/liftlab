@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
-"""Dahua HTTP historical probe (Honeywell I-HNVR-1240, Dahua-OEM). RTSP historical
-is dead here (channel + starttime both ignored). Try the Dahua HTTP API,
-authoritative-first, for ch27 over 2026-07-12 08:00-08:05 (and 18:00 for a
-time-selection contrast):
+"""Dahua HTTP historical probe (Honeywell I-HNVR-1240, Dahua-OEM), ROBUST edition.
+Every mechanism is wrapped — one failure never aborts the others. Capability-first:
+we ask magicBox whether the Dahua HTTP API exists AT ALL before hunting endpoints.
 
-  M1  CGI   GET /cgi-bin/mediaFileFind.cgi   (Digest)
-  M2  RPC2  POST /RPC2  (JSON-RPC, global.login session + mediaFileFind.*)
-  M3  CGI   GET /cgi-bin/loadfile.cgi?action=startLoad&channel&startTime&endTime
-
-Channel indexing tested BOTH N and N-1 (Dahua RPC is often 0-indexed). For the
-first mechanism that yields a file, we download one frame and UPLOAD it to the
-validation viewer (ch27, mode=dahua-cgi) for OSD-clock verification on the
-dashboard. PROOF: right cabin (not 42B-REFUGE) at the requested PAST window, and
-the 08:00 vs 18:00 OSD clocks must DIFFER. Run with the B4 venv.
+  CAP   GET /cgi-bin/magicBox.cgi?action=getSystemInfo (Digest)  -> API present?
+  PORTS status of candidate endpoints (find the layer that's actually there)
+  M1    CGI  mediaFileFind.cgi (Digest)                          -> historical finder
+  M2    RPC2 JSON login (/RPC2_Login then /RPC2) + mediaFileFind -> historical finder
+  M3    CGI  loadfile.cgi?action=startLoad&channel&startTime&endTime
+Then, if a finder works: two-window (ch27 @ 08:00 vs 18:00) OSD proof via the
+validation viewer. Run with the B4 venv.
 """
 import hashlib
 import json
 import re
 import subprocess
+import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import quote
@@ -44,10 +42,9 @@ USER, PW, HOST = c.get("NVR_USER", ""), c.get("NVR_PASS", ""), c.get("NVR_HOST",
 CLOUD = c.get("CLOUD_URL", "").rstrip("/")
 GWID = c.get("GATEWAY_ID", "site-A")
 TOKEN = c.get("GATEWAY_TOKEN", "")
-
 WINDOWS = [("0800", "2026-07-12 08:00:00", "2026-07-12 08:05:00"),
            ("1800", "2026-07-12 18:00:00", "2026-07-12 18:05:00")]
-DISP_CH = 27
+CH = 27
 
 
 def digest_opener():
@@ -59,9 +56,35 @@ def digest_opener():
 OP = digest_opener()
 
 
-def cgi(path, timeout=15, maxbytes=None):
-    r = OP.open(f"http://{HOST}/cgi-bin/{path}", timeout=timeout)
-    return r.read(maxbytes) if maxbytes else r.read()
+def hget(path, timeout=10, maxbytes=None):
+    """Digest GET -> (status:int|None, body:bytes). Never raises."""
+    try:
+        r = OP.open(f"http://{HOST}/{path}", timeout=timeout)
+        return getattr(r, "status", 200), (r.read(maxbytes) if maxbytes else r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read()
+        except Exception:
+            return e.code, b""
+    except Exception as e:
+        return None, str(e).encode()
+
+
+def hpost(url, obj, timeout=12):
+    """Plain JSON POST -> (status:int|None, body:bytes). Never raises. (RPC2 uses
+    in-band session auth, not HTTP digest.)"""
+    try:
+        req = urllib.request.Request(url, data=json.dumps(obj).encode(),
+                                     headers={"Content-Type": "application/json"})
+        r = urllib.request.urlopen(req, timeout=timeout)
+        return getattr(r, "status", 200), r.read()
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read()
+        except Exception:
+            return e.code, b""
+    except Exception as e:
+        return None, str(e).encode()
 
 
 def grab(dav, out):
@@ -91,19 +114,43 @@ def validate_upload(ch, tag, jpg):
                                  headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "image/jpeg"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return f"uploaded ({r.status})"
+            return f"uploaded ({getattr(r,'status',200)})"
     except Exception as e:
         return f"upload failed: {str(e)[:60]}"
 
 
-# ---------------- M1: CGI mediaFileFind ----------------
+# ================= CAPABILITY =================
+print(f"Dahua HTTP probe: NVR {HOST}\n")
+print("=== CAPABILITY: is the Dahua HTTP API present? ===")
+api_present = False
+for path in ("cgi-bin/magicBox.cgi?action=getSystemInfo",
+             "cgi-bin/magicBox.cgi?action=getDeviceType",
+             "cgi-bin/global.cgi?action=getCurrentTime"):
+    st, body = hget(path)
+    txt = body.decode(errors="replace").replace("\r", " ").replace("\n", " ")[:110]
+    print(f"  GET /{path.split('?')[0]:32} action={path.split('action=')[-1]:16} -> {st}  {txt.strip()}")
+    if st == 200:
+        api_present = True
+print(f"  => Dahua CGI API present: {api_present}")
+
+print("\n=== ENDPOINT PRESENCE (GET status; POST-only paths show 405 if they EXIST) ===")
+for path in ("cgi-bin/mediaFileFind.cgi?action=factory.create",
+             "cgi-bin/loadfile.cgi", "RPC2_Login", "RPC2", "RPC_Loadfile"):
+    st, _ = hget(path, timeout=8)
+    print(f"  /{path.split('?')[0]:34} -> {st}")
+
+
+# ================= M1: CGI mediaFileFind =================
 def cgi_find(ch, s, e):
-    obj = cgi("mediaFileFind.cgi?action=factory.create").decode(errors="replace").strip().split("=")[-1]
-    cgi(f"mediaFileFind.cgi?action=findFile&object={obj}&condition.Channel={ch}"
-        f"&condition.StartTime={quote(s)}&condition.EndTime={quote(e)}&condition.Types[0]=dav")
-    resp = cgi(f"mediaFileFind.cgi?action=findNextFile&object={obj}&count=100").decode(errors="replace")
+    st, body = hget("cgi-bin/mediaFileFind.cgi?action=factory.create")
+    if st != 200:
+        return None, f"factory.create -> {st}"
+    obj = body.decode(errors="replace").strip().split("=")[-1]
+    hget(f"cgi-bin/mediaFileFind.cgi?action=findFile&object={obj}&condition.Channel={ch}"
+         f"&condition.StartTime={quote(s)}&condition.EndTime={quote(e)}&condition.Types[0]=dav")
+    st, body = hget(f"cgi-bin/mediaFileFind.cgi?action=findNextFile&object={obj}&count=100")
     files = []
-    for line in resp.splitlines():
+    for line in body.decode(errors="replace").splitlines():
         m = re.match(r"items\[(\d+)\]\.(\w+)=(.*)", line)
         if m:
             i, k, v = int(m.group(1)), m.group(2), m.group(3)
@@ -111,147 +158,142 @@ def cgi_find(ch, s, e):
                 files.append({})
             files[i][k] = v
     for a in ("close", "destroy"):
-        try:
-            cgi(f"mediaFileFind.cgi?action={a}&object={obj}")
-        except Exception:
-            pass
-    return [f for f in files if f.get("FilePath")]
+        hget(f"cgi-bin/mediaFileFind.cgi?action={a}&object={obj}")
+    return [f for f in files if f.get("FilePath")], f"{st}"
 
 
-def cgi_download(filepath, out_dav, maxbytes=8_000_000):
-    out_dav.write_bytes(cgi(f"RPC_Loadfile{filepath}", timeout=45, maxbytes=maxbytes))
-
-
-# ---------------- M2: RPC2 JSON login + mediaFileFind ----------------
-def rpc(url, body, timeout=12):
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode(errors="replace"))
-
-
-def rpc2_login():
-    base = f"http://{HOST}/RPC2_Login"
-    r1 = rpc(base, {"method": "global.login",
-                    "params": {"userName": USER, "password": "", "clientType": "Web3.0", "loginType": "Direct"},
-                    "id": 1})
-    p = r1.get("params", {})
-    realm, random, session = p.get("realm"), p.get("random"), r1.get("session")
-    if not realm:
-        return None, f"no realm (step1={str(r1)[:120]})"
-    a1 = hashlib.md5(f"{USER}:{realm}:{PW}".encode()).hexdigest().upper()
-    pwh = hashlib.md5(f"{USER}:{random}:{a1}".encode()).hexdigest().upper()
-    r2 = rpc(base, {"method": "global.login", "session": session, "id": 2,
-                    "params": {"userName": USER, "password": pwh, "clientType": "Web3.0",
-                               "loginType": "Direct", "authorityType": "Default", "passwordType": "Default"}})
-    if r2.get("result"):
-        return session, "ok"
-    return None, f"login failed (step2={str(r2)[:120]})"
-
-
-def rpc2_find(session, ch, s, e):
-    rurl = f"http://{HOST}/RPC2"
-    fac = rpc(rurl, {"method": "mediaFileFind.factory.create", "session": session, "id": 3})["result"]
-    rpc(rurl, {"method": "mediaFileFind.findFile", "object": fac, "session": session, "id": 4,
-               "params": {"condition": {"Channel": ch, "StartTime": s, "EndTime": e, "Types": ["dav"]}}})
-    nf = rpc(rurl, {"method": "mediaFileFind.findNextFile", "object": fac, "session": session, "id": 5,
-                    "params": {"count": 100}})
+print("\n=== M1: CGI mediaFileFind ===")
+cgi_ok_ch = None
+for ch in (CH, CH - 1):
     try:
-        rpc(rurl, {"method": "mediaFileFind.destroy", "object": fac, "session": session, "id": 6})
-    except Exception:
-        pass
-    return nf.get("params", {}).get("infos", []) or []
-
-
-# ---------------- M3: loadfile.cgi by time ----------------
-def loadfile_time(ch, s, e, out_dav, maxbytes=8_000_000):
-    r = OP.open(f"http://{HOST}/cgi-bin/loadfile.cgi?action=startLoad&channel={ch}"
-                f"&startTime={quote(s)}&endTime={quote(e)}&subtype=0", timeout=45)
-    out_dav.write_bytes(r.read(maxbytes))
-
-
-print(f"Dahua HTTP probe: NVR {HOST}\n")
-s0, e0 = WINDOWS[0][1], WINDOWS[0][2]
-
-# ---- M1 CGI find, ch27 and ch26 ----
-print("=== M1: CGI mediaFileFind /cgi-bin/mediaFileFind.cgi (Digest) ===")
-cgi_ok = None
-for ch in (DISP_CH, DISP_CH - 1):
-    try:
-        files = cgi_find(ch, s0, e0)
-        print(f"  Channel={ch}: {len(files)} file(s)" + (f"  e.g. {files[0].get('FilePath')} @ {files[0].get('StartTime')}" if files else ""))
-        if files and cgi_ok is None:
-            cgi_ok = ch
+        files, note = cgi_find(ch, WINDOWS[0][1], WINDOWS[0][2])
+        if files is None:
+            print(f"  Channel={ch}: FAIL ({note})")
+        else:
+            print(f"  Channel={ch}: {len(files)} file(s) [{note}]" + (f"  e.g. {files[0].get('FilePath')} @ {files[0].get('StartTime')}" if files else ""))
+            if files and cgi_ok_ch is None:
+                cgi_ok_ch = ch
     except Exception as ex:
-        print(f"  Channel={ch}: FAILED {type(ex).__name__}: {str(ex)[:70]}")
+        print(f"  Channel={ch}: EXC {type(ex).__name__}: {str(ex)[:70]}")
 
-# ---- M2 RPC2 ----
-print("\n=== M2: RPC2 JSON (POST /RPC2, global.login) ===")
-rpc_ok = None
-sess, note = rpc2_login()
-print(f"  login: {note}")
-if sess:
-    for ch in (DISP_CH, DISP_CH - 1):
+
+# ================= M2: RPC2 =================
+def rpc2_login():
+    for base in (f"http://{HOST}/RPC2_Login", f"http://{HOST}/RPC2"):
+        st, body = hpost(base, {"method": "global.login",
+                                "params": {"userName": USER, "password": "", "clientType": "Web3.0", "loginType": "Direct"},
+                                "id": 1})
+        if st != 200:
+            print(f"  login step1 @ {base.rsplit('/',1)[-1]} -> {st} ({body.decode(errors='replace')[:60]})")
+            continue
         try:
-            infos = rpc2_find(sess, ch, s0, e0)
-            print(f"  Channel={ch}: {len(infos)} file(s)" + (f"  e.g. {infos[0].get('FilePath')} @ {infos[0].get('StartTime')}" if infos else ""))
-            if infos and rpc_ok is None:
-                rpc_ok = ch
-        except Exception as ex:
-            print(f"  Channel={ch}: FAILED {type(ex).__name__}: {str(ex)[:70]}")
+            r1 = json.loads(body)
+        except Exception:
+            print(f"  login step1 @ {base.rsplit('/',1)[-1]} -> non-JSON"); continue
+        p = r1.get("params", {})
+        realm, random, session = p.get("realm"), p.get("random"), r1.get("session")
+        if not realm:
+            print(f"  login step1 -> no realm ({str(r1)[:80]})"); continue
+        a1 = hashlib.md5(f"{USER}:{realm}:{PW}".encode()).hexdigest().upper()
+        pwh = hashlib.md5(f"{USER}:{random}:{a1}".encode()).hexdigest().upper()
+        st2, body2 = hpost(base, {"method": "global.login", "session": session, "id": 2,
+                                  "params": {"userName": USER, "password": pwh, "clientType": "Web3.0",
+                                             "loginType": "Direct", "authorityType": "Default", "passwordType": "Default"}})
+        try:
+            r2 = json.loads(body2)
+        except Exception:
+            r2 = {}
+        if r2.get("result"):
+            return session, base
+        print(f"  login step2 @ {base.rsplit('/',1)[-1]} -> {st2} ({str(r2)[:80]})")
+    return None, None
 
-# ---- M3 loadfile by time (quick grab) ----
-print("\n=== M3: loadfile.cgi by time (Digest) ===")
-m3_ok = False
+
+print("\n=== M2: RPC2 JSON ===")
+rpc_ok_ch = None
+sess = rbase = None
 try:
-    dav = WORK / "m3.dav"
-    loadfile_time(DISP_CH, s0, e0, dav)
-    f = WORK / "m3.jpg"
-    m3_ok = grab(dav, f)
-    print(f"  ch{DISP_CH}: {dav.stat().st_size} bytes, frame={m3_ok}")
-    if m3_ok:
-        print("  OSD:"); osd(f)
+    sess, _ = rpc2_login()
+    print(f"  login: {'ok' if sess else 'UNAVAILABLE'}")
+    if sess:
+        for ch in (CH, CH - 1):
+            st, body = hpost(f"http://{HOST}/RPC2", {"method": "mediaFileFind.factory.create", "session": sess, "id": 3})
+            try:
+                fac = json.loads(body).get("result")
+            except Exception:
+                fac = None
+            if not fac:
+                print(f"  Channel={ch}: factory.create -> {st}"); continue
+            hpost(f"http://{HOST}/RPC2", {"method": "mediaFileFind.findFile", "object": fac, "session": sess, "id": 4,
+                                         "params": {"condition": {"Channel": ch, "StartTime": WINDOWS[0][1], "EndTime": WINDOWS[0][2], "Types": ["dav"]}}})
+            st, body = hpost(f"http://{HOST}/RPC2", {"method": "mediaFileFind.findNextFile", "object": fac, "session": sess, "id": 5, "params": {"count": 100}})
+            try:
+                infos = json.loads(body).get("params", {}).get("infos", []) or []
+            except Exception:
+                infos = []
+            print(f"  Channel={ch}: {len(infos)} file(s)" + (f"  e.g. {infos[0].get('FilePath')} @ {infos[0].get('StartTime')}" if infos else ""))
+            if infos and rpc_ok_ch is None:
+                rpc_ok_ch = ch
 except Exception as ex:
-    print(f"  FAILED {type(ex).__name__}: {str(ex)[:80]}")
+    print(f"  M2 EXC {type(ex).__name__}: {str(ex)[:80]}")
 
-# ---- pick a finder+downloader and do the two-window OSD proof ----
+
+# ================= M3: loadfile by time =================
+print("\n=== M3: loadfile.cgi by time ===")
+try:
+    st, body = hget(f"cgi-bin/loadfile.cgi?action=startLoad&channel={CH}"
+                    f"&startTime={quote(WINDOWS[0][1])}&endTime={quote(WINDOWS[0][2])}&subtype=0",
+                    timeout=45, maxbytes=8_000_000)
+    if st == 200 and len(body) > 10000:
+        dav = WORK / "m3.dav"; dav.write_bytes(body)
+        f = WORK / "m3.jpg"
+        ok = grab(dav, f)
+        print(f"  ch{CH}: {len(body)} bytes, frame={ok}")
+        if ok:
+            print("  OSD:"); osd(f)
+    else:
+        print(f"  ch{CH}: -> {st} ({len(body)} bytes) — not a media stream")
+except Exception as ex:
+    print(f"  M3 EXC {type(ex).__name__}: {str(ex)[:80]}")
+
+
+# ================= TWO-WINDOW PROOF =================
 print("\n=== TWO-WINDOW PROOF (ch27 @ 08:00 vs 18:00) ===")
-finder = downloader = None
-if cgi_ok is not None:
-    finder = lambda ch, s, e: cgi_find(cgi_ok, s, e)
-    downloader = cgi_download
-    print(f"  using M1 CGI mediaFileFind (Channel index {cgi_ok})")
-elif rpc_ok is not None and sess:
-    finder = lambda ch, s, e: rpc2_find(sess, rpc_ok, s, e)
-    downloader = lambda fp, out, maxbytes=8_000_000: cgi_download(fp, out, maxbytes)
-    print(f"  using M2 RPC2 (Channel index {rpc_ok})")
+finder = None
+if cgi_ok_ch is not None:
+    finder = ("M1 CGI", cgi_ok_ch, lambda ch, s, e: cgi_find(ch, s, e)[0])
+    dl = lambda fp, out: out.write_bytes(hget(f"cgi-bin/RPC_Loadfile{fp}", timeout=45, maxbytes=8_000_000)[1])
+elif rpc_ok_ch is not None and sess:
+    def _rpc_find(ch, s, e):
+        st, body = hpost(f"http://{HOST}/RPC2", {"method": "mediaFileFind.factory.create", "session": sess, "id": 7})
+        fac = json.loads(body).get("result")
+        hpost(f"http://{HOST}/RPC2", {"method": "mediaFileFind.findFile", "object": fac, "session": sess, "id": 8,
+                                     "params": {"condition": {"Channel": ch, "StartTime": s, "EndTime": e, "Types": ["dav"]}}})
+        st, body = hpost(f"http://{HOST}/RPC2", {"method": "mediaFileFind.findNextFile", "object": fac, "session": sess, "id": 9, "params": {"count": 100}})
+        return json.loads(body).get("params", {}).get("infos", []) or []
+    finder = ("M2 RPC2", rpc_ok_ch, _rpc_find)
+    dl = lambda fp, out: out.write_bytes(hget(f"cgi-bin/RPC_Loadfile{fp}", timeout=45, maxbytes=8_000_000)[1])
 
 if finder:
+    name, idx, find = finder
+    print(f"  using {name} (Channel index {idx})")
     for tag, s, e in WINDOWS:
         try:
-            files = finder(DISP_CH, s, e)
+            files = find(idx, s, e)
+            print(f"  {tag}: {len(files)} file(s)")
+            if not files:
+                print(f"    -> no footage at {s} (outside retention?)"); continue
+            fp = files[0].get("FilePath")
+            print(f"    file: {fp}  start={files[0].get('StartTime')}")
+            dav, jpg = WORK / f"w{tag}.dav", WORK / f"w{tag}.jpg"
+            dl(fp, dav)
+            if grab(dav, jpg):
+                print("    OSD:"); osd(jpg)
+                print(f"    validation: {validate_upload(CH, f'20260712_{tag}_dahua', jpg)}")
         except Exception as ex:
-            print(f"  {tag}: find FAILED {str(ex)[:70]}"); continue
-        print(f"  {tag}: {len(files)} file(s)")
-        if not files:
-            print(f"    -> no footage at {s} (outside retention?)"); continue
-        fp = files[0].get("FilePath")
-        print(f"    file: {fp} start={files[0].get('StartTime')}")
-        dav = WORK / f"w{tag}.dav"
-        jpg = WORK / f"w{tag}.jpg"
-        try:
-            downloader(fp, dav)
-        except Exception as ex:
-            print(f"    download FAILED {str(ex)[:70]}"); continue
-        if grab(dav, jpg):
-            print("    OSD (read the burned-in clock):"); osd(jpg)
-            print(f"    validation: {validate_upload(DISP_CH, f'20260712_{tag}_dahua', jpg)}")
-elif m3_ok:
-    print("  (M1/M2 found nothing, but M3 loadfile grabbed a frame — check its OSD above)")
+            print(f"  {tag}: EXC {type(ex).__name__}: {str(ex)[:70]}")
 else:
-    print("  NONE of CGI/RPC2/loadfile returned historical footage for ch27.")
-    print("  => This NVR does not serve historical by channel+time over the network.")
-    print("     Retrieval is an NVR-export/SDK/FM question, not a code fix.")
-
-print("\nCheck /validation/site-A: the two dahua-cgi ch27 tiles must show a CABIN with OSD")
-print("clocks 2026-07-12 08:0x and 18:0x (different) — that proves channel AND time.")
+    print("  NO finder mechanism worked.")
+    print("  If CAPABILITY above shows the Dahua CGI API ABSENT (all 404), this OEM stripped")
+    print("  the HTTP API -> historical is an NVR-export/SDK/FM finding, not a code fix.")
+    print("  If the API is present but no finder path matched, we hunt the OEM's finder next.")
