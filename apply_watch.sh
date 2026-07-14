@@ -10,14 +10,22 @@
 #   * watch_manager.py (STDLIB ONLY) lives in the agent dir; the agent imports it.
 #   * The gateway token is stripped from the child; the agent (parent) posts.
 #
-# SMOKE_ONLY=1  -> discover + install + smoke-test, STOP before grafting.
-# Additive + reversible: backups first, aborts on any smoke failure.
+# MODE (positional arg — args survive sudo; env does NOT under env_reset):
+#   sudo bash apply_watch.sh          -> SMOKE: discover+install+smoke, STOP before graft
+#   sudo bash apply_watch.sh graft    -> GRAFT: the above, then patch agent + restart
+# Fail-CLOSED: anything other than the literal 'graft' argument is smoke, and
+# SMOKE_ONLY=1 forces smoke even if 'graft' was passed. A missing/garbled flag can
+# only ever result in NO mutation.
 set -uo pipefail
+MODE="${1:-smoke}"
+[ "$MODE" = graft ] || MODE=smoke                 # only the exact word 'graft' mutates
+[ "${SMOKE_ONLY:-0}" = 1 ] && MODE=smoke          # env can force smoke, never graft
 AGENT_DIR="${AGENT_DIR:-/home/askjitk/liftlab-b3/pi-agent}"
 AGENT="$AGENT_DIR/agent.py"
 B4_DIR="${B4_DIR:-/home/askjitk/liftlab-b4}"
 B4_PY="${B4_PY:-$B4_DIR/.venv/bin/python}"
 say(){ echo "[watch] $*"; }
+say "MODE=$MODE  ($([ "$MODE" = graft ] && echo 'WILL patch agent + restart' || echo 'install+smoke only, NO agent mutation'))"
 
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
 for f in /tmp/continuous_scheduler.py /tmp/watch_manager.py /tmp/watch_channel_graft.py; do
@@ -66,11 +74,12 @@ fi
   || { say "watch_manager import FAILED in agent venv (should be stdlib-only!) — aborting"; rm -f "$AGENT_DIR/watch_manager.py" "$AGENT_DIR/watch_runtime.conf"; exit 1; }
 say "smoke: scheduler+reuse-map import under B4_PY; watch_manager import in agent venv — BOTH GREEN"
 
-if [ "${SMOKE_ONLY:-0}" = 1 ]; then
-  say "SMOKE_ONLY: stopping BEFORE graft. Agent untouched at $(grep -oE 'VERSION = \"[0-9.]+\"' "$AGENT" | head -1)."
-  say "Re-run without SMOKE_ONLY to graft once the auth boundary is signed off."
+if [ "$MODE" != graft ]; then
+  say "MODE=$MODE — install + smoke complete, STOPPING BEFORE graft. Agent untouched at $(grep -oE 'VERSION = \"[0-9.]+\"' "$AGENT" | head -1)."
+  say "To graft: sudo bash $0 graft"
   exit 0
 fi
+say "MODE=graft — proceeding to patch the agent + restart."
 
 # ---- graft the non-blocking dispatch (backup-first, idempotent) ----
 sudo -u "$OWNER" "$AGENT_PY" /tmp/watch_channel_graft.py || { say "graft step failed"; exit 1; }
