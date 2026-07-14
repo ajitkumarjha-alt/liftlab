@@ -281,6 +281,11 @@ class _Runner:
             "latency_med_s": round(float(np.median(self.lat_recent)), 3) if self.lat_recent else None,
             "latency_max_s": round(self.lat_max, 3),
             "cycles_emitted": len(self.cycles), "alarms": self.alarms[-5:],
+            # last few full cycle timings so CORRECTNESS is eyeball-able off the Pi
+            # status file (not just the tier1 aggregates): check close_travel_s ~2-2.5s,
+            # dwell_s sane — a stable loop emitting nonsense cycles fails differently
+            # than a drifting one, and health metrics won't show it.
+            "recent_cycles": self.cycles[-5:],
             "tier1": self.rollups(), "health": self._health(),
         }
 
