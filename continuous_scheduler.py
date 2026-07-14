@@ -106,6 +106,16 @@ def _post(url, payload, headers, timeout=10):
         return None
 
 
+def _post_bytes(url, body, headers, ctype="image/jpeg", timeout=30):
+    try:
+        h = {"Content-Type": ctype, **(headers or {})}
+        req = urllib.request.Request(url, data=body, headers=h, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status
+    except Exception:
+        return None
+
+
 def _event_row(tl, c):
     """Exact production event schema (mirrors agent._event_payload). Occupancy
     stays None — v1 has no detector."""
@@ -176,6 +186,11 @@ class _Runner:
         self.hub = _FrameHub()
         self.state = "seeding"
         self.error = None
+        # Q1 seed provenance: one OSD-intact validation frame + eyeball flag
+        self._want_full = threading.Event()
+        self._seed_full = None            # one full BGR frame stashed during seed
+        self.baseline_confirmed = False   # operator must eyeball doors-shut
+        self.validation_fn = None
         # signal buffers (absolute offsets from run start — never re-based)
         self.t0 = None
         self.start_wall = None
@@ -211,6 +226,7 @@ class _Runner:
         el = (time.time() - self.t0) if self.t0 else 0.0
         return {
             "channel": self.channel, "camera": self.camera, "state": self.state,
+            "baseline_confirmed": self.baseline_confirmed, "validation_frame": self.validation_fn,
             "error": self.error, "elapsed_s": round(el, 1), "samples": self.samples,
             "signal_fps": round(self.samples / el, 2) if el > 1 else None,
             "latency_med_s": round(float(np.median(self.lat_recent)), 3) if self.lat_recent else None,
@@ -236,6 +252,12 @@ class _Runner:
                     except Exception:
                         continue
                     self.hub.put(crop, time.time())
+                    # stash ONE full OSD-intact frame for the seed validation proof
+                    if self._want_full.is_set() and self._seed_full is None:
+                        try:
+                            self._seed_full = frame.to_ndarray(format="bgr24")
+                        except Exception:
+                            pass
                 cont.close()
             except Exception as e:
                 self.error = f"capture: {type(e).__name__}: {str(e)[:80]}"
@@ -247,7 +269,14 @@ class _Runner:
     def _seed_baseline(self):
         """Collect SEED_FRAMES fresh crops, verify the window is QUIET (doors not
         moving), set baseline=median, closed_floor=median distance. If not quiet,
-        FAIL and surface — never guess a baseline from a busy window."""
+        FAIL and surface — never guess a baseline from a busy window.
+
+        The motion-quiet gate proves doors-not-MOVING, but a stationary OPEN door
+        is also quiet and would pass while seeding the OPEN appearance as 'closed'
+        (self-cancel that passes the check). So we also upload ONE OSD-intact
+        validation frame from the seed window and leave baseline_confirmed=False:
+        the operator must EYEBALL doors-shut at /validation/<gw> before trusting it."""
+        self._want_full.set()             # ask capture to stash one full frame
         crops, deadline = [], time.time() + 20.0
         last_seq = -1
         while len(crops) < SEED_FRAMES and time.time() < deadline and not self.stop_event.is_set():
@@ -266,7 +295,38 @@ class _Runner:
                            f"— doors were moving/active; retry during a visibly doors-shut still moment")
         self.baseline = baseline.astype(np.float32)
         self.closed_floor = float(np.median(raw))
-        return True, f"seed OK (quiet spread {spread:.1f}, closed_floor {self.closed_floor:.1f}, {len(crops)} frames)"
+        vmsg = self._upload_seed_frame()
+        return True, (f"seed motion-quiet (spread {spread:.1f}, closed_floor {self.closed_floor:.1f}, "
+                      f"{len(crops)} frames). {vmsg} baseline_confirmed=False — EYEBALL doors-shut at "
+                      f"/validation/{self.gw_id} (a stationary OPEN door passes the motion gate).")
+
+    def _upload_seed_frame(self):
+        """Encode the stashed full frame as JPEG and POST it to the validation
+        viewer (OSD intact). Reuses the keep_validation_frame endpoint/proof."""
+        self._want_full.clear()
+        deadline = time.time() + 3.0
+        while self._seed_full is None and time.time() < deadline:
+            time.sleep(0.1)
+        if self._seed_full is None:
+            return "(no validation frame captured;"
+        try:
+            import cv2
+            img = self._seed_full
+            h, w = img.shape[:2]
+            if w > 720:
+                img = cv2.resize(img, (720, max(1, int(h * 720 / w))), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", img)
+            self._seed_full = None
+            if not ok or not self.cloud:
+                return "(validation encode/cloud unavailable;"
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            self.validation_fn = f"ch{self.channel:02d}_{stamp}.jpg"
+            url = f"{self.cloud}/api/gw/{self.gw_id}/validation/{self.channel}?requested_start={stamp}&mode=watch-seed"
+            code = _post_bytes(url, buf.tobytes(), self.headers)
+            return f"validation frame uploaded ({code}) -> /validation/{self.gw_id};"
+        except Exception as e:
+            self._seed_full = None
+            return f"(validation upload failed: {type(e).__name__};"
 
     # ---- per-sample ingest (also the unit-test entry point) ----
     def step(self, crop, ts):
@@ -358,6 +418,7 @@ class _Runner:
             "declared_tz": str(self.start_wall.tzinfo) if self.start_wall else "local",
             "tz_source": "live-wallclock", "start_ts": self.start_wall.isoformat(),
             "events": rows, "door_signal": [], "tier1": self.rollups(), "mode": "continuous",
+            "baseline_confirmed": self.baseline_confirmed,
         }
         code = _post(f"{self.cloud}/api/gw/events", payload, self.headers)
         self._log(f"[watch ch{self.channel}] emitted {len(rows)} cycle(s) -> {code}")
@@ -449,6 +510,18 @@ def run_watch(job, *, report=None, log=None, cloud=None, gw_id=None, headers=Non
     report = report or (lambda *a, **k: None)
     action = (job.get("action") or "start").lower()
     channel = int(job.get("channel", 29))
+
+    if action == "confirm":
+        # operator eyeballed the /validation seed frame and confirms doors were shut
+        with _REG_LOCK:
+            r = _REGISTRY.get(channel)
+        if not r:
+            res = {"status": "not_running", "channel": channel}
+            report(job, res); return res
+        r.baseline_confirmed = True
+        log(f"[watch ch{channel}] baseline CONFIRMED doors-shut by operator")
+        res = {"status": "confirmed", "channel": channel}
+        report(job, res); return res
 
     if action == "stop":
         with _REG_LOCK:
