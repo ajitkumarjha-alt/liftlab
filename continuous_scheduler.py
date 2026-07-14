@@ -424,9 +424,16 @@ class _Runner:
         self._log(f"[watch ch{self.channel}] emitted {len(rows)} cycle(s) -> {code}")
 
     def _status_post(self):
-        if not self.cloud:
-            return
-        _post(f"{self.cloud}/api/gw/{self.gw_id}/watch_status", self.status(), self.headers)
+        st = self.status()
+        if self.cloud:
+            _post(f"{self.cloud}/api/gw/{self.gw_id}/watch_status", st, self.headers)
+        import os
+        sf = os.environ.get("WATCH_STATUS_FILE")
+        if sf:
+            try:
+                Path(sf).write_text(json.dumps(st))
+            except Exception:
+                pass
 
     # ---- the runner thread ----
     def _run(self):
@@ -555,3 +562,49 @@ def run_watch(job, *, report=None, log=None, cloud=None, gw_id=None, headers=Non
 def list_running():
     with _REG_LOCK:
         return {ch: r.status() for ch, r in _REGISTRY.items()}
+
+
+# =========================================================================
+# standalone entry point — run as a SUBPROCESS under the full-deps python.
+# The import-light agent cannot import numpy/av/liftlab, so watch_manager.py
+# (stdlib-only) launches THIS as a child process. Config comes from env; SIGTERM
+# stops gracefully, SIGUSR1 confirms the baseline (operator eyeballed doors-shut).
+# =========================================================================
+def _runner_from_env(channel):
+    import os
+    nvr = (os.environ.get("NVR_HOST", ""), os.environ.get("NVR_PORT", "80"),
+           os.environ.get("NVR_USER", ""), os.environ.get("NVR_PASS", ""))
+    token = os.environ.get("GATEWAY_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    camera, roi = _resolve_roi(os.environ.get("ZONES_PATH", ""), channel)
+    return _Runner(channel, roi, camera,
+                   cloud=os.environ.get("CLOUD_URL", ""),
+                   gw_id=os.environ.get("GATEWAY_ID", "site-A"),
+                   headers=headers, nvr=nvr, url=os.environ.get("WATCH_URL") or None,
+                   log=lambda *a, **k: print(*a, flush=True))
+
+
+def main():
+    import os
+    import signal
+    import sys
+    channel = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("WATCH_CHANNEL", "29"))
+    r = _runner_from_env(channel)
+    with _REG_LOCK:
+        _REGISTRY[channel] = r
+    signal.signal(signal.SIGTERM, lambda *_: r.stop_event.set())
+    signal.signal(signal.SIGINT, lambda *_: r.stop_event.set())
+    try:
+        def _confirm(*_):
+            r.baseline_confirmed = True
+            print(f"[watch ch{channel}] baseline CONFIRMED doors-shut (SIGUSR1)", flush=True)
+        signal.signal(signal.SIGUSR1, _confirm)
+    except (AttributeError, ValueError):
+        pass  # SIGUSR1 not on this platform
+    print(f"[watch ch{channel}] scheduler process starting (pid {os.getpid()})", flush=True)
+    r._run()  # foreground; returns when stop_event is set
+    print("FINAL " + json.dumps(r.status()), flush=True)
+
+
+if __name__ == "__main__":
+    main()
