@@ -238,6 +238,39 @@ class _Runner:
         self.state = "stopped"
         return self.status()
 
+    def _health(self):
+        """SoC temp, LIVE vs STICKY throttle (bits 0-3 now / 16-19 since-boot), free
+        mem, and the child's own RSS (memory-growth watch). All for the soak gate."""
+        import subprocess
+        h = {}
+        try:
+            raw = subprocess.check_output(["vcgencmd", "get_throttled"], text=True, timeout=3).strip().split("=")[1]
+            val = int(raw, 16)
+            h["throttled_hex"] = raw
+            h["throttle_live"] = [n for b, n in {0: "undervolt", 1: "freqcap", 2: "throttled", 3: "templimit"}.items() if val & (1 << b)]
+            h["throttle_sticky"] = [n for b, n in {16: "undervolt", 17: "freqcap", 18: "throttled", 19: "templimit"}.items() if val & (1 << b)]
+        except Exception:
+            h["throttled_hex"] = None
+        try:
+            h["soc_temp"] = float(subprocess.check_output(["vcgencmd", "measure_temp"], text=True, timeout=3).split("=")[1].split("'")[0])
+        except Exception:
+            pass
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemAvailable:"):
+                    h["mem_avail_mb"] = int(line.split()[1]) // 1024
+                    break
+        except Exception:
+            pass
+        try:
+            for line in open("/proc/self/status"):
+                if line.startswith("VmRSS:"):
+                    h["rss_mb"] = int(line.split()[1]) // 1024
+                    break
+        except Exception:
+            pass
+        return h
+
     def status(self):
         el = (time.time() - self.t0) if self.t0 else 0.0
         return {
@@ -248,7 +281,7 @@ class _Runner:
             "latency_med_s": round(float(np.median(self.lat_recent)), 3) if self.lat_recent else None,
             "latency_max_s": round(self.lat_max, 3),
             "cycles_emitted": len(self.cycles), "alarms": self.alarms[-5:],
-            "tier1": self.rollups(),
+            "tier1": self.rollups(), "health": self._health(),
         }
 
     # ---- capture thread (real live stream) ----
@@ -428,15 +461,17 @@ class _Runner:
         self._log(f"[watch ch{self.channel}] ALARM {msg}")
 
     def _emit(self, rows):
-        """Emit derived events for the PARENT to Bearer-POST. NO imagery, NO token."""
+        """Emit derived events for the PARENT to Bearer-POST. NO imagery, NO token.
+        The payload is EXACTLY analyze_local's 7-key shape, so it rides the existing,
+        proven /api/gw/events ingest with zero schema change. tier1/baseline_confirmed
+        travel in status() (read off the Pi), never in this POST."""
         if not rows:
             return
         payload = {
             "gateway_id": self.gw_id, "camera": self.camera,
             "declared_tz": str(self.start_wall.tzinfo) if self.start_wall else "local",
             "tz_source": "live-wallclock", "start_ts": self.start_wall.isoformat(),
-            "events": rows, "door_signal": [], "tier1": self.rollups(), "mode": "continuous",
-            "baseline_confirmed": self.baseline_confirmed,
+            "events": rows, "door_signal": [],
         }
         _emit_out({"kind": "events", "payload": payload})
         self._log(f"[watch ch{self.channel}] emitted {len(rows)} cycle(s) to parent")
