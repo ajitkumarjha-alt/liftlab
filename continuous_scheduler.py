@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
-"""Continuous single-cabin door-cycle scheduler — Tier-1 live metrics.
+"""Continuous single-cabin door-cycle scheduler — Tier-1 live metrics (v1=A).
 
-Job: watch_channel {channel, action: start|stop}. v1 = A (door cycles only). NO
-onnxruntime, NO ultralytics, NO occupancy — the cheap openness/diff signal only.
-The certified door-CLOSE time is NOT sourced here; it stays on the exported-file
-full-fps path. This run gives door-cycle RHYTHM, headway, stop counts, idle
-periods and hourly profile at the live frame rate.
+Runs as a SUBPROCESS under the B4 venv (numpy/av/cv2/liftlab), launched by the
+import-light agent via watch_manager.py — the SAME out-of-process shape
+analyze_local uses (PYTHONPATH=B4_DIR, cwd=B4_DIR, job as JSON on STDIN).
 
-DESIGN (satisfies the two guards):
- * NON-BLOCKING start. run_watch(start) spawns a daemon runner thread and returns
-   at once, so the agent's single-threaded poll loop keeps HEARTBEATING and can
-   receive a later {action: stop}. The runner never touches the agent's shared
-   httpx client; it does its own urllib POSTs.
- * NO double-count. A cycle emits only when COMPLETE (detect_cycles requires both
-   fall edges) AND SETTLED (close_full is >= SETTLE_S behind the newest sample, so
-   the post-close floor is fully sampled and close_full is stable), then de-duped
-   by close_full within a tolerance. A trailing partial cannot emit then re-emit.
+TOKEN BOUNDARY (matches analyze_local exactly): the gateway token is STRIPPED from
+this child's env. So this child NEVER posts. It EMITS newline-delimited JSON on
+STDOUT — {"kind":"events"|"status"|"validation"} — and the PARENT agent (which
+owns the Bearer credential) does every POST. Human logs/tracebacks go to STDERR
+(captured to a logfile); STDOUT is the structured channel ONLY. If the parent dies,
+STDOUT breaks and the child stops (auto-reap).
 
-ANCHORING: live wall-clock. Each sample is stamped at capture time (time.time());
-offsets are seconds from run start. Capture->compute latency is bounded and
-LOGGED, so depicted time ~= capture time (container PTS is NOT trusted — see the
-pulled-clip-PTS finding). BASELINE is seeded ONCE, clean and checkable, from a
-short LIVE quiet (doors-shut) grab, then refreshed slowly from confirmed-closed
-frames only — never re-established from a busy window.
+v1 = door cycles only. NO onnxruntime/ultralytics/occupancy — cheap openness/diff
+signal. The certified door-CLOSE time is NOT sourced here (exported-file full-fps
+path). This gives door-cycle RHYTHM, headway, stop counts, idle, hourly profile.
+
+NO double-count: a cycle emits only when COMPLETE (detect_cycles needs both fall
+edges) AND SETTLED (close_full >= SETTLE_S behind newest), de-duped by close_full.
+ANCHORING: live wall-clock; capture->compute latency bounded+logged. BASELINE
+seeded once from a quiet doors-shut grab + an OSD-intact validation frame the
+operator must eyeball (baseline_confirmed stays False until action:confirm).
 """
 from __future__ import annotations
 
+import base64
 import json
+import sys
 import threading
 import time
-import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +59,29 @@ SEED_QUIET_SPREAD = MOTION_FLOOR   # seed rejected if raw spread exceeds this (m
 
 _REGISTRY: dict[int, "_Runner"] = {}
 _REG_LOCK = threading.Lock()
+_STDOUT_BROKEN = threading.Event()   # set if the parent (stdout reader) went away
+_OUT_LOCK = threading.Lock()
+
+
+# =========================================================================
+# child->parent channel: NDJSON on stdout. The child NEVER posts (no token).
+# =========================================================================
+def _emit_out(obj):
+    line = json.dumps(obj)
+    with _OUT_LOCK:
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            _STDOUT_BROKEN.set()   # parent gone -> stop the run (auto-reap)
+
+
+def _log_err(msg):
+    try:
+        sys.stderr.write(str(msg) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 # =========================================================================
@@ -77,8 +99,9 @@ def _live_url(nvr, channel):
 
 
 def _resolve_roi(zones_path, channel):
-    """door_roi for this channel from the survey zones. Returns (camera, roi) or
-    (camera, None) if uncalibrated — the caller surfaces needs_calibration."""
+    """door_roi for this channel from ZONES_PATH (B4_DIR/camera_zones.json — same
+    source analyze_local uses). Returns (camera, roi) or (camera, None) if
+    uncalibrated (caller surfaces needs_calibration)."""
     try:
         z = json.loads(Path(zones_path).read_text())
     except Exception:
@@ -93,27 +116,6 @@ def _resolve_roi(zones_path, channel):
     if cam and isinstance(z.get(cam), dict) and z[cam].get("door_roi"):
         return cam, tuple(z[cam]["door_roi"])
     return f"ch{int(channel):02d}", None
-
-
-def _post(url, payload, headers, timeout=10):
-    try:
-        data = json.dumps(payload).encode()
-        h = {"Content-Type": "application/json", **(headers or {})}
-        req = urllib.request.Request(url, data=data, headers=h, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status
-    except Exception:
-        return None
-
-
-def _post_bytes(url, body, headers, ctype="image/jpeg", timeout=30):
-    try:
-        h = {"Content-Type": ctype, **(headers or {})}
-        req = urllib.request.Request(url, data=body, headers=h, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status
-    except Exception:
-        return None
 
 
 def _event_row(tl, c):
@@ -171,14 +173,12 @@ class _FrameHub:
 # the runner
 # =========================================================================
 class _Runner:
-    def __init__(self, channel, roi, camera, *, cloud, gw_id, headers,
-                 nvr=None, url=None, log=None):
+    def __init__(self, channel, roi, camera, *, gw_id="site-A",
+                 nvr=None, url=None, log=None, cloud=None, headers=None):
         self.channel = int(channel)
         self.roi = roi
         self.camera = camera
-        self.cloud = (cloud or "").rstrip("/")
         self.gw_id = gw_id
-        self.headers = headers or {}
         self.nvr = nvr
         self.url = url                    # optional pre-resolved / injected URL
         self._log = log or (lambda *a, **k: None)
@@ -273,7 +273,7 @@ class _Runner:
 
         The motion-quiet gate proves doors-not-MOVING, but a stationary OPEN door
         is also quiet and would pass while seeding the OPEN appearance as 'closed'
-        (self-cancel that passes the check). So we also upload ONE OSD-intact
+        (self-cancel that passes the check). So we also emit ONE OSD-intact
         validation frame from the seed window and leave baseline_confirmed=False:
         the operator must EYEBALL doors-shut at /validation/<gw> before trusting it."""
         self._want_full.set()             # ask capture to stash one full frame
@@ -295,14 +295,14 @@ class _Runner:
                            f"— doors were moving/active; retry during a visibly doors-shut still moment")
         self.baseline = baseline.astype(np.float32)
         self.closed_floor = float(np.median(raw))
-        vmsg = self._upload_seed_frame()
+        vmsg = self._emit_seed_frame()
         return True, (f"seed motion-quiet (spread {spread:.1f}, closed_floor {self.closed_floor:.1f}, "
                       f"{len(crops)} frames). {vmsg} baseline_confirmed=False — EYEBALL doors-shut at "
                       f"/validation/{self.gw_id} (a stationary OPEN door passes the motion gate).")
 
-    def _upload_seed_frame(self):
-        """Encode the stashed full frame as JPEG and POST it to the validation
-        viewer (OSD intact). Reuses the keep_validation_frame endpoint/proof."""
+    def _emit_seed_frame(self):
+        """Encode the stashed full frame as JPEG and EMIT it (base64) for the
+        PARENT to POST to the validation viewer. The child does not post."""
         self._want_full.clear()
         deadline = time.time() + 3.0
         while self._seed_full is None and time.time() < deadline:
@@ -317,16 +317,17 @@ class _Runner:
                 img = cv2.resize(img, (720, max(1, int(h * 720 / w))), interpolation=cv2.INTER_AREA)
             ok, buf = cv2.imencode(".jpg", img)
             self._seed_full = None
-            if not ok or not self.cloud:
-                return "(validation encode/cloud unavailable;"
+            if not ok:
+                return "(validation encode failed;"
             stamp = datetime.now().strftime("%Y%m%d%H%M%S")
             self.validation_fn = f"ch{self.channel:02d}_{stamp}.jpg"
-            url = f"{self.cloud}/api/gw/{self.gw_id}/validation/{self.channel}?requested_start={stamp}&mode=watch-seed"
-            code = _post_bytes(url, buf.tobytes(), self.headers)
-            return f"validation frame uploaded ({code}) -> /validation/{self.gw_id};"
+            _emit_out({"kind": "validation", "channel": self.channel,
+                       "jpg_b64": base64.b64encode(buf.tobytes()).decode(),
+                       "requested_start": stamp, "mode": "watch-seed"})
+            return f"validation frame emitted to parent -> /validation/{self.gw_id};"
         except Exception as e:
             self._seed_full = None
-            return f"(validation upload failed: {type(e).__name__};"
+            return f"(validation emit failed: {type(e).__name__};"
 
     # ---- per-sample ingest (also the unit-test entry point) ----
     def step(self, crop, ts):
@@ -411,7 +412,8 @@ class _Runner:
         self._log(f"[watch ch{self.channel}] ALARM {msg}")
 
     def _emit(self, rows):
-        if not rows or not self.cloud:
+        """Emit derived events for the PARENT to Bearer-POST. NO imagery, NO token."""
+        if not rows:
             return
         payload = {
             "gateway_id": self.gw_id, "camera": self.camera,
@@ -420,13 +422,12 @@ class _Runner:
             "events": rows, "door_signal": [], "tier1": self.rollups(), "mode": "continuous",
             "baseline_confirmed": self.baseline_confirmed,
         }
-        code = _post(f"{self.cloud}/api/gw/events", payload, self.headers)
-        self._log(f"[watch ch{self.channel}] emitted {len(rows)} cycle(s) -> {code}")
+        _emit_out({"kind": "events", "payload": payload})
+        self._log(f"[watch ch{self.channel}] emitted {len(rows)} cycle(s) to parent")
 
     def _status_post(self):
         st = self.status()
-        if self.cloud:
-            _post(f"{self.cloud}/api/gw/{self.gw_id}/watch_status", st, self.headers)
+        _emit_out({"kind": "status", "status": st})
         import os
         sf = os.environ.get("WATCH_STATUS_FILE")
         if sf:
@@ -435,17 +436,21 @@ class _Runner:
             except Exception:
                 pass
 
-    # ---- the runner thread ----
+    # ---- the runner thread / foreground loop ----
     def _run(self):
         # resolve URL if not injected
         if not self.url and self.nvr:
-            self.url = _live_url(self.nvr, self.channel)
+            try:
+                self.url = _live_url(self.nvr, self.channel)
+            except Exception as e:
+                self.state = "failed"; self.error = f"onvif resolve: {type(e).__name__}: {str(e)[:80]}"
+                self._log(f"[watch ch{self.channel}] {self.error}"); self._status_post(); self._deregister(); return
         if not self.url:
             self.state = "failed"; self.error = "no live URL (ONVIF resolve failed)"
-            self._log(f"[watch ch{self.channel}] {self.error}"); self._deregister(); return
+            self._log(f"[watch ch{self.channel}] {self.error}"); self._status_post(); self._deregister(); return
         if not self.roi:
             self.state = "failed"; self.error = "needs_calibration (no door_roi)"
-            self._log(f"[watch ch{self.channel}] {self.error}"); self._deregister(); return
+            self._log(f"[watch ch{self.channel}] {self.error}"); self._status_post(); self._deregister(); return
 
         self._cap_thread = threading.Thread(target=self._capture_loop, name=f"cap-ch{self.channel}", daemon=True)
         self._cap_thread.start()
@@ -462,10 +467,9 @@ class _Runner:
         next_t = time.time()
         last_seq = -1
         last_status = time.time()
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() and not _STDOUT_BROKEN.is_set():
             now = time.time()
             crop, ts, seq = self.hub.latest()
-            # freshness / stall
             age = now - ts if ts else 999
             if ts and seq != last_seq:
                 lat = now - ts
@@ -476,26 +480,25 @@ class _Runner:
                 last_seq = seq
             elif age > STALL_S:
                 self._alarm(f"capture stalled (freshest {age:.1f}s old)")
-            # detection
             if self.t0 and (now - self.last_detect) >= DETECT_EVERY_S:
                 self.last_detect = now
                 rows = self.maybe_detect(self.offs[-1] if self.offs else 0.0)
                 if rows:
                     self._emit(rows)
-            # periodic status + fps drift alarm (every ~15s)
             if now - last_status >= 15.0:
                 el = now - self.t0 if self.t0 else 1
                 fps = self.samples / el if el > 0 else 0
                 if el > 30 and fps < SIGNAL_FPS_ALARM:
                     self._alarm(f"signal fps {fps:.1f} < {SIGNAL_FPS_ALARM}")
                 self._status_post(); last_status = now
-            # pace at SIGNAL_HZ
             next_t += period
             sleep = next_t - time.time()
             if sleep > 0:
                 self.stop_event.wait(sleep)
             else:
                 next_t = time.time()
+        if _STDOUT_BROKEN.is_set():
+            self._log(f"[watch ch{self.channel}] parent stdout closed — stopping (auto-reap)")
         self.state = "stopped"
         self._status_post()
         self._deregister()
@@ -507,89 +510,72 @@ class _Runner:
 
 
 # =========================================================================
-# agent entry point (dispatched from the poll loop — MUST stay non-blocking)
+# in-process handler (kept for tests / non-agent callers; the agent uses the
+# subprocess path via watch_manager). NON-BLOCKING start.
 # =========================================================================
-def run_watch(job, *, report=None, log=None, cloud=None, gw_id=None, headers=None,
-              zones_path=None, nvr=None, **_):
-    """Dispatch handler. action=start spawns a daemon runner and returns AT ONCE
-    (poll loop keeps heartbeating; a later action=stop is receivable)."""
+def run_watch(job, *, report=None, log=None, gw_id=None, zones_path=None, nvr=None, **_):
     log = log or (lambda *a, **k: None)
     report = report or (lambda *a, **k: None)
     action = (job.get("action") or "start").lower()
     channel = int(job.get("channel", 29))
 
     if action == "confirm":
-        # operator eyeballed the /validation seed frame and confirms doors were shut
         with _REG_LOCK:
             r = _REGISTRY.get(channel)
         if not r:
-            res = {"status": "not_running", "channel": channel}
-            report(job, res); return res
+            res = {"status": "not_running", "channel": channel}; report(job, res); return res
         r.baseline_confirmed = True
-        log(f"[watch ch{channel}] baseline CONFIRMED doors-shut by operator")
-        res = {"status": "confirmed", "channel": channel}
-        report(job, res); return res
+        res = {"status": "confirmed", "channel": channel}; report(job, res); return res
 
     if action == "stop":
         with _REG_LOCK:
             r = _REGISTRY.get(channel)
         if not r:
-            res = {"status": "not_running", "channel": channel}
-            report(job, res); return res
-        st = r.stop()
-        log(f"[watch ch{channel}] stopped: {st.get('cycles_emitted')} cycles, "
-            f"{st.get('samples')} samples, lat_max {st.get('latency_max_s')}s")
-        res = {"status": "stopped", "channel": channel, "final": st}
-        report(job, res); return res
+            res = {"status": "not_running", "channel": channel}; report(job, res); return res
+        res = {"status": "stopped", "channel": channel, "final": r.stop()}; report(job, res); return res
 
-    # action == start
     with _REG_LOCK:
         if channel in _REGISTRY:
-            res = {"status": "already_running", "channel": channel}
-            report(job, res); return res
+            res = {"status": "already_running", "channel": channel}; report(job, res); return res
         camera, roi = _resolve_roi(zones_path, channel)
-        r = _Runner(channel, roi, camera, cloud=cloud, gw_id=gw_id, headers=headers,
-                    nvr=nvr, url=job.get("url"), log=log)
+        r = _Runner(channel, roi, camera, gw_id=gw_id, nvr=nvr, url=job.get("url"), log=log)
         _REGISTRY[channel] = r
     r.start()
-    log(f"[watch ch{channel}] starting (camera={camera}, roi={'set' if roi else 'MISSING'})")
-    res = {"status": "starting", "channel": channel, "camera": camera,
-           "calibrated": bool(roi)}
+    res = {"status": "starting", "channel": channel, "camera": camera, "calibrated": bool(roi)}
     report(job, res)
     return res
 
 
-def list_running():
-    with _REG_LOCK:
-        return {ch: r.status() for ch, r in _REGISTRY.items()}
-
-
 # =========================================================================
-# standalone entry point — run as a SUBPROCESS under the full-deps python.
-# The import-light agent cannot import numpy/av/liftlab, so watch_manager.py
-# (stdlib-only) launches THIS as a child process. Config comes from env; SIGTERM
-# stops gracefully, SIGUSR1 confirms the baseline (operator eyeballed doors-shut).
+# standalone entry point — run as a SUBPROCESS under the B4 python.
+# Job arrives as JSON on STDIN (matches analyze_local's runner contract).
+# STDOUT = NDJSON to the parent; STDERR = human logs. SIGTERM stops; SIGUSR1
+# confirms the baseline (operator eyeballed doors-shut).
 # =========================================================================
-def _runner_from_env(channel):
+def _runner_from_job(job):
     import os
-    nvr = (os.environ.get("NVR_HOST", ""), os.environ.get("NVR_PORT", "80"),
-           os.environ.get("NVR_USER", ""), os.environ.get("NVR_PASS", ""))
-    token = os.environ.get("GATEWAY_TOKEN", "")
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    camera, roi = _resolve_roi(os.environ.get("ZONES_PATH", ""), channel)
-    return _Runner(channel, roi, camera,
-                   cloud=os.environ.get("CLOUD_URL", ""),
-                   gw_id=os.environ.get("GATEWAY_ID", "site-A"),
-                   headers=headers, nvr=nvr, url=os.environ.get("WATCH_URL") or None,
-                   log=lambda *a, **k: print(*a, flush=True))
+    ns = job.get("nvr_settings") or {}
+    nvr = (ns.get("host") or os.environ.get("NVR_HOST", ""),
+           str(ns.get("port") or os.environ.get("NVR_PORT", "80")),
+           ns.get("user") or os.environ.get("NVR_USER", ""),
+           ns.get("password") or os.environ.get("NVR_PASS", ""))
+    zones = job.get("zones_path") or os.environ.get("ZONES_PATH", "")
+    channel = int(job.get("channel", 29))
+    camera, roi = _resolve_roi(zones, channel)
+    return channel, _Runner(channel, roi, camera, gw_id=job.get("gateway_id", "site-A"),
+                            nvr=nvr, url=job.get("url") or None, log=_log_err)
 
 
 def main():
     import os
     import signal
-    import sys
-    channel = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("WATCH_CHANNEL", "29"))
-    r = _runner_from_env(channel)
+    raw = sys.stdin.read()
+    try:
+        job = json.loads(raw) if raw.strip() else {}
+    except Exception as e:
+        _emit_out({"kind": "status", "status": {"state": "failed", "error": f"bad job json: {e}"}})
+        return
+    channel, r = _runner_from_job(job)
     with _REG_LOCK:
         _REGISTRY[channel] = r
     signal.signal(signal.SIGTERM, lambda *_: r.stop_event.set())
@@ -597,13 +583,13 @@ def main():
     try:
         def _confirm(*_):
             r.baseline_confirmed = True
-            print(f"[watch ch{channel}] baseline CONFIRMED doors-shut (SIGUSR1)", flush=True)
+            _log_err(f"[watch ch{channel}] baseline CONFIRMED doors-shut (SIGUSR1)")
         signal.signal(signal.SIGUSR1, _confirm)
     except (AttributeError, ValueError):
         pass  # SIGUSR1 not on this platform
-    print(f"[watch ch{channel}] scheduler process starting (pid {os.getpid()})", flush=True)
-    r._run()  # foreground; returns when stop_event is set
-    print("FINAL " + json.dumps(r.status()), flush=True)
+    _log_err(f"[watch ch{channel}] scheduler process starting (pid {os.getpid()})")
+    r._run()  # foreground; returns when stop_event set or parent stdout closes
+    _emit_out({"kind": "status", "status": r.status()})
 
 
 if __name__ == "__main__":
