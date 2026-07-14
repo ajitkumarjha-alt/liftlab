@@ -2,28 +2,25 @@
 On-Pi channel survey (commissioning) — imported LAZILY by the agent for the
 'survey' job type, so the agent stays import-light.
 
-One ~480px snapshot per channel. DEFAULT mode is 'playback' (a 3 s pull from
-~lag seconds ago): the Dahua playback grammar is field-proven to honour the
-channel param on this firmware. 'live' (realmonitor sub-stream) is opt-in via
-params.snapshot_mode='live' — on some Dahua OEM firmware realmonitor IGNORES the
-channel and returns one default camera (observed on this NVR: all 40 channels
-came back as the same "42B REFUGE" feed), so it is NOT the default. Either way a
-per-channel TRIPWIRE logs mode + masked request URL, so "one camera 40 times" is
-visible in journalctl. Per-channel errors are recorded (non-fatal); snapshots
-are deleted locally after upload.
+Channel selection: this NVR ignores ?channel=N on constructed RTSP and returns a
+single default camera under EVERY grammar we tried (proven by grammar_probe).
+ONVIF is authoritative — it hands us path-based per-channel URIs
+(rtsp://host:554/<channel>/<stream>?...). So the survey resolves the channel->URI
+map via ONVIF (cached per gateway) and grabs one ~480px snapshot per channel from
+the sub-stream. Per-channel errors are recorded (non-fatal); a per-channel TRIPWIRE
+logs mode + masked URL so a wrong-camera regression is visible in journalctl.
 """
 import json
 import re
 import shlex
 import subprocess
-from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
+
+import onvif_resolve
 
 
 def _mask(url: str) -> str:
-    """Mask userinfo up to the LAST '@' in the authority — robust even if a
-    malformed (unencoded) password leaves a stray '@' in the string."""
     m = re.match(r"^(\w+://)([^/]*)(/.*)?$", url or "")
     if not m:
         return url or ""
@@ -33,9 +30,13 @@ def _mask(url: str) -> str:
     return scheme + authority + rest
 
 
+def _inject_creds(uri: str, user: str, pw: str) -> str:
+    if not uri or urlparse(uri).username:
+        return uri
+    return uri.replace("rtsp://", f"rtsp://{quote(user, safe='')}:{quote(pw, safe='')}@", 1)
+
+
 def _grab_frame(url: str, out: Path, timeout: int) -> bool:
-    """Grab one frame ~1.5 s in (middle of ~3 s), scaled to 480px wide.
-    True only on a non-trivial jpg."""
     transport = "-rtsp_transport tcp " if url.startswith("rtsp://") else ""
     cmd = (f"ffmpeg -hide_banner -loglevel error -y {transport}"
            f"-i {shlex.quote(url)} -ss 1.5 -frames:v 1 -vf scale=480:-1 -q:v 5 "
@@ -48,7 +49,6 @@ def _grab_frame(url: str, out: Path, timeout: int) -> bool:
 
 
 def _zoned_channels(zones_path) -> set:
-    """Channels with a door_roi in camera_zones.json (for the has_zones flag)."""
     try:
         z = json.loads(Path(zones_path).read_text())
     except Exception:
@@ -68,14 +68,21 @@ def run_survey(job, *, client, cloud, gw_id, headers, report, log,
     jid = job["id"]
     c_from = int(p.get("from", 1))
     c_to = int(p.get("to", 40))
-    lag = int(p.get("playback_lag_s", 180))
-    snap_mode = str(p.get("snapshot_mode", "playback")).lower()   # 'playback' | 'live'
     total = max(1, c_to - c_from + 1)
     host, port, user, pw = nvr
     zoned = _zoned_channels(zones_path)
     work = Path(workdir) / "survey"
     work.mkdir(parents=True, exist_ok=True)
-    log(f"survey start: gw={gw_id} ch {c_from}..{c_to} snapshot_mode={snap_mode}")
+
+    # Resolve per-channel URIs via ONVIF (path-based selection; cached per gateway).
+    cache = Path(workdir) / f"onvif_map_{gw_id}.json"
+    try:
+        cmap = onvif_resolve.resolve_map(host, user, pw, cache_path=str(cache),
+                                         refresh=bool(p.get("refresh_onvif", False)))
+        log(f"survey onvif: {len(cmap)} channels resolved (cache {cache})")
+    except Exception as e:
+        report(client, jid, "failed", 0, f"ONVIF resolve failed: {type(e).__name__}: {e}")
+        return
 
     def post(ch, params, content=None):
         h = dict(headers)
@@ -95,28 +102,23 @@ def run_survey(job, *, client, cloud, gw_id, headers, report, log,
                f"ch {ch}/{c_to} (ok {ok}, err {err})")
         out = work / f"ch{ch:02d}.jpg"
         out.unlink(missing_ok=True)
-        url = mode = None
-        got = False
-        if snap_mode == "live":                       # opt-in; may not honour channel
-            url = (f"rtsp://{quote(user, safe='')}:{quote(pw, safe='')}@{host}:{port}"
-                   f"/cam/realmonitor?channel={ch}&subtype=1")
-            mode = "live"
-            got = _grab_frame(url, out, 20)
-        if not got:                                    # field-proven per-channel path
-            s = datetime.now() - timedelta(seconds=lag)
-            e = s + timedelta(seconds=3)
-            url = playback_url(ch, s.isoformat(), e.isoformat())
-            mode = "playback"
-            got = _grab_frame(url, out, 30)
-        log(f"survey ch{ch}: mode={mode} got={got} url={_mask(url)}")   # TRIPWIRE
+        raw = onvif_resolve.uri_for(cmap, ch, prefer=2)     # sub-stream for thumbnails
+        if not raw:
+            err += 1
+            log(f"survey ch{ch}: no ONVIF URI")
+            post(ch, {"error": "no ONVIF URI for channel"})
+            continue
+        url = _inject_creds(raw, user, pw)
+        got = _grab_frame(url, out, 20)
+        log(f"survey ch{ch}: mode=onvif got={got} url={_mask(url)}")   # TRIPWIRE
         hz = 1 if ch in zoned else 0
         if got:
-            if post(ch, {"has_zones": hz, "mode": mode}, out.read_bytes()):
+            if post(ch, {"has_zones": hz, "mode": "onvif"}, out.read_bytes()):
                 ok += 1
             else:
                 err += 1
             out.unlink(missing_ok=True)
         else:
             err += 1
-            post(ch, {"error": f"no frame ({mode} failed)"})
+            post(ch, {"error": "no frame (onvif uri)"})
     report(client, jid, "done", 100, f"survey complete: {ok} ok, {err} errored of {total}")
