@@ -532,8 +532,9 @@ class _Runner:
 def run_watch(job, *, report=None, log=None, gw_id=None, zones_path=None, nvr=None, **_):
     log = log or (lambda *a, **k: None)
     report = report or (lambda *a, **k: None)
-    action = (job.get("action") or "start").lower()
-    channel = int(job.get("channel", 29))
+    p = job.get("params") if isinstance(job.get("params"), dict) else {}
+    action = (p.get("action") or job.get("action") or "start").lower()
+    channel = int(p.get("channel", job.get("channel", 29)))
 
     if action == "confirm":
         with _REG_LOCK:
@@ -554,7 +555,8 @@ def run_watch(job, *, report=None, log=None, gw_id=None, zones_path=None, nvr=No
         if channel in _REGISTRY:
             res = {"status": "already_running", "channel": channel}; report(job, res); return res
         camera, roi = _resolve_roi(zones_path, channel)
-        r = _Runner(channel, roi, camera, gw_id=gw_id, nvr=nvr, url=job.get("url"), log=log)
+        r = _Runner(channel, roi, camera, gw_id=gw_id, nvr=nvr,
+                    url=(p.get("url") or job.get("url")), log=log)
         _REGISTRY[channel] = r
     r.start()
     res = {"status": "starting", "channel": channel, "camera": camera, "calibrated": bool(roi)}

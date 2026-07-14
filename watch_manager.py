@@ -160,8 +160,13 @@ def run_watch(job, *, report=None, log=None, cloud=None, gw_id=None, headers=Non
               zones_path=None, nvr=None, **_):
     log = log or (lambda *a, **k: None)
     report = report or (lambda *a, **k: None)
-    action = (job.get("action") or "start").lower()
-    channel = int(job.get("channel", 29))
+    # The cloud stores job params in a JSON column; the agent passes them nested as
+    # job["params"] (same as analyze_local's `p = job.get("params", {})`). Read from
+    # there FIRST — reading top-level would collapse every stop/confirm into start.
+    p = job.get("params") if isinstance(job.get("params"), dict) else {}
+    action = (p.get("action") or job.get("action") or "start").lower()
+    channel = int(p.get("channel", job.get("channel", 29)))
+    job_url = p.get("url") or job.get("url")
     RUN_DIR.mkdir(parents=True, exist_ok=True)
 
     if action == "stop":
@@ -232,8 +237,8 @@ def run_watch(job, *, report=None, log=None, cloud=None, gw_id=None, headers=Non
         "work_dir": str(RUN_DIR / f"analyze_ch{channel}"),
         "nvr_settings": {"host": host, "port": int(port or 80), "user": user, "password": pw},
     }
-    if job.get("url"):
-        runner_job["url"] = job["url"]
+    if job_url:
+        runner_job["url"] = job_url
 
     # match analyze_local EXACTLY: strip the token, PYTHONPATH=B4_DIR, cwd=B4_DIR
     child_env = {k: v for k, v in os.environ.items() if k != "GATEWAY_TOKEN"}

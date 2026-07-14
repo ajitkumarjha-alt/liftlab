@@ -109,10 +109,22 @@ def test_rollups():
           f"dwell_med={ru['dwell_median_s']}s hourly={list(ru['hourly_profile'].values())} OK")
 
 
+def test_params_nesting():
+    # cloud enqueues params NESTED under job["params"]; stop/confirm must be read
+    # from there, not collapsed to a default 'start'. With nothing registered, a
+    # correctly-read stop/confirm returns not_running (and never spawns a runner).
+    res = cs.run_watch({"type": "watch_channel", "params": {"channel": 97, "action": "stop"}})
+    assert res == {"status": "not_running", "channel": 97}, res
+    res = cs.run_watch({"type": "watch_channel", "params": {"channel": 96, "action": "confirm"}})
+    assert res["status"] == "not_running" and res["channel"] == 96, res
+    print("  (6) nested job params read correctly (stop/confirm NOT collapsed to start) OK")
+
+
 if __name__ == "__main__":
     print("synthetic scheduler emit-logic proof:")
     test_clean_emits_once()
     test_partial_holds_then_no_reemit()
     test_hole_straddle_rejected()
     test_rollups()
+    test_params_nesting()
     print("ALL PASS")
