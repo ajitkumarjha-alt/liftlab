@@ -384,13 +384,20 @@ def telemetry_series(gw: str):
         " FROM pi_telemetry WHERE gateway_id=? AND ts>? ORDER BY ts", (gw, since))]
     db.close()
 
-    def _flagged(t):
+    def _live(t):
         try:
-            return int(str(t), 16) != 0
+            return (int(str(t), 16) & 0xF) != 0          # bits 0-3 = throttling NOW
         except Exception:
             return False
-    last_thr = next((r["ts"] for r in reversed(rows) if _flagged(r["throttled"])), None)
-    return {"rows": rows, "last_throttle_ts": last_thr, "now": time.time()}
+
+    def _sticky(t):
+        try:
+            return (int(str(t), 16) & 0xF0000) != 0       # bits 16-19 = since boot
+        except Exception:
+            return False
+    last_thr = next((r["ts"] for r in reversed(rows) if _live(r["throttled"])), None)
+    sticky_seen = any(_sticky(r["throttled"]) for r in rows)
+    return {"rows": rows, "last_throttle_ts": last_thr, "sticky_seen": sticky_seen, "now": time.time()}
 
 
 @survey_router.get("/pihealth/{gw}", response_class=HTMLResponse)
@@ -415,7 +422,7 @@ button.on{border-color:#e3a53f;color:#e3a53f} a{color:#63a37e} svg{width:100%;ba
 <script>
 const GW="__GW__"; let WIN=172800;
 function setWin(s){WIN=s;document.getElementById('b1').className=s===3600?'on':'';document.getElementById('b48').className=s===3600?'':'on';draw();}
-function flagged(h){try{return parseInt(h,16)!==0}catch(e){return false}}
+function flagged(h){try{return (parseInt(h,16)&15)!==0}catch(e){return false}}
 function chart(title,rows,now,val,lo,hi,thr,unit){
   const W=960,H=150,pad=34;
   const X=t=>pad+(W-2*pad)*(1-(now-t)/WIN), Y=v=>H-pad-(H-2*pad)*((Math.max(lo,Math.min(hi,v))-lo)/((hi-lo)||1));
@@ -435,7 +442,7 @@ async function draw(){
   const now=d.now; let rows=(d.rows||[]).filter(r=>now-r.ts<=WIN);
   document.getElementById('count').textContent=rows.length;
   const thr=d.last_throttle_ts;
-  document.getElementById('badge').innerHTML=thr?('<b style="color:#d0574d">\\u26a0 throttled '+Math.round((now-thr)/60)+'m ago</b>'):'<b style="color:#63a37e">throttle clean</b>';
+  document.getElementById('badge').innerHTML=(thr?('<b style="color:#d0574d">\\u26a0 LIVE throttled '+Math.round((now-thr)/60)+'m ago</b>'):'<b style="color:#63a37e">live throttle clean</b>')+(d.sticky_seen?' <span style="color:#7a8b93;font-size:11px">(sticky: threw earlier since boot)</span>':'');
   const peak=rows.reduce((m,r)=>Math.max(m,r.temp||0),0);
   document.getElementById('peak').textContent=peak.toFixed(1)+'C';
   const memtot=rows.length?(rows[rows.length-1].mem_total_mb||4096):4096;
