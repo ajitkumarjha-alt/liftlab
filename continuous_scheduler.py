@@ -61,17 +61,33 @@ _REGISTRY: dict[int, "_Runner"] = {}
 _REG_LOCK = threading.Lock()
 _STDOUT_BROKEN = threading.Event()   # set if the parent (stdout reader) went away
 _OUT_LOCK = threading.Lock()
+_NDJSON = None                       # private fd to the parent; set by main() only
 
 
 # =========================================================================
-# child->parent channel: NDJSON on stdout. The child NEVER posts (no token).
+# child->parent channel: NDJSON on a PRIVATE stdout fd. The child NEVER posts.
 # =========================================================================
+def _isolate_ndjson_channel():
+    """Make the parent's pipe a channel ONLY _emit_out can write. Dup the real
+    stdout (fd 1 -> the pipe) aside, then point fd 1 AND sys.stdout at stderr, so
+    NO native library (PyAV/ffmpeg, OpenCV) and no stray print() can corrupt the
+    NDJSON the parent parses as events over a multi-hour run. Called by main() only
+    (never at import), so the smoke-import is unaffected."""
+    global _NDJSON
+    import os
+    real = os.dup(1)             # the pipe to the parent
+    os.dup2(2, 1)                # fd 1 -> stderr: native/stray fd-1 writes hit the log
+    sys.stdout = sys.stderr      # Python-level prints also go to stderr
+    _NDJSON = os.fdopen(real, "w", buffering=1)
+
+
 def _emit_out(obj):
     line = json.dumps(obj)
+    ch = _NDJSON if _NDJSON is not None else sys.stdout   # fallback for tests
     with _OUT_LOCK:
         try:
-            sys.stdout.write(line + "\n")
-            sys.stdout.flush()
+            ch.write(line + "\n")
+            ch.flush()
         except (BrokenPipeError, ValueError, OSError):
             _STDOUT_BROKEN.set()   # parent gone -> stop the run (auto-reap)
 
@@ -569,6 +585,18 @@ def _runner_from_job(job):
 def main():
     import os
     import signal
+    _isolate_ndjson_channel()   # FIRST: fd 1 becomes private NDJSON; all else -> stderr
+    # belt-and-suspenders: quiet the native decoders so the logfile isn't spammed
+    try:
+        import av
+        av.logging.set_level(av.logging.ERROR)
+    except Exception:
+        pass
+    try:
+        import cv2
+        cv2.setLogLevel(0)   # SILENT
+    except Exception:
+        pass
     raw = sys.stdin.read()
     try:
         job = json.loads(raw) if raw.strip() else {}

@@ -110,6 +110,7 @@ def _reader(ch, proc, cloud, gw_id, headers, log):
     """Pump the child's NDJSON stdout -> cloud POSTs. Runs in the agent process,
     which holds the token. The child never posts."""
     cloud = (cloud or "").rstrip("/")
+    bad = 0
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -118,6 +119,12 @@ def _reader(ch, proc, cloud, gw_id, headers, log):
             try:
                 obj = json.loads(line)
             except Exception:
+                # The child isolates fd 1 so this should never happen; if a stray
+                # non-JSON line ever appears, SKIP it (never misparse as an event)
+                # and LOG it (bounded) rather than drop it silently.
+                bad += 1
+                if bad <= 10 or bad % 500 == 0:
+                    log(f"[watch ch{ch}] non-JSON stdout line #{bad} SKIPPED: {line[:100]}")
                 continue
             kind = obj.get("kind")
             if kind == "events" and cloud:
