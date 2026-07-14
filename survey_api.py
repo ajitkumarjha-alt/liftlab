@@ -56,6 +56,10 @@ def _db() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS loadtest (
       id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, t REAL, temp REAL,
       throttled TEXT, load1 REAL, mem_mb INTEGER, payload TEXT, uploaded_at REAL);
+    CREATE TABLE IF NOT EXISTS pi_telemetry (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, ts REAL,
+      temp REAL, throttled TEXT, load1 REAL, load5 REAL, load15 REAL,
+      mem_free_mb INTEGER, mem_total_mb INTEGER, disk_free_gb REAL, uptime_s INTEGER);
     """)
     # guarded state column on the pre-existing gateway table (idempotent)
     cols = [r[1] for r in db.execute("PRAGMA table_info(gateway)")]
@@ -368,6 +372,25 @@ def loadtest_page(gw: str):
       <text x="{pad}" y="16" fill="#7a8b93" font-size="10" font-family="monospace">SoC temp {tempmin}-{tempmax}C, t=0..{tmax:.0f}s</text>
     </svg>
     <table><thead><tr><th>cabin</th><th>fps</th><th>decoded</th><th>dropped</th><th>events</th><th>backjumps</th><th>err</th></tr></thead><tbody>{fps_rows}</tbody></table>"""
+
+
+# ---------------- Pi health telemetry (heartbeat ring buffer, for card sparklines) ----------------
+@survey_router.get("/telemetry/{gw}")
+def telemetry_series(gw: str):
+    db = _db()
+    since = time.time() - 48 * 3600
+    rows = [dict(r) for r in db.execute(
+        "SELECT ts,temp,throttled,load1,load5,load15,mem_free_mb,mem_total_mb,disk_free_gb,uptime_s"
+        " FROM pi_telemetry WHERE gateway_id=? AND ts>? ORDER BY ts", (gw, since))]
+    db.close()
+
+    def _flagged(t):
+        try:
+            return int(str(t), 16) != 0
+        except Exception:
+            return False
+    last_thr = next((r["ts"] for r in reversed(rows) if _flagged(r["throttled"])), None)
+    return {"rows": rows, "last_throttle_ts": last_thr, "now": time.time()}
 
 
 # Run the migration at import so fleet_status (SELECT *) sees the state column.
