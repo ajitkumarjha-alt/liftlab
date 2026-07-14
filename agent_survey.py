@@ -18,10 +18,19 @@ import shlex
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 
 def _mask(url: str) -> str:
-    return re.sub(r"://[^@/]*@", "://***:***@", url or "")
+    """Mask userinfo up to the LAST '@' in the authority — robust even if a
+    malformed (unencoded) password leaves a stray '@' in the string."""
+    m = re.match(r"^(\w+://)([^/]*)(/.*)?$", url or "")
+    if not m:
+        return url or ""
+    scheme, authority, rest = m.group(1), m.group(2), m.group(3) or ""
+    if "@" in authority:
+        authority = "***:***@" + authority.rsplit("@", 1)[1]
+    return scheme + authority + rest
 
 
 def _grab_frame(url: str, out: Path, timeout: int) -> bool:
@@ -89,7 +98,8 @@ def run_survey(job, *, client, cloud, gw_id, headers, report, log,
         url = mode = None
         got = False
         if snap_mode == "live":                       # opt-in; may not honour channel
-            url = f"rtsp://{user}:{pw}@{host}:{port}/cam/realmonitor?channel={ch}&subtype=1"
+            url = (f"rtsp://{quote(user, safe='')}:{quote(pw, safe='')}@{host}:{port}"
+                   f"/cam/realmonitor?channel={ch}&subtype=1")
             mode = "live"
             got = _grab_frame(url, out, 20)
         if not got:                                    # field-proven per-channel path
