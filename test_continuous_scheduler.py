@@ -66,6 +66,12 @@ def test_clean_emits_once():
     em = drive(r, 0, 30)          # full cycle + settle tail
     assert len(em) == 1, f"expected 1 emit, got {len(em)}"
     assert len(r.cycles) == 1
+    # the EMITTED event row (what the cloud ingests) MUST carry close_travel_s —
+    # its absence rendered '—' on /events (the number the project measures).
+    row = em[0]
+    assert "close_travel_s" in row and 1.5 < row["close_travel_s"] < 2.5, row
+    assert "door_close_start_ts" in row and "door_close_full_ts" in row, row
+    print(f"  emitted event row has close_travel_s={row['close_travel_s']} (renders on /events)")
     c = r.cycles[0]
     # synthetic cycle: 2s open ramp, 4s plateau, 2s close ramp -> dwell ~8s
     assert 7.0 < c["dwell_s"] < 9.0, c

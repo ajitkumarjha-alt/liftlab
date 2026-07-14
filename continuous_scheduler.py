@@ -135,14 +135,19 @@ def _resolve_roi(zones_path, channel):
 
 
 def _event_row(tl, c):
-    """Exact production event schema (mirrors agent._event_payload). Occupancy
-    stays None — v1 has no detector."""
+    """Production event schema. Includes the DERIVED close_travel_s (and
+    open_travel_s), computed exactly like app.py:211 — the /events renderer reads
+    the close_travel_s COLUMN (ev.get('close_travel_s') at ingest), so omitting the
+    key stores NULL and renders '—'. This is THE number the project measures.
+    Occupancy stays None — v1 has no detector."""
     wt = cycle_wall_times(tl, c)
     return {
         "door_open_start_ts": wt["door_open_start"].isoformat(),
         "door_open_full_ts": wt["door_open_full"].isoformat(),
         "door_close_start_ts": wt["door_close_start"].isoformat(),
         "door_close_full_ts": wt["door_close_full"].isoformat(),
+        "open_travel_s": round(c.open_travel_s, 3),
+        "close_travel_s": round(c.close_travel_s, 3),
         "plateau": round(c.plateau, 4),
         "ramp_residual": round(c.residual, 4),
         "floor": None, "floor_source": "unknown",
