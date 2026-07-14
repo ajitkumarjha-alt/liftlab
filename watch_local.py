@@ -16,6 +16,7 @@ is stdlib-only; it launches the CV child under B4 per watch_runtime.conf.
 confirm/stop/status signal/read the child by PID via the state file, so they work
 from a separate short invocation while `start` holds the parent alive.
 """
+import os
 import sys
 import time
 
@@ -41,14 +42,34 @@ def load_env(p):
 def main():
     action = sys.argv[1] if len(sys.argv) > 1 else "status"
     channel = int(sys.argv[2]) if len(sys.argv) > 2 else 29
-    c = load_env(ENV)
-    token = c.get("GATEWAY_TOKEN", "")
+    filecfg = load_env(ENV)
+
+    def val(k, d=""):
+        # os.environ FIRST (how the agent gets creds — systemd EnvironmentFile),
+        # then the env FILE (for a root/manual run that can read it).
+        v = os.environ.get(k)
+        return v if v not in (None, "") else filecfg.get(k, d)
+
+    # FAIL LOUD on empty config instead of silently resolving ONVIF with no host.
+    nvr_host = val("NVR_HOST")
+    if not nvr_host:
+        who = os.environ.get("USER") or os.environ.get("LOGNAME") or "this user"
+        sys.stderr.write(
+            f"[watch_local] FATAL: NVR_HOST empty — config not loaded.\n"
+            f"  Neither os.environ nor {ENV} (readable as {who}?) provided it. That file is\n"
+            f"  typically root-only (the agent receives it via systemd EnvironmentFile), so a\n"
+            f"  `sudo -u askjitk` run can't read it. Run as root, or source the env, e.g.:\n"
+            f"    sudo bash -c 'set -a; . {ENV}; set +a; exec "
+            f"/home/askjitk/liftlab-b3/pi-agent/.venv/bin/python {' '.join(sys.argv)}'\n")
+        sys.exit(2)
+
+    token = val("GATEWAY_TOKEN")
     kw = dict(
         log=lambda m: print(m, flush=True),
-        cloud=c.get("CLOUD_URL", ""), gw_id=c.get("GATEWAY_ID", "site-A"),
+        cloud=val("CLOUD_URL"), gw_id=val("GATEWAY_ID", "site-A"),
         headers=({"Authorization": f"Bearer {token}"} if token else {}),
-        zones_path=c.get("ZONES_PATH", "/home/askjitk/liftlab-b4/camera_zones.json"),
-        nvr=(c.get("NVR_HOST", ""), c.get("NVR_PORT", "80"), c.get("NVR_USER", ""), c.get("NVR_PASS", "")),
+        zones_path=val("ZONES_PATH", "/home/askjitk/liftlab-b4/camera_zones.json"),
+        nvr=(nvr_host, val("NVR_PORT", "80"), val("NVR_USER"), val("NVR_PASS")),
     )
     job = {"type": "watch_channel", "params": {"channel": channel, "action": action}}
     res = wm.run_watch(job, **kw)
