@@ -53,6 +53,9 @@ def _db() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS validation_frame (
       gateway_id TEXT, channel INTEGER, requested_start TEXT, fn TEXT, mode TEXT,
       uploaded_at REAL, PRIMARY KEY (gateway_id, channel, requested_start));
+    CREATE TABLE IF NOT EXISTS loadtest (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, t REAL, temp REAL,
+      throttled TEXT, load1 REAL, mem_mb INTEGER, payload TEXT, uploaded_at REAL);
     """)
     # guarded state column on the pre-existing gateway table (idempotent)
     cols = [r[1] for r in db.execute("PRAGMA table_info(gateway)")]
@@ -312,6 +315,59 @@ def validation_page(gw: str):
       <button class=danger onclick="if(confirm('Delete all validation frames for {gw}?'))fetch('/validation/{gw}/delete',{{method:'POST'}}).then(()=>location.reload())">Delete validation frames</button>
       <a href="/">&larr; fleet</a></div>
     <div id=grid>{body}</div>"""
+
+
+# ---------------- Load-test telemetry (Pi throughput probe) ----------------
+@survey_router.post("/api/gw/{gw}/loadtest")
+async def loadtest_upload(gw: str, request: Request, authorization: str = Header(default="")):
+    _auth(gw, authorization)
+    b = await request.json()
+    db = _db()
+    db.execute(
+        "INSERT INTO loadtest (gateway_id,t,temp,throttled,load1,mem_mb,payload,uploaded_at)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (gw, b.get("t"), b.get("temp"), ",".join(b.get("throttle_flags") or []),
+         b.get("load1"), b.get("mem_mb"), json.dumps(b.get("streams") or {}), time.time()))
+    db.commit(); db.close()
+    return {"ok": True}
+
+
+@survey_router.get("/loadtest/{gw}", response_class=HTMLResponse)
+def loadtest_page(gw: str):
+    db = _db()
+    rows = [dict(r) for r in db.execute(
+        "SELECT t,temp,throttled,load1,mem_mb,payload FROM loadtest WHERE gateway_id=? ORDER BY t", (gw,))]
+    db.close()
+    if not rows:
+        return f"<!doctype html><meta charset=utf-8><body style='background:#0e1417;color:#dbe3e6;font:14px system-ui;padding:20px'><h1 style='color:#e3a53f'>load-test · {gw}</h1><p>No telemetry yet. Run load_probe.py.</p><a style='color:#63a37e' href='/'>&larr; fleet</a>"
+    W, H, pad = 900, 240, 36
+    tmax = max(r["t"] or 0 for r in rows) or 1
+    tempmin, tempmax = 35, 90
+    def X(t): return pad + (W - 2 * pad) * (t / tmax)
+    def Y(v): return H - pad - (H - 2 * pad) * ((v - tempmin) / (tempmax - tempmin))
+    templine = " ".join(f"{X(r['t']):.0f},{Y(r['temp'] or tempmin):.0f}" for r in rows)
+    thr = [r for r in rows if r["throttled"]]
+    thrmarks = "".join(f'<line x1="{X(r["t"]):.0f}" y1="{pad}" x2="{X(r["t"]):.0f}" y2="{H-pad}" stroke="#d0574d" stroke-width="1" opacity=".5"/>' for r in thr)
+    y80 = Y(80)
+    last = json.loads(rows[-1]["payload"] or "{}")
+    fps_rows = "".join(f"<tr><td>ch{ch}</td><td>{d.get('fps')}</td><td>{d.get('decoded')}</td><td>{d.get('dropped')}</td><td>{d.get('events')}</td><td>{d.get('backjumps')}</td><td style='color:#d0574d'>{d.get('err') or ''}</td></tr>" for ch, d in last.items())
+    peak = max((r["temp"] or 0) for r in rows)
+    return f"""<!doctype html><meta charset=utf-8><title>load-test · {gw}</title>
+    <style>body{{background:#0e1417;color:#dbe3e6;font:14px system-ui;max-width:960px;margin:auto;padding:18px}}
+    h1{{font-size:14px;letter-spacing:.15em;text-transform:uppercase;color:#e3a53f}}
+    table{{width:100%;border-collapse:collapse;font-family:ui-monospace,Consolas,monospace;font-size:12px;margin-top:10px}}
+    th,td{{text-align:left;padding:5px;border-bottom:1px solid #26333a}} th{{color:#7a8b93}} a{{color:#63a37e}}</style>
+    <h1>load-test · {gw}</h1>
+    <p style="color:#7a8b93">SoC temp over time (red lines = throttle flags set). Peak {peak:.1f}C.
+    {"<b style='color:#d0574d'>THROTTLING OCCURRED</b>" if thr else "<b style='color:#63a37e'>throttle-clean</b>"} &nbsp;·&nbsp; <a href="/">&larr; fleet</a></p>
+    <svg viewBox="0 0 {W} {H}" style="width:100%;background:#151d22;border:1px solid #26333a;border-radius:6px">
+      {thrmarks}
+      <line x1="{pad}" y1="{y80:.0f}" x2="{W-pad}" y2="{y80:.0f}" stroke="#e3a53f" stroke-dasharray="4,4" stroke-width="1"/>
+      <text x="{W-pad}" y="{y80-4:.0f}" fill="#e3a53f" font-size="10" text-anchor="end" font-family="monospace">80C</text>
+      <polyline points="{templine}" fill="none" stroke="#63a37e" stroke-width="2"/>
+      <text x="{pad}" y="16" fill="#7a8b93" font-size="10" font-family="monospace">SoC temp {tempmin}-{tempmax}C, t=0..{tmax:.0f}s</text>
+    </svg>
+    <table><thead><tr><th>cabin</th><th>fps</th><th>decoded</th><th>dropped</th><th>events</th><th>backjumps</th><th>err</th></tr></thead><tbody>{fps_rows}</tbody></table>"""
 
 
 # Run the migration at import so fleet_status (SELECT *) sees the state column.
