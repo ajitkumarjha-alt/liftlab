@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import time
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 # TMPFS by default: segments are RAM-backed, vanish on reboot, never an archive.
 LIVE_DIR = Path(os.environ.get("LIVE_DIR", "/dev/shm/liftlab-live"))
 KEEP_SEGMENTS = int(os.environ.get("LIVE_KEEP_SEGMENTS", "12"))  # ~24s @ 2s segments
+DB_PATH = os.environ.get("GATEWAY_DB", "./gateway.db")           # same DB survey_api writes
 GATEWAY_TOKENS = {
     g.split(":", 1)[0]: g.split(":", 1)[1]
     for g in os.environ.get("GATEWAY_TOKENS", "site-A:devtoken").split(",") if ":" in g
@@ -87,6 +89,27 @@ async def live_put(gw: str, cam: str, fname: str, request: Request,
         _prune(d)
     (d / ".last").write_text(str(time.time()))     # liveness marker for the viewer/report
     return PlainTextResponse("ok")
+
+
+@live_router.get("/api/gw/{gw}/lift_channels")
+async def lift_channels(gw: str, authorization: str = Header("")):
+    """The marked lift cabins from the survey (channel_map.is_lift=1). Bearer-authed so
+    the Pi can read the source of truth instead of hardcoding a channel list."""
+    _auth(gw, authorization)
+    try:
+        db = sqlite3.connect(DB_PATH)
+        db.row_factory = sqlite3.Row
+        try:
+            rows = db.execute(
+                "SELECT channel FROM channel_map WHERE gateway_id=? AND is_lift=1 ORDER BY channel",
+                (gw,)).fetchall()
+            chans = [int(r["channel"]) for r in rows]
+        except sqlite3.OperationalError:
+            chans = []                                # channel_map not created yet
+        db.close()
+    except Exception as e:
+        raise HTTPException(500, f"db: {type(e).__name__}")
+    return {"gateway": gw, "channels": chans}
 
 
 @live_router.delete("/api/gw/{gw}/live/{cam}/{fname}")
