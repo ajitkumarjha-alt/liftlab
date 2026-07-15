@@ -81,6 +81,33 @@ door_fps(){ /home/askjitk/liftlab-b3/pi-agent/.venv/bin/python \
 pid_jiffies(){ awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null||echo 0; }
 ff_stat(){ tr '\r' '\n' < "$1" 2>/dev/null | grep -oE "$2=[0-9.]+" | tail -1 | grep -oE "[0-9.]+$"; }
 
+uplink_audit(){ # can eth0 (NVR VLAN) reach the internet, or is wlan0 the ONLY path? (24/7 risk)
+  hr; say "UPLINK AUDIT — which interface can actually carry a 24/7 relay to the internet?"
+  ip -brief -4 addr 2>/dev/null | sed 's/^/    /'
+  local defif; defif=$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')
+  say "default-route iface (current uplink): ${defif:-none}"
+  local reach_wlan="" reach_eth=""
+  for f in wlan0 eth0; do
+    ip link show "$f" >/dev/null 2>&1 || { say "  $f: absent"; continue; }
+    local ip4; ip4=$(ip -brief -4 addr show "$f" 2>/dev/null | awk '{print $3}')
+    # SO_BINDTODEVICE (root): force egress out THIS iface, try to reach the cloud host.
+    local code; code=$(curl --interface "$f" -s -o /dev/null -w '%{http_code}' --max-time 6 \
+      -H "Authorization: Bearer $GATEWAY_TOKEN" "$CLOUD/api/gw/$GW/lift_channels" 2>/dev/null)
+    if [ -n "$code" ] && [ "$code" != 000 ]; then
+      say "  $f (${ip4:-no-ip}): REACHES internet/cloud (HTTP $code) => viable uplink"
+      [ "$f" = wlan0 ] && reach_wlan=1; [ "$f" = eth0 ] && reach_eth=1
+    else
+      say "  $f (${ip4:-no-ip}): cannot reach cloud (no internet route via this iface)"
+    fi
+  done
+  if [ -n "$reach_eth" ]; then
+    say "VERDICT: eth0 CAN reach the internet — prefer WIRED for a 24/7 relay (set IFACE=eth0 + route)."
+  elif [ "$defif" = wlan0 ] || [ -n "$reach_wlan" ]; then
+    say "VERDICT: wlan0 is the ONLY internet path (eth0 = NVR VLAN 172.50.x, no internet route)."
+    say "  A 24/7 production relay would ride entirely on WIFI stability. Real risk — flag to Aj."
+  fi; hr
+}
+
 launch_stream(){ # $1=idx  -> starts ffmpeg copy relay, echoes pid
   local i=$1 ch=${S_CH[$1]} cam=${S_CAM[$1]}
   local url="rtsp://${USER_ENC}:${PASS_ENC}@${NVR_HOST}:554/${ch}/1?transmode=unicast&profile=vam"
@@ -99,6 +126,7 @@ launch_stream(){ # $1=idx  -> starts ffmpeg copy relay, echoes pid
 declare -a PIDS IDX_ORDER
 running=0
 trap 'for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done' EXIT
+uplink_audit
 fps0=$(door_fps); say "door signal_fps BEFORE any relay: ${fps0:-unavailable}"; hr
 
 for target in "${STEPS[@]}"; do
@@ -150,6 +178,15 @@ while IFS='|' read -r st al mb cpu tmax tl ts fmin ma; do
   [ -z "$st" ] && continue
   printf "    %-5s %-7s %-9s %-8s %-7s %-11s %-13s %-9s %s\n" "$st" "$al/$st" "${mb}Mbps" "${cpu}%" "${tmax}C" "$tl" "$ts" "$fmin" "${ma}"
 done < /tmp/relay8_results.txt
+hr
+say "UPLINK SCALING — does Mbps track stream count, or PLATEAU (the link ceiling)?"
+awk -F'|' 'NR==1{base=($2?$3/$2:0)} {ps=($2?$3/$2:0); lin=base*$2;
+  printf "    %s streams: %.2f Mbps total  (%.2f/stream, linear=%.2f, %d%% of linear)\n",
+    $2,$3,ps,lin,(lin?$3/lin*100:0)}' /tmp/relay8_results.txt
+PLAT=$(awk -F'|' 'NR==1{base=($2?$3/$2:0)} END{lin=base*$2;
+  if(lin>0 && $3/lin<0.85) printf "PLATEAU: at %s streams measured %.2f Mbps vs %.2f linear (%d%%) — LINK CEILING FOUND",$2,$3,lin,$3/lin*100;
+  else printf "no plateau: uplink still scaled ~linearly to %s streams (%.2f Mbps) — link not yet the limit",$2,$3}' /tmp/relay8_results.txt)
+say "  => $PLAT"
 hr
 say "NOTE: thr_sticky is almost certainly PRE-SET (freqcap/throttled/templimit) from the occ 81C"
 say "  event — sticky bits only clear on reboot. Judge THERMAL by thr_live (current) + peakT, not sticky."
