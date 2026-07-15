@@ -2,13 +2,14 @@
 # PURE-LINK concurrency test — NO ffmpeg, NO HLS, NO disk. N parallel HTTPS PUTs of a fixed
 # blob to the VM /blackhole sink, ramped. Isolates the LINK + Caddy + uvicorn from the relay.
 #
-# WHY: the sub ramp collapsed to 1.83 Mbps with ONE winner (ch16 ~1Mbps, rest ~200kbps) even
-# though the link demonstrably carried 8.5 Mbps of main. One-winner = SERIALIZATION, not a
-# bandwidth ceiling. This test answers: is the wall the LINK, or the VM/relay?
-#   - aggregate scales to ~6-8 Mbps, streams roughly EVEN  -> link is fine; bug is VM/relay-side
-#     (the async live_put blocking, or ffmpeg's PUT handling). Re-ramp with the handler fix.
-#   - aggregate ALSO collapses / one-winner                 -> wall is below the app: Caddy,
-#     uvicorn accept loop, or wifi. Then run vm_diag.sh + check Caddy.
+# WHY: the sub ramp delivered only 1.83 Mbps. Is that the LINK, or the VM/relay? The tell is
+# whether TOTAL throughput STAYS FLAT or DROPS as streams are added:
+#   - TOTAL flat while N rises  -> SATURATED LINK. One stream already fills the pipe; the uneven
+#     per-stream split at high N is TCP unfairness (normal). The relay is NOT the wall here.
+#   - TOTAL drops as N rises     -> COLLAPSE / serialization below the app (Caddy, uvicorn accept
+#     loop, wifi). Then run vm_diag.sh + check Caddy.
+# NOTE: do NOT judge against "N x single-stream" — you cannot scale past a saturated pipe; that
+# denominator is meaningless. Judge flat-vs-dropping, and report the saturated capacity.
 #
 # RUN ON THE PI AS ROOT:  sudo bash link_probe.sh
 #   sudo SZ_MB=8 DUR=25 STEPS_REQ="1 2 4 7" bash link_probe.sh
@@ -71,13 +72,23 @@ printf "    %-4s %-12s %-12s %-9s %s\n" N iface_tx sum_streams min_Mbps max_Mbps
 while IFS='|' read -r n tx sm mn mx; do [ -z "$n" ] && continue
   printf "    %-4s %-12s %-12s %-9s %s\n" "$n" "${tx}Mbps" "${sm}Mbps" "$mn" "$mx"; done < /tmp/lp_results.txt
 hr
-VERDICT=$(awk -F'|' 'NR==1{base=$2} END{ratio=(base>0?$2/(base*$1)*100:0);
-  even=($5>0 && $4/$5>=0.5)?"even":"ONE-WINNER";
-  printf "at %s streams: %.2f Mbps (%d%% of linear), distribution=%s",$1,$2,ratio,even}' /tmp/lp_results.txt)
+# Judge flat-vs-dropping total (NOT % of an impossible N x single-stream linear).
+VERDICT=$(awk -F'|' '
+NR==1{first=$3; firstN=$1}
+{last=$3; lastN=$1; if($3>cap)cap=$3}
+END{
+  rt=(first>0)?last/first:1; grew=(lastN>firstN)?(lastN/firstN):1;
+  if(rt<0.85)
+    printf "COLLAPSE: total FELL %.2f (N=%s) -> %.2f (N=%s) as streams were added => contention collapse / serialization BELOW the app. Run vm_diag + check Caddy.", first,firstN,last,lastN;
+  else if(rt < grew*0.6)
+    printf "SATURATED LINK ~%.1f Mbps: total stayed ~flat (%.2f at N=%s -> %.2f at N=%s) while N rose %.0fx. The pipe is the wall; one stream nearly fills it. The uneven per-stream split at high N is TCP unfairness (normal) — app serialization would have DROPPED the total, not held it.", cap,first,firstN,last,lastN,grew;
+  else
+    printf "SCALING: total grew with N (%.2f at N=%s -> %.2f at N=%s) => link still has headroom.", first,firstN,last,lastN;
+}' /tmp/lp_results.txt)
 say "=> $VERDICT"
 say "READ IT:"
-say "  scales ~linearly + even  => LINK IS FINE. The sub-ramp collapse is VM/relay-side."
-say "                              Redeploy live_api.py (handler now off-loads writes) + re-ramp."
-say "  collapses / one-winner   => wall is BELOW the app (Caddy / uvicorn accept loop / wifi)."
-say "                              Run vm_diag.sh on the VM; check Caddy for connection caps."
+say "  SATURATED (total flat as N rises) => the LINK is the wall at ~cap Mbps. Sub streams (~6.5"
+say "     total) fit under it with headroom; 7 main (~10.5) do not. Per-stream skew = TCP, normal."
+say "  COLLAPSE  (total DROPS as N rises) => VM/relay serialization; go to vm_diag + Caddy."
+say "  SCALING   (total grows with N)     => link not yet the limit."
 rm -f "$BLOB"

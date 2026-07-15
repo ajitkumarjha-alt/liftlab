@@ -5,7 +5,7 @@
 #
 # RUN ON THE PI AS ROOT (door watch liftlab-watch stays RUNNING — it is the hard gate):
 #   sudo STREAM=1 bash live_relay_8.sh                # MAIN stream (1920x1080 HEVC)
-#   sudo STREAM=2 bash live_relay_8.sh                # SUB stream (704x576, ffprobe confirms codec)
+#   sudo STREAM=2 LINK_CEIL=10 bash live_relay_8.sh   # SUB (1280x720 HEVC); LINK_CEIL from link_probe
 #   sudo STEP_S=60 STEPS_REQ="1 2 4 6 7" bash live_relay_8.sh
 #   sudo CHANNELS="27 28 29 30 32 33 34" bash live_relay_8.sh   # override the channel source
 #   sudo ALLOW_DUP=1 bash live_relay_8.sh                        # pad past #cabins with dup channels
@@ -222,14 +222,25 @@ while IFS='|' read -r st al dl mb cpu tmax tl ts fmin ma mink maxk sumk; do
     "$st" "$dl/$st" "${mb}" "$(awk -v k="$sumk" 'BEGIN{printf "%.2f",k/1000}')" "${cpu}%" "${tmax}C" "$tl" "$fmin" "$mink/$maxk"
 done < /tmp/relay8_results.txt
 hr
-say "UPLINK SCALING (DELIVERED) — does throughput track stream count, or PLATEAU (link ceiling)?"
-awk -F'|' 'NR==1{base=($1?($13/1000)/$1:0)} {tot=$13/1000; lin=base*$1;
-  printf "    %s streams: %.2f Mbps DELIVERED  (linear=%.2f, %d%% of linear; delivering %s/%s)\n",
-    $1,tot,lin,(lin?tot/lin*100:0),$3,$1}' /tmp/relay8_results.txt
-PLAT=$(awk -F'|' 'NR==1{base=($1?($13/1000)/$1:0)} END{tot=$13/1000; lin=base*$1;
-  if(lin>0 && tot/lin<0.85) printf "PLATEAU at %s streams: %.2f Mbps delivered vs %.2f linear (%d%%) — LINK CEILING",$1,tot,lin,tot/lin*100;
-  else printf "no plateau: delivered throughput scaled ~linearly to %s streams (%.2f Mbps)",$1,tot}' /tmp/relay8_results.txt)
-say "  => $PLAT"
+say "DELIVERED THROUGHPUT vs stream count (set LINK_CEIL=<Mbps> from link_probe to auto-classify):"
+awk -F'|' '{printf "    %s streams: %.2f Mbps delivered  (delivering %s/%s, per-stream kbps min/max %s/%s)\n",
+    $1,$13/1000,$3,$1,$11,$12}' /tmp/relay8_results.txt
+# flat total = SATURATED (at the link, IF near LINK_CEIL; at the RELAY if well below it);
+# growing = SCALING (headroom); dropping = COLLAPSE. Never "% of N x single-stream".
+SCAL=$(awk -F'|' -v ceil="${LINK_CEIL:-0}" '
+NR==1{first=$13/1000; firstN=$1}
+{last=$13/1000; lastN=$1; if($13/1000>cap)cap=$13/1000}
+END{
+  rt=(first>0)?last/first:1; grew=(lastN>firstN)?(lastN/firstN):1;
+  if(rt<0.85) printf "COLLAPSE: delivered FELL %.2f->%.2f as N %s->%s => starvation/serialization, not the link.",first,last,firstN,lastN;
+  else if(rt < grew*0.6){
+    printf "PLATEAU ~%.2f Mbps delivered (flat while N rose).",cap;
+    if(ceil>0 && cap<ceil*0.85) printf " BELOW the ~%.1f Mbps link => capped by the RELAY/VM (handler?), NOT the link.",ceil;
+    else if(ceil>0) printf " ~= the ~%.1f Mbps link => LINK-limited (expected for main).",ceil;
+    else printf " (pass LINK_CEIL to say whether that is the link or the relay.)";
+  } else printf "SCALING ~linearly to %s streams (%.2f Mbps delivered) => link has headroom, delivery healthy.",lastN,last;
+}' /tmp/relay8_results.txt)
+say "  => $SCAL"
 hr
 say "NOTE: thr_sticky is PRE-SET (freqcap/throttled/templimit) from the occ 81C event (clears on"
 say "  reboot). Judge THERMAL by thr_live + peakT. And judge each stream by DELIVERED kbps, not"
@@ -244,6 +255,7 @@ if [ -n "$CEIL" ]; then
 else
   say "HONEST CEILING: even 1 stream failed to deliver or harmed the door loop — see the table."
 fi
-say "  Failing row: deliver<step => uplink RATIONING (streams starved, not dead); door<floor => watch"
-say "  starved; thr_live sets => thermal; delivered plateaus => LINK ceiling (the wall for main was here)."
+say "  Failing row: deliver<step => streams starved (rationed, not dead); door<floor => watch starved;"
+say "  thr_live sets => thermal. Delivered FLAT while N rises = SATURATION: at the LINK if ~LINK_CEIL,"
+say "  at the RELAY if well below it. Delivered DROPPING as N rises = serialization (a real bug)."
 say "done. (VM tmpfs holds only the last few segments per cam; nothing durable written.)"
