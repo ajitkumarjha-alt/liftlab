@@ -13,13 +13,15 @@ STATE_DIR=/home/askjitk/liftlab-watch
 UNIT=/etc/systemd/system/liftlab-watch.service
 say(){ echo "[watch-svc] $*"; }
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
-for f in /tmp/liftlab-watch.service /tmp/watch_local.py /tmp/continuous_scheduler.py; do
+for f in /tmp/liftlab-watch.service /tmp/watch_local.py /tmp/watch_manager.py /tmp/continuous_scheduler.py; do
   [ -f "$f" ] || { echo "missing $f — curl it first"; exit 2; }
 done
 
-# 1) redeploy the freeze-fixed scheduler (B4) + the run-capable watch_local (agent dir)
+# 1) redeploy the freeze-fixed scheduler (B4) + the run-capable watch_local + the
+#    watch_manager whose RUN_DIR default now points at the durable state dir (agent dir)
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/continuous_scheduler.py "$B4_DIR/continuous_scheduler.py"
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/watch_local.py "$AGENT_DIR/watch_local.py"
+install -o "$OWNER" -g "$OWNER" -m 644 /tmp/watch_manager.py "$AGENT_DIR/watch_manager.py"
 grep -q '_seg_remeasure' "$B4_DIR/continuous_scheduler.py" && say "scheduler: freeze-fix present"
 ( cd "$B4_DIR" && sudo -u "$OWNER" env PYTHONPATH="$B4_DIR" "$B4_DIR/.venv/bin/python" -c "import continuous_scheduler;print('scheduler import OK')" ) \
   || { say "scheduler import FAILED under B4 — aborting"; exit 1; }
