@@ -4,18 +4,22 @@
 # door_fps 9.88 — naive x8 = 12 Mbps / 24%. Concurrency isn't linear; this measures it.
 #
 # RUN ON THE PI AS ROOT (door watch liftlab-watch stays RUNNING — it is the hard gate):
-#   sudo bash live_relay_8.sh
-#   sudo STEP_S=60 STEPS_REQ="1 2 4 6 8" bash live_relay_8.sh
+#   sudo STREAM=1 bash live_relay_8.sh                # MAIN stream (1920x1080 HEVC)
+#   sudo STREAM=2 bash live_relay_8.sh                # SUB stream (704x576, ffprobe confirms codec)
+#   sudo STEP_S=60 STEPS_REQ="1 2 4 6 7" bash live_relay_8.sh
 #   sudo CHANNELS="27 28 29 30 32 33 34" bash live_relay_8.sh   # override the channel source
 #   sudo ALLOW_DUP=1 bash live_relay_8.sh                        # pad past #cabins with dup channels
 #
-# copy mode = HEVC remux (near-zero CPU); this stresses NIC + 8 RTSP sessions + 8 TLS PUTs +
-# NVR session limits + uplink, NOT the CPU. Chrome can't play the HEVC; viewing isn't the point.
+# copy mode = remux (near-zero CPU); this stresses NIC + RTSP sessions + TLS PUTs + NVR limits +
+# UPLINK, NOT the CPU. Per-stream health is judged on DELIVERED bytes/sec at the VM (live_stats),
+# NOT process liveness — ffmpeg stays alive at speed=1x while the PUT blocks and drops under a
+# saturated uplink (the main ramp's 8x byte spread across identical cams was exactly that).
 set -uo pipefail
 
 GW_DEFAULT=site-A
+STREAM="${STREAM:-1}"                  # 1=main, 2=sub
 STEP_S="${STEP_S:-60}"
-STEPS_REQ="${STEPS_REQ:-1 2 4 6 8}"
+STEPS_REQ="${STEPS_REQ:-1 2 4 6 7}"
 ENVF="${ENVF:-/etc/liftlab-agent.env}"
 SEG_T="${SEG_T:-2}"
 ALLOW_DUP="${ALLOW_DUP:-0}"
@@ -48,7 +52,19 @@ else
 fi
 NCH=${#CHANS[@]}
 [ "$NCH" -gt 0 ] || { say "no channels resolved — aborting"; exit 1; }
-say "channels ($CHAN_SRC): ${CHANS[*]}   count=$NCH   iface=$IFACE   step=${STEP_S}s"
+say "channels ($CHAN_SRC): ${CHANS[*]}   count=$NCH   iface=$IFACE   step=${STEP_S}s   STREAM=$STREAM ($([ "$STREAM" = 2 ] && echo sub || echo main))"
+
+# ---------- probe the ACTUAL bytes (ONVIF lied: main claimed h264, is HEVC) ----------
+PROBE_CH=${CHANS[0]}
+PURL="rtsp://${USER_ENC}:${PASS_ENC}@${NVR_HOST}:554/${PROBE_CH}/${STREAM}?transmode=unicast&profile=vam"
+say "ffprobe ch${PROBE_CH} stream=$STREAM (real codec/res/bitrate):"
+PROBE=$(ffprobe -v error -rtsp_transport tcp -select_streams v:0 \
+  -show_entries stream=codec_name,width,height,avg_frame_rate,bit_rate \
+  -of default=noprint_wrappers=1 "$PURL" 2>/dev/null)
+echo "$PROBE" | sed 's/^/    /'
+SRC_CODEC=$(echo "$PROBE" | awk -F= '/codec_name/{print $2}')
+SRC_BR=$(echo "$PROBE" | awk -F= '/bit_rate/{print $2}')
+[ -n "$SRC_CODEC" ] || say "  (probe empty — stream=$STREAM may not exist on this NVR; check RTSP path)"
 [ "$IFACE" = wlan0 ] && say "NOTE: uplink is WIFI (wlan0). Sustained Mbps on wifi != wired; flagging per the brief."
 
 # ---------- build the ordered stream plan (distinct first; dup only if ALLOW_DUP) ----------
@@ -108,9 +124,16 @@ uplink_audit(){ # can eth0 (NVR VLAN) reach the internet, or is wlan0 the ONLY p
   fi; hr
 }
 
+live_stats_json(){ curl -s --max-time 6 -H "Authorization: Bearer $GATEWAY_TOKEN" "$CLOUD/api/gw/$GW/live_stats" 2>/dev/null; }
+stat_bytes(){ # $1=json $2=cam -> delivered bytes for that cam at the VM (0 if absent)
+  printf '%s' "$1" | python3 -c "import sys,json
+try: d=json.load(sys.stdin)
+except Exception: print(0); sys.exit()
+print(d.get('cams',{}).get('$2',{}).get('bytes',0))" 2>/dev/null || echo 0; }
+
 launch_stream(){ # $1=idx  -> starts ffmpeg copy relay, echoes pid
   local i=$1 ch=${S_CH[$1]} cam=${S_CAM[$1]}
-  local url="rtsp://${USER_ENC}:${PASS_ENC}@${NVR_HOST}:554/${ch}/1?transmode=unicast&profile=vam"
+  local url="rtsp://${USER_ENC}:${PASS_ENC}@${NVR_HOST}:554/${ch}/${STREAM}?transmode=unicast&profile=vam"
   local base="$CLOUD/api/gw/$GW/live/$cam" log="/tmp/relay8_${i}_${cam}.log"
   ffmpeg -nostdin -hide_banner -loglevel warning -stats \
     -rtsp_transport tcp -i "$url" -an -c:v copy \
@@ -127,7 +150,11 @@ declare -a PIDS IDX_ORDER
 running=0
 trap 'for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done' EXIT
 uplink_audit
-fps0=$(door_fps); say "door signal_fps BEFORE any relay: ${fps0:-unavailable}"; hr
+fps0=$(door_fps); say "door signal_fps BEFORE any relay: ${fps0:-unavailable}"
+DOOR_FLOOR="${DOOR_FLOOR:-$(awk -v b="${fps0:-9.9}" 'BEGIN{f=b-0.1; if(f>9.8)f=9.8; printf "%.2f",f}')}"
+say "door gate = signal_fps must stay >= $DOOR_FLOOR (baseline ${fps0:-?})"
+REF_KBPS=""                              # uncontended single-stream delivery, set at step 1
+hr
 
 for target in "${STEPS[@]}"; do
   while [ "$running" -lt "$target" ]; do
@@ -136,9 +163,9 @@ for target in "${STEPS[@]}"; do
   done
   sleep 4                                  # settle: RTSP open + first segments
   say "STEP: $target concurrent  (cams: $(for i in $(seq 0 $((target-1))); do printf '%s ' "${S_CAM[$i]}"; done))"
-  # measurement window
-  local_tx0=$(tx_bytes); t0=$(date +%s.%N)
-  declare -A CJ0; for i in $(seq 0 $((target-1))); do CJ0[$i]=$(pid_jiffies "${PIDS[$i]}"); done
+  # measurement window: snapshot tx, cpu jiffies, AND VM delivered-bytes per cam
+  local_tx0=$(tx_bytes); t0=$(date +%s.%N); SJ0=$(live_stats_json)
+  declare -A CJ0 B0; for i in $(seq 0 $((target-1))); do CJ0[$i]=$(pid_jiffies "${PIDS[$i]}"); B0[$i]=$(stat_bytes "$SJ0" "${S_CAM[$i]}"); done
   tmax=0; thrL="none"; thrS="none"; fpsmin=99; n=$(( STEP_S/5 )); [ "$n" -lt 1 ]&&n=1
   for ((k=0;k<n;k++)); do
     sleep 5
@@ -147,58 +174,76 @@ for target in "${STEPS[@]}"; do
     ts=$(throttle_sticky); [ "$ts" != none ] && thrS=$ts
     fp=$(door_fps); [ -n "$fp" ] && awk "BEGIN{exit !($fp<$fpsmin)}" 2>/dev/null && fpsmin=$fp
   done
-  t1=$(date +%s.%N); local_tx1=$(tx_bytes); dt=$(awk "BEGIN{print $t1-$t0}")
-  # aggregate cpu across live streams
-  hz=$(getconf CLK_TCK); cpusum=0; alive=0
+  t1=$(date +%s.%N); local_tx1=$(tx_bytes); dt=$(awk "BEGIN{print $t1-$t0}"); SJ1=$(live_stats_json)
+  # per-stream: DELIVERED kbps at the VM (the honest signal) + cpu; delivering != alive
+  hz=$(getconf CLK_TCK); cpusum=0; alive=0; deliver=0; sumk=0; mink=""; maxk=0
+  FLOOR_KBPS=$(awk -v r="${REF_KBPS:-0}" 'BEGIN{f=r*0.5; if(f<50)f=50; printf "%.0f",f}')
   perstream=""
   for i in $(seq 0 $((target-1))); do
+    b1=$(stat_bytes "$SJ1" "${S_CAM[$i]}")
+    dk=$(awk -v a="${B0[$i]}" -v b="$b1" -v dt="$dt" 'BEGIN{printf "%.0f",(b-a)*8/dt/1000}')   # delivered kbps
+    sumk=$(awk -v s="$sumk" -v k="$dk" 'BEGIN{print s+k}')
+    awk "BEGIN{exit !($dk>$maxk)}" && maxk=$dk
+    [ -z "$mink" ] && mink=$dk; awk "BEGIN{exit !($dk<$mink)}" && mink=$dk
     if kill -0 "${PIDS[$i]}" 2>/dev/null; then
       j1=$(pid_jiffies "${PIDS[$i]}"); c=$(awk -v a="${CJ0[$i]}" -v b="$j1" -v hz="$hz" -v dt="$dt" 'BEGIN{printf "%.1f",(b-a)/hz/dt*100}')
-      cpusum=$(awk -v s="$cpusum" -v c="$c" 'BEGIN{printf "%.1f",s+c}')
-      alive=$((alive+1))
-      sp=$(ff_stat "/tmp/relay8_${i}_${S_CAM[$i]}.log" speed); fpss=$(ff_stat "/tmp/relay8_${i}_${S_CAM[$i]}.log" fps)
-      perstream+="      ${S_CAM[$i]}: alive fps=${fpss:-?} speed=${sp:-?}x cpu=${c}%\n"
+      cpusum=$(awk -v s="$cpusum" -v c="$c" 'BEGIN{printf "%.1f",s+c}'); alive=$((alive+1))
+      sp=$(ff_stat "/tmp/relay8_${i}_${S_CAM[$i]}.log" speed)
+      if awk "BEGIN{exit !($dk>=$FLOOR_KBPS)}"; then
+        deliver=$((deliver+1)); tag="delivering"
+      else
+        tag="STARVED (< ${FLOOR_KBPS}kbps floor = rationed by the uplink)"
+      fi
+      perstream+="      ${S_CAM[$i]}: ${dk}kbps delivered  src_speed=${sp:-?}x  cpu=${c}%  -> $tag\n"
     else
       err=$(tr '\r' '\n' < "/tmp/relay8_${i}_${S_CAM[$i]}.log" 2>/dev/null | grep -iE "error|failed|refused|453|503|unauthor|timed out" | tail -1)
-      perstream+="      ${S_CAM[$i]}: DEAD  ${err:-<no stderr; check log>}\n"
+      perstream+="      ${S_CAM[$i]}: DEAD (0kbps)  ${err:-<no stderr; check log>}\n"
     fi
   done
+  [ -z "$REF_KBPS" ] && [ "$target" -ge 1 ] && REF_KBPS=$maxk    # uncontended reference from step 1
+  [ -z "$mink" ] && mink=0
   mbps=$(awk -v a="$local_tx0" -v b="$local_tx1" -v dt="$dt" 'BEGIN{printf "%.2f",(b-a)*8/dt/1e6}')
   ma=$(mem_avail); fpsA=$(door_fps)
-  printf "%d|%d|%s|%s|%s|%s|%s|%s|%s\n" "$target" "$alive" "$mbps" "$cpusum" "$tmax" "$thrL" "$thrS" "$fpsmin" "$ma" >> /tmp/relay8_results.txt
-  say "  -> alive=$alive/$target  uplink=${mbps}Mbps  ff_cpu=${cpusum}%  temp=${tmax}C  thr_live=$thrL  thr_sticky=$thrS  door_fps min=$fpsmin after=${fpsA:-?}  mem_avail=${ma}MB"
+  printf "%d|%d|%d|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
+    "$target" "$alive" "$deliver" "$mbps" "$cpusum" "$tmax" "$thrL" "$thrS" "$fpsmin" "$ma" "$mink" "$maxk" "$sumk" >> /tmp/relay8_results.txt
+  say "  -> alive=$alive/$target  DELIVERING=$deliver/$target  uplink=${mbps}Mbps (sum_delivered=$(awk -v k="$sumk" 'BEGIN{printf "%.2f",k/1000}')Mbps)"
+  say "     ff_cpu=${cpusum}%  temp=${tmax}C  thr_live=$thrL  door_fps min=$fpsmin after=${fpsA:-?}  mem=${ma}MB  per-stream kbps: min=$mink max=$maxk"
   printf "%b" "$perstream"
   hr
 done
 
 # ---------- report + honest ceiling ----------
-say "SUMMARY  (copy/HEVC remux, ${STEP_S}s/step, iface=$IFACE, door watch running, src=$CHAN_SRC)"
-printf "    %-5s %-7s %-9s %-8s %-7s %-11s %-13s %-9s %s\n" step alive uplink ffcpu% peakT thr_live thr_sticky doorFPS memMB
-while IFS='|' read -r st al mb cpu tmax tl ts fmin ma; do
+# fields: 1 step 2 alive 3 deliver 4 mbps 5 cpu 6 tmax 7 thrL 8 thrS 9 fmin 10 mem 11 mink 12 maxk 13 sumk
+say "SUMMARY  (copy remux, stream=$STREAM codec=${SRC_CODEC:-?}, ${STEP_S}s/step, iface=$IFACE, src=$CHAN_SRC)"
+printf "    %-5s %-9s %-10s %-11s %-7s %-6s %-9s %-9s %s\n" step deliver tx_Mbps deliv_Mbps ffcpu peakT thr_live doorFPS "kbps min/max"
+while IFS='|' read -r st al dl mb cpu tmax tl ts fmin ma mink maxk sumk; do
   [ -z "$st" ] && continue
-  printf "    %-5s %-7s %-9s %-8s %-7s %-11s %-13s %-9s %s\n" "$st" "$al/$st" "${mb}Mbps" "${cpu}%" "${tmax}C" "$tl" "$ts" "$fmin" "${ma}"
+  printf "    %-5s %-9s %-10s %-11s %-7s %-6s %-9s %-9s %s\n" \
+    "$st" "$dl/$st" "${mb}" "$(awk -v k="$sumk" 'BEGIN{printf "%.2f",k/1000}')" "${cpu}%" "${tmax}C" "$tl" "$fmin" "$mink/$maxk"
 done < /tmp/relay8_results.txt
 hr
-say "UPLINK SCALING — does Mbps track stream count, or PLATEAU (the link ceiling)?"
-awk -F'|' 'NR==1{base=($2?$3/$2:0)} {ps=($2?$3/$2:0); lin=base*$2;
-  printf "    %s streams: %.2f Mbps total  (%.2f/stream, linear=%.2f, %d%% of linear)\n",
-    $2,$3,ps,lin,(lin?$3/lin*100:0)}' /tmp/relay8_results.txt
-PLAT=$(awk -F'|' 'NR==1{base=($2?$3/$2:0)} END{lin=base*$2;
-  if(lin>0 && $3/lin<0.85) printf "PLATEAU: at %s streams measured %.2f Mbps vs %.2f linear (%d%%) — LINK CEILING FOUND",$2,$3,lin,$3/lin*100;
-  else printf "no plateau: uplink still scaled ~linearly to %s streams (%.2f Mbps) — link not yet the limit",$2,$3}' /tmp/relay8_results.txt)
+say "UPLINK SCALING (DELIVERED) — does throughput track stream count, or PLATEAU (link ceiling)?"
+awk -F'|' 'NR==1{base=($1?($13/1000)/$1:0)} {tot=$13/1000; lin=base*$1;
+  printf "    %s streams: %.2f Mbps DELIVERED  (linear=%.2f, %d%% of linear; delivering %s/%s)\n",
+    $1,tot,lin,(lin?tot/lin*100:0),$3,$1}' /tmp/relay8_results.txt
+PLAT=$(awk -F'|' 'NR==1{base=($1?($13/1000)/$1:0)} END{tot=$13/1000; lin=base*$1;
+  if(lin>0 && tot/lin<0.85) printf "PLATEAU at %s streams: %.2f Mbps delivered vs %.2f linear (%d%%) — LINK CEILING",$1,tot,lin,tot/lin*100;
+  else printf "no plateau: delivered throughput scaled ~linearly to %s streams (%.2f Mbps)",$1,tot}' /tmp/relay8_results.txt)
 say "  => $PLAT"
 hr
-say "NOTE: thr_sticky is almost certainly PRE-SET (freqcap/throttled/templimit) from the occ 81C"
-say "  event — sticky bits only clear on reboot. Judge THERMAL by thr_live (current) + peakT, not sticky."
-# ceiling = highest step where ALL streams alive AND door_fps held >=9.5 AND no LIVE throttle
-CEIL=$(awk -F'|' '$2==$1 && $8>=9.5 && $6=="none" {c=$1; u=$3} END{if(c)printf "%d|%s",c,u}' /tmp/relay8_results.txt)
+say "NOTE: thr_sticky is PRE-SET (freqcap/throttled/templimit) from the occ 81C event (clears on"
+say "  reboot). Judge THERMAL by thr_live + peakT. And judge each stream by DELIVERED kbps, not"
+say "  liveness — the main ramp's 'alive=7/7' hid an 8x rationing spread; deliver-count is the truth."
+# ceiling = highest step where ALL streams DELIVERING evenly AND door held AND no LIVE throttle
+CEIL=$(awk -F'|' -v fl="$DOOR_FLOOR" '$3==$1 && $9>=fl && $7=="none" {c=$1; u=$13/1000} END{if(c)printf "%d|%.2f",c,u}' /tmp/relay8_results.txt)
 if [ -n "$CEIL" ]; then
   cn=${CEIL%|*}; cu=${CEIL#*|}
-  say "HONEST CEILING: $cn concurrent cameras — all streams alive, door_fps held >=9.5, no throttle."
-  say "  uplink at $cn cams = ${cu} Mbps sustained (${IFACE}). Above $cn, a gate broke (see the row that fails)."
+  say "HONEST CEILING: $cn cameras — all $cn DELIVERING (not just alive), door_fps>=$DOOR_FLOOR, no throttle."
+  say "  delivered throughput at $cn = ${cu} Mbps sustained on ${IFACE}. Above $cn a gate broke (see the failing row)."
+  [ "$STREAM" = 2 ] && say "  PASS CONDITION for subs = all 7 delivering + linear + door held. Check deliver=7/7 at the top row."
 else
-  say "HONEST CEILING: even 1 stream harmed the door loop or dropped — see the table. Relay-on-this-Pi not viable alongside the watch."
+  say "HONEST CEILING: even 1 stream failed to deliver or harmed the door loop — see the table."
 fi
-say "  Read the failing row: alive<step => NVR session cap or stream drop; door_fps<9.5 => watch starved;"
-say "  thr_sticky sets => thermal even if live clear; uplink plateaus => link ceiling (not linear)."
+say "  Failing row: deliver<step => uplink RATIONING (streams starved, not dead); door<floor => watch"
+say "  starved; thr_live sets => thermal; delivered plateaus => LINK ceiling (the wall for main was here)."
 say "done. (VM tmpfs holds only the last few segments per cam; nothing durable written.)"

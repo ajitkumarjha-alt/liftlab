@@ -40,6 +40,12 @@ _ALLOWED_EXT = (".m3u8", ".ts", ".mp4", ".m4s")
 _CT = {".m3u8": "application/vnd.apple.mpegurl", ".ts": "video/mp2t",
        ".mp4": "video/mp4", ".m4s": "video/iso.segment"}
 
+# Per-cam DELIVERED-bytes counters. This is ground truth for a relay under a saturated
+# uplink: ffmpeg stays 'alive' and reads the source at 1x while the PUT blocks and drops,
+# so process liveness lies. Only bytes that LAND here count as delivered. In-memory,
+# monotonic; a load test reads deltas, so a restart wiping them is fine.
+_STATS: dict[tuple, dict] = {}
+
 live_router = APIRouter()
 
 
@@ -86,9 +92,23 @@ async def live_put(gw: str, cam: str, fname: str, request: Request,
     tmp.write_bytes(body)                          # atomic swap so GETs never see a half file
     tmp.replace(d / fname)
     if fname.endswith(".ts"):
+        st = _STATS.setdefault((gw, cam), {"bytes": 0, "segs": 0, "last": 0.0})
+        st["bytes"] += len(body)                   # DELIVERED bytes — the honest per-stream signal
+        st["segs"] += 1
+        st["last"] = time.time()
         _prune(d)
-    (d / ".last").write_text(str(time.time()))     # liveness marker for the viewer/report
     return PlainTextResponse("ok")
+
+
+@live_router.get("/api/gw/{gw}/live_stats")
+async def live_stats(gw: str, authorization: str = Header("")):
+    """Cumulative DELIVERED bytes/segments per cam. A ramp reads this at window start/end;
+    (b1-b0)/dt = bytes actually landed per stream. Catches uplink rationing that process
+    liveness (ffmpeg speed=1x) hides."""
+    _auth(gw, authorization)
+    cams = {cam: {"bytes": s["bytes"], "segs": s["segs"], "last": s["last"]}
+            for (g, cam), s in _STATS.items() if g == gw}
+    return {"gateway": gw, "t": time.time(), "cams": cams}
 
 
 @live_router.get("/api/gw/{gw}/lift_channels")
