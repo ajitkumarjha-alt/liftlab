@@ -70,32 +70,33 @@ def events_dashboard():
         shown = min(total, CAP)
         trs = []
         for r in rs[:CAP]:
-            flag = "" if r["ov"] else \'<span title="opening ramp clipped in the export; close still measured" style="color:#e3a53f">open?</span>\'
+            flag = "" if r["ov"] else \'<span title="opening ramp clipped in the export; close still measured" style="color:#b06a00">open?</span>\'
             ct = "—" if r["ct"] is None else ("%.2f" % r["ct"])
             trs.append(\'<tr><td>%s</td><td>%s</td><td style="text-align:right">%s</td><td>%s</td></tr>\'
                        % (_esc(r["os"])[11:19], _esc(r["floor"]), ct, flag))
+        _gw = key.split("/", 1)[0]
         blocks.append("""
         <section>
-          <h2>%s <span style="color:#7a8b93;font-family:var(--mono);font-size:12px">%s</span></h2>
+          <h2>%s <span style="color:#666;font-family:var(--mono);font-size:12px">%s</span></h2>
           <p class=muted style="font-size:12px">%d openings · %d with clipped opening (close still counted)%s
-          &nbsp;·&nbsp; showing latest %d of %d rows</p>
+          &nbsp;·&nbsp; showing latest %d of %d rows &nbsp;·&nbsp; <a href="/pihealth/%s">pi health</a></p>
           <table><thead><tr><th>open</th><th>floor</th><th>close (s)</th><th></th></tr></thead>
           <tbody>%s</tbody></table>
-        </section>""" % (key, dist, opens, n_clip, dqnote, shown, total, "".join(trs)))
+        </section>""" % (key, dist, opens, n_clip, dqnote, shown, total, _gw, "".join(trs)))
 
     body = ("<p class=\\'muted\\'>No gateway events yet. The Pi posts to "
             "<code>/api/gw/events</code>.</p>" if not blocks else "".join(blocks))
     return """<!doctype html><meta charset=utf-8><title>liftlab · events</title>
     <meta http-equiv="refresh" content="30">
     <style>:root{--mono:ui-monospace,Consolas,monospace}
-    body{background:#0e1417;color:#dbe3e6;font:14px system-ui;max-width:900px;margin:auto;padding:20px}
-    h1{font-size:14px;letter-spacing:.2em;text-transform:uppercase;color:#e3a53f}
-    h2{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:#7a8b93;margin:18px 0 4px}
-    section{border-bottom:1px solid #26333a;padding-bottom:14px;margin-bottom:8px}
+    body{background:#fff;color:#1a1a1a;font:14px system-ui;max-width:900px;margin:auto;padding:20px}
+    h1{font-size:14px;letter-spacing:.2em;text-transform:uppercase;color:#333}
+    h2{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:#666;margin:18px 0 4px}
+    section{border-bottom:1px solid #e2e2e2;padding-bottom:14px;margin-bottom:8px}
     table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;margin-top:8px}
-    th{color:#7a8b93;text-align:left;font-weight:500;border-bottom:1px solid #26333a;padding:5px}
-    td{padding:5px;border-bottom:1px solid rgba(38,51,58,.5)} .muted{color:#7a8b93}
-    code{color:#e3a53f} a{color:#63a37e}</style>
+    th{color:#888;text-align:left;font-weight:500;border-bottom:1px solid #ddd;padding:5px}
+    td{padding:5px;border-bottom:1px solid #eee} .muted{color:#666}
+    code{color:#b06a00} a{color:#0a6}</style>
     <h1>liftlab · cloud events</h1>
     <p class=muted>Per-camera door events from on-site gateways. Footage stays on site;
     only derived rows arrive here. Live (30s refresh). &nbsp;·&nbsp;
@@ -136,8 +137,8 @@ def events_csv():
 
 p = pathlib.Path(os.environ.get("EVENTS_API", "/opt/liftlab-b3/cloud/events_api.py"))
 s = p.read_text(encoding="utf-8")
-if "/events.csv" in s or "events_csv" in s:
-    print("events_api.py already has the CSV/dashboard upgrade — skip")
+if "events_csv" in s and "background:#fff" in s:
+    print("events_api.py already has the light CSV/dashboard upgrade — skip")
     raise SystemExit
 
 lines = s.split("\n")
