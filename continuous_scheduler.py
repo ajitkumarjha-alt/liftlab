@@ -58,6 +58,8 @@ SEED_FRAMES = 40          # ~a few seconds of live frames to seed the baseline
 SEED_QUIET_SPREAD = MOTION_FLOOR   # seed rejected if raw spread exceeds this (moving/active)
 SEG_PAD_S = 6.0           # samples kept each side of a committed segment for re-measure
 SEED_RETRY_S = 120.0      # if no persisted baseline and the cabin is busy: retry seed this often
+OCC_PERIOD_S = 0.5        # occupancy YOLO sample period while doors-open (~2 Hz)
+OCC_CLOSE_WINDOW_S = 2.0  # occupancy_after = median cabin count over this window before close_start
 
 _REGISTRY: dict[int, "_Runner"] = {}
 _REG_LOCK = threading.Lock()
@@ -136,6 +138,19 @@ def _resolve_roi(zones_path, channel):
     return f"ch{int(channel):02d}", None
 
 
+def _resolve_zone_cabin(zones_path, channel):
+    """zone_cabin polygon for LOAD counting (frame coords). None if not calibrated."""
+    try:
+        z = json.loads(Path(zones_path).read_text())
+    except Exception:
+        return None
+    for key in (f"ch{int(channel):02d}", f"ch{channel}", str(channel)):
+        node = z.get(key)
+        if isinstance(node, dict) and node.get("zone_cabin"):
+            return [[float(x), float(y)] for x, y in node["zone_cabin"]]
+    return None
+
+
 def _event_row(tl, c):
     """Production event schema. Includes the DERIVED close_travel_s (and
     open_travel_s), computed exactly like app.py:211 — the /events renderer reads
@@ -205,10 +220,11 @@ class _FrameHub:
 # =========================================================================
 class _Runner:
     def __init__(self, channel, roi, camera, *, gw_id="site-A",
-                 nvr=None, url=None, log=None, cloud=None, headers=None):
+                 nvr=None, url=None, log=None, cloud=None, headers=None, zones_path=None):
         self.channel = int(channel)
         self.roi = roi
         self.camera = camera
+        self.zones_path = zones_path
         self.gw_id = gw_id
         self.nvr = nvr
         self.url = url                    # optional pre-resolved / injected URL
@@ -238,6 +254,12 @@ class _Runner:
         # commitment bookkeeping — freeze by [open,close] INTERVAL (drift-robust)
         self.committed = []               # committed (open_start_s, close_full_s) intervals
         self.cycles = []                  # committed cycle summaries (for rollups)
+        # occupancy (LOAD proxy) — parallel sampler, door pipeline untouched
+        self.occ = None                   # CabinCounter (onnx) or None if uncalibrated
+        self.occ_samples = deque()        # (offset, cabin_count) while doors-open
+        self._occ_frame = None            # latest full BGR frame for YOLO (throttled)
+        self._last_occ_t = 0.0
+        self._last_full_t = 0.0
         # health
         self.samples = 0
         self.lat_recent = deque(maxlen=200)
@@ -332,6 +354,13 @@ class _Runner:
                     if self._want_full.is_set() and self._seed_full is None:
                         try:
                             self._seed_full = frame.to_ndarray(format="bgr24")
+                        except Exception:
+                            pass
+                    # throttled full frame for the occupancy sampler (only when calibrated)
+                    if self.occ is not None and (time.time() - self._last_full_t) > 0.3:
+                        try:
+                            self._occ_frame = frame.to_ndarray(format="bgr24")
+                            self._last_full_t = time.time()
                         except Exception:
                             pass
                 cont.close()
@@ -516,13 +545,24 @@ class _Runner:
                 commit = c                                     # fall back to the window cycle
             if any(_overlaps(commit.open_start_s, commit.close_full_s, io, ic) for io, ic in self.committed):
                 continue                                       # stable interval already committed
+            # LOAD: occupancy_after = median cabin count over the last OCC_CLOSE_WINDOW_S
+            # before close_start (the departing car load; NOT peak-during-open, which
+            # would conflate the alighting+boarding exchange transient).
+            occ_after = None
+            if self.occ is not None:
+                _cs = commit.close_start_s
+                _cnts = [c for off, c in self.occ_samples if _cs - OCC_CLOSE_WINDOW_S <= off <= _cs]
+                if _cnts:
+                    occ_after = int(round(float(np.median(_cnts))))
             self.committed.append((commit.open_start_s, commit.close_full_s))
             row = _event_row(tl, commit)                       # tl.wall_of maps absolute offsets
+            row["occupancy_after"] = occ_after
             self.cycles.append({
                 "open_full_ts": row["door_open_full_ts"],
                 "close_full_ts": row["door_close_full_ts"],
                 "dwell_s": round(commit.dwell_s, 3), "open_travel_s": round(commit.open_travel_s, 3),
                 "close_travel_s": round(commit.close_travel_s, 3), "transfer_s": round(commit.transfer_s, 3),
+                "occupancy_after": occ_after,
             })
             new_rows.append(row)
         # prune committed intervals whose close slid fully out of the window
@@ -542,12 +582,15 @@ class _Runner:
         for o in opens:
             hourly[o.strftime("%Y-%m-%dT%H")] = hourly.get(o.strftime("%Y-%m-%dT%H"), 0) + 1
         dwells = [c["dwell_s"] for c in cy]
+        occs = [c["occupancy_after"] for c in cy if c.get("occupancy_after") is not None]
         return {
             "stop_count": len(cy),
             "headway_median_s": round(float(np.median(headways)), 1) if headways else None,
             "headway_p90_s": round(float(np.percentile(headways, 90)), 1) if headways else None,
             "dwell_median_s": round(float(np.median(dwells)), 2) if dwells else None,
             "idle_periods": len(idle), "idle_longest_s": round(max(idle), 1) if idle else 0,
+            "occupancy_median": round(float(np.median(occs)), 1) if occs else None,
+            "occupancy_max": max(occs) if occs else None, "occupancy_n": len(occs),
             "hourly_profile": hourly,
         }
 
@@ -598,6 +641,22 @@ class _Runner:
         if not self.roi:
             self.state = "failed"; self.error = "needs_calibration (no door_roi)"
             self._log(f"[watch ch{self.channel}] {self.error}"); self._status_post(); self._deregister(); return
+
+        # occupancy sampler (LOAD proxy) — optional; disabled if zone_cabin or model absent
+        import os as _os
+        try:
+            zc = _resolve_zone_cabin(self.zones_path or _os.environ.get("ZONES_PATH", ""), self.channel)
+            model = _os.environ.get("OCC_MODEL", "/home/askjitk/liftlab-b4/yolo11n.onnx")
+            if zc and Path(model).exists():
+                import occupancy
+                self.occ = occupancy.CabinCounter(model, zc, threads=int(_os.environ.get("OCC_THREADS", "3")))
+                self._log(f"[watch ch{self.channel}] occupancy ON (zone_cabin {len(zc)}pts, model {Path(model).name})")
+            else:
+                self._log(f"[watch ch{self.channel}] occupancy OFF "
+                          f"(zone_cabin={'yes' if zc else 'MISSING'}, model={'yes' if Path(model).exists() else 'MISSING'})")
+        except Exception as e:
+            self.occ = None
+            self._log(f"[watch ch{self.channel}] occupancy init failed: {type(e).__name__}: {str(e)[:80]}")
 
         self._cap_thread = threading.Thread(target=self._capture_loop, name=f"cap-ch{self.channel}", daemon=True)
         self._cap_thread.start()
@@ -651,6 +710,15 @@ class _Runner:
                 last_seq = seq
             elif age > STALL_S:
                 self._alarm(f"capture stalled (freshest {age:.1f}s old)")
+            # occupancy sampling while doors-open (raw elevated) — parallel to the door path
+            if (self.occ is not None and self.raws and self._occ_frame is not None
+                    and self.raws[-1] > self.closed_floor + MOTION_FLOOR
+                    and (now - self._last_occ_t) >= OCC_PERIOD_S):
+                self.occ_samples.append((self.offs[-1], self.occ.count(self._occ_frame)))
+                self._last_occ_t = now
+                _cut = self.offs[-1] - WINDOW_S
+                while self.occ_samples and self.occ_samples[0][0] < _cut:
+                    self.occ_samples.popleft()
             if self.t0 and (now - self.last_detect) >= DETECT_EVERY_S:
                 self.last_detect = now
                 rows = self.maybe_detect(self.offs[-1] if self.offs else 0.0)
@@ -736,7 +804,7 @@ def _runner_from_job(job):
     channel = int(job.get("channel", 29))
     camera, roi = _resolve_roi(zones, channel)
     return channel, _Runner(channel, roi, camera, gw_id=job.get("gateway_id", "site-A"),
-                            nvr=nvr, url=job.get("url") or None, log=_log_err)
+                            nvr=nvr, url=job.get("url") or None, log=_log_err, zones_path=zones)
 
 
 def main():
