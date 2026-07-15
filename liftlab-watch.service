@@ -12,6 +12,14 @@ EnvironmentFile=/etc/liftlab-agent.env
 # durable state OUT of /tmp
 Environment=WATCH_RUN_DIR=/home/askjitk/liftlab-watch
 Environment=WATCH_CHANNEL=29
+# Occupancy LOAD sampler (YOLO): OFF by default — it throttled this passively-cooled Pi
+# (81C/freq-cap, 2026-07-15). This env REACHES the process (systemd -> watch_local ->
+# watch_manager child_env copies os.environ), unlike a shell `OCC_ENABLED=0 systemctl start`
+# which sudo/systemd strips. Flip to 1 (and set OCC_THREADS) ONLY after occ_thermal_probe
+# PASSES on this Pi. Runtime kill without editing this unit: touch $WATCH_RUN_DIR/occ_disabled.
+Environment=OCC_ENABLED=0
+Environment=OCC_THREADS=1
+# Environment=OCC_PERIOD_S=1.5
 # `run` = clean any orphan, start fresh, then hold (its reader posts events; the
 # gateway token stays in THIS parent, stripped from the B4 child).
 ExecStart=/home/askjitk/liftlab-b3/pi-agent/.venv/bin/python /home/askjitk/liftlab-b3/pi-agent/watch_local.py run 29

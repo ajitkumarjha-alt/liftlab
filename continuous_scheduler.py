@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sys
 import threading
 import time
@@ -58,7 +59,11 @@ SEED_FRAMES = 40          # ~a few seconds of live frames to seed the baseline
 SEED_QUIET_SPREAD = MOTION_FLOOR   # seed rejected if raw spread exceeds this (moving/active)
 SEG_PAD_S = 6.0           # samples kept each side of a committed segment for re-measure
 SEED_RETRY_S = 120.0      # if no persisted baseline and the cabin is busy: retry seed this often
-OCC_PERIOD_S = 0.5        # occupancy YOLO sample period while doors-open (~2 Hz)
+OCC_PERIOD_S = float(os.environ.get("OCC_PERIOD_S", "1.5"))  # YOLO sample period doors-open
+                          # (~0.67 Hz). Was 0.5 (2 Hz) — too hot: near-continuous YOLO through the
+                          # peak (doors-open is a big duty fraction then) threw 81C. occupancy_after
+                          # only needs a couple samples in the last OCC_CLOSE_WINDOW_S before close,
+                          # so 0.67 Hz suffices at far lower thermal duty.
 OCC_CLOSE_WINDOW_S = 2.0  # occupancy_after = median cabin count over this window before close_start
 
 _REGISTRY: dict[int, "_Runner"] = {}
@@ -260,6 +265,7 @@ class _Runner:
         self._occ_frame = None            # latest full BGR frame for YOLO (throttled)
         self._last_occ_t = 0.0
         self._last_full_t = 0.0
+        self._last_kill_check = 0.0       # throttles the occ_disabled kill-file stat()
         # health
         self.samples = 0
         self.lat_recent = deque(maxlen=200)
@@ -356,8 +362,12 @@ class _Runner:
                             self._seed_full = frame.to_ndarray(format="bgr24")
                         except Exception:
                             pass
-                    # throttled full frame for the occupancy sampler (only when calibrated)
-                    if self.occ is not None and (time.time() - self._last_full_t) > 0.3:
+                    # Full frame for the occupancy sampler — ONLY while doors-open (raw
+                    # elevated). Converting 1080p BGR every 0.3s regardless of door state was
+                    # a continuous 2MP color-convert on this capture thread that starved the
+                    # door signal even doors-closed. Gated now: closed => zero occ CPU here.
+                    if (self.occ is not None and (time.time() - self._last_full_t) > 0.3
+                            and self.raws and self.raws[-1] > self.closed_floor + MOTION_FLOOR):
                         try:
                             self._occ_frame = frame.to_ndarray(format="bgr24")
                             self._last_full_t = time.time()
@@ -642,15 +652,30 @@ class _Runner:
             self.state = "failed"; self.error = "needs_calibration (no door_roi)"
             self._log(f"[watch ch{self.channel}] {self.error}"); self._status_post(); self._deregister(); return
 
-        # occupancy sampler (LOAD proxy) — optional; disabled if zone_cabin or model absent
+        # occupancy sampler (LOAD proxy) — OPT-IN and OFF by default: YOLO throttles this
+        # passively-cooled Pi (soc 81C in 15 min, freq-capped, 2026-07-15). Three real gates
+        # that ACTUALLY reach the process (unlike a shell env through sudo/systemd):
+        #   1. OCC_ENABLED=1 in the systemd unit's Environment= (default OFF)
+        #   2. no RUN_DIR/occ_disabled kill-file present (touch it to force OFF; live-checked)
+        #   3. zone_cabin + model present
+        # OCC_THREADS defaults to 1 (pin ONE core; door loop keeps the rest cool).
         import os as _os
+        self.occ = None
         try:
+            occ_enabled = _os.environ.get("OCC_ENABLED", "0") == "1"
+            kill = self.run_dir / "occ_disabled"
             zc = _resolve_zone_cabin(self.zones_path or _os.environ.get("ZONES_PATH", ""), self.channel)
             model = _os.environ.get("OCC_MODEL", "/home/askjitk/liftlab-b4/yolo11n.onnx")
-            if zc and Path(model).exists():
+            if not occ_enabled:
+                self._log(f"[watch ch{self.channel}] occupancy OFF (OCC_ENABLED != 1 in unit env)")
+            elif kill.exists():
+                self._log(f"[watch ch{self.channel}] occupancy OFF (kill-file {kill.name} present)")
+            elif zc and Path(model).exists():
                 import occupancy
-                self.occ = occupancy.CabinCounter(model, zc, threads=int(_os.environ.get("OCC_THREADS", "3")))
-                self._log(f"[watch ch{self.channel}] occupancy ON (zone_cabin {len(zc)}pts, model {Path(model).name})")
+                threads = int(_os.environ.get("OCC_THREADS", "1"))
+                self.occ = occupancy.CabinCounter(model, zc, threads=threads)
+                self._log(f"[watch ch{self.channel}] occupancy ON (zone_cabin {len(zc)}pts, "
+                          f"{threads} thread(s), {OCC_PERIOD_S:.2g}s period, model {Path(model).name})")
             else:
                 self._log(f"[watch ch{self.channel}] occupancy OFF "
                           f"(zone_cabin={'yes' if zc else 'MISSING'}, model={'yes' if Path(model).exists() else 'MISSING'})")
@@ -710,6 +735,15 @@ class _Runner:
                 last_seq = seq
             elif age > STALL_S:
                 self._alarm(f"capture stalled (freshest {age:.1f}s old)")
+            # live kill-switch: touch RUN_DIR/occ_disabled to stop YOLO WITHOUT a restart
+            # (immediate cooling). Tears down the session so idle threads/heat go too.
+            if self.occ is not None and (now - self._last_kill_check) > 5.0:
+                self._last_kill_check = now
+                if (self.run_dir / "occ_disabled").exists():
+                    self.occ = None
+                    self._occ_frame = None
+                    self._log(f"[watch ch{self.channel}] occupancy DISABLED live "
+                              f"(kill-file occ_disabled) — YOLO stopped")
             # occupancy sampling while doors-open (raw elevated) — parallel to the door path
             if (self.occ is not None and self.raws and self._occ_frame is not None
                     and self.raws[-1] > self.closed_floor + MOTION_FLOOR
