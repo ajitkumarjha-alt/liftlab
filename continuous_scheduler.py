@@ -57,6 +57,7 @@ STALL_S = 5.0             # capture considered stalled if freshest older than th
 SEED_FRAMES = 40          # ~a few seconds of live frames to seed the baseline
 SEED_QUIET_SPREAD = MOTION_FLOOR   # seed rejected if raw spread exceeds this (moving/active)
 SEG_PAD_S = 6.0           # samples kept each side of a committed segment for re-measure
+SEED_RETRY_S = 120.0      # if no persisted baseline and the cabin is busy: retry seed this often
 
 _REGISTRY: dict[int, "_Runner"] = {}
 _REG_LOCK = threading.Lock()
@@ -221,6 +222,12 @@ class _Runner:
         self._seed_full = None            # one full BGR frame stashed during seed
         self.baseline_confirmed = False   # operator must eyeball doors-shut
         self.validation_fn = None
+        self.confirmed_at = None          # when the baseline was operator-confirmed (persisted)
+        self.baseline_source = None       # "persisted" | "live-seed"
+        self._pending_confirm = False     # set by SIGUSR1; applied+persisted in the run loop
+        import os as _os
+        self.run_dir = Path(_os.environ.get("WATCH_RUN_DIR", "/home/askjitk/liftlab-watch"))
+        self.baseline_path = self.run_dir / f"baseline_ch{self.channel}.npz"
         # signal buffers (absolute offsets from run start — never re-based)
         self.t0 = None
         self.start_wall = None
@@ -290,6 +297,7 @@ class _Runner:
         return {
             "channel": self.channel, "camera": self.camera, "state": self.state,
             "baseline_confirmed": self.baseline_confirmed, "validation_frame": self.validation_fn,
+            "baseline_source": self.baseline_source, "confirmed_at": self.confirmed_at,
             "error": self.error, "elapsed_s": round(el, 1), "samples": self.samples,
             "signal_fps": round(self.samples / el, 2) if el > 1 else None,
             "latency_med_s": round(float(np.median(self.lat_recent)), 3) if self.lat_recent else None,
@@ -396,6 +404,39 @@ class _Runner:
         except Exception as e:
             self._seed_full = None
             return f"(validation emit failed: {type(e).__name__};"
+
+    # ---- durable baseline: reuse a CONFIRMED baseline across restarts (option b) ----
+    def _save_baseline(self):
+        try:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            np.savez(str(self.baseline_path), baseline=self.baseline,
+                     closed_floor=np.float32(self.closed_floor),
+                     roi=np.asarray(self.roi, dtype=np.int64),
+                     confirmed_at=np.float64(self.confirmed_at or time.time()))
+            self._log(f"[watch ch{self.channel}] confirmed baseline persisted -> {self.baseline_path.name}")
+        except Exception as e:
+            self._log(f"[watch ch{self.channel}] baseline persist failed: {type(e).__name__}: {e}")
+
+    def _load_baseline(self):
+        """Reuse a previously-CONFIRMED baseline so a restart (incl. a reboot at peak)
+        needs no self-seed. Reused ONLY if the ROI still matches (camera unmoved).
+        baseline_confirmed carries its original confirmed_at provenance."""
+        try:
+            if not self.baseline_path.exists():
+                return False
+            d = np.load(str(self.baseline_path), allow_pickle=False)
+            if tuple(int(x) for x in d["roi"]) != tuple(int(x) for x in self.roi):
+                self._log(f"[watch ch{self.channel}] persisted baseline ROI != current — will re-seed")
+                return False
+            self.baseline = d["baseline"].astype(np.float32)
+            self.closed_floor = float(d["closed_floor"])
+            self.confirmed_at = float(d["confirmed_at"])
+            self.baseline_confirmed = True
+            self.baseline_source = "persisted"
+            return True
+        except Exception as e:
+            self._log(f"[watch ch{self.channel}] baseline load failed: {type(e).__name__}: {e}")
+            return False
 
     # ---- per-sample ingest (also the unit-test entry point) ----
     def step(self, crop, ts):
@@ -561,13 +602,31 @@ class _Runner:
         self._cap_thread = threading.Thread(target=self._capture_loop, name=f"cap-ch{self.channel}", daemon=True)
         self._cap_thread.start()
 
-        ok, msg = self._seed_baseline()
-        self._log(f"[watch ch{self.channel}] {msg}")
-        if not ok:
-            self.state = "failed"; self.error = msg
-            self.stop_event.set(); self._status_post(); self._deregister(); return
-
-        self.state = "running"
+        # (b) reuse a persisted CONFIRMED baseline if present (unless a re-seed is forced),
+        # so a restart/reboot at PEAK does not need a doors-shut moment to self-seed.
+        import os as _os
+        reseed = _os.environ.get("WATCH_RESEED") == "1"
+        if not reseed and self._load_baseline():
+            from datetime import datetime as _dt
+            when = _dt.fromtimestamp(self.confirmed_at).strftime("%Y-%m-%d %H:%M") if self.confirmed_at else "?"
+            self.state = "running"
+            self._log(f"[watch ch{self.channel}] reusing persisted baseline (confirmed {when}); no re-seed")
+        else:
+            # (a) live seed, RETRY-until-quiet instead of dying on a busy cabin
+            self.baseline_source = "live-seed"
+            while not self.stop_event.is_set():
+                ok, msg = self._seed_baseline()
+                self._log(f"[watch ch{self.channel}] {msg}")
+                if ok:
+                    self.state = "running"
+                    break
+                self.state = "seeding-retry"; self.error = msg
+                self._status_post()             # ALIVE + retrying (not dead) — visible on /pihealth
+                if self.stop_event.wait(SEED_RETRY_S):
+                    break
+            if self.state != "running":
+                self._deregister(); return
+        self.error = None
         self._status_post()
         period = 1.0 / SIGNAL_HZ
         next_t = time.time()
@@ -575,6 +634,12 @@ class _Runner:
         last_status = time.time()
         while not self.stop_event.is_set() and not _STDOUT_BROKEN.is_set():
             now = time.time()
+            if self._pending_confirm:                          # operator confirmed (SIGUSR1)
+                self._pending_confirm = False
+                self.baseline_confirmed = True
+                self.confirmed_at = time.time()
+                self._save_baseline()                          # survives restarts (option b)
+                self._log(f"[watch ch{self.channel}] baseline CONFIRMED + persisted")
             crop, ts, seq = self.hub.latest()
             age = now - ts if ts else 999
             if ts and seq != last_seq:
@@ -702,8 +767,7 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: r.stop_event.set())
     try:
         def _confirm(*_):
-            r.baseline_confirmed = True
-            _log_err(f"[watch ch{channel}] baseline CONFIRMED doors-shut (SIGUSR1)")
+            r._pending_confirm = True     # minimal handler; run loop confirms + persists
         signal.signal(signal.SIGUSR1, _confirm)
     except (AttributeError, ValueError):
         pass  # SIGUSR1 not on this platform

@@ -207,6 +207,23 @@ def run_watch(job, *, report=None, log=None, cloud=None, gw_id=None, headers=Non
         log(f"[watch ch{channel}] baseline confirm signal sent")
         report(job, res); return res
 
+    if action == "reseed":
+        # genuinely fresh seed (camera moved / lighting changed permanently): drop the
+        # persisted baseline, then stop the child so the next start re-seeds live.
+        try:
+            (RUN_DIR / f"baseline_ch{channel}.npz").unlink(missing_ok=True)
+        except Exception:
+            pass
+        pid = _running(channel)
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        log(f"[watch ch{channel}] persisted baseline dropped; child stopped — restart to re-seed live")
+        res = {"status": "reseed", "channel": channel}
+        report(job, res); return res
+
     if action == "status":
         pid = _running(channel)
         detail = None
