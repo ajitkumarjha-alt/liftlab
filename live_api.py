@@ -88,23 +88,35 @@ async def live_put(gw: str, cam: str, fname: str, request: Request,
     if not fname.endswith(_ALLOWED_EXT):
         raise HTTPException(400, "bad extension")
     body = await request.body()
-    # Do the blocking disk work OFF the event loop. As an async handler, these sync writes
-    # + the glob-based prune ran ON the single uvicorn worker's loop — while one PUT wrote,
-    # the loop could not read any other stream's body, stalling every other stream. That is a
-    # prime suspect for the one-winner starvation. run_in_threadpool hands it to the anyio
-    # worker pool (default 40) so concurrent PUTs actually overlap.
+    # SHED LOAD, never OOM: if the VM-side watchdog tripped (store near the tmpfs cap or
+    # liftlab-cloud RSS climbing), reject segments with 503 instead of accepting more. The
+    # door-event ingest on the same app must not be put at risk by the relay.
+    if (LIVE_DIR / ".reject").exists():
+        raise HTTPException(503, "relay store guard active — segment shed")
+    # Blocking disk work OFF the event loop (anyio pool) so concurrent PUTs overlap instead
+    # of one write stalling every other stream's body read.
     def _persist():
         d = _camdir(gw, cam)
         tmp = d / (fname + ".part")
-        tmp.write_bytes(body)                      # atomic swap so GETs never see a half file
-        tmp.replace(d / fname)
+        try:
+            tmp.write_bytes(body)                  # atomic swap so GETs never see a half file
+            tmp.replace(d / fname)
+        except OSError:                            # tmpfs full (hard-capped) — clean partial, re-raise
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
         if fname.endswith(".ts"):
             st = _STATS.setdefault((gw, cam), {"bytes": 0, "segs": 0, "last": 0.0})
             st["bytes"] += len(body)               # DELIVERED bytes — the honest per-stream signal
             st["segs"] += 1
             st["last"] = time.time()
             _prune(d)
-    await run_in_threadpool(_persist)
+    try:
+        await run_in_threadpool(_persist)
+    except OSError as e:                            # capped tmpfs full => 503, do NOT 500/leak
+        raise HTTPException(503, f"store full (errno {e.errno}) — segment dropped")
     return PlainTextResponse("ok")
 
 

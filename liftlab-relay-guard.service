@@ -1,0 +1,16 @@
+[Unit]
+Description=liftlab relay watchdog (tmpfs/RSS guard -> shed segments before OOM)
+After=liftlab-cloud.service
+
+[Service]
+Type=simple
+User=root
+Environment=LIVE_DIR=/dev/shm/liftlab-live
+Environment=CAP_MB=200
+Environment=RSS_TRIP_MB=900
+ExecStart=/bin/bash /opt/liftlab-b3/cloud/relay_watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

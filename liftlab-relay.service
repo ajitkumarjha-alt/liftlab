@@ -1,0 +1,27 @@
+[Unit]
+Description=liftlab overnight sub-stream relay soak (7 cabins -> VM, HLS copy)
+After=network-online.target liftlab-watch.service
+Wants=network-online.target
+# The door watch is sacred; relay is expendable. If the watch is down, still allow relay,
+# but the relay self-kills on door_fps sag (see relay_soak.sh DOOR GUARD).
+
+[Service]
+Type=simple
+User=askjitk
+# creds injected by systemd (root reads this file, passes to the askjitk process) — same as
+# liftlab-watch, so no root-only-file read problem inside the script.
+EnvironmentFile=/etc/liftlab-agent.env
+Environment=RELAY_CSV=/home/askjitk/liftlab-watch/relay_soak.csv
+Environment=RELAY_INTERVAL=30
+Environment=RELAY_DOOR_FLOOR=9.5
+ExecStart=/bin/bash /home/askjitk/liftlab-b3/pi-agent/relay_soak.sh
+# on-failure only: a DOOR GUARD trip exits 0 (stay stopped, don't fight the watch); a crash
+# exits non-zero and restarts. Internal per-stream restarts handle wifi/NVR dropouts.
+Restart=on-failure
+RestartSec=15
+# never let the relay drag the box down
+Nice=5
+CPUWeight=50
+
+[Install]
+WantedBy=multi-user.target
