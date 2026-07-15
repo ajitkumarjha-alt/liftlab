@@ -38,8 +38,9 @@ PUT_NOAUTH=$(code -X PUT --data-binary 'x' "$BASE/api/gw/site-A/live/ch29/index.
 SEG_404=$(code "$BASE/live/site-A/ch29/nope.ts")           # 404 = serve route exists, file absent
 LC_NOAUTH=$(code "$BASE/api/gw/site-A/lift_channels")       # 401 = lift_channels route exists
 LS_NOAUTH=$(code "$BASE/api/gw/site-A/live_stats")          # 401 = live_stats route exists
-say "AFTER: service=$AC  /live page=$PAGE  PUT(no-token)=$PUT_NOAUTH  GET(missing seg)=$SEG_404  lift_channels=$LC_NOAUTH  live_stats=$LS_NOAUTH"
-if [ "$AC" = active ] && [ "$PAGE" = 200 ] && [ "$PUT_NOAUTH" = 401 ] && [ "$SEG_404" = 404 ] && [ "$LC_NOAUTH" = 401 ] && [ "$LS_NOAUTH" = 401 ]; then
+BH_NOAUTH=$(code -X PUT --data-binary 'x' "$BASE/api/gw/site-A/blackhole")  # 401 = blackhole route exists
+say "AFTER: service=$AC  /live page=$PAGE  PUT(no-token)=$PUT_NOAUTH  GET(missing seg)=$SEG_404  lift_channels=$LC_NOAUTH  live_stats=$LS_NOAUTH  blackhole=$BH_NOAUTH"
+if [ "$AC" = active ] && [ "$PAGE" = 200 ] && [ "$PUT_NOAUTH" = 401 ] && [ "$SEG_404" = 404 ] && [ "$LC_NOAUTH" = 401 ] && [ "$LS_NOAUTH" = 401 ] && [ "$BH_NOAUTH" = 401 ]; then
   say "RESULT: PASS — ingest live (401 w/o token = route exists), viewer + serve up."
   say "Now run live_relay.sh on the Pi; then open  https://lift.gargi.online/live/site-A/ch29  in Chrome."
 else

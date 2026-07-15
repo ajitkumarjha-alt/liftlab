@@ -25,6 +25,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 # TMPFS by default: segments are RAM-backed, vanish on reboot, never an archive.
 LIVE_DIR = Path(os.environ.get("LIVE_DIR", "/dev/shm/liftlab-live"))
@@ -87,17 +88,38 @@ async def live_put(gw: str, cam: str, fname: str, request: Request,
     if not fname.endswith(_ALLOWED_EXT):
         raise HTTPException(400, "bad extension")
     body = await request.body()
-    d = _camdir(gw, cam)
-    tmp = d / (fname + ".part")
-    tmp.write_bytes(body)                          # atomic swap so GETs never see a half file
-    tmp.replace(d / fname)
-    if fname.endswith(".ts"):
-        st = _STATS.setdefault((gw, cam), {"bytes": 0, "segs": 0, "last": 0.0})
-        st["bytes"] += len(body)                   # DELIVERED bytes — the honest per-stream signal
-        st["segs"] += 1
-        st["last"] = time.time()
-        _prune(d)
+    # Do the blocking disk work OFF the event loop. As an async handler, these sync writes
+    # + the glob-based prune ran ON the single uvicorn worker's loop — while one PUT wrote,
+    # the loop could not read any other stream's body, stalling every other stream. That is a
+    # prime suspect for the one-winner starvation. run_in_threadpool hands it to the anyio
+    # worker pool (default 40) so concurrent PUTs actually overlap.
+    def _persist():
+        d = _camdir(gw, cam)
+        tmp = d / (fname + ".part")
+        tmp.write_bytes(body)                      # atomic swap so GETs never see a half file
+        tmp.replace(d / fname)
+        if fname.endswith(".ts"):
+            st = _STATS.setdefault((gw, cam), {"bytes": 0, "segs": 0, "last": 0.0})
+            st["bytes"] += len(body)               # DELIVERED bytes — the honest per-stream signal
+            st["segs"] += 1
+            st["last"] = time.time()
+            _prune(d)
+    await run_in_threadpool(_persist)
     return PlainTextResponse("ok")
+
+
+@live_router.put("/api/gw/{gw}/blackhole")
+async def blackhole(gw: str, request: Request, authorization: str = Header("")):
+    """Pure-transport sink: stream the body and discard, NO disk work. Isolates the
+    link + Caddy + uvicorn concurrency from the live_put handler. If N concurrent PUTs
+    here scale to the link's real capacity but live_put starves, the bug is the handler
+    (or ffmpeg), not the link. If this ALSO collapses to one-winner, the wall is below the
+    app — Caddy, the uvicorn accept loop, or wifi."""
+    _auth(gw, authorization)
+    n = 0
+    async for chunk in request.stream():
+        n += len(chunk)
+    return {"bytes": n}
 
 
 @live_router.get("/api/gw/{gw}/live_stats")
