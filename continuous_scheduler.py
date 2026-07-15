@@ -56,7 +56,6 @@ LATENCY_ALARM_S = 1.0      # freshness alarm threshold
 STALL_S = 5.0             # capture considered stalled if freshest older than this
 SEED_FRAMES = 40          # ~a few seconds of live frames to seed the baseline
 SEED_QUIET_SPREAD = MOTION_FLOOR   # seed rejected if raw spread exceeds this (moving/active)
-COMMIT_OPEN_TOL_S = 1.0   # opens within this = the SAME physical opening (commit key)
 SEG_PAD_S = 6.0           # samples kept each side of a committed segment for re-measure
 
 _REGISTRY: dict[int, "_Runner"] = {}
@@ -170,6 +169,14 @@ def _straddles_hole(c: DoorCycle, holes) -> bool:
     return False
 
 
+def _overlaps(a0, a1, b0, b1):
+    """Do time intervals [a0,a1] and [b0,b1] overlap? Commitment matches on this,
+    not on an exact edge value — a re-emit's edges drift by seconds across window
+    slides but its [open,close] still overlaps the committed interval, while a
+    genuinely distinct opening (a real reopen after the close) does not."""
+    return a0 < b1 and b0 < a1
+
+
 # =========================================================================
 # frame hub — the latest-frame-drop hand-off
 # =========================================================================
@@ -221,8 +228,8 @@ class _Runner:
         self.raws = deque()               # raw gray-level distance
         self.baseline = None
         self.closed_floor = 0.0
-        # commitment bookkeeping — freeze by the OPEN edge, not close_full
-        self.committed = []               # committed open_start offsets (one per opening)
+        # commitment bookkeeping — freeze by [open,close] INTERVAL (drift-robust)
+        self.committed = []               # committed (open_start_s, close_full_s) intervals
         self.cycles = []                  # committed cycle summaries (for rollups)
         # health
         self.samples = 0
@@ -436,12 +443,13 @@ class _Runner:
         return max(cycles, key=lambda c: c.plateau) if cycles else None
 
     def maybe_detect(self, now_off):
-        """Detect opens on the window, then COMMIT each once its close has settled and
-        the door has returned to closed. Commitment keys on the OPEN edge (sharp,
-        sub-ms stable) — NOT close_full (soft, window-normalization drifts it across
-        slides, which WAS the duplicate bug: one open re-measured N times). The
-        committed close is RE-MEASURED segment-locally so it is deterministic. One open
-        -> one committed cycle. Returns the newly emitted rows."""
+        """Detect opens on the window, RE-MEASURE each settled one segment-locally for a
+        deterministic close, and COMMIT it as an [open,close] INTERVAL. A candidate whose
+        interval OVERLAPS an already-committed interval is the same physical opening
+        re-detected — edges drift by seconds across slides (rise_lo/extrapolation
+        cascade) but the intervals still overlap — so it is skipped. Interval-overlap is
+        robust to that drift where an exact open-edge value key was not. One physical
+        opening -> one committed cycle. Returns the newly emitted rows."""
         if len(self.raws) < 8:
             return []
         tl, offs = self._timeline()
@@ -449,23 +457,25 @@ class _Runner:
         newest = float(offs[-1])
         new_rows = []
         for c in detect_cycles(tl.signal, tl):   # DETECTION only; the window VALUE isn't trusted
-            if any(abs(c.open_start_s - o) < COMMIT_OPEN_TOL_S for o in self.committed):
-                continue                                       # this open is already committed
+            # cheap pre-check: the (drifty) window interval already overlaps a committed one
+            if any(_overlaps(c.open_start_s, c.close_full_s, io, ic) for io, ic in self.committed):
+                continue
             if newest - c.close_full_s < SETTLE_S:
                 continue                                       # close not settled yet
             if not _quality_ok(c) or _straddles_hole(c, tl.holes):
                 continue
             # the door must have RETURNED TO CLOSED after the close (not a mid-wobble
-            # dip): post-close samples near the closed floor for SETTLE_S, else the
-            # window-detected close isn't final — wait.
+            # dip): post-close samples near the closed floor for SETTLE_S, else wait.
             post = raws[(offs > c.close_full_s) & (offs <= c.close_full_s + SETTLE_S)]
             if len(post) >= 3 and float(np.median(post)) > self.closed_floor + MOTION_FLOOR:
                 continue
-            # COMMIT: freeze this open, re-measure the close deterministically
+            # re-measure segment-locally -> deterministic close, then commit the INTERVAL
             commit = self._seg_remeasure(c.open_start_s - SEG_PAD_S, c.close_full_s + SEG_PAD_S)
             if commit is None or not _quality_ok(commit):
                 commit = c                                     # fall back to the window cycle
-            self.committed.append(c.open_start_s)
+            if any(_overlaps(commit.open_start_s, commit.close_full_s, io, ic) for io, ic in self.committed):
+                continue                                       # stable interval already committed
+            self.committed.append((commit.open_start_s, commit.close_full_s))
             row = _event_row(tl, commit)                       # tl.wall_of maps absolute offsets
             self.cycles.append({
                 "open_full_ts": row["door_open_full_ts"],
@@ -474,9 +484,9 @@ class _Runner:
                 "close_travel_s": round(commit.close_travel_s, 3), "transfer_s": round(commit.transfer_s, 3),
             })
             new_rows.append(row)
-        # prune committed opens slid fully out of the window (can no longer be detected)
+        # prune committed intervals whose close slid fully out of the window
         cutoff = newest - WINDOW_S
-        self.committed = [o for o in self.committed if o >= cutoff]
+        self.committed = [(io, ic) for io, ic in self.committed if ic >= cutoff]
         return new_rows
 
     # ---- Tier-1 rollups from emitted cycles ----

@@ -442,7 +442,7 @@ def watch_status_series(gw: str, hours: int = 48):
 
 @survey_router.get("/pihealth/{gw}", response_class=HTMLResponse)
 def pihealth_graph(gw: str):
-    _P = "__GW__"
+    _P = gw
     _html = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>pi health GW_PLACEHOLDER</title>
 <style>
