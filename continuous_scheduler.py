@@ -56,6 +56,8 @@ LATENCY_ALARM_S = 1.0      # freshness alarm threshold
 STALL_S = 5.0             # capture considered stalled if freshest older than this
 SEED_FRAMES = 40          # ~a few seconds of live frames to seed the baseline
 SEED_QUIET_SPREAD = MOTION_FLOOR   # seed rejected if raw spread exceeds this (moving/active)
+COMMIT_OPEN_TOL_S = 1.0   # opens within this = the SAME physical opening (commit key)
+SEG_PAD_S = 6.0           # samples kept each side of a committed segment for re-measure
 
 _REGISTRY: dict[int, "_Runner"] = {}
 _REG_LOCK = threading.Lock()
@@ -219,9 +221,9 @@ class _Runner:
         self.raws = deque()               # raw gray-level distance
         self.baseline = None
         self.closed_floor = 0.0
-        # emission bookkeeping
-        self.emitted = []                 # list of close_full offsets already emitted
-        self.cycles = []                  # emitted cycle summaries (for rollups)
+        # commitment bookkeeping — freeze by the OPEN edge, not close_full
+        self.committed = []               # committed open_start offsets (one per opening)
+        self.cycles = []                  # committed cycle summaries (for rollups)
         # health
         self.samples = 0
         self.lat_recent = deque(maxlen=200)
@@ -413,35 +415,68 @@ class _Runner:
         holes = [(float(offs[i]), float(offs[i + 1])) for i in np.where(dh > DATA_HOLE_S)[0]]
         return StitchedTimeline(offs, sig, self.start_wall, holes, []), offs
 
+    def _seg_remeasure(self, off_lo, off_hi):
+        """Re-detect the cycle in [off_lo, off_hi] with SEGMENT-LOCAL normalization:
+        the STABLE closed_floor as the 0-level (NOT the segment/window median, which
+        self-cancels on an open-dominated slice) and this segment's own plateau as the
+        1-level. Deterministic and window-independent — this is what kills the ~6s
+        close disagreement. Returns a DoorCycle (offsets absolute-from-t0) or None."""
+        offs = np.asarray(self.offs, dtype=np.float64)
+        raws = np.asarray(self.raws, dtype=np.float32)
+        m = (offs >= off_lo) & (offs <= off_hi)
+        if int(m.sum()) < 8:
+            return None
+        so, sr = offs[m], raws[m]
+        lo = float(self.closed_floor)
+        hi = float(np.percentile(sr, 98))
+        if hi - lo < MOTION_FLOOR:
+            return None
+        sig = np.clip((sr - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+        cycles = detect_cycles(sig, StitchedTimeline(so, sig, self.start_wall, [], []))
+        return max(cycles, key=lambda c: c.plateau) if cycles else None
+
     def maybe_detect(self, now_off):
-        """Detect over the window; emit only COMPLETE + SETTLED + quality + hole-free
-        + non-duplicate cycles. Returns the list of newly emitted rows."""
+        """Detect opens on the window, then COMMIT each once its close has settled and
+        the door has returned to closed. Commitment keys on the OPEN edge (sharp,
+        sub-ms stable) — NOT close_full (soft, window-normalization drifts it across
+        slides, which WAS the duplicate bug: one open re-measured N times). The
+        committed close is RE-MEASURED segment-locally so it is deterministic. One open
+        -> one committed cycle. Returns the newly emitted rows."""
         if len(self.raws) < 8:
             return []
         tl, offs = self._timeline()
+        raws = np.asarray(self.raws, dtype=np.float32)
         newest = float(offs[-1])
         new_rows = []
-        for c in detect_cycles(tl.signal, tl):
-            # SETTLE: close_full must be safely behind the newest sample
+        for c in detect_cycles(tl.signal, tl):   # DETECTION only; the window VALUE isn't trusted
+            if any(abs(c.open_start_s - o) < COMMIT_OPEN_TOL_S for o in self.committed):
+                continue                                       # this open is already committed
             if newest - c.close_full_s < SETTLE_S:
-                continue
+                continue                                       # close not settled yet
             if not _quality_ok(c) or _straddles_hole(c, tl.holes):
                 continue
-            # DE-DUP by close_full within tolerance (offsets are absolute+stable)
-            if any(abs(c.close_full_s - e) < DEDUP_TOL_S for e in self.emitted):
+            # the door must have RETURNED TO CLOSED after the close (not a mid-wobble
+            # dip): post-close samples near the closed floor for SETTLE_S, else the
+            # window-detected close isn't final — wait.
+            post = raws[(offs > c.close_full_s) & (offs <= c.close_full_s + SETTLE_S)]
+            if len(post) >= 3 and float(np.median(post)) > self.closed_floor + MOTION_FLOOR:
                 continue
-            self.emitted.append(c.close_full_s)
-            row = _event_row(tl, c)
+            # COMMIT: freeze this open, re-measure the close deterministically
+            commit = self._seg_remeasure(c.open_start_s - SEG_PAD_S, c.close_full_s + SEG_PAD_S)
+            if commit is None or not _quality_ok(commit):
+                commit = c                                     # fall back to the window cycle
+            self.committed.append(c.open_start_s)
+            row = _event_row(tl, commit)                       # tl.wall_of maps absolute offsets
             self.cycles.append({
                 "open_full_ts": row["door_open_full_ts"],
                 "close_full_ts": row["door_close_full_ts"],
-                "dwell_s": round(c.dwell_s, 3), "open_travel_s": round(c.open_travel_s, 3),
-                "close_travel_s": round(c.close_travel_s, 3), "transfer_s": round(c.transfer_s, 3),
+                "dwell_s": round(commit.dwell_s, 3), "open_travel_s": round(commit.open_travel_s, 3),
+                "close_travel_s": round(commit.close_travel_s, 3), "transfer_s": round(commit.transfer_s, 3),
             })
             new_rows.append(row)
-        # prune emitted markers that have slid fully out of the window
+        # prune committed opens slid fully out of the window (can no longer be detected)
         cutoff = newest - WINDOW_S
-        self.emitted = [e for e in self.emitted if e >= cutoff]
+        self.committed = [o for o in self.committed if o >= cutoff]
         return new_rows
 
     # ---- Tier-1 rollups from emitted cycles ----
