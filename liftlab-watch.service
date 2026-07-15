@@ -1,0 +1,22 @@
+[Unit]
+Description=liftlab continuous door-cycle watch (single cabin, ch29)
+After=network-online.target liftlab-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=askjitk
+# creds via systemd (same EnvironmentFile the agent uses) — os.environ, no file read,
+# so no root-only-file permission problem the manual run hit.
+EnvironmentFile=/etc/liftlab-agent.env
+# durable state OUT of /tmp
+Environment=WATCH_RUN_DIR=/home/askjitk/liftlab-watch
+Environment=WATCH_CHANNEL=29
+# `run` = clean any orphan, start fresh, then hold (its reader posts events; the
+# gateway token stays in THIS parent, stripped from the B4 child).
+ExecStart=/home/askjitk/liftlab-b3/pi-agent/.venv/bin/python /home/askjitk/liftlab-b3/pi-agent/watch_local.py run 29
+Restart=always
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target

@@ -71,6 +71,12 @@ def main():
         zones_path=val("ZONES_PATH", "/home/askjitk/liftlab-b4/camera_zones.json"),
         nvr=(nvr_host, val("NVR_PORT", "80"), val("NVR_USER"), val("NVR_PASS")),
     )
+    if action == "run":
+        # SERVICE MODE (systemd): clear any orphaned child, then start fresh + hold.
+        wm.run_watch({"type": "watch_channel", "params": {"channel": channel, "action": "stop"}}, **kw)
+        time.sleep(2)
+        action = "start"
+
     job = {"type": "watch_channel", "params": {"channel": channel, "action": action}}
     res = wm.run_watch(job, **kw)
     print(f"[watch_local] {action} ch{channel} -> {res}", flush=True)

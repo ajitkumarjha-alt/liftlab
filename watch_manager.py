@@ -36,7 +36,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CONF = HERE / "watch_runtime.conf"
-RUN_DIR = Path(os.environ.get("WATCH_RUN_DIR", "/tmp/liftlab-watch"))
+RUN_DIR = Path(os.environ.get("WATCH_RUN_DIR", "/home/askjitk/liftlab-watch"))  # durable, NOT /tmp
 _READERS = {}                       # channel -> {"proc":Popen, "thread":Thread}
 _LOCK = threading.Lock()
 
