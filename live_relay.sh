@@ -19,7 +19,6 @@ set -uo pipefail
 # ---------- config ----------
 CH="${CH:-29}"
 CAM="${CAM:-ch$CH}"
-GW="${GW:-site-A}"
 DURATION="${DURATION:-90}"            # seconds measured per mode
 MODE="${MODE:-sweep}"                 # sweep | copy | hw | sw
 ENVF="${ENVF:-/etc/liftlab-agent.env}"
@@ -35,8 +34,11 @@ hr(){ printf '%s\n' "-----------------------------------------------------------
 set -a; . "$ENVF"; set +a
 : "${NVR_HOST:?NVR_HOST empty in env}"
 : "${GATEWAY_TOKEN:?GATEWAY_TOKEN empty in env}"
-CLOUD="${CLOUD_URL:-${CLOUD:-https://lift.gargi.online}}"
-CLOUD="${CLOUD%/}"
+# Bind to the SAME cloud URL + gateway id the agent already POSTs to (proven reachable,
+# valid cert). Do NOT invent a fallback — if it's absent, the env is wrong, fail loud.
+: "${CLOUD_URL:?CLOUD_URL empty in env — the agent uses this to POST; not guessing a URL}"
+CLOUD="${CLOUD_URL%/}"
+GW="${GW:-${GATEWAY_ID:-site-A}}"
 USER_ENC=$(python3 -c "import os,urllib.parse as u;print(u.quote(os.environ.get('NVR_USER','admin'),safe=''))")
 PASS_ENC=$(python3 -c "import os,urllib.parse as u;print(u.quote(os.environ.get('NVR_PASS',os.environ.get('NVR_PASSWORD','')),safe=''))")
 RTSP_URL="${RTSP_URL:-rtsp://${USER_ENC}:${PASS_ENC}@${NVR_HOST}:554/${CH}/1?transmode=unicast&profile=vam}"
@@ -58,7 +60,12 @@ PROBE=$(ffprobe -v error -rtsp_transport tcp -select_streams v:0 \
 echo "$PROBE" | sed 's/^/    /'
 SRC_CODEC=$(echo "$PROBE" | awk -F= '/codec_name/{print $2}')
 [ -n "$SRC_CODEC" ] || { say "could not probe source — check RTSP_URL/creds. Aborting."; exit 1; }
-say "source codec = ${SRC_CODEC:-?}  (h264 => -c:v copy is viable = near-zero CPU relay)"
+say "source codec = ${SRC_CODEC:-?}  (ch29 main is HEVC; ONVIF metadata lies and claims h264)"
+if [ "$SRC_CODEC" = hevc ]; then
+  say "  copy-mode = near-zero CPU remux, but Chrome CANNOT play HEVC-in-HLS (black player)."
+  say "  copy answers STEP 2 (analyse on the VM: ffmpeg decodes HEVC fine, no browser)."
+  say "  hw/sw transcode answer the DEMO (browser viewing). Different questions — both reported."
+fi
 
 # ---------- helpers: sample tx bytes / temp / throttle / door fps ----------
 tx_bytes(){ cat "/sys/class/net/$IFACE/statistics/tx_bytes" 2>/dev/null || echo 0; }
@@ -151,7 +158,7 @@ run_mode(){
 MODES=()
 case "$MODE" in
   sweep)
-    [ "$SRC_CODEC" = h264 ] && MODES+=(copy) || say "source not h264 — skipping copy mode"
+    MODES+=(copy)     # always: measures the STEP-2 (VM-analysis) relay bandwidth regardless of codec
     if hw_probe; then MODES+=(hw); say "h264_v4l2m2m PROBE: works -> will test hw"; \
       else say "h264_v4l2m2m PROBE: NOT functional on this Pi -> skipping hw (would fall back to sw)"; fi
     MODES+=(sw);;
@@ -168,20 +175,33 @@ while IFS='|' read -r m ok mb cpu tmax thr fmin ffbr; do
   [ -z "$m" ] && continue
   printf "    %-6s %-7s %-9s %-9s %-8s %-11s %-9s %s\n" "$m" "$ok" "${mb}Mbps" "${cpu}%" "${tmax}C" "$thr" "$fmin" "$ffbr"
 done < /tmp/live_relay_results.txt
-hr; say "EXTRAPOLATION TO 7-8 CAMS (read the cheapest WORKING mode's row):"
-BEST=$(awk -F'|' '$2=="OK"{print; exit}' /tmp/live_relay_results.txt)
-if [ -n "$BEST" ]; then
-  bm=$(echo "$BEST"|cut -d'|' -f1); bmb=$(echo "$BEST"|cut -d'|' -f3); bcpu=$(echo "$BEST"|cut -d'|' -f4)
-  awk -v m="$bm" -v mb="$bmb" -v cpu="$bcpu" 'BEGIN{
-    printf "    cheapest working mode: %s  -> per-stream %.2f Mbps up, ffmpeg ~%s%% of one core-equiv\n", m, mb, cpu;
-    printf "    x8 uplink  = %.1f Mbps SUSTAINED 24/7 (the site uplink must carry this)\n", mb*8;
-    printf "    x8 pi cpu  = ~%d%% aggregate (Pi 4 = 400%% total across 4 cores)\n", cpu*8;
-    if(cpu*8>300) print "    => CPU: 8x will saturate the Pi. copy-mode or fewer streams, or push raw to the VM.";
-    else print "    => CPU: 8x may fit IF this is copy-mode; transcode x8 will not (see per-mode rows).";
-    print  "    => THERMAL: watch peakT/throttle above — anything that set freqcap/templimit fails at x8.";
-    print  "    => DOOR LOOP: if doorFPS dropped below ~10 or fired the fps alarm at x1, x8 is off the table on this Pi.";
+hr; say "EXTRAPOLATION TO 7-8 CAMS — copy and transcode answer DIFFERENT questions:"
+COPY=$(awk -F'|' '$1=="copy"&&$2=="OK"{print; exit}' /tmp/live_relay_results.txt)
+XCODE=$(awk -F'|' '($1=="hw"||$1=="sw")&&$2=="OK"{print; exit}' /tmp/live_relay_results.txt)  # prefer hw (listed first)
+
+say "  [STEP 2 — analyse on the VM] read the COPY row (HEVC remux; no browser, VM decodes fine):"
+if [ -n "$COPY" ]; then
+  cmb=$(echo "$COPY"|cut -d'|' -f3); ccpu=$(echo "$COPY"|cut -d'|' -f4)
+  awk -v mb="$cmb" -v cpu="$ccpu" 'BEGIN{
+    printf "    copy: per-stream %.2f Mbps up, ffmpeg ~%s%% of one core (remux = near-free CPU)\n", mb, cpu;
+    printf "    x8 uplink = %.1f Mbps SUSTAINED 24/7 (the REAL question — site uplink must carry this)\n", mb*8;
+    printf "    x8 pi cpu = ~%d%% aggregate of 400%% — remux is cheap; the constraint is the network, not the Pi\n", cpu*8;
   }'
-else
-  say "no mode succeeded — nothing to extrapolate. Check the fflogs in /tmp/live_relay_*.fflog"
-fi
-say "done. Viewer (while a relay runs): $CLOUD/live/$GW/$CAM"
+else say "    copy row missing/failed — check /tmp/live_relay_copy.fflog"; fi
+
+say "  [DEMO — browser viewing] read the transcode row (HEVC->H264 so Chrome can play):"
+if [ -n "$XCODE" ]; then
+  xm=$(echo "$XCODE"|cut -d'|' -f1); xmb=$(echo "$XCODE"|cut -d'|' -f3); xcpu=$(echo "$XCODE"|cut -d'|' -f4)
+  awk -v m="$xm" -v mb="$xmb" -v cpu="$xcpu" 'BEGIN{
+    printf "    %s: per-stream %.2f Mbps up, ffmpeg ~%s%% of one core-equiv\n", m, mb, cpu;
+    printf "    x8 pi cpu = ~%d%% aggregate of 400%%\n", cpu*8;
+    if(cpu*8>300) print "    => transcode x8 SATURATES the Pi. Browser viewing of all 8 is not a Pi job — transcode on the VM.";
+    else print "    => transcode x8 may fit on CPU, but check thermal below before believing it.";
+  }'
+  [ "$xm" = sw ] && say "    NOTE: this is libx264 (SW) — h264_v4l2m2m didn't engage; SW transcode x8 will not scale."
+else say "    no transcode mode succeeded — Chrome viewing unproven; see the fflogs"; fi
+
+say "  [BOTH] THERMAL: any row that set freqcap/templimit already fails at x8 (see occ 81C finding)."
+say "  [BOTH] DOOR LOOP: if doorFPS dropped below ~10 or fired the fps alarm at x1, x8 is off the table."
+hr
+say "done. Viewer (transcode row only; HEVC copy shows black): $CLOUD/live/$GW/$CAM"
