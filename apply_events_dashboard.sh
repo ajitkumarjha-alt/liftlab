@@ -21,7 +21,8 @@ BASE="http://127.0.0.1:$PORT"
 say "service=$SVC port=$PORT"
 
 httpcode(){ curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$1" 2>/dev/null || echo 000; }
-verdicts(){ curl -s --max-time 8 "$1" 2>/dev/null | grep -cE 'NON-COMPLIANT|COMPLIANT|2\.31|Decision line' || true; }
+# verdict markers ONLY — never a bare number (a close-travel of 2.31s is DATA, not the threshold)
+verdicts(){ curl -s --max-time 8 "$1" 2>/dev/null | grep -cE 'NON-COMPLIANT|COMPLIANT|Decision line|DECISION_LINE_S' || true; }
 facts(){    curl -s --max-time 8 "$1" 2>/dev/null | grep -cE '[0-9]+ opens|openings' || true; }
 csvhdr(){   curl -s --max-time 8 "$1" 2>/dev/null | head -1 | grep -c '^id,gateway_id,camera' || true; }
 

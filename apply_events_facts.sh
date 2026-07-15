@@ -29,7 +29,7 @@ probe(){
   printf '%s\t%s\t%s\t%s' \
     "${code:-000}" \
     "$(printf '%s' "$body" | wc -c)" \
-    "$(printf '%s' "$body" | grep -cE 'NON-COMPLIANT|COMPLIANT|2\.31|Decision line' || true)" \
+    "$(printf '%s' "$body" | grep -cE 'NON-COMPLIANT|COMPLIANT|Decision line|DECISION_LINE_S' || true)" \
     "$(printf '%s' "$body" | grep -cE '[0-9]+ opens|openings' || true)"
 }
 
