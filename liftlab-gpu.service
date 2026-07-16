@@ -1,0 +1,25 @@
+[Unit]
+Description=liftlab GPU transit analyzer (ch29 landing<->cabin, YOLO11n+ByteTrack on L4)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+# StateDirectory persists the resume cursor across Spot PREEMPTION + reboot (/var/lib/liftlab-gpu).
+StateDirectory=liftlab-gpu
+Environment=CLOUD_URL=https://lift.gargi.online
+Environment=GW=site-A
+Environment=CAM=ch29
+Environment=DEVICE=cuda
+Environment=MODEL=__MODEL__
+Environment=STATE_DIR=/var/lib/liftlab-gpu
+# ANALYSIS_TOKEN (read-only worker token) lives here, root-only:
+EnvironmentFile=/etc/liftlab-gpu.env
+ExecStart=__VENVPY__ __APPDIR__/gpu_analyze.py
+# survive preemption: always restart; the unit is enabled so it starts on boot of the restarted VM
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

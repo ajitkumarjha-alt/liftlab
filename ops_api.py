@@ -131,10 +131,22 @@ def ops_data(gw: str):
             relay["per_stream"] = json.loads(relay["per_stream"])
         except Exception:
             relay["per_stream"] = {}
+    transit = None
+    try:
+        day0 = time.time() - 86400
+        tc = {r["direction"]: r["c"] for r in db.execute(
+            "SELECT direction, COUNT(*) c FROM transit_event WHERE gateway_id=? AND ts>=? GROUP BY direction",
+            (gw, day0)).fetchall()}
+        last = db.execute("SELECT ts FROM transit_event WHERE gateway_id=? ORDER BY id DESC LIMIT 1", (gw,)).fetchone()
+        transit = {"boarded": tc.get("in", 0), "alighted": tc.get("out", 0),
+                   "last_ts": last["ts"] if last else None}
+    except sqlite3.OperationalError:
+        pass                                       # transit_event not created yet (analysis not deployed)
     out = {
         "t": time.time(),
         "watch": watch,
         "relay": relay,
+        "transit": transit,
         "relay_series": _series(db, "relay_status", "ts,sum_delivered_mbps,soc_temp,door_fps,streams_delivering", gw),
         "watch_series": _series(db, "watch_status", "ts,signal_fps,soc_temp", gw),
     }
@@ -171,6 +183,7 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)
 <div class=wrap>
   <h2>Live cameras <span class=pill id=camcount></span></h2>
   <div class=grid id=grid></div>
+  <h2>Transit (GPU) <span class=pill>boarded / alighted</span></h2><div class=cards id=transit></div>
   <h2>Door watch</h2><div class=cards id=watch></div>
   <h2>Relay</h2><div class=cards id=relay></div>
 </div>
@@ -200,7 +213,13 @@ function tickGrid(){fetch('/ops/'+GW+'/snapmeta').then(function(r){return r.json
 function kv(k,v,c){return '<div class=kv><span>'+k+'</span><b class="'+(c||'')+'">'+esc(v)+'</b></div>'}
 function drawData(d){
   document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString();
-  var w=d.watch||{},r=d.relay||{};
+  var w=d.watch||{},r=d.relay||{},tr=d.transit;
+  document.getElementById('transit').innerHTML = tr ?
+    ('<div class=card><h3>boarded (24h)</h3><div class="big ok">'+esc(tr.boarded)+'</div></div>'
+    +'<div class=card><h3>alighted (24h)</h3><div class=big>'+esc(tr.alighted)+'</div></div>'
+    +'<div class=card><h3>last transit</h3>'+kv('ago',tr.last_ts?Math.round(d.t-tr.last_ts)+'s':'—')
+    +kv('source','GPU L4 ch29')+'</div>')
+    : '<div class=card><h3>transit</h3><div class=kv><span>GPU analyzer not reporting yet</span></div></div>';
   var age=w.ts?Math.round(d.t-w.ts):null;
   document.getElementById('watch').innerHTML=
     '<div class=card><h3>state</h3><div class=big>'+esc(w.state||'—')+'</div>'
