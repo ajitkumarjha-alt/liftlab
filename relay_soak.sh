@@ -101,7 +101,7 @@ say "launched $NCH direct-PUT sub relays: ${PIDS[*]}"
 sleep 6
 prev_tx=$(tx_bytes); prev_sj=$(live_stats_json); prev_t=$(date +%s.%N)
 declare -A PREVB; for ((i=0;i<NCH;i++)); do PREVB[$i]=$(stat_bytes "$prev_sj" "${CAMS[$i]}"); PREVJ[${PIDS[$i]}]=$(pid_jiffies "${PIDS[$i]}"); done
-strikes=0; hz=$(getconf CLK_TCK)
+strikes=0; hz=$(getconf CLK_TCK); GUARD_TRIPS=0
 
 # ---------- soak loop ----------
 while :; do
@@ -110,12 +110,12 @@ while :; do
   cur_tx=$(tx_bytes); cur_sj=$(live_stats_json)
   upl=$(awk -v a="$prev_tx" -v b="$cur_tx" -v dt="$dt" 'BEGIN{printf "%.2f",(b-a)*8/dt/1e6}')
   # per-stream delivered kbps + cpu + liveness
-  percols=""; sumk=0; alive=0; delivering=0; cpu=0
+  percols=""; sumk=0; alive=0; delivering=0; cpu=0; ps_json="{"
   for ((i=0;i<NCH;i++)); do
     cam=${CAMS[$i]}
     b1=$(stat_bytes "$cur_sj" "$cam")
     dk=$(awk -v a="${PREVB[$i]}" -v b="$b1" -v dt="$dt" 'BEGIN{printf "%.0f",(b-a)*8/dt/1000}')
-    PREVB[$i]=$b1; percols+=",${dk}"; sumk=$(awk -v s="$sumk" -v k="$dk" 'BEGIN{print s+k}')
+    PREVB[$i]=$b1; percols+=",${dk}"; sumk=$(awk -v s="$sumk" -v k="$dk" 'BEGIN{print s+k}'); ps_json+="\"$cam\":$dk,"
     # delivering = segments still arriving. A dead/stalled ffmpeg drops delivery to ~0; a quiet
     # cabin still trickles > ARRIVING_KBPS. No rate model — bitrate can't tell scene from fault.
     awk "BEGIN{exit !($dk>=$ARRIVING_KBPS)}" && delivering=$((delivering+1))
@@ -130,8 +130,12 @@ while :; do
     fi
   done
   smbps=$(awk -v k="$sumk" 'BEGIN{printf "%.2f",k/1000}')
-  tp=$(temp_c); thr=$(throttle_live); ma=$(mem_avail); df=$(door_fps)
+  tp=$(temp_c); thr=$(throttle_live); ma=$(mem_avail); df=$(door_fps); ps_json="${ps_json%,}}"
   echo "$(date -u +%FT%TZ),${upl},${smbps}${percols},${cpu},${tp},${thr},${ma},${df:-NA},${alive},${delivering}" >> "$CSV"
+  # POST relay metrics to the cloud so /ops shows relay health without SSH (separate from the watch)
+  payload="{\"sum_delivered_mbps\":${smbps},\"streams_alive\":${alive},\"streams_delivering\":${delivering},\"ff_cpu\":${cpu:-0},\"soc_temp\":${tp:-0},\"throttle_live\":\"${thr}\",\"mem_avail_mb\":${ma:-0},\"door_fps\":${df:-0},\"guard_trips\":${GUARD_TRIPS:-0},\"per_stream\":${ps_json}}"
+  curl -s -o /dev/null --max-time 5 -X POST -H "Authorization: Bearer $GATEWAY_TOKEN" \
+    -H "Content-Type: application/json" -d "$payload" "$CLOUD/api/gw/$GW/relay_status" 2>/dev/null || true
   prev_tx=$cur_tx; prev_sj=$cur_sj; prev_t=$now
   # ---------- DOOR GUARD: the watch is sacred ----------
   if [ -n "$df" ] && awk "BEGIN{exit !($df < $DOOR_FLOOR)}"; then
@@ -140,6 +144,10 @@ while :; do
     if [ "$strikes" -ge "$DOOR_STRIKES_MAX" ]; then
       say "DOOR GUARD TRIPPED: door_fps=$df sustained < $DOOR_FLOOR — STOPPING relay to protect the watch."
       echo "$(date -u +%FT%TZ),GUARD_TRIP,door_fps=$df,relay_stopped_to_protect_watch" >> "$CSV"
+      GUARD_TRIPS=1
+      curl -s -o /dev/null --max-time 5 -X POST -H "Authorization: Bearer $GATEWAY_TOKEN" -H "Content-Type: application/json" \
+        -d "{\"sum_delivered_mbps\":0,\"streams_alive\":0,\"streams_delivering\":0,\"door_fps\":${df:-0},\"guard_trips\":1,\"per_stream\":{}}" \
+        "$CLOUD/api/gw/$GW/relay_status" 2>/dev/null || true   # surface the trip on /ops
       cleanup; trap - EXIT; exit 0   # exit 0 => systemd Restart=on-failure will NOT restart
     fi
   else

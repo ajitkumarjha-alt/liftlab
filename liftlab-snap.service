@@ -1,0 +1,26 @@
+[Unit]
+Description=liftlab snapshot grid (1 frame per new segment per cam, niced)
+After=liftlab-cloud.service
+
+[Service]
+Type=simple
+User=liftlab
+Group=liftlab
+# RuntimeDirectory creates /run/liftlab-snap owned by liftlab (0755 so the cloud app can read),
+# auto-removed on stop. RAM-backed, tiny (~40KB x cams) — NOT the capped /dev/shm relay store.
+RuntimeDirectory=liftlab-snap
+RuntimeDirectoryMode=0755
+Environment=LIVE_DIR=/dev/shm/liftlab-live
+Environment=SNAP_DIR=/run/liftlab-snap
+Environment=SNAP_PERIOD=2.0
+Environment=SNAP_WIDTH=480
+# Protect the event ingest on the e2-small: decode runs at low priority, idle I/O.
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=30
+ExecStart=/opt/liftlab-b3/cloud/.venv/bin/python /opt/liftlab-b3/cloud/snapshot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
