@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # VM: put a HARD 200M tmpfs cap on the live store + install the watchdog, and PROVE the cap
-# physically holds before the soak. RUN AS ROOT ON THE VM:
-#   sudo bash /tmp/apply_relay_vm.sh          (needs /tmp/relay_watchdog.sh + /tmp/liftlab-relay-guard.service)
-# Assumes live_api.py with the .reject/ENOSPC guard is already deployed (re-run apply_live.sh first).
+# physically holds before the soak. Assumes live_api.py (.reject/ENOSPC guard) already deployed.
+# FILES NEEDED IN /tmp: apply_relay_vm.sh relay_watchdog.sh liftlab-relay-guard.service
+# CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
+#       for f in apply_relay_vm.sh relay_watchdog.sh liftlab-relay-guard.service; do curl -fsSL -o /tmp/$f $B/$f; done
+#   sudo bash /tmp/apply_relay_vm.sh
 set -uo pipefail
 APP=/opt/liftlab-b3/cloud
 LIVE_DIR=/dev/shm/liftlab-live

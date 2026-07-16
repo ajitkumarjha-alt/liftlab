@@ -14,11 +14,13 @@ INTERVAL="${RELAY_INTERVAL:-30}"
 CSV="${RELAY_CSV:-/home/askjitk/liftlab-watch/relay_soak.csv}"
 DOOR_FLOOR="${RELAY_DOOR_FLOOR:-9.5}"          # relay stops if door_fps sags below this
 DOOR_STRIKES_MAX="${RELAY_DOOR_STRIKES:-3}"    # for this many consecutive samples (~90s)
-# Per-camera delivery judged as a FRACTION of each cam's OWN source rate (cameras are mixed:
-# 720p30 ~1Mbps vs 4CIF/25 ~0.3Mbps). A fixed kbps floor falsely flagged small cams as starved.
-DELIVER_FRAC="${RELAY_DELIVER_FRAC:-0.7}"      # delivering if >= this fraction of source rate
-DEAD_KBPS="${RELAY_DEAD_KBPS:-30}"             # absolute floor: below this = a dead stream
-NVR_SOLO="${NVR_SOLO_JSON:-/home/askjitk/liftlab-watch/nvr_solo.json}"
+# Delivery health = is the stream ALIVE and are SEGMENTS STILL ARRIVING at the VM (bytes up this
+# interval). HEVC sub bitrate is scene-dependent, so its VALUE — fixed, peak, OR rolling — cannot
+# tell a quiet cabin from a fault: both are just fewer bytes (a rolling EMA still false-flags a
+# cabin that empties from ~400->80 kbps). The only bitrate-independent fault signal is "are
+# segments landing". A stall/death drops delivery to ~zero; a quiet cabin still trickles bytes.
+# The raw per-stream kbps is in the CSV for the full picture.
+ARRIVING_KBPS="${RELAY_ARRIVING_KBPS:-10}"     # below this over an interval = no segments = stalled/dead
 HLS_TIME="${RELAY_HLS_TIME:-2}"                # segment seconds
 MREQ_ARG=""; [ "${RELAY_MULTIPLE_REQUESTS:-}" = 1 ] && MREQ_ARG="-multiple_requests 1"
 WATCH_CH="${WATCH_CHANNEL:-29}"
@@ -48,17 +50,7 @@ CHANS=("${CHANS[@]:0:7}"); NCH=${#CHANS[@]}
 CAMS=(); for ch in "${CHANS[@]}"; do CAMS+=("ch${ch}"); done
 say "channels ($CSRC): ${CHANS[*]}  iface=$IFACE  interval=${INTERVAL}s  csv=$CSV  door_floor=$DOOR_FLOOR"
 
-# ---------- per-camera expected source rates (from nvr_solo.json) ----------
-declare -A EXPECTED PEAK
-if [ -f "$NVR_SOLO" ]; then
-  while IFS='=' read -r k v; do [ -n "$k" ] && EXPECTED[$k]=$v; done < <(python3 -c "import json
-try: d=json.load(open('$NVR_SOLO'))
-except Exception: d={}
-[print(f'{k}={int(v)}') for k,v in d.items()]" 2>/dev/null)
-  say "loaded source rates from $NVR_SOLO: $(for c in "${CAMS[@]}"; do printf '%s=%s ' "$c" "${EXPECTED[$c]:-?}"; done)"
-else
-  say "no $NVR_SOLO — self-calibrating each cam's rate from its running-max delivered (run nvr_solo.sh for exact rates)"
-fi
+say "delivery health = segments still arriving (>= ${ARRIVING_KBPS}kbps/interval); bitrate value can't distinguish a quiet cabin from a fault"
 
 # ---------- helpers ----------
 tx_bytes(){ cat "/sys/class/net/$IFACE/statistics/tx_bytes" 2>/dev/null||echo 0; }
@@ -121,13 +113,9 @@ while :; do
     b1=$(stat_bytes "$cur_sj" "$cam")
     dk=$(awk -v a="${PREVB[$i]}" -v b="$b1" -v dt="$dt" 'BEGIN{printf "%.0f",(b-a)*8/dt/1000}')
     PREVB[$i]=$b1; percols+=",${dk}"; sumk=$(awk -v s="$sumk" -v k="$dk" 'BEGIN{print s+k}')
-    # delivering = >= DELIVER_FRAC of THIS cam's source rate (from probe, else running-max), and not dead
-    exp=${EXPECTED[$cam]:-0}
-    if [ "$exp" -le 0 ] 2>/dev/null; then
-      awk "BEGIN{exit !($dk>${PEAK[$cam]:-0})}" && PEAK[$cam]=$dk    # self-calibrate
-      exp=${PEAK[$cam]:-0}
-    fi
-    awk "BEGIN{exit !($dk>=$DEAD_KBPS && $exp>0 && $dk>=$DELIVER_FRAC*$exp)}" && delivering=$((delivering+1))
+    # delivering = segments still arriving. A dead/stalled ffmpeg drops delivery to ~0; a quiet
+    # cabin still trickles > ARRIVING_KBPS. No rate model — bitrate can't tell scene from fault.
+    awk "BEGIN{exit !($dk>=$ARRIVING_KBPS)}" && delivering=$((delivering+1))
     local_pid=${PIDS[$i]}
     if kill -0 "$local_pid" 2>/dev/null; then
       alive=$((alive+1)); j1=$(pid_jiffies "$local_pid"); pj=${PREVJ[$local_pid]:-$j1}

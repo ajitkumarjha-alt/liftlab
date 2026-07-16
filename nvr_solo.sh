@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Measure each cabin's SOLO sub-stream bitrate (one at a time, uncontended) and store it as that
-# camera's EXPECTED source rate. The cameras are mixed: ch16 is 720p30 (~1 Mbps), the six 4CIF/25
-# subs are ~260-520 kbps. A FIXED kbps delivery floor is meaningless across them and falsely
-# flagged 5/6 subs as "starved" for delivering 100% of what exists. relay_soak reads this and
-# judges each stream as a FRACTION OF ITS OWN measured rate.
-# RUN ON THE PI AS ROOT (relay stopped is cleanest but not required):
-#   sudo bash nvr_solo.sh          -> writes /home/askjitk/liftlab-watch/nvr_solo.json
+# DIAGNOSTIC ONLY. Measure each cabin's SOLO sub-stream bitrate (one at a time) to SEE the mixed
+# camera configs: ch16 720p30 (~1 Mbps) vs six 4CIF/25 subs (~260-520 kbps). NOTE these rates
+# DRIFT run-to-run — HEVC bitrate is scene-dependent (empty cabin ~nothing, busy cabin more), e.g.
+# ch27 0.51->0.23, ch34 0.52->0.19 between runs. So a STATIC per-camera threshold is fragile;
+# relay_soak does NOT use this file — it self-calibrates each stream against a rolling EMA of its
+# OWN recent rate. This probe is just for eyeballing the configs.
+# RUN ON THE PI AS ROOT:  sudo bash nvr_solo.sh   (writes /home/askjitk/liftlab-watch/nvr_solo.json)
+# FILES: nvr_solo.sh (no other deps)
 set -uo pipefail
 ENVF=/etc/liftlab-agent.env; STREAM=2; PROBE_S="${PROBE_S:-15}"
 OUT="${NVR_SOLO_JSON:-/home/askjitk/liftlab-watch/nvr_solo.json}"
@@ -37,5 +38,5 @@ for ch in "${CHANS[@]}"; do
   entries+="\"$cam\":$kbps,"
 done
 echo "{${entries%,}}" > "$OUT"
-say "wrote $OUT:"; cat "$OUT" | sed 's/^/    /'
-say "relay_soak now judges each stream vs 70% of its own rate (RELAY_DELIVER_FRAC)."
+say "wrote $OUT (informational):"; cat "$OUT" | sed 's/^/    /'
+say "NOTE: these drift with cabin activity; relay_soak self-calibrates and does NOT read this file."

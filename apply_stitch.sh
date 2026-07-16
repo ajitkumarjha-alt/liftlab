@@ -3,7 +3,10 @@
 # OPEN 8->15) so real long-close interference is no longer discarded from the door data.
 # Restarts liftlab-watch, which REUSES the persisted baseline (baseline_ch29.npz, proven last night:
 # up in 12.8s, baseline_source='persisted', confirmed) — NO lull, NO re-seed needed.
-#   sudo bash /tmp/apply_stitch.sh          (needs /tmp/stitch.py)
+# FILES NEEDED IN /tmp: apply_stitch.sh stitch.py
+# CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
+#       for f in apply_stitch.sh stitch.py; do curl -fsSL -o /tmp/$f $B/$f; done
+#   sudo bash /tmp/apply_stitch.sh
 set -uo pipefail
 B4=/home/askjitk/liftlab-b4
 B4PY="$B4/.venv/bin/python"

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Install the live HLS relay proxy (live_api.py + mount) on the VM. ADDITIVE, transient.
-# RUN AS ROOT ON THE VM: sudo bash /tmp/apply_live.sh   (needs /tmp/live_api.py + /tmp/apply_live_patch.py)
-# Backup-first, compile-check, restart, verify routes by STATUS (not substrings).
+# FILES NEEDED IN /tmp: apply_live.sh live_api.py apply_live_patch.py
+# CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
+#       for f in apply_live.sh live_api.py apply_live_patch.py; do curl -fsSL -o /tmp/$f $B/$f; done
+# RUN AS ROOT ON THE VM: sudo bash /tmp/apply_live.sh   (verify routes by STATUS, not substrings)
 set -uo pipefail
 APP=/opt/liftlab-b3/cloud
 PY=$APP/.venv/bin/python
