@@ -148,11 +148,19 @@ def ops_data(gw: str):
                    "last_ts": last["ts"] if last else None}
     except sqlite3.OperationalError:
         pass                                       # transit_event not created yet (analysis not deployed)
+    validation = {}
+    try:
+        for r in db.execute("SELECT cam,state,n_reviewed,n_exact,provenance FROM camera_validation "
+                            "WHERE gateway_id=?", (gw,)).fetchall():
+            validation[r["cam"]] = dict(r)
+    except sqlite3.OperationalError:
+        pass                                       # camera_validation not created yet
     out = {
         "t": time.time(),
         "watch": watch,
         "relay": relay,
         "transit": transit,
+        "validation": validation,
         "relay_series": _series(db, "relay_status", "ts,sum_delivered_mbps,soc_temp,door_fps,streams_delivering", gw),
         "watch_series": _series(db, "watch_status", "ts,signal_fps,soc_temp", gw),
     }
@@ -219,13 +227,19 @@ function tickGrid(){fetch('/ops/'+GW+'/snapmeta').then(function(r){return r.json
 function kv(k,v,c){return '<div class=kv><span>'+k+'</span><b class="'+(c||'')+'">'+esc(v)+'</b></div>'}
 function drawData(d){
   document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString();
-  var w=d.watch||{},r=d.relay||{},tr=d.transit;
-  document.getElementById('transit').innerHTML = tr ?
+  var w=d.watch||{},r=d.relay||{},tr=d.transit,val=d.validation||{};
+  var vcards=Object.keys(val).sort().map(function(cam){var v=val[cam];
+    var pct=v.n_reviewed?Math.round(100*v.n_exact/v.n_reviewed):0;
+    var prov=v.provenance||(v.n_reviewed?(v.n_reviewed+' reviewed, '+pct+'% exact'):'not reviewed');
+    return '<div class=card><h3>'+cam+' provenance</h3>'
+      +'<div class="big '+(v.state==='live'?'ok':'warn')+'">'+esc(v.state)+'</div>'
+      +kv('precision',prov)+(v.state!=='live'?'<div class=kv><a href="/validate">review →</a></div>':'')+'</div>';}).join('');
+  document.getElementById('transit').innerHTML = (tr ?
     ('<div class=card><h3>boarded (24h)</h3><div class="big ok">'+esc(tr.boarded)+'</div></div>'
     +'<div class=card><h3>alighted (24h)</h3><div class=big>'+esc(tr.alighted)+'</div></div>'
     +'<div class=card><h3>last transit</h3>'+kv('ago',tr.last_ts?Math.round(d.t-tr.last_ts)+'s':'—')
-    +kv('source','GPU L4 ch29')+'</div>')
-    : '<div class=card><h3>transit</h3><div class=kv><span>GPU analyzer not reporting yet</span></div></div>';
+    +kv('source','GPU L4')+'</div>')
+    : '<div class=card><h3>transit</h3><div class=kv><span>GPU analyzer not reporting yet</span></div></div>') + vcards;
   var age=w.ts?Math.round(d.t-w.ts):null;
   document.getElementById('watch').innerHTML=
     '<div class=card><h3>state</h3><div class=big>'+esc(w.state||'—')+'</div>'

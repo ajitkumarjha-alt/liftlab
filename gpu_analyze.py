@@ -11,7 +11,9 @@ Env: CLOUD_URL, GW, CAM, ANALYSIS_TOKEN, MODEL (yolo11n.pt), STATE_DIR (systemd 
      CONF, DEVICE (cuda), POLL_S.  Zones: desk-rig 1920x1080, PER-AXIS scaled to the sub frame
      (verified 2026-07-16: sub is a full-frame resample, per-axis transfers).
 """
+import base64
 import io
+import json
 import os
 import sys
 import time
@@ -30,6 +32,9 @@ CONF = float(os.environ.get("CONF", "0.35"))
 DEVICE = os.environ.get("DEVICE", "cuda")
 POLL_S = float(os.environ.get("POLL_S", "1.0"))
 STATE_DIR = os.environ.get("STATE_DIR", "/var/lib/liftlab-gpu")
+VAL_POLL_S = float(os.environ.get("VAL_POLL_S", "30"))     # how often to re-check this cam's mode
+EPISODE_GAP_S = float(os.environ.get("EPISODE_GAP_S", "8"))  # transits >this apart = different opening
+VAL_MAX_IMGS = int(os.environ.get("VAL_MAX_IMGS", "4"))
 CALIB_W, CALIB_H = 1920, 1080
 ZONE_CABIN = [[630, 870], [932, 747], [1042, 733], [1308, 1056], [587, 1056], [548, 914]]
 ZONE_LANDING = [[514, 394], [834, 322], [722, 529], [732, 684], [761, 776], [618, 827]]
@@ -53,6 +58,36 @@ def http_post_json(url, obj, timeout=10):
     req = urllib.request.Request(url, data=data, headers={**HDRS, "Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status
+
+
+def get_val_state():
+    """This camera's mode from the cloud: 'validating' (snap + review) or 'live' (counts only)."""
+    try:
+        return json.loads(http_get(f"{CLOUD}/api/gw/{GW}/validation_mode/{CAM}").decode())["state"]
+    except Exception:
+        return "validating"                       # default: validate an unknown/new camera
+
+
+def jpeg_b64(fr, width=480):
+    """Downscaled JPEG of a validation frame (privacy: small, short-lived, deleted after verdict)."""
+    import cv2
+    h, w = fr.shape[:2]
+    if w > width:
+        fr = cv2.resize(fr, (width, int(h * width / w)))
+    ok, buf = cv2.imencode(".jpg", fr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    return base64.b64encode(buf.tobytes()).decode() if ok else None
+
+
+def post_episode(ep):
+    if not ep or (ep["b"] + ep["a"]) == 0:
+        return
+    try:
+        http_post_json(f"{CLOUD}/api/gw/{GW}/validation_item/{CAM}",
+                       {"ts_start": ep["ts_start"], "ts_end": ep["ts_end"],
+                        "machine_boarded": ep["b"], "machine_alighted": ep["a"], "images": ep["imgs"]})
+        log(f"validation episode -> boarded={ep['b']} alighted={ep['a']} imgs={len(ep['imgs'])}")
+    except Exception as e:
+        log(f"validation_item POST failed: {e}")
 
 
 def playlist_segments():
@@ -134,11 +169,17 @@ def main():
     log(f"detector on device={DEVICE} — verify with nvidia-smi (non-zero GPU-Util = actually on the L4)")
     ctr = None                                   # ZoneCounter, built once we know the frame size
     posted = 0
+    val_state = get_val_state()
+    last_val_poll = time.time()
+    episode = None                                # current door-open episode being validated
+    log(f"validation mode: {val_state}")
 
     while True:
         segs = playlist_segments()
         new = [s for s in segs if s not in seen]
         if not new:
+            if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
+                post_episode(episode); episode = None
             time.sleep(POLL_S)
             continue
         for name in new:
@@ -160,19 +201,42 @@ def main():
             n_fr = len(frames)
             for i, fr in enumerate(frames):
                 dets = det.track(fr)
+                pre = len(ctr.transits)
                 ctr.update(dets, offset_s=seg_wall - (n_fr - i) * 0.04)   # ~25fps back-stamp
-            # POST any NEW transits (idempotent by cam+track_id+direction; cloud dedups)
-            for t in ctr.transits[before:]:
-                try:
-                    http_post_json(f"{CLOUD}/api/gw/{GW}/transit",
-                                   {"cam": CAM, "ts": t.offset_s, "direction": t.direction, "track_id": t.track_id})
-                    posted += 1
-                except Exception as e:
-                    log(f"transit POST failed (will not double-count on retry): {e}")
+                for t in ctr.transits[pre:]:      # transits detected ON this frame
+                    try:                          # POST the count (both modes; idempotent, cloud dedups)
+                        http_post_json(f"{CLOUD}/api/gw/{GW}/transit",
+                                       {"cam": CAM, "ts": t.offset_s, "direction": t.direction, "track_id": t.track_id})
+                        posted += 1
+                    except Exception as e:
+                        log(f"transit POST failed (no double-count on retry): {e}")
+                    if val_state == "validating":  # capture THIS frame into the door-open episode
+                        now = t.offset_s
+                        if episode and now - episode["ts_end"] > EPISODE_GAP_S:
+                            post_episode(episode); episode = None
+                        if episode is None:
+                            episode = {"ts_start": now, "ts_end": now, "b": 0, "a": 0, "imgs": []}
+                        episode["ts_end"] = now
+                        episode["b" if t.direction == "in" else "a"] += 1
+                        if len(episode["imgs"]) < VAL_MAX_IMGS:
+                            j = jpeg_b64(fr)
+                            if j:
+                                episode["imgs"].append(j)
             b, a = ctr.counts()
             if len(ctr.transits) > before:
                 log(f"{name}: +{len(ctr.transits)-before} transits (cum boarded={b} alighted={a}, posted={posted})")
             seen.add(name)
+        # close a stale validation episode (door shut) + refresh this cam's mode periodically
+        if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
+            post_episode(episode); episode = None
+        if time.time() - last_val_poll > VAL_POLL_S:
+            ns = get_val_state()
+            if ns != val_state:
+                log(f"validation mode: {val_state} -> {ns}")
+                if ns == "live" and episode:
+                    post_episode(episode); episode = None   # flush before going quiet
+            val_state = ns
+            last_val_poll = time.time()
         # persist cursor (rolling: keep the last ~40 seg names)
         try:
             with open(cursor_path, "w") as f:
