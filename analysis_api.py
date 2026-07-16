@@ -19,6 +19,7 @@ import os
 import re
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -74,6 +75,60 @@ def pull_segment(gw: str, cam: str, fname: str, authorization: str = Header(""))
                     headers={"Cache-Control": "no-store, no-cache, max-age=0"})
 
 
+_GW_COLS = None
+_BACKFILL_LOGGED = False
+
+
+def _gw_cols():
+    global _GW_COLS
+    if _GW_COLS is None:
+        try:
+            db = sqlite3.connect(DB_PATH)
+            _GW_COLS = {r[1] for r in db.execute("PRAGMA table_info(gw_event)").fetchall()}
+            db.close()
+        except Exception:
+            _GW_COLS = set()
+    return _GW_COLS
+
+
+def _backfill_gw_event(db, gw, cam, ts):
+    """Fill the NULL boarded/alighted on the gw_event whose door-open window contains this transit.
+    Recomputes from transit_event (idempotent SET). GUARDED: only writes if gw_event has the expected
+    wall-time columns + gw_source.camera; otherwise a safe no-op. Never touches door timing columns."""
+    global _BACKFILL_LOGGED
+    cols = _gw_cols()
+    need = {"door_open_start_ts", "door_close_full_ts", "boarded", "alighted", "source_id"}
+    if not need.issubset(cols):
+        if not _BACKFILL_LOGGED:
+            print(f"[analysis_api] gw_event backfill DISABLED: columns {sorted(cols)} lack {sorted(need - cols)} "
+                  f"— transits still stored + shown on /ops; paste the schema to finalize."); _BACKFILL_LOGGED = True
+        return None
+    iso = datetime.fromtimestamp(ts, timezone.utc).isoformat()
+    try:
+        cyc = db.execute(
+            "SELECT e.id id, e.door_open_start_ts o, e.door_close_full_ts c FROM gw_event e "
+            "JOIN gw_source s ON s.id=e.source_id WHERE s.camera=? "
+            "AND e.door_open_start_ts<=? AND e.door_close_full_ts>=? ORDER BY e.id DESC LIMIT 1",
+            (cam, iso, iso)).fetchone()
+    except sqlite3.OperationalError as e:
+        if not _BACKFILL_LOGGED:
+            print(f"[analysis_api] gw_event backfill match query failed ({e}) — no-op; paste the schema."); _BACKFILL_LOGGED = True
+        return None
+    if not cyc:
+        return None                                # transit outside any known cycle window (a signal, kept)
+    try:
+        o_ep = datetime.fromisoformat(cyc["o"]).timestamp()
+        c_ep = datetime.fromisoformat(cyc["c"]).timestamp()
+    except Exception:
+        return None
+    b = db.execute("SELECT COUNT(*) FROM transit_event WHERE gateway_id=? AND cam=? AND direction='in' "
+                   "AND ts BETWEEN ? AND ?", (gw, cam, o_ep, c_ep)).fetchone()[0]
+    a = db.execute("SELECT COUNT(*) FROM transit_event WHERE gateway_id=? AND cam=? AND direction='out' "
+                   "AND ts BETWEEN ? AND ?", (gw, cam, o_ep, c_ep)).fetchone()[0]
+    db.execute("UPDATE gw_event SET boarded=?, alighted=? WHERE id=?", (b, a, cyc["id"]))
+    return (cyc["id"], b, a)
+
+
 # ---- transit ingest (Bearer, idempotent) ----
 @analysis_router.post("/api/gw/{gw}/transit")
 async def transit_ingest(gw: str, request: Request, authorization: str = Header("")):
@@ -90,9 +145,10 @@ async def transit_ingest(gw: str, request: Request, authorization: str = Header(
     db.execute("INSERT OR IGNORE INTO transit_event "
                "(gateway_id,cam,ts,ts_bucket,direction,track_id,received_at) VALUES (?,?,?,?,?,?,?)",
                (gw, cam, ts, int(ts), direction, int(d.get("track_id", -1)), time.time()))
+    filled = _backfill_gw_event(db, gw, cam, ts)   # fill NULL boarded/alighted on the matching cycle
     db.commit()
     db.close()
-    return {"ok": True}
+    return {"ok": True, "gw_event": filled}
 
 
 # ---- recent transits (Bearer) — for /ops / debugging ----

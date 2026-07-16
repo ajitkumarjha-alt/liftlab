@@ -69,15 +69,50 @@ def scale_zone(poly, sx, sy):
     return [[x * sx, y * sy] for x, y in poly]
 
 
+USE_NVDEC = os.environ.get("USE_NVDEC", "0") == "1"
+_NVDEC_WH = {}
+
+
+def _decode_nvdec(data):
+    """NVDEC via ffmpeg hevc_cuvid (keeps HEVC decode off the 4 vCPU — the ByteTrack cap). Needs the
+    frame dims, probed once via PyAV header. Returns BGR frames, or None to fall back to CPU."""
+    import subprocess
+    import av
+    wh = _NVDEC_WH.get("wh")
+    if wh is None:
+        try:
+            c = av.open(io.BytesIO(data)); vs = c.streams.video[0]; wh = (vs.width, vs.height); c.close()
+            _NVDEC_WH["wh"] = wh
+        except Exception:
+            return None
+    W, H = wh
+    try:
+        p = subprocess.run(["ffmpeg", "-hwaccel", "cuda", "-c:v", "hevc_cuvid", "-i", "pipe:0",
+                            "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+                           input=data, capture_output=True, timeout=20)
+    except Exception:
+        return None
+    if p.returncode != 0 or not p.stdout:
+        return None
+    fsz = W * H * 3
+    buf = p.stdout
+    return [np.frombuffer(buf[i:i + fsz], np.uint8).reshape(H, W, 3) for i in range(0, len(buf) - fsz + 1, fsz)]
+
+
 def decode_segment(data):
-    """HEVC segment bytes -> list of BGR frames. CPU decode via PyAV (704x576 is cheap; NVDEC is a
-    scale-up optimization, not needed for one cam — ByteTrack CPU-assoc is the real cap)."""
+    """HEVC segment bytes -> list of BGR frames. NVDEC if USE_NVDEC=1 (L4 has hevc_cuvid), else CPU
+    via PyAV (704x576 CPU decode is cheap; not the cap — ByteTrack CPU-assoc is)."""
+    if USE_NVDEC:
+        fr = _decode_nvdec(data)
+        if fr is not None:
+            return fr
+        log("NVDEC decode unavailable/failed — CPU fallback")
     import av
     frames = []
     try:
         c = av.open(io.BytesIO(data))
-        for fr in c.decode(video=0):
-            frames.append(fr.to_ndarray(format="bgr24"))
+        for f in c.decode(video=0):
+            frames.append(f.to_ndarray(format="bgr24"))
         c.close()
     except Exception as e:
         log(f"decode failed: {e}")
