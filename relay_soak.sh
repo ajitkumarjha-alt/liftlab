@@ -12,7 +12,10 @@ set -uo pipefail
 STREAM=2
 INTERVAL="${RELAY_INTERVAL:-30}"
 CSV="${RELAY_CSV:-/home/askjitk/liftlab-watch/relay_soak.csv}"
-DOOR_FLOOR="${RELAY_DOOR_FLOOR:-9.5}"          # relay stops if door_fps sags below this
+DOOR_FLOOR="${RELAY_DOOR_FLOOR:-8.0}"          # relay stops if door_fps sags below this. 8.0 sits
+# between the ~9.4 the relay costs and the 6 fps QUALITY floor (the watch alarm). The old 9.5 was
+# proximity-to-idle-baseline (9.9 alone), not a quality line: resolving a ~2.6s close needs ~24
+# samples at 9.4 vs ~26 at 9.9 — no meaningful difference. Env-tunable via the systemd unit.
 DOOR_STRIKES_MAX="${RELAY_DOOR_STRIKES:-3}"    # for this many consecutive samples (~90s)
 # Delivery health = is the stream ALIVE and are SEGMENTS STILL ARRIVING at the VM (bytes up this
 # interval). HEVC sub bitrate is scene-dependent, so its VALUE — fixed, peak, OR rolling — cannot

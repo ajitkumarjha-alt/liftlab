@@ -13,7 +13,7 @@ User=askjitk
 EnvironmentFile=/etc/liftlab-agent.env
 Environment=RELAY_CSV=/home/askjitk/liftlab-watch/relay_soak.csv
 Environment=RELAY_INTERVAL=30
-Environment=RELAY_DOOR_FLOOR=9.5
+Environment=RELAY_DOOR_FLOOR=8.0
 ExecStart=/bin/bash /home/askjitk/liftlab-b3/pi-agent/relay_soak.sh
 # on-failure only: a DOOR GUARD trip exits 0 (stay stopped, don't fight the watch); a crash
 # exits non-zero and restarts. Internal per-stream restarts handle wifi/NVR dropouts.

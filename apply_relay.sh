@@ -19,8 +19,9 @@ install -m 644 /tmp/liftlab-relay.service "$UNIT"
 mkdir -p /home/askjitk/liftlab-watch && chown askjitk:askjitk /home/askjitk/liftlab-watch
 systemctl daemon-reload
 systemctl enable liftlab-relay >/dev/null 2>&1 || true
-say "installed direct-PUT relay_soak.sh + unit (NOT started). Delivery is self-calibrated per"
-say "  stream (rolling EMA) — no nvr_solo.json needed (that probe is diagnostic-only; rates drift)."
+say "installed direct-PUT relay_soak.sh + unit (NOT started). Delivery health = segments ARRIVING"
+say "  (alive AND >=10kbps/interval) — NOT a bitrate threshold; nvr_solo.json is diagnostic-only."
+say "  door guard floor = 8.0 fps (RELAY_DOOR_FLOOR in the unit; above the 6fps quality alarm)."
 say "door watch active? -> $(systemctl is-active liftlab-watch 2>/dev/null)"
 say ""
 say "PLAN:"
