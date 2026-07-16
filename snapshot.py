@@ -11,6 +11,8 @@ process (liftlab-snap.service) — NOT inside uvicorn — so HEVC decode can't s
 """
 import glob
 import os
+import re
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -19,6 +21,23 @@ LIVE = Path(os.environ.get("LIVE_DIR", "/dev/shm/liftlab-live"))
 SNAP = Path(os.environ.get("SNAP_DIR", "/run/liftlab-snap"))
 PERIOD = float(os.environ.get("SNAP_PERIOD", "2.0"))
 WIDTH = os.environ.get("SNAP_WIDTH", "480")
+DB_PATH = os.environ.get("GATEWAY_DB", "")            # channel_map source of truth (best-effort)
+# never snapshot these leftover/non-stream dirs (relay_diag scratch, verification images)
+JUNK = re.compile(r"^chdiag|^_|zonecheck")
+
+
+def allowed_cams(gw):
+    """Set of ch{N} marked is_lift in channel_map, or None if the DB is unavailable (then fall
+    back to the JUNK filter). Keeps the snapshotter off relay_diag scratch dirs etc."""
+    if not DB_PATH or not os.path.exists(DB_PATH):
+        return None
+    try:
+        db = sqlite3.connect(DB_PATH)
+        rows = db.execute("SELECT channel FROM channel_map WHERE gateway_id=? AND is_lift=1", (gw,)).fetchall()
+        db.close()
+        return {f"ch{int(r[0])}" for r in rows} if rows else None
+    except Exception:
+        return None
 
 
 def newest_seg(camdir: Path):
@@ -57,10 +76,15 @@ def main():
                 continue
             gw = gwdir.name
             (SNAP / gw).mkdir(parents=True, exist_ok=True)
+            allowed = allowed_cams(gw)               # channel_map cams, or None -> JUNK filter only
             for camdir in sorted(gwdir.glob("*")):
                 if not camdir.is_dir():
                     continue
                 cam = camdir.name
+                if JUNK.search(cam):
+                    continue                         # chdiag*/zonecheck/_* -> never decode (was journal spam)
+                if allowed is not None and cam not in allowed:
+                    continue                         # not a marked lift cabin
                 seg = newest_seg(camdir)
                 if not seg:
                     continue

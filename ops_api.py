@@ -90,6 +90,10 @@ def snap_jpg(gw: str, cam: str):
                     headers={"Cache-Control": "no-store, no-cache, max-age=0"})
 
 
+SNAP_STALE_S = float(os.environ.get("SNAP_STALE_S", "20"))   # NVR->Pi->2s HLS cut->upload->decode
+                                                            # is 6-12s normally; only flag past 20s
+
+
 @ops_router.get("/ops/{gw}/snapmeta")
 def snapmeta(gw: str):
     _safe(gw)
@@ -98,8 +102,10 @@ def snapmeta(gw: str):
     cams = {}
     if d.exists():
         for jpg in sorted(d.glob("*.jpg")):
+            if jpg.stem == "zonecheck" or jpg.stem.startswith("_"):
+                continue                            # verification image, not a live stream
             age = now - jpg.stat().st_mtime
-            cams[jpg.stem] = {"age_s": round(age, 1), "stale": age > 6.0}
+            cams[jpg.stem] = {"age_s": round(age, 1), "stale": age > SNAP_STALE_S}
     return {"cams": cams, "t": now}
 
 

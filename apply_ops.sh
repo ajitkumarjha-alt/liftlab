@@ -28,6 +28,16 @@ install -m 644 /tmp/liftlab-snap.service /etc/systemd/system/liftlab-snap.servic
 sudo -u "$OWNER" $PY /tmp/apply_ops_patch.py || { say "patch failed — restore main.py.bak.*"; exit 1; }
 $PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restore backup"; exit 1; }
 
+# pass the cloud's GATEWAY_DB to the snapshotter so it only decodes channel_map cams (best-effort;
+# the JUNK filter skips chdiag*/zonecheck/_ regardless)
+GDB=$(systemctl show "$SVC" -p Environment 2>/dev/null | grep -oP 'GATEWAY_DB=\K\S+' | head -1)
+if [ -n "$GDB" ]; then
+  install -d /etc/systemd/system/liftlab-snap.service.d
+  printf '[Service]\nEnvironment=GATEWAY_DB=%s\n' "$GDB" > /etc/systemd/system/liftlab-snap.service.d/db.conf
+  say "snapshotter GATEWAY_DB=$GDB (channel_map gating on)"
+else
+  say "GATEWAY_DB not found in $SVC env — snapshotter uses the JUNK filter only (still skips chdiag/zonecheck)"
+fi
 systemctl daemon-reload
 systemctl restart "$SVC"; sleep 3
 systemctl enable --now liftlab-snap >/dev/null 2>&1 || systemctl restart liftlab-snap
