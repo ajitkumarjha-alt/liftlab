@@ -27,13 +27,22 @@ $PY -m py_compile /tmp/live_api.py || { say "live_api.py does NOT compile — ab
 install -d -o "$OWNER" -g "$OWNER" -m 755 "$LIVE_DIR"
 say "live store: $LIVE_DIR (tmpfs — segments never hit disk, pruned to a rolling window)"
 
-cp "$APP/main.py" "$APP/main.py.bak.$(date +%Y%m%d-%H%M%S)"
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/live_api.py "$APP/live_api.py"
-say "installed live_api.py (main.py backed up)"
-sudo -u "$OWNER" $PY /tmp/apply_live_patch.py || { say "patch failed — restore main.py.bak.*"; exit 1; }
-
-$PY -c "import ast,sys; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restore backup"; exit 1; }
-systemctl restart "$SVC"; sleep 3
+# SMOKE-IMPORT before touching main.py — a missing dep fails HERE, ingest untouched.
+if ! ( cd "$APP" && sudo -u "$OWNER" $PY -c "from fastapi import FastAPI
+import live_api
+a=FastAPI(); a.include_router(live_api.live_router); a.openapi(); print('smoke ok')" ); then
+  say "SMOKE-IMPORT FAILED — NOT patching main.py, ingest untouched. Fix the error above."; exit 1; fi
+BAK="$APP/main.py.bak.$(date +%Y%m%d-%H%M%S)"; cp "$APP/main.py" "$BAK"
+$PY /tmp/apply_live_patch.py || { say "patch failed — restoring"; cp "$BAK" "$APP/main.py"; exit 1; }  # ROOT
+chown "$OWNER:$OWNER" "$APP/main.py"
+$PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restoring"; cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; exit 1; }
+systemctl restart "$SVC"; sleep 4
+if [ "$(systemctl is-active "$SVC")" != active ]; then
+  say "cloud FAILED to start — RESTORING $BAK and restarting to protect the ingest"
+  cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; systemctl restart "$SVC"
+  say "restored. journalctl -u $SVC -n 40"; exit 1
+fi
 AC=$(systemctl is-active "$SVC")
 PAGE=$(code "$BASE/live/site-A/ch29")                       # viewer page (app-direct, bypasses Caddy)
 PUT_NOAUTH=$(code -X PUT --data-binary 'x' "$BASE/api/gw/site-A/live/ch29/index.m3u8")  # 401 = route exists

@@ -21,12 +21,18 @@ $PY -m py_compile /tmp/ops_api.py || { say "ops_api.py does not compile — abor
 $PY -m py_compile /tmp/snapshot.py || { say "snapshot.py does not compile — aborting"; exit 1; }
 command -v ffmpeg >/dev/null || { say "ffmpeg not installed on the VM — snapshots need it. Aborting."; exit 1; }
 
-cp "$APP/main.py" "$APP/main.py.bak.$(date +%Y%m%d-%H%M%S)"
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/ops_api.py  "$APP/ops_api.py"
 install -o "$OWNER" -g "$OWNER" -m 755 /tmp/snapshot.py "$APP/snapshot.py"
 install -m 644 /tmp/liftlab-snap.service /etc/systemd/system/liftlab-snap.service
-sudo -u "$OWNER" $PY /tmp/apply_ops_patch.py || { say "patch failed — restore main.py.bak.*"; exit 1; }
-$PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restore backup"; exit 1; }
+# SMOKE-IMPORT before touching main.py — a missing dep fails HERE, ingest untouched.
+if ! ( cd "$APP" && sudo -u "$OWNER" $PY -c "from fastapi import FastAPI
+import ops_api
+a=FastAPI(); a.include_router(ops_api.ops_router); a.openapi(); print('smoke ok')" ); then
+  say "SMOKE-IMPORT FAILED — NOT patching main.py, ingest untouched. Fix the error above."; exit 1; fi
+BAK="$APP/main.py.bak.$(date +%Y%m%d-%H%M%S)"; cp "$APP/main.py" "$BAK"
+$PY /tmp/apply_ops_patch.py || { say "patch failed — restoring"; cp "$BAK" "$APP/main.py"; exit 1; }  # ROOT
+chown "$OWNER:$OWNER" "$APP/main.py"
+$PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restoring"; cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; exit 1; }
 
 # pass the cloud's GATEWAY_DB to the snapshotter so it only decodes channel_map cams (best-effort;
 # the JUNK filter skips chdiag*/zonecheck/_ regardless)
@@ -39,7 +45,12 @@ else
   say "GATEWAY_DB not found in $SVC env — snapshotter uses the JUNK filter only (still skips chdiag/zonecheck)"
 fi
 systemctl daemon-reload
-systemctl restart "$SVC"; sleep 3
+systemctl restart "$SVC"; sleep 4
+if [ "$(systemctl is-active "$SVC")" != active ]; then
+  say "cloud FAILED to start — RESTORING $BAK and restarting to protect the ingest"
+  cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; systemctl restart "$SVC"
+  say "restored. journalctl -u $SVC -n 40"; exit 1
+fi
 systemctl enable --now liftlab-snap >/dev/null 2>&1 || systemctl restart liftlab-snap
 sleep 2
 PORT=$(systemctl cat "$SVC" 2>/dev/null | grep -oP '\-\-port\s+\K[0-9]+' | head -1); [ -n "$PORT" ] || PORT=9090

@@ -19,11 +19,17 @@ for f in analysis_api.py apply_analysis_patch.py ops_api.py; do [ -f "/tmp/$f" ]
 id "$OWNER" >/dev/null 2>&1 || OWNER=root
 
 $PY -m py_compile /tmp/analysis_api.py /tmp/ops_api.py || { say "compile failed — aborting"; exit 1; }
-cp "$APP/main.py" "$APP/main.py.bak.$(date +%Y%m%d-%H%M%S)"
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/analysis_api.py "$APP/analysis_api.py"
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/ops_api.py "$APP/ops_api.py"
-sudo -u "$OWNER" $PY /tmp/apply_analysis_patch.py || { say "patch failed — restore main.py.bak.*"; exit 1; }
-$PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restore backup"; exit 1; }
+# SMOKE-IMPORT before touching main.py — a missing dep fails HERE, ingest untouched.
+if ! ( cd "$APP" && sudo -u "$OWNER" $PY -c "from fastapi import FastAPI
+import analysis_api, ops_api
+a=FastAPI(); a.include_router(analysis_api.analysis_router); a.include_router(ops_api.ops_router); a.openapi(); print('smoke ok')" ); then
+  say "SMOKE-IMPORT FAILED — NOT patching main.py, ingest untouched. Fix the error above."; exit 1; fi
+BAK="$APP/main.py.bak.$(date +%Y%m%d-%H%M%S)"; cp "$APP/main.py" "$BAK"
+$PY /tmp/apply_analysis_patch.py || { say "patch failed — restoring"; cp "$BAK" "$APP/main.py"; exit 1; }  # ROOT: patch backup-writes into $APP
+chown "$OWNER:$OWNER" "$APP/main.py"
+$PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restoring"; cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; exit 1; }
 
 # ---- mint the read-only analysis token (systemd drop-in; separate from GATEWAY_TOKENS) ----
 mkdir -p "$(dirname "$DROPIN")"
@@ -35,7 +41,12 @@ else
 fi
 
 systemctl daemon-reload
-systemctl restart "$SVC"; sleep 3
+systemctl restart "$SVC"; sleep 4
+if [ "$(systemctl is-active "$SVC")" != active ]; then
+  say "cloud FAILED to start — RESTORING $BAK and restarting to protect the ingest"
+  cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; systemctl restart "$SVC"
+  say "restored. journalctl -u $SVC -n 40"; exit 1
+fi
 PORT=$(systemctl cat "$SVC" 2>/dev/null | grep -oP '\-\-port\s+\K[0-9]+' | head -1); [ -n "$PORT" ] || PORT=9090
 BASE="http://127.0.0.1:$PORT"; code(){ curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$@"; }
 AC=$(systemctl is-active "$SVC")
