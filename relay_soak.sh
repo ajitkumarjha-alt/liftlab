@@ -14,6 +14,10 @@ CSV="${RELAY_CSV:-/home/askjitk/liftlab-watch/relay_soak.csv}"
 DOOR_FLOOR="${RELAY_DOOR_FLOOR:-9.5}"          # relay stops if door_fps sags below this
 DOOR_STRIKES_MAX="${RELAY_DOOR_STRIKES:-3}"    # for this many consecutive samples (~90s)
 DELIVER_FLOOR_KBPS="${RELAY_DELIVER_FLOOR:-400}"  # a sub delivering below this = starved
+HLS_TIME="${RELAY_HLS_TIME:-2}"                # segment seconds; bigger = fewer/less-synced PUTs
+# opt-in ffmpeg http tweak (empty by default = keep the known-to-run flags; set to 1 to try
+# forcing single-connection reuse). Some ffmpeg builds reject it on the hls muxer, so off unless asked.
+MREQ_ARG=""; [ "${RELAY_MULTIPLE_REQUESTS:-}" = 1 ] && MREQ_ARG="-multiple_requests 1"
 WATCH_CH="${WATCH_CHANNEL:-29}"
 AGENT_PY=/home/askjitk/liftlab-b3/pi-agent/.venv/bin/python
 WATCH_LOCAL=/home/askjitk/liftlab-b3/pi-agent/watch_local.py
@@ -61,8 +65,9 @@ launch(){ # $1=slot -> (re)start ffmpeg for that cam, echo pid
   local base="$CLOUD/api/gw/$GW/live/$cam"
   ffmpeg -nostdin -hide_banner -loglevel error \
     -rtsp_transport tcp -i "$url" -an -c:v copy \
-    -f hls -hls_time 2 -hls_list_size 5 -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts \
-    -method PUT -http_persistent 1 -headers "Authorization: Bearer ${GATEWAY_TOKEN}"$'\r\n' \
+    -f hls -hls_time "$HLS_TIME" -hls_list_size 5 -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts \
+    -method PUT -http_persistent 1 $MREQ_ARG \
+    -headers "Authorization: Bearer ${GATEWAY_TOKEN}"$'\r\n' \
     -hls_segment_filename "$base/seg%03d.ts" "$base/index.m3u8" \
     >"/tmp/relay_soak_${cam}.log" 2>&1 &
   echo $!
