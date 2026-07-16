@@ -2,6 +2,10 @@
 Description=liftlab GPU transit analyzer (ch29 landing<->cabin, YOLO11n+ByteTrack on L4)
 After=network-online.target
 Wants=network-online.target
+# A startup crash (e.g. a bad call) must fail LOUDLY once, not restart-loop into journal spam:
+# after 5 starts in 120s, systemd stops and enters failed state.
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple

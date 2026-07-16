@@ -55,15 +55,20 @@ class YoloDetector:
     """Production detector. Weights download on first use."""
 
     def __init__(self, weights: str = "yolo11n.pt", conf: float = 0.35,
-                 tracker: str = "bytetrack.yaml"):
+                 tracker: str = "bytetrack.yaml", device=None):
         from ultralytics import YOLO
         self.model = YOLO(weights)
+        if device is not None:
+            self.model.to(device)          # move weights onto the GPU; Pi/desk-rig pass None = CPU
         self.conf = conf
         self.tracker = tracker
+        self.device = device
 
     def track(self, frame: np.ndarray) -> list[Detection]:
-        r = self.model.track(frame, classes=[0], persist=True, verbose=False,
-                             tracker=self.tracker, conf=self.conf)[0]
+        kw = dict(classes=[0], persist=True, verbose=False, tracker=self.tracker, conf=self.conf)
+        if self.device is not None:
+            kw["device"] = self.device     # ensure INFERENCE runs on the GPU, not CPU (track() default is CPU)
+        r = self.model.track(frame, **kw)[0]
         if r.boxes is None or r.boxes.id is None:
             return []
         out = []

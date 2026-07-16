@@ -130,11 +130,8 @@ def main():
             pass
     log(f"start: {BASE}  model={MODEL} device={DEVICE}  (resume: {len(seen)} segs known)")
 
-    det = counting.YoloDetector(model_path=MODEL, conf=CONF, tracker="bytetrack.yaml")
-    try:
-        det.model.to(DEVICE)
-    except Exception as e:
-        log(f"model.to({DEVICE}) failed ({e}) — running on default device")
+    det = counting.YoloDetector(weights=MODEL, conf=CONF, tracker="bytetrack.yaml", device=DEVICE)
+    log(f"detector on device={DEVICE} — verify with nvidia-smi (non-zero GPU-Util = actually on the L4)")
     ctr = None                                   # ZoneCounter, built once we know the frame size
     posted = 0
 
