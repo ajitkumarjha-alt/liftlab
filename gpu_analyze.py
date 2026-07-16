@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
 import numpy as np
@@ -34,7 +35,9 @@ POLL_S = float(os.environ.get("POLL_S", "1.0"))
 STATE_DIR = os.environ.get("STATE_DIR", "/var/lib/liftlab-gpu")
 VAL_POLL_S = float(os.environ.get("VAL_POLL_S", "30"))     # how often to re-check this cam's mode
 EPISODE_GAP_S = float(os.environ.get("EPISODE_GAP_S", "8"))  # transits >this apart = different opening
+EPISODE_MAX_S = float(os.environ.get("EPISODE_MAX_S", "25"))  # force-close an episode this long (safety)
 VAL_MAX_IMGS = int(os.environ.get("VAL_MAX_IMGS", "4"))
+MAX_BEHIND = int(os.environ.get("MAX_BEHIND", "3"))        # if >this new segs queued, jump to live edge
 CALIB_W, CALIB_H = 1920, 1080
 ZONE_CABIN = [[630, 870], [932, 747], [1042, 733], [1308, 1056], [587, 1056], [548, 914]]
 ZONE_LANDING = [[514, 394], [834, 322], [722, 529], [732, 684], [761, 776], [618, 827]]
@@ -78,16 +81,23 @@ def jpeg_b64(fr, width=480):
     return base64.b64encode(buf.tobytes()).decode() if ok else None
 
 
-def post_episode(ep):
-    if not ep or (ep["b"] + ep["a"]) == 0:
+def post_episode(ep, reason=""):
+    """Post a door-open episode for review. Logs the ATTEMPT and the RESULT so a silent failure
+    (rejected POST, live-mode skip, exception) can't hide."""
+    if not ep:
         return
+    if ep["b"] + ep["a"] == 0:
+        log(f"episode closed EMPTY (0 transits, {reason}) — not posting")
+        return
+    log(f"episode attempt ({reason}): boarded={ep['b']} alighted={ep['a']} imgs={len(ep['imgs'])} "
+        f"span={ep['ts_end'] - ep['ts_start']:.0f}s")
     try:
-        http_post_json(f"{CLOUD}/api/gw/{GW}/validation_item/{CAM}",
-                       {"ts_start": ep["ts_start"], "ts_end": ep["ts_end"],
-                        "machine_boarded": ep["b"], "machine_alighted": ep["a"], "images": ep["imgs"]})
-        log(f"validation episode -> boarded={ep['b']} alighted={ep['a']} imgs={len(ep['imgs'])}")
+        st = http_post_json(f"{CLOUD}/api/gw/{GW}/validation_item/{CAM}",
+                            {"ts_start": ep["ts_start"], "ts_end": ep["ts_end"],
+                             "machine_boarded": ep["b"], "machine_alighted": ep["a"], "images": ep["imgs"]})
+        log(f"episode POST -> HTTP {st}")
     except Exception as e:
-        log(f"validation_item POST failed: {e}")
+        log(f"episode POST FAILED: {type(e).__name__}: {getattr(e, 'code', '')} {str(e)[:120]}")
 
 
 def playlist_segments():
@@ -172,6 +182,8 @@ def main():
     val_state = get_val_state()
     last_val_poll = time.time()
     episode = None                                # current door-open episode being validated
+    dropped = 0                                   # segments never processed (pruned/lag) — running count
+    last_drop_log = time.time()
     log(f"validation mode: {val_state}")
 
     while True:
@@ -179,15 +191,30 @@ def main():
         new = [s for s in segs if s not in seen]
         if not new:
             if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
-                post_episode(episode); episode = None
+                post_episode(episode, "gap"); episode = None
             time.sleep(POLL_S)
             continue
+        # STAY NEAR LIVE: if we've fallen behind, skip the old queued segments (they're about to be
+        # pruned -> would 404 anyway). lag = how many segs behind the newest playlist entry we are.
+        lag = len(new)
+        if lag > MAX_BEHIND:
+            for s in new[:-MAX_BEHIND]:
+                seen.add(s)
+            dropped += lag - MAX_BEHIND
+            new = new[-MAX_BEHIND:]
+        if time.time() - last_drop_log > 60:
+            log(f"segment lag={lag} behind live, dropped_total={dropped} (skipped-to-live + pruned)")
+            last_drop_log = time.time()
         for name in new:
             try:
                 data = http_get(f"{BASE}/{name}")
+            except urllib.error.HTTPError as e:
+                if e.code == 404:                 # pruned off the rolling window before we fetched it
+                    seen.add(name); dropped += 1
+                    continue                       # do NOT retry old segs; move toward live
+                log(f"segment {name} HTTP {e.code}"); continue
             except Exception as e:
-                log(f"segment {name} fetch failed: {e}")
-                continue
+                log(f"segment {name} fetch failed: {type(e).__name__}: {e}"); continue
             frames = decode_segment(data)
             if not frames:
                 seen.add(name); continue
@@ -212,10 +239,12 @@ def main():
                         log(f"transit POST failed (no double-count on retry): {e}")
                     if val_state == "validating":  # capture THIS frame into the door-open episode
                         now = t.offset_s
-                        if episode and now - episode["ts_end"] > EPISODE_GAP_S:
-                            post_episode(episode); episode = None
+                        if episode and (now - episode["ts_end"] > EPISODE_GAP_S
+                                        or now - episode["ts_start"] > EPISODE_MAX_S):
+                            post_episode(episode, "gap/max"); episode = None
                         if episode is None:
                             episode = {"ts_start": now, "ts_end": now, "b": 0, "a": 0, "imgs": []}
+                            log(f"episode opened at {now:.0f}")
                         episode["ts_end"] = now
                         episode["b" if t.direction == "in" else "a"] += 1
                         if len(episode["imgs"]) < VAL_MAX_IMGS:
@@ -228,13 +257,13 @@ def main():
             seen.add(name)
         # close a stale validation episode (door shut) + refresh this cam's mode periodically
         if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
-            post_episode(episode); episode = None
+            post_episode(episode, "gap-between-segments"); episode = None
         if time.time() - last_val_poll > VAL_POLL_S:
             ns = get_val_state()
             if ns != val_state:
                 log(f"validation mode: {val_state} -> {ns}")
                 if ns == "live" and episode:
-                    post_episode(episode); episode = None   # flush before going quiet
+                    post_episode(episode, "mode->live flush"); episode = None
             val_state = ns
             last_val_poll = time.time()
         # persist cursor (rolling: keep the last ~40 seg names)

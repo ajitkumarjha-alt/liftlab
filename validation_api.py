@@ -40,6 +40,8 @@ GATEWAY_TOKENS = {g.split(":", 1)[0]: g.split(":", 1)[1]
 ANALYSIS_TOKENS = {g.split(":", 1)[0]: g.split(":", 1)[1]
                    for g in os.environ.get("ANALYSIS_TOKENS", "").split(",") if ":" in g}
 MAX_IMGS = int(os.environ.get("VALIDATION_MAX_IMGS", "4"))
+MIN_VALIDATE_N = int(os.environ.get("MIN_VALIDATE_N", "20"))   # GO-LIVE refuses below this (load>=1
+                                                              # reviews only; a 100%-on-n=1 is meaningless)
 _SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 validation_router = APIRouter()
@@ -163,11 +165,15 @@ def verdict(item_id: int = Form(...), human_boarded: int = Form(...), human_alig
 
 
 @validation_router.post("/validate/golive")
-def golive(gw: str = Form(...), cam: str = Form(...), reviewer: str = Form("operator")):
+def golive(gw: str = Form(...), cam: str = Form(...), reviewer: str = Form("operator"), force: str = Form("")):
     _safe(gw, cam)
     db = _db()
     r = db.execute("SELECT n_reviewed,n_exact FROM camera_validation WHERE gateway_id=? AND cam=?", (gw, cam)).fetchone()
     nr, ne = (r["n_reviewed"], r["n_exact"]) if r else (0, 0)
+    if nr < MIN_VALIDATE_N and force != "1":
+        db.close()
+        raise HTTPException(400, f"Only {nr} reviewed (need >= {MIN_VALIDATE_N} with load>=1 before "
+                                 f"trusting {cam}). A 100%-on-n=1 provenance is meaningless. Keep reviewing.")
     prov = _provenance(cam, nr, ne)
     db.execute("INSERT INTO camera_validation (gateway_id,cam,state,confirmed_at,provenance,updated_at) "
                "VALUES (?,?,'live',?,?,?) ON CONFLICT(gateway_id,cam) DO UPDATE SET "
@@ -203,15 +209,22 @@ def _render(cams, pend):
     .mc{font:13px ui-monospace,monospace;margin:4px 0}form{display:inline}
     input[type=number]{width:48px}button{font:13px system-ui;padding:4px 12px;border-radius:6px;border:1px solid #cbd5db;background:#fff;cursor:pointer}
     button.ok{background:#2f9e5f;color:#fff;border-color:#2f9e5f}button.go{background:#4a9eda;color:#fff;border-color:#4a9eda}
+    button:disabled{opacity:.45;cursor:not-allowed}
     @media(prefers-color-scheme:dark){body{background:#0e1418;color:#d6dee3}header,.cam,.item{background:#161d22;border-color:#243038}}</style>"""
     cam_rows = ""
     for c in cams:
-        pct = round(100.0 * c["n_exact"] / c["n_reviewed"]) if c["n_reviewed"] else 0
-        gl = "" if c["state"] == "live" else (
-            f'<form method=post action=/validate/golive><input type=hidden name=gw value="{c["gateway_id"]}">'
-            f'<input type=hidden name=cam value="{c["cam"]}"><button class=go '
-            f'onclick="return confirm(\'GO-LIVE {c["cam"]}? No more prompts/images after this.\')">GO-LIVE</button></form>')
-        prov = c["provenance"] or (f'{c["n_reviewed"]} reviewed, {pct}% exact' if c["n_reviewed"] else "not reviewed yet")
+        nr = c["n_reviewed"]
+        pct = round(100.0 * c["n_exact"] / nr) if nr else 0
+        if c["state"] == "live":
+            gl = ""
+        elif nr < MIN_VALIDATE_N:
+            gl = f'<button class=go disabled title="need {MIN_VALIDATE_N}">GO-LIVE ({nr}/{MIN_VALIDATE_N})</button>'
+        else:
+            gl = (f'<form method=post action=/validate/golive><input type=hidden name=gw value="{c["gateway_id"]}">'
+                  f'<input type=hidden name=cam value="{c["cam"]}"><button class=go '
+                  f'onclick="return confirm(\'GO-LIVE {c["cam"]} at {pct}% on n={nr}? No more prompts/images after this.\')">'
+                  f'GO-LIVE ({nr}/{MIN_VALIDATE_N})</button></form>')
+        prov = c["provenance"] or (f'{nr}/{MIN_VALIDATE_N} reviewed, {pct}% exact' if nr else "not reviewed yet")
         cam_rows += (f'<div class=cam><b>{c["cam"]}</b><span class="badge {c["state"]}">{c["state"]}</span>'
                      f'<span style="flex:1">{prov}</span>{gl}</div>')
     items = ""
