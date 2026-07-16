@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# OVERNIGHT SUB-STREAM RELAY SOAK supervisor. Run by the liftlab-relay systemd service (NOT
-# by hand for the soak). Relays 7 cabin SUB streams (copy mode) continuously, logs a CSV row
-# every 30s to a DURABLE path, restarts dropped streams, and KILLS ITSELF if the door loop
-# (liftlab-watch signal_fps) sags — the watch is sacred, the relay is expendable.
+# DECOUPLED relay supervisor (liftlab-relay service). ffmpeg writes SUB segments to LOCAL Pi
+# tmpfs — never blocks on the network — and ONE uploader (relay_upload.py) drains them to the
+# VM over a single persistent connection, round-robin. This sidesteps the 7-concurrent-PUT
+# starvation that killed the direct-PUT soak (1-2/7 delivering, one stream owned the pipe).
+# Logs a CSV row every 30s to a DURABLE path, restarts dead producers/uploader, and KILLS
+# ITSELF if the door loop (liftlab-watch signal_fps) sags — the watch is sacred.
 #
-# Creds come from the systemd EnvironmentFile (/etc/liftlab-agent.env) injected into the env;
-# this script reads os.environ-style vars and does NOT read the root-only file itself.
+# Creds come from the systemd EnvironmentFile (/etc/liftlab-agent.env) injected into the env.
 set -uo pipefail
 
 STREAM=2
 INTERVAL="${RELAY_INTERVAL:-30}"
 CSV="${RELAY_CSV:-/home/askjitk/liftlab-watch/relay_soak.csv}"
+OUT="${RELAY_OUT:-/dev/shm/liftlab-relay-out}"  # LOCAL Pi tmpfs (capped by apply_relay.sh)
 DOOR_FLOOR="${RELAY_DOOR_FLOOR:-9.5}"          # relay stops if door_fps sags below this
 DOOR_STRIKES_MAX="${RELAY_DOOR_STRIKES:-3}"    # for this many consecutive samples (~90s)
 DELIVER_FLOOR_KBPS="${RELAY_DELIVER_FLOOR:-400}"  # a sub delivering below this = starved
-HLS_TIME="${RELAY_HLS_TIME:-2}"                # segment seconds; bigger = fewer/less-synced PUTs
-# opt-in ffmpeg http tweak (empty by default = keep the known-to-run flags; set to 1 to try
-# forcing single-connection reuse). Some ffmpeg builds reject it on the hls muxer, so off unless asked.
-MREQ_ARG=""; [ "${RELAY_MULTIPLE_REQUESTS:-}" = 1 ] && MREQ_ARG="-multiple_requests 1"
+SEG_TIME="${RELAY_HLS_TIME:-2}"                # segment seconds
 WATCH_CH="${WATCH_CHANNEL:-29}"
 AGENT_PY=/home/askjitk/liftlab-b3/pi-agent/.venv/bin/python
+UPLOADER=/home/askjitk/liftlab-b3/pi-agent/relay_upload.py
 WATCH_LOCAL=/home/askjitk/liftlab-b3/pi-agent/watch_local.py
 say(){ echo "[relay-soak] $(date -u +%FT%TZ) $*"; }
 
@@ -59,17 +59,22 @@ try: d=json.load(sys.stdin)
 except Exception: print(0); sys.exit()
 print(d.get('cams',{}).get('$2',{}).get('bytes',0))" 2>/dev/null || echo 0; }
 
-launch(){ # $1=slot -> (re)start ffmpeg for that cam, echo pid
+launch(){ # $1=slot -> (re)start the LOCAL producer for that cam, echo pid. NO network here:
+  # ffmpeg writes mpegts segments to Pi tmpfs; the uploader handles transport separately.
   local i=$1 ch=${CHANS[$i]} cam=${CAMS[$i]}
   local url="rtsp://${USER_ENC}:${PASS_ENC}@${NVR_HOST}:554/${ch}/${STREAM}?transmode=unicast&profile=vam"
-  local base="$CLOUD/api/gw/$GW/live/$cam"
+  local d="$OUT/$cam"; mkdir -p "$d"
   ffmpeg -nostdin -hide_banner -loglevel error \
     -rtsp_transport tcp -i "$url" -an -c:v copy \
-    -f hls -hls_time "$HLS_TIME" -hls_list_size 5 -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts \
-    -method PUT -http_persistent 1 $MREQ_ARG \
-    -headers "Authorization: Bearer ${GATEWAY_TOKEN}"$'\r\n' \
-    -hls_segment_filename "$base/seg%03d.ts" "$base/index.m3u8" \
+    -f segment -segment_time "$SEG_TIME" -segment_format mpegts -segment_wrap 0 \
+    "$d/seg%08d.ts" \
     >"/tmp/relay_soak_${cam}.log" 2>&1 &
+  echo $!
+}
+
+start_uploader(){ # ONE uploader drains all cams -> VM over a single persistent connection
+  RELAY_OUT="$OUT" RELAY_CAMS="${CAMS[*]}" GW="$GW" CLOUD_URL="$CLOUD" GATEWAY_TOKEN="$GATEWAY_TOKEN" \
+    "$AGENT_PY" "$UPLOADER" >>/tmp/relay_uploader.log 2>&1 &
   echo $!
 }
 
@@ -81,16 +86,21 @@ if [ ! -s "$CSV" ]; then
   echo "$hdr" > "$CSV"
 fi
 
-# ---------- launch all, set up teardown ----------
+# ---------- launch producers + the single uploader, set up teardown ----------
+[ -x "$AGENT_PY" ] || { say "B3 venv python missing at $AGENT_PY"; exit 1; }
+[ -f "$UPLOADER" ] || { say "uploader missing at $UPLOADER (apply_relay.sh installs it)"; exit 1; }
+mkdir -p "$OUT"
 declare -a PIDS; declare -A PREVJ
 for ((i=0;i<NCH;i++)); do PIDS[$i]=$(launch "$i"); done
-cleanup(){ say "stopping — killing ${#PIDS[@]} ffmpeg"; for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; }
+UP_PID=$(start_uploader)
+cleanup(){ say "stopping — killing $NCH producers + uploader"; for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; kill "${UP_PID:-0}" 2>/dev/null; }
 trap 'cleanup; exit 0' TERM INT
 trap 'cleanup' EXIT
-say "launched $NCH sub relays: ${PIDS[*]}"
+say "launched $NCH local producers: ${PIDS[*]}  + uploader pid $UP_PID"
 sleep 6
 prev_tx=$(tx_bytes); prev_sj=$(live_stats_json); prev_t=$(date +%s.%N)
 declare -A PREVB; for ((i=0;i<NCH;i++)); do PREVB[$i]=$(stat_bytes "$prev_sj" "${CAMS[$i]}"); PREVJ[${PIDS[$i]}]=$(pid_jiffies "${PIDS[$i]}"); done
+PREVJ[$UP_PID]=$(pid_jiffies "$UP_PID")
 strikes=0; hz=$(getconf CLK_TCK)
 
 # ---------- soak loop ----------
@@ -116,6 +126,15 @@ while :; do
       np=$(launch "$i"); PIDS[$i]=$np; PREVJ[$np]=$(pid_jiffies "$np")
     fi
   done
+  # uploader: keep it alive + fold its cpu into the total (transport now lives here, not in ffmpeg)
+  if kill -0 "$UP_PID" 2>/dev/null; then
+    j1=$(pid_jiffies "$UP_PID"); pj=${PREVJ[$UP_PID]:-$j1}
+    cpu=$(awk -v s="$cpu" -v a="$pj" -v b="$j1" -v hz="$hz" -v dt="$dt" 'BEGIN{printf "%.1f",s+(b-a)/hz/dt*100}')
+    PREVJ[$UP_PID]=$j1
+  else
+    say "UPLOADER died — restarting. tail: $(tail -2 /tmp/relay_uploader.log 2>/dev/null | tr '\n' ' ')"
+    UP_PID=$(start_uploader); PREVJ[$UP_PID]=$(pid_jiffies "$UP_PID")
+  fi
   smbps=$(awk -v k="$sumk" 'BEGIN{printf "%.2f",k/1000}')
   tp=$(temp_c); thr=$(throttle_live); ma=$(mem_avail); df=$(door_fps)
   echo "$(date -u +%FT%TZ),${upl},${smbps}${percols},${cpu},${tp},${thr},${ma},${df:-NA},${alive},${delivering}" >> "$CSV"
