@@ -66,11 +66,19 @@ def log(m):
 try:
     import requests as _requests
     _SESSION = _requests.Session()
-    _SESSION.headers.update(HDRS)
+    _SESSION.headers.update({**HDRS, "Connection": "keep-alive"})   # ask to keep the socket warm
+    # ONE shared session (module-level) with an explicit pool sized for the prefetch concurrency, so warm
+    # connections are REUSED across segments AND across the prefetch threads (Session is thread-safe here).
+    _adapter = _requests.adapters.HTTPAdapter(pool_connections=4,
+                                              pool_maxsize=max(4, PREFETCH_N + 2), max_retries=0)
+    _SESSION.mount("https://", _adapter)
+    _SESSION.mount("http://", _adapter)
     _HAS_SESSION = True
 except Exception:
     _SESSION = None
     _HAS_SESSION = False
+
+_KA_PROBED = [False]
 
 
 def http_get(url, timeout=15):
@@ -85,11 +93,21 @@ def http_get_timed(url, timeout=15):
         t0 = time.time()
         r = _SESSION.get(url, timeout=timeout, stream=True)   # returns once headers are in
         t1 = time.time()
+        if not _KA_PROBED[0]:   # PROVE client-vs-server ONCE: does the server keep the connection alive?
+            _KA_PROBED[0] = True
+            try:
+                ver = getattr(getattr(r, "raw", None), "version", None)   # 11 = HTTP/1.1
+            except Exception:
+                ver = None
+            log(f"keep-alive probe: server Connection={r.headers.get('Connection')!r} "
+                f"Keep-Alive={r.headers.get('Keep-Alive')!r} http_ver={ver}. If connect stays ~200ms AND "
+                f"this is 'close'/None, Caddy is closing the socket per request (server-side fix needed).")
         if r.status_code >= 400:
             code = r.status_code
             r.close()
             raise urllib.error.HTTPError(url, code, "http error", None, None)
         body = r.content                                       # read the body
+        r.close()                                              # release the connection back to the pool for reuse
         t2 = time.time()
         return body, (t1 - t0) * 1000, (t2 - t1) * 1000
     t0 = time.time()
