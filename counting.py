@@ -55,20 +55,15 @@ class YoloDetector:
     """Production detector. Weights download on first use."""
 
     def __init__(self, weights: str = "yolo11n.pt", conf: float = 0.35,
-                 tracker: str = "bytetrack.yaml", device=None):
+                 tracker: str = "bytetrack.yaml"):
         from ultralytics import YOLO
         self.model = YOLO(weights)
-        if device is not None:
-            self.model.to(device)          # move weights onto the GPU; Pi/desk-rig pass None = CPU
         self.conf = conf
         self.tracker = tracker
-        self.device = device
 
     def track(self, frame: np.ndarray) -> list[Detection]:
-        kw = dict(classes=[0], persist=True, verbose=False, tracker=self.tracker, conf=self.conf)
-        if self.device is not None:
-            kw["device"] = self.device     # ensure INFERENCE runs on the GPU, not CPU (track() default is CPU)
-        r = self.model.track(frame, **kw)[0]
+        r = self.model.track(frame, classes=[0], persist=True, verbose=False,
+                             tracker=self.tracker, conf=self.conf)[0]
         if r.boxes is None or r.boxes.id is None:
             return []
         out = []
@@ -123,6 +118,14 @@ def in_poly(pt: tuple[float, float], poly: Zone) -> bool:
     return inside
 
 
+def _centroid(poly: Zone) -> tuple[float, float]:
+    return (sum(p[0] for p in poly) / len(poly), sum(p[1] for p in poly) / len(poly))
+
+
+def _dist(a, b) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
 @dataclass
 class Transit:
     track_id: int
@@ -132,17 +135,24 @@ class Transit:
 
 @dataclass
 class ZoneCounter:
-    """Ordered A->B transit counter with dwell-in-origin debouncing."""
+    """Ordered A->B transit counter with dwell + displacement guards. A count requires: dwell
+    min_frames in the ORIGIN (arm), then dwell min_frames in the DESTINATION, AND the foot moved at
+    least disp_frac of the zone separation. This rejects the flicker we saw — a near-stationary
+    person (or object) whose foot jitters across the boundary, counted as boarding then alighting
+    every ~40s. A single boundary-crossing frame or a barely-moving track no longer counts."""
     zone_landing: Zone
     zone_cabin: Zone
     min_frames: int = 2
+    disp_frac: float = 0.35            # min foot travel to count, as a fraction of the zone separation
 
     def __post_init__(self):
         self.zone_landing = as_zone(self.zone_landing)
         self.zone_cabin = as_zone(self.zone_cabin)
+        self._sep = _dist(_centroid(self.zone_landing), _centroid(self.zone_cabin))
+        self._min_disp = self.disp_frac * self._sep
 
     _streak: dict[int, tuple[str, int]] = field(default_factory=dict)   # tid -> (zone, count)
-    _armed: dict[int, str] = field(default_factory=dict)                # tid -> origin zone
+    _armed: dict[int, tuple[str, tuple]] = field(default_factory=dict)  # tid -> (origin zone, foot)
     transits: list[Transit] = field(default_factory=list)
 
     def _zone_of(self, det: Detection) -> str | None:
@@ -165,21 +175,26 @@ class ZoneCounter:
             count = count + 1 if prev_zone == z else 1
             self._streak[d.track_id] = (z, count)
 
-            origin = self._armed.get(d.track_id)
-            if origin is None:
+            armed = self._armed.get(d.track_id)
+            if armed is None:
                 if count >= self.min_frames:
-                    self._armed[d.track_id] = z
+                    self._armed[d.track_id] = (z, d.foot)      # arm + remember WHERE it dwelled
                 continue
+            origin, armed_foot = armed
 
-            if z != origin and count >= 1:
+            # DWELL: min_frames in the destination (a single boundary-jitter frame no longer counts).
+            # DISPLACEMENT: the foot must have actually travelled across, not oscillated in place.
+            if z != origin and count >= self.min_frames:
+                if _dist(d.foot, armed_foot) < self._min_disp:
+                    continue                                   # barely moved -> flicker, not a crossing
                 if origin == "landing" and z == "cabin":
                     self.transits.append(Transit(d.track_id, "in", offset_s))
                 elif origin == "cabin" and z == "landing":
                     self.transits.append(Transit(d.track_id, "out", offset_s))
                 else:
                     continue
-                # re-arm in the new zone so a return trip is countable
-                self._armed[d.track_id] = z
+                # re-arm at the new position so a genuine return trip is still countable
+                self._armed[d.track_id] = (z, d.foot)
                 self._streak[d.track_id] = (z, 1)
 
     def counts(self) -> tuple[int, int]:

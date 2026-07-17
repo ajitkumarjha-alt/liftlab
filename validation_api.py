@@ -84,6 +84,17 @@ def _state(db, gw, cam):
     return r["state"] if r else "validating"          # a new camera defaults to validating
 
 
+def _precision(db, gw, cam):
+    """n_reviewed / n_exact DERIVED from the reviewed validation_items — the source of truth, never
+    an incrementing counter (a counter drifted to 143 on 3 real reviews and wrongly unlocked GO-LIVE).
+    A verdict is 'exact' iff the human counts equal the machine counts."""
+    r = db.execute(
+        "SELECT COUNT(*) nr, COALESCE(SUM(CASE WHEN human_boarded=machine_boarded "
+        "AND human_alighted=machine_alighted THEN 1 ELSE 0 END),0) ne "
+        "FROM validation_item WHERE gateway_id=? AND cam=? AND status='reviewed'", (gw, cam)).fetchone()
+    return (r["nr"] or 0, r["ne"] or 0)
+
+
 # ---------------- GPU-facing ----------------
 @validation_router.get("/api/gw/{gw}/validation_mode/{cam}")
 def validation_mode(gw: str, cam: str, authorization: str = Header("")):
@@ -159,10 +170,13 @@ def verdict(item_id: int = Form(...), human_boarded: int = Form(...), human_alig
     db.execute("UPDATE validation_item SET status='reviewed',human_boarded=?,human_alighted=?,reviewer=?,"
                "reviewed_at=? WHERE id=?", (human_boarded, human_alighted, reviewer, time.time(), item_id))
     gw, cam = it["gateway_id"], it["cam"]
-    db.execute("INSERT INTO camera_validation (gateway_id,cam,updated_at) VALUES (?,?,?) "
-               "ON CONFLICT(gateway_id,cam) DO NOTHING", (gw, cam, time.time()))
-    db.execute("UPDATE camera_validation SET n_reviewed=n_reviewed+1, n_exact=n_exact+?, updated_at=? "
-               "WHERE gateway_id=? AND cam=?", (exact, time.time(), gw, cam))
+    # SET n_reviewed/n_exact = derived truth (recompute from reviewed items), never increment -> the
+    # column can't drift and unlock the gate on a phantom number. This also self-heals a bad value.
+    nr, ne = _precision(db, gw, cam)
+    db.execute("INSERT INTO camera_validation (gateway_id,cam,n_reviewed,n_exact,updated_at) "
+               "VALUES (?,?,?,?,?) ON CONFLICT(gateway_id,cam) DO UPDATE SET "
+               "n_reviewed=excluded.n_reviewed, n_exact=excluded.n_exact, updated_at=excluded.updated_at",
+               (gw, cam, nr, ne, time.time()))
     db.commit()
     db.close()
     shutil.rmtree(IMG_DIR / str(item_id), ignore_errors=True)   # PRIVACY: imagery gone at the verdict
@@ -173,8 +187,7 @@ def verdict(item_id: int = Form(...), human_boarded: int = Form(...), human_alig
 def golive(gw: str = Form(...), cam: str = Form(...), reviewer: str = Form("operator"), force: str = Form("")):
     _safe(gw, cam)
     db = _db()
-    r = db.execute("SELECT n_reviewed,n_exact FROM camera_validation WHERE gateway_id=? AND cam=?", (gw, cam)).fetchone()
-    nr, ne = (r["n_reviewed"], r["n_exact"]) if r else (0, 0)
+    nr, ne = _precision(db, gw, cam)               # derived truth, not the (formerly-drifting) column
     if nr < MIN_VALIDATE_N and force != "1":
         db.close()
         raise HTTPException(400, f"Only {nr} reviewed (need >= {MIN_VALIDATE_N} with load>=1 before "
@@ -196,9 +209,13 @@ def golive(gw: str = Form(...), cam: str = Form(...), reviewer: str = Form("oper
 @validation_router.get("/validate", response_class=HTMLResponse)
 def validate_page():
     db = _db()
-    cams = db.execute("SELECT gateway_id,cam,state,n_reviewed,n_exact,provenance FROM camera_validation "
-                      "ORDER BY gateway_id,cam").fetchall()
-    pend = db.execute("SELECT * FROM validation_item WHERE status='pending' ORDER BY id ASC LIMIT 50").fetchall()
+    cams = []
+    for c in db.execute("SELECT gateway_id,cam,state,provenance FROM camera_validation ORDER BY gateway_id,cam").fetchall():
+        nr, ne = _precision(db, c["gateway_id"], c["cam"])   # derived truth
+        cams.append({**dict(c), "n_reviewed": nr, "n_exact": ne})
+    # NEWEST first so the multi-frame episodes surface (old single-image overnight ones were burying
+    # them past the 50-item window, so every reviewable item looked like it had one image).
+    pend = db.execute("SELECT * FROM validation_item WHERE status='pending' ORDER BY id DESC LIMIT 50").fetchall()
     db.close()
     return HTMLResponse(_render(cams, pend))
 
