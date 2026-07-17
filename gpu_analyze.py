@@ -240,24 +240,37 @@ def _decode_nvdec(data):
     return [np.frombuffer(buf[i:i + fsz], np.uint8).reshape(H, W, 3) for i in range(0, len(buf) - fsz + 1, fsz)]
 
 
+def _rel_times(pts, n, seg_dur):
+    """Per-frame seconds relative to the segment start. Uses REAL container PTS (handles variable fps /
+    irregular 19-82-frame segments) when every frame carries a monotonic PTS; else uniform over the
+    nominal segment duration. Absolute time is anchored on wall-clock by the caller (seg_wall) — PTS is
+    used ONLY for intra-segment spacing, so pulled-clip PTS absolute drift can't corrupt the timeline."""
+    if n and all(p is not None for p in pts) and pts[-1] > pts[0]:
+        p0 = pts[0]
+        return [p - p0 for p in pts]
+    return [i * (seg_dur / n) for i in range(n)] if n else []
+
+
 def decode_segment(data):
-    """HEVC segment bytes -> list of BGR frames. NVDEC if USE_NVDEC=1 (L4 has hevc_cuvid), else CPU
-    via PyAV (704x576 CPU decode is cheap; not the cap — ByteTrack CPU-assoc is)."""
+    """HEVC segment bytes -> (BGR frames, per-frame relative-seconds). NVDEC if USE_NVDEC=1 (L4 has
+    hevc_cuvid, but rawvideo loses PTS -> uniform), else CPU via PyAV (704x576 CPU decode is cheap)."""
     if USE_NVDEC:
         fr = _decode_nvdec(data)
         if fr is not None:
-            return fr
+            return fr, _rel_times([None] * len(fr), len(fr), SEG_DUR_S)   # rawvideo: no PTS -> uniform
         log("NVDEC decode unavailable/failed — CPU fallback")
     import av
-    frames = []
+    frames, pts = [], []
     try:
         c = av.open(io.BytesIO(data))
+        tb = c.streams.video[0].time_base
         for f in c.decode(video=0):
             frames.append(f.to_ndarray(format="bgr24"))
+            pts.append(float(f.pts * tb) if (f.pts is not None and tb) else None)
         c.close()
     except Exception as e:
         log(f"decode failed: {e}")
-    return frames
+    return frames, _rel_times(pts, len(frames), SEG_DUR_S)
 
 
 def main():
@@ -384,7 +397,7 @@ def main():
                 log(f"segment {name} fetch failed: {type(e).__name__}: {e}"); continue
             fetch_ms = connect_ms + transfer_ms   # fetch DURATION (ran overlapped w/ the prior track)
             dec_t0 = time.time()
-            frames = decode_segment(data)
+            frames, rel = decode_segment(data)
             decode_ms = (time.time() - dec_t0) * 1000       # HEVC decode cost
             if not frames:
                 seen.add(name); continue
@@ -411,6 +424,7 @@ def main():
                 tr_t0 = time.time()
                 dets = det.track(fr)
                 track_ms += (time.time() - tr_t0) * 1000     # YOLO inference — the cost that must fit the budget
+                frame_off = seg_wall - ((rel[-1] - rel[i]) if rel else 0.0)   # REAL per-frame time (not 25fps assumed)
                 if val_state == "validating":                # DETECTION AUDIT: what did YOLO actually see?
                     ids = tuple(d.track_id for d in dets)
                     cfs = tuple(d.conf for d in dets)
@@ -421,7 +435,7 @@ def main():
                         episode["confs"].extend(cfs)
                 pre = len(ctr.transits)
                 pre_rej = len(ctr.rejections)
-                ctr.update(dets, offset_s=seg_wall - (n_fr - i) * 0.04)   # ~25fps back-stamp
+                ctr.update(dets, offset_s=frame_off)         # real per-frame wall time (see decode_segment rel)
                 for rj in ctr.rejections[pre_rej:]:   # would-be crossings the guards killed
                     bi = min(int(rj.achieved_frac / 0.05 + 1e-9), 7)   # +eps: 0.35/0.05 is 6.999… in float
                     rej_hist[bi] += 1

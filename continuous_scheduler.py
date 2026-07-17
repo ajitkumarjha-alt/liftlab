@@ -174,6 +174,7 @@ def _event_row(tl, c):
         "ramp_residual": round(c.residual, 4),
         "floor": None, "floor_source": "unknown",
         "boarded": None, "alighted": None,
+        "quality": "ok",              # clean cycle; the rejected-but-real path overrides this + NULLs the close
     }
 
 
@@ -615,6 +616,24 @@ class _Runner:
                                      "cur_raw": round(float(raws[-1]), 1)})
                     self.recent_rejections.append(diag)
                     self._log(f"[watch ch{self.channel}] cycle REJECT {diag}")
+                    # EMIT-FACTS-FLAG-QUALITY (comparability boundary: quality!='ok' rows begin at this
+                    # deploy; the existing clean rows + the 2.81s Bank C median are UNTOUCHED). A rejected
+                    # cycle is a REAL opening — emit it FLAGGED so the opening count / demand curve recover;
+                    # NULL the untrustworthy close so the CLEAN median is unaffected. Commit -> emits once.
+                    self.committed.append((c.open_start_s, c.close_full_s))
+                    frow = _event_row(tl, c)
+                    frow["quality"] = reason
+                    if reason in ("not_returned_closed", "transfer_negative", "data_hole"):
+                        frow["close_travel_s"] = None          # no trustworthy close -> withhold, never fabricate
+                    if reason in ("open_travel_short", "open_travel_long"):
+                        frow["open_valid"] = False
+                    self.cycles.append({
+                        "open_full_ts": frow["door_open_full_ts"], "close_full_ts": frow["door_close_full_ts"],
+                        "dwell_s": round(c.dwell_s, 3), "open_travel_s": round(c.open_travel_s, 3),
+                        "close_travel_s": frow["close_travel_s"], "transfer_s": round(c.transfer_s, 3),
+                        "occupancy_after": None, "quality": reason,
+                    })
+                    new_rows.append(frow)
                 continue
             # re-measure segment-locally -> deterministic close, then commit the INTERVAL
             commit = self._seg_remeasure(c.open_start_s - SEG_PAD_S, c.close_full_s + SEG_PAD_S)
@@ -647,7 +666,7 @@ class _Runner:
                 "close_full_ts": row["door_close_full_ts"],
                 "dwell_s": round(commit.dwell_s, 3), "open_travel_s": round(commit.open_travel_s, 3),
                 "close_travel_s": round(commit.close_travel_s, 3), "transfer_s": round(commit.transfer_s, 3),
-                "occupancy_after": occ_after,
+                "occupancy_after": occ_after, "quality": "ok",
             })
             new_rows.append(row)
         # prune committed intervals whose close slid fully out of the window
@@ -659,18 +678,23 @@ class _Runner:
     # ---- Tier-1 rollups from emitted cycles ----
     def rollups(self):
         cy = self.cycles
+        # EVERY emitted cycle is a real OPENING (flagged included) -> counts for demand: stops, headway,
+        # hourly. But close/dwell MEDIANS use CLEAN cycles only (a flagged not_returned has no trustworthy
+        # close/dwell) so the 2.81s Bank C finding is not polluted.
+        clean = [c for c in cy if c.get("quality", "ok") == "ok"]
         opens = [datetime.fromisoformat(c["open_full_ts"]) for c in cy]
         headways = [round((opens[i] - opens[i - 1]).total_seconds(), 1) for i in range(1, len(opens))]
-        # idle periods = inter-open gaps beyond 3x median headway (or >120s)
         idle_thr = max(120.0, 3 * float(np.median(headways))) if headways else 120.0
         idle = [g for g in headways if g > idle_thr]
         hourly = {}
         for o in opens:
             hourly[o.strftime("%Y-%m-%dT%H")] = hourly.get(o.strftime("%Y-%m-%dT%H"), 0) + 1
-        dwells = [c["dwell_s"] for c in cy]
+        dwells = [c["dwell_s"] for c in clean]
         occs = [c["occupancy_after"] for c in cy if c.get("occupancy_after") is not None]
         return {
-            "stop_count": len(cy),
+            "stop_count": len(cy),                 # all real openings (demand)
+            "stop_count_clean": len(clean),        # openings with a trustworthy close
+            "stop_count_flagged": len(cy) - len(clean),
             "headway_median_s": round(float(np.median(headways)), 1) if headways else None,
             "headway_p90_s": round(float(np.percentile(headways, 90)), 1) if headways else None,
             "dwell_median_s": round(float(np.median(dwells)), 2) if dwells else None,
@@ -699,7 +723,9 @@ class _Runner:
             "events": rows, "door_signal": [],
         }
         _emit_out({"kind": "events", "payload": payload})
-        self._log(f"[watch ch{self.channel}] emitted {len(rows)} cycle(s) to parent")
+        nflag = sum(1 for r in rows if r.get("quality", "ok") != "ok")
+        self._log(f"[watch ch{self.channel}] emitted {len(rows)} cycle(s) to parent"
+                  + (f" ({nflag} FLAGGED — real openings, close withheld; quality!='ok' = comparability boundary from this deploy)" if nflag else ""))
 
     def _status_post(self):
         st = self.status()
