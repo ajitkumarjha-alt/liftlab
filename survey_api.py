@@ -71,6 +71,13 @@ def _db() -> sqlite3.Connection:
     cols = [r[1] for r in db.execute("PRAGMA table_info(gateway)")]
     if cols and "state" not in cols:
         db.execute("ALTER TABLE gateway ADD COLUMN state TEXT DEFAULT 'installed'")
+    # rejection audit columns on the pre-existing watch_status table (idempotent)
+    for col, typ in (("opens_detected", "INTEGER"), ("cycles_rejected", "INTEGER"),
+                     ("cycles_rejected_by_reason", "TEXT")):
+        try:
+            db.execute(f"ALTER TABLE watch_status ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     db.commit()
     return db
 
@@ -416,14 +423,17 @@ async def watch_status_ingest(gw: str, request: Request, authorization: str = He
     db.execute(
         "INSERT INTO watch_status (gateway_id,camera,ts,state,baseline_confirmed,signal_fps,"
         "latency_med_s,latency_max_s,samples,cycles_emitted,soc_temp,throttle_live,throttle_sticky,"
-        "mem_avail_mb,rss_mb,alarms,tier1) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "mem_avail_mb,rss_mb,alarms,tier1,opens_detected,cycles_rejected,cycles_rejected_by_reason) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (gw, st.get("camera"), time.time(), st.get("state"),
          1 if st.get("baseline_confirmed") else 0, st.get("signal_fps"),
          st.get("latency_med_s"), st.get("latency_max_s"), st.get("samples"),
          st.get("cycles_emitted"), h.get("soc_temp"),
          ",".join(h.get("throttle_live") or []), ",".join(h.get("throttle_sticky") or []),
          h.get("mem_avail_mb"), h.get("rss_mb"),
-         json.dumps(st.get("alarms") or []), json.dumps(st.get("tier1") or {})))
+         json.dumps(st.get("alarms") or []), json.dumps(st.get("tier1") or {}),
+         st.get("opens_detected"), st.get("cycles_rejected"),
+         json.dumps(st.get("cycles_rejected_by_reason") or {})))
     db.commit(); db.close()
     return {"ok": True}
 
@@ -434,7 +444,8 @@ def watch_status_series(gw: str, hours: int = 48):
     since = time.time() - hours * 3600
     rows = [dict(r) for r in db.execute(
         "SELECT ts,camera,state,baseline_confirmed,signal_fps,latency_med_s,latency_max_s,"
-        "samples,cycles_emitted,soc_temp,throttle_live,throttle_sticky,mem_avail_mb,rss_mb,alarms,tier1"
+        "samples,cycles_emitted,soc_temp,throttle_live,throttle_sticky,mem_avail_mb,rss_mb,alarms,tier1,"
+        "opens_detected,cycles_rejected,cycles_rejected_by_reason"
         " FROM watch_status WHERE gateway_id=? AND ts>? ORDER BY ts", (gw, since))]
     db.close()
     return {"rows": rows, "now": time.time()}
@@ -470,6 +481,7 @@ svg{width:100%;background:#fafafa;border:1px solid #ddd;border-radius:6px;margin
   &nbsp; <a href="/events">events</a> &middot; <a href="/">&larr; fleet</a>
 </div>
 <div class=now id=now></div>
+<div class=bar id=rejbreak></div>
 <div id=charts></div>
 <div class=alarms id=alarms></div>
 <script>
@@ -501,6 +513,9 @@ async function draw(){
     card('signal fps',(L.signal_fps==null?'-':(+L.signal_fps).toFixed(2)),(L.signal_fps!=null&&L.signal_fps<6?'warn':'ok'))+
     card('latency med/max',((L.latency_med_s==null?'-':(+L.latency_med_s).toFixed(3))+' / '+(L.latency_max_s==null?'-':(+L.latency_max_s).toFixed(3))+'s'),((L.latency_max_s||0)>1?'warn':''))+
     card('cycles emitted',(L.cycles_emitted==null?'-':L.cycles_emitted))+
+    card('opens detected',(L.opens_detected==null?'-':L.opens_detected))+
+    card('cycles rejected',(L.cycles_rejected==null?'-':L.cycles_rejected),((L.cycles_rejected||0)>0?'warn':''))+
+    card('detect:emit',((L.opens_detected&&L.cycles_emitted)?(L.opens_detected/L.cycles_emitted).toFixed(2)+'x':'-'),((L.opens_detected&&L.cycles_emitted&&L.opens_detected/L.cycles_emitted>=1.5)?'warn':''))+
     card('samples',(L.samples==null?'-':L.samples))+
     card('SoC temp',(L.soc_temp==null?'-':(+L.soc_temp).toFixed(1)+'C'),((L.soc_temp||0)>75?'warn':''))+
     card('throttle',(live?'<span class=bad>LIVE</span>':'<span class=ok>clean</span>')+(sticky?' <span class=warn>+sticky</span>':''))+
@@ -512,6 +527,11 @@ async function draw(){
     chart('latency max (s) - flat=fresh, creep=staleness',rows,now,r=>r.latency_max_s,0,1.0,null,'s','#b06a00')+
     chart('SoC temp',rows,now,r=>r.soc_temp,35,85,80,'C','#c0392b')+
     chart('RSS (MB) - flat = no leak',rows,now,r=>r.rss_mb,0,memmax,null,'','#2a6db0');
+  let rej={}; try{ rej=JSON.parse(L.cycles_rejected_by_reason||'{}'); }catch(e){}
+  const rk=Object.keys(rej).sort((a,b)=>rej[b]-rej[a]);
+  document.getElementById('rejbreak').innerHTML = rk.length
+    ? ('rejected openings by reason (detected, not emitted):  '+rk.map(k=>k+' '+rej[k]).join('   ·   '))
+    : 'rejected openings by reason: none yet';
   let al=[]; try{ al=JSON.parse(L.alarms||'[]'); }catch(e){}
   document.getElementById('alarms').innerHTML=al.length?('recent alarms:<br>'+al.join('<br>')):'';
 }

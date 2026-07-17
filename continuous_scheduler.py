@@ -183,6 +183,24 @@ def _quality_ok(c: DoorCycle) -> bool:
             and CLOSE_TRAVEL_MIN < c.close_travel_s < CLOSE_TRAVEL_MAX)
 
 
+def _reject_reason(c: DoorCycle):
+    """Which quality gate a cycle FAILS — mirrors _quality_ok exactly (same conditions, same order).
+    None if it passes. AUDIT ONLY: never used to decide emission, only to name why a detected opening
+    was dropped, so the door dataset's censoring (esp. messy peak cycles) is measurable — the same
+    instrument-the-rejections move that proved disp_frac innocent on the counting side."""
+    if not (OPEN_TRAVEL_MIN < c.open_travel_s):
+        return "open_travel_short"
+    if not (c.open_travel_s < OPEN_TRAVEL_MAX):
+        return "open_travel_long"      # door held/blocked while opening (or mis-detected long open ramp)
+    if not (c.transfer_s >= 0):
+        return "transfer_negative"
+    if not (CLOSE_TRAVEL_MIN < c.close_travel_s):
+        return "close_travel_short"
+    if not (c.close_travel_s < CLOSE_TRAVEL_MAX):
+        return "close_travel_long"     # door held/blocked while closing — the peak-censoring suspect
+    return None
+
+
 def _straddles_hole(c: DoorCycle, holes) -> bool:
     for h0, h1 in holes:
         if c.open_start_s < h1 and h0 < c.close_full_s:
@@ -259,6 +277,11 @@ class _Runner:
         # commitment bookkeeping — freeze by [open,close] INTERVAL (drift-robust)
         self.committed = []               # committed (open_start_s, close_full_s) intervals
         self.cycles = []                  # committed cycle summaries (for rollups)
+        # rejection audit: distinct SETTLED openings that were DETECTED but did NOT emit, by reason.
+        # NEW HYPOTHESIS this measures: the watcher under-emits at peak because messy cycles (doors
+        # held/blocked/reopened) fail the gates -> a systematic hole exactly where MEP-02 needs it.
+        self.rejected = []                # in-window distinct rejected openings: (open_start, close_full, reason)
+        self.rej_counts = {}              # cumulative reason -> count (never pruned; survives window slide)
         # occupancy (LOAD proxy) — parallel sampler, door pipeline untouched
         self.occ = None                   # CabinCounter (onnx) or None if uncalibrated
         self.occ_samples = deque()        # (offset, cabin_count) while doors-open
@@ -331,6 +354,12 @@ class _Runner:
             "latency_med_s": round(float(np.median(self.lat_recent)), 3) if self.lat_recent else None,
             "latency_max_s": round(self.lat_max, 3),
             "cycles_emitted": len(self.cycles), "alarms": self.alarms[-5:],
+            # rejection audit: opens_detected = emitted + dropped, so opens_detected/cycles_emitted is
+            # the censoring ratio. by_reason localizes it (close_travel_long / not_returned_closed at peak
+            # = doors held/reopened, the systematic hole).
+            "cycles_rejected": sum(self.rej_counts.values()),
+            "cycles_rejected_by_reason": dict(self.rej_counts),
+            "opens_detected": len(self.cycles) + sum(self.rej_counts.values()),
             # last few full cycle timings so CORRECTNESS is eyeball-able off the Pi
             # status file (not just the tier1 aggregates): check close_travel_s ~2-2.5s,
             # dwell_s sane — a stable loop emitting nonsense cycles fails differently
@@ -541,13 +570,28 @@ class _Runner:
             if any(_overlaps(c.open_start_s, c.close_full_s, io, ic) for io, ic in self.committed):
                 continue
             if newest - c.close_full_s < SETTLE_S:
-                continue                                       # close not settled yet
-            if not _quality_ok(c) or _straddles_hole(c, tl.holes):
-                continue
-            # the door must have RETURNED TO CLOSED after the close (not a mid-wobble
-            # dip): post-close samples near the closed floor for SETTLE_S, else wait.
-            post = raws[(offs > c.close_full_s) & (offs <= c.close_full_s + SETTLE_S)]
-            if len(post) >= 3 and float(np.median(post)) > self.closed_floor + MOTION_FLOOR:
+                continue                                       # close not settled yet (transient; revisit)
+            # SETTLED, uncommitted opening -> it will EITHER emit OR be a hard rejection. Classify the
+            # rejection reason for the AUDIT. This does NOT change control flow: every rejected cycle
+            # still `continue`s exactly as before (quality/hole, then post-return). Dedup by interval so
+            # one physical opening is counted once even though it's re-detected each window slide.
+            reason = _reject_reason(c)
+            if reason is None and _straddles_hole(c, tl.holes):
+                reason = "data_hole"
+            if reason is None:
+                # the door must have RETURNED TO CLOSED after the close (not a mid-wobble dip):
+                post = raws[(offs > c.close_full_s) & (offs <= c.close_full_s + SETTLE_S)]
+                if len(post) >= 3 and float(np.median(post)) > self.closed_floor + MOTION_FLOOR:
+                    reason = "not_returned_closed"             # reopened / never settled shut (messy peak)
+            if reason is not None:
+                if not any(_overlaps(c.open_start_s, c.close_full_s, ro, rc) for ro, rc, _ in self.rejected):
+                    self.rejected.append((c.open_start_s, c.close_full_s, reason))
+                    self.rej_counts[reason] = self.rej_counts.get(reason, 0) + 1
+                    wt = cycle_wall_times(tl, c)["door_open_start"]
+                    self._log(f"[watch ch{self.channel}] cycle REJECT {reason}: "
+                              f"open_travel={c.open_travel_s:.2f} close_travel={c.close_travel_s:.2f} "
+                              f"transfer={c.transfer_s:.2f} plateau={c.plateau:.3f} residual={c.residual:.3f} "
+                              f"@ {wt.strftime('%H:%M:%S')}")
                 continue
             # re-measure segment-locally -> deterministic close, then commit the INTERVAL
             commit = self._seg_remeasure(c.open_start_s - SEG_PAD_S, c.close_full_s + SEG_PAD_S)
@@ -555,6 +599,14 @@ class _Runner:
                 commit = c                                     # fall back to the window cycle
             if any(_overlaps(commit.open_start_s, commit.close_full_s, io, ic) for io, ic in self.committed):
                 continue                                       # stable interval already committed
+            # this opening EMITS -> if an earlier (drifty) slide had counted it rejected, un-count it so
+            # opens_detected stays exact (emitted and rejected are mutually exclusive per opening).
+            for _k in range(len(self.rejected) - 1, -1, -1):
+                ro, rc, rr = self.rejected[_k]
+                if _overlaps(commit.open_start_s, commit.close_full_s, ro, rc):
+                    self.rejected.pop(_k)
+                    if self.rej_counts.get(rr):
+                        self.rej_counts[rr] -= 1
             # LOAD: occupancy_after = median cabin count over the last OCC_CLOSE_WINDOW_S
             # before close_start (the departing car load; NOT peak-during-open, which
             # would conflate the alighting+boarding exchange transient).
@@ -578,6 +630,7 @@ class _Runner:
         # prune committed intervals whose close slid fully out of the window
         cutoff = newest - WINDOW_S
         self.committed = [(io, ic) for io, ic in self.committed if ic >= cutoff]
+        self.rejected = [(ro, rc, rr) for ro, rc, rr in self.rejected if rc >= cutoff]  # counts stay cumulative
         return new_rows
 
     # ---- Tier-1 rollups from emitted cycles ----
