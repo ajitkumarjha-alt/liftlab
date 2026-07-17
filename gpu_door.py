@@ -144,51 +144,83 @@ def ncc(a, b):
 
 
 class FloorReader:
-    """Template-match the LED indicator. digit_cells/arrow_cell are calibrated (x,y,w,h) sub-ROIs
-    WITHIN a panel crop; templates is {label: 2D-uint8}. Reads BOTH panels and requires AGREEMENT —
-    disagreement is discarded (a confidence no single-panel OCR gets). arrow -> travel direction."""
+    """Template-match the LED indicator. Floors are 1-2 (or more) digits, so digit cells are NOT fixed:
+    the digit_region is SEGMENTED on the dark gaps between glyphs (column-brightness projection) and
+    each glyph run is classified — so 6, 22, 42 all read. arrow_cell is a fixed rightmost sub-ROI.
+    Reads BOTH panels and requires AGREEMENT — disagreement is discarded (a confidence no single-panel
+    OCR gets). arrow -> travel direction. digit_region/arrow_cell are (x,y,w,h) WITHIN a panel crop."""
 
-    def __init__(self, templates, digit_cells, arrow_cell=None, min_score=0.55):
+    def __init__(self, templates, digit_region, arrow_cell=None, min_score=0.55,
+                 min_glyph_w=3, gap_frac=0.35, max_digits=3):
         self.templates = {k: np.asarray(v, dtype=np.float32) for k, v in templates.items()}
-        self.digit_cells = digit_cells
+        self.digit_region = digit_region
         self.arrow_cell = arrow_cell
         self.min_score = min_score
+        self.min_glyph_w = min_glyph_w        # a bright run narrower than this is noise, not a glyph
+        self.gap_frac = gap_frac              # column brighter than lo+gap_frac*(hi-lo) counts as "lit"
+        self.max_digits = max_digits          # >this many runs -> not a clean read, discard
         self._tsz = next(iter(self.templates.values())).shape if self.templates else (16, 12)
 
     def _match(self, cell_img, labels):
         import cv2
-        if cell_img.size == 0:
-            return None, 0.0
+        if cell_img.size == 0 or cell_img.shape[0] < 2 or cell_img.shape[1] < 2:
+            return None, -2.0
         c = cv2.resize(cell_img, (self._tsz[1], self._tsz[0]))
         best, bs = None, -2.0
         for lab in labels:
             t = self.templates.get(lab)
-            if t is None:
-                continue
-            s = ncc(c, t)
-            if s > bs:
-                best, bs = lab, s
+            if t is not None:
+                s = ncc(c, t)
+                if s > bs:
+                    best, bs = lab, s
         return best, bs
 
+    def segment_glyphs(self, reg_gray):
+        """Column-brightness projection -> runs of lit columns = glyphs (variable count). Robust to
+        1 vs 2 digits and to the glyphs' horizontal position within the region."""
+        col = reg_gray.astype(np.float32).mean(axis=0)
+        rng = float(col.max() - col.min())
+        if rng < 1e-3:
+            return []
+        thr = float(col.min()) + self.gap_frac * rng
+        on = col > thr
+        runs, i, n = [], 0, len(on)
+        while i < n:
+            if on[i]:
+                j = i
+                while j < n and on[j]:
+                    j += 1
+                if j - i >= self.min_glyph_w:
+                    runs.append((i, j))
+                i = j
+            else:
+                i += 1
+        return runs
+
     def read_panel(self, panel_gray):
-        scores = []
-        digits = ""
-        for cell in self.digit_cells:
-            lab, s = self._match(crop(panel_gray, cell), DIGITS)
+        reg = crop(panel_gray, self.digit_region)
+        runs = self.segment_glyphs(reg)
+        if not runs or len(runs) > self.max_digits:
+            return None                              # unread (no glyph / smeared into >max_digits) -> discard
+        digits, scores = "", []
+        for (x0, x1) in runs:
+            lab, s = self._match(reg[:, x0:x1], DIGITS)
             if lab is None or s < self.min_score:
-                return None                         # a cell we can't read -> discard the whole panel
-            digits += lab; scores.append(s)
-        direction, ds = (None, 1.0)
+                return None                          # a glyph we can't confidently name -> discard panel
+            digits += lab
+            scores.append(s)
+        direction = None
         if self.arrow_cell is not None:
             direction, ds = self._match(crop(panel_gray, self.arrow_cell), ARROWS)
             if direction is None or ds < self.min_score:
-                direction = None                    # floor still usable without a confident arrow
-            scores.append(ds if direction else self.min_score)
+                direction = None                     # floor still usable without a confident arrow
+            else:
+                scores.append(ds)
         try:
             floor = int(digits)
         except ValueError:
             return None
-        return {"floor": floor, "direction": direction, "score": round(min(scores), 3)}
+        return {"floor": floor, "direction": direction, "score": round(min(scores), 3), "n_digits": len(runs)}
 
     def reconcile(self, panel_reads):
         """AGREE-OR-DISCARD across the two panels. Both read + agree on floor -> confident (mean score,

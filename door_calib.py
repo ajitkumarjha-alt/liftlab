@@ -114,11 +114,30 @@ def _frame_grid(img, step=40):
     return out
 
 
+def _montage(crops, cols, factor):
+    import cv2
+    import numpy as np
+    if not crops:
+        return None
+    ups = [cv2.resize(c, (0, 0), fx=factor, fy=factor, interpolation=cv2.INTER_NEAREST) for c in crops]
+    hh = max(u.shape[0] for u in ups); ww = max(u.shape[1] for u in ups)
+    rows = []
+    for k in range(0, len(ups), cols):
+        row = ups[k:k + cols]
+        cells = [np.pad(u, ((0, hh - u.shape[0]), (0, ww - u.shape[1]), (0, 0))) for u in row]
+        while len(cells) < cols:
+            cells.append(np.zeros((hh, ww, 3), np.uint8))
+        rows.append(np.hstack(cells))
+    return np.vstack(rows)
+
+
 def main():
     import cv2
     ap = argparse.ArgumentParser()
     ap.add_argument("--collect", type=int, default=0)
+    ap.add_argument("--frames", type=int, default=0, help="collect N frames -> door + panel montages")
     a = ap.parse_args()
+    nframes = max(a.collect, a.frames)
     outdir = SNAP_DIR / GW
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -146,35 +165,33 @@ def main():
     for i in range(len(prois)):
         print(f"[calib]        {CLOUD}/snap/{GW}/_calib_p{i}.jpg   (panel{i}, ruler in absolute frame px)")
 
-    if a.collect:
-        # montage of panel crops over time (upscaled) -> read floors off ONE viewable image
-        tiles = {i: [] for i in range(len(prois))}
+    if nframes:
+        # Time-ordered montages over N distinct segments. Panels -> read the floors. DOOR -> the leaf
+        # edge sweeps across columns between shut and open frames; a montage spanning a cycle shows the
+        # travel band (or, if the box is on a fixed jamb/wall, the edge NEVER moves — which is the test).
+        panels = {i: [] for i in range(len(prois))}
+        doors = []
         seen = set()
-        for _ in range(a.collect):
+        for _ in range(nframes):
             seg = _newest_seg()
-            key = seg
-            if seg and key not in seen:
-                seen.add(key)
+            if seg and seg not in seen:
+                seen.add(seg)
                 f2 = _decode_last_frame(seg)
                 if f2 is not None:
                     for i, pr in enumerate(prois):
-                        tiles[i].append(cv2.resize(gd.crop(f2, pr), (0, 0), fx=8, fy=8, interpolation=cv2.INTER_NEAREST))
-            time.sleep(2)
-        import numpy as np
-        for i, ts in tiles.items():
-            if not ts:
-                continue
-            cols = 5
-            rows = [ts[k:k + cols] for k in range(0, len(ts), cols)]
-            hh = max(t.shape[0] for t in ts); ww = max(t.shape[1] for t in ts)
-            grid = []
-            for row in rows:
-                cells = [np.pad(t, ((0, hh - t.shape[0]), (0, ww - t.shape[1]), (0, 0))) for t in row]
-                while len(cells) < cols:
-                    cells.append(np.zeros((hh, ww, 3), np.uint8))
-                grid.append(np.hstack(cells))
-            cv2.imwrite(str(outdir / f"_calib_glyphs{i}.jpg"), np.vstack(grid))
-            print(f"[calib] montage {len(ts)} crops -> {CLOUD}/snap/{GW}/_calib_glyphs{i}.jpg  (tell me the floors, row-major)")
+                        panels[i].append(gd.crop(f2, pr))
+                    doors.append(gd.crop(f2, droi))
+            time.sleep(2)          # ~one per 2s segment -> N*2s of coverage (catches a door cycle)
+        for i, ts in panels.items():
+            m = _montage(ts, cols=5, factor=8)
+            if m is not None:
+                cv2.imwrite(str(outdir / f"_calib_glyphs{i}.jpg"), m)
+                print(f"[calib] panel{i}: {len(ts)} crops -> {CLOUD}/snap/{GW}/_calib_glyphs{i}.jpg  (floors row-major)")
+        md = _montage(doors, cols=6, factor=2)
+        if md is not None:
+            cv2.imwrite(str(outdir / "_calib_doormap.jpg"), md)
+            print(f"[calib] door: {len(doors)} crops -> {CLOUD}/snap/{GW}/_calib_doormap.jpg  "
+                  f"(edge should SWEEP columns shut<->open; if it never moves, the box is on a fixed jamb/wall)")
 
 
 if __name__ == "__main__":
