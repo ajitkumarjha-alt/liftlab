@@ -35,7 +35,7 @@ import numpy as np
 # dwell/displacement guards, tracker). A validation verdict is only valid for the version it was
 # made against — precision must reset when this changes (same principle as the CLOSE_TRAVEL_MAX
 # comparability boundary). The cloud's COUNTING_VERSION env MUST match this string.
-COUNTING_VERSION = "2026-07-17-dwell-disp"
+COUNTING_VERSION = "2026-07-17-yolo11m-dwell-disp"
 
 
 @dataclass

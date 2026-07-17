@@ -54,9 +54,14 @@ BAK="$APP/main.py.bak.$(date +%Y%m%d-%H%M%S)"; cp "$APP/main.py" "$BAK"
 $PY /tmp/apply_validation_patch.py || { say "patch failed — restoring"; cp "$BAK" "$APP/main.py"; exit 1; }
 chown "$OWNER:$OWNER" "$APP/main.py"
 $PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restoring"; cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; exit 1; }
-# VALIDATION_IMG_DIR into the service env (matches this install)
+# VALIDATION_IMG_DIR + COUNTING_VERSION into the service env (matches this install).
+# COUNTING_VERSION MUST equal counting.COUNTING_VERSION on the GPU, else new verdicts are filtered as
+# a foreign version. A model/logic change is a comparability boundary -> bump both together.
+CV="${COUNTING_VERSION:-2026-07-17-yolo11m-dwell-disp}"
 mkdir -p "/etc/systemd/system/$SVC.service.d"
-printf '[Service]\nEnvironment=VALIDATION_IMG_DIR=%s\n' "$IMGDIR" > "/etc/systemd/system/$SVC.service.d/validation.conf"
+printf '[Service]\nEnvironment=VALIDATION_IMG_DIR=%s\nEnvironment=COUNTING_VERSION=%s\n' \
+    "$IMGDIR" "$CV" > "/etc/systemd/system/$SVC.service.d/validation.conf"
+say "cloud COUNTING_VERSION pinned to: $CV  (must match the GPU's counting.py)"
 
 # ---- 5. restart + VERIFY it came up; if not, RESTORE main.py and restart (self-heal the ingest) ----
 systemctl daemon-reload

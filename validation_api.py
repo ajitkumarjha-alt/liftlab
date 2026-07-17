@@ -46,7 +46,7 @@ MIN_VALIDATE_N = int(os.environ.get("MIN_VALIDATE_N", "20"))   # GO-LIVE refuses
 # The counting logic verdicts must be valid against. MUST match counting.COUNTING_VERSION on the GPU.
 # Only verdicts made against THIS version count toward precision — when the logic changes, prior
 # verdicts (a different version) are superseded and validation restarts from n=0.
-CURRENT_COUNTING_VERSION = os.environ.get("COUNTING_VERSION", "2026-07-17-dwell-disp")
+CURRENT_COUNTING_VERSION = os.environ.get("COUNTING_VERSION", "2026-07-17-yolo11m-dwell-disp")
 _SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 validation_router = APIRouter()

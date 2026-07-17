@@ -19,8 +19,10 @@ LABUSER="${LABUSER:-$(ls -d /home/*/lab 2>/dev/null | head -1 | cut -d/ -f3)}"
 LABDIR="/home/$LABUSER/lab"
 VENVPY=$(ls "$LABDIR"/bin/python* 2>/dev/null | head -1 || ls "$LABDIR"/.venv/bin/python* 2>/dev/null | head -1)
 [ -x "$VENVPY" ] || { echo "no venv python under $LABDIR (bin/ or .venv/bin/)"; exit 2; }
-# model is at ~/yolo11n.pt (home dir), fall back to ~/lab or a bare name (ultralytics auto-downloads)
-MODEL=$(ls "/home/$LABUSER/yolo11n.pt" 2>/dev/null || ls "$LABDIR"/yolo11n.pt 2>/dev/null || echo "yolo11n.pt")
+# MODEL: honor an explicit env, else PREFER yolo11m.pt (bench: 35fps vs 38.5 for 11n — ~9% cost, 10x
+# the model; we're CPU-bound on ByteTrack, so the bigger model is nearly free), else fall back to 11n.
+MODEL="${MODEL:-$(ls "/home/$LABUSER/yolo11m.pt" 2>/dev/null || ls "$LABDIR"/yolo11m.pt 2>/dev/null \
+       || ls "/home/$LABUSER/yolo11n.pt" 2>/dev/null || ls "$LABDIR"/yolo11n.pt 2>/dev/null || echo "yolo11n.pt")}"
 APPDIR=/opt/liftlab-gpu
 say "user=$LABUSER venv=$VENVPY model=$MODEL"
 
