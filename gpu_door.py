@@ -43,20 +43,33 @@ def crop(img, roi_xywh):
 
 
 # ============================================================ 1. door edge / openness
+def _edge_from_gradient(gx_abs, min_edge_rows, row_peak_ratio=3.0):
+    """Per-row edge -> robust median. gx_abs = |Sobel-x| (rows x cols). In EACH row take the column of
+    the strongest horizontal gradient, KEEP it only if that peak clearly beats the row mean (a real
+    edge in that row, row_peak_ratio). The MEDIAN of the kept columns is the leaf's horizontal position
+    — this is what makes a DIAGONAL / barrel-distorted edge tractable: the diagonal is a fixed offset,
+    so the median moves with the leaf's TRANSLATION, and the median rejects per-row outliers. strength
+    = fraction of rows with a clear edge; below min_edge_rows -> no trustworthy leaf (honest None)."""
+    n_rows = gx_abs.shape[0]
+    rowmax = gx_abs.max(axis=1)
+    rowmean = gx_abs.mean(axis=1) + 1e-6
+    strong = rowmax > (row_peak_ratio * rowmean)
+    cols = gx_abs.argmax(axis=1)[strong]
+    if cols.size < min_edge_rows:
+        return None, float(cols.size) / max(1, n_rows)
+    return float(np.median(cols)), float(strong.mean())
+
+
 def door_edge_column(gray_roi):
-    """Dominant vertical edge column in the ROI = the moving door-leaf boundary. Returns
-    (col, strength): strength = peak-to-mean of the |Sobel-x| column profile, so the caller can REJECT
-    a frame with no clear edge (honest failure) instead of inventing a position. cv2 only here."""
+    """Leaf-edge column in the ROI, DIAGONAL-robust (wide-angle skew ~30px/280px smears a column-sum
+    profile). Per-row argmax(|Sobel-x|) kept if it beats the row mean, then MEDIAN across rows. Returns
+    (median_col, strength=fraction-of-edge-rows). cv2 only here; the aggregation (_edge_from_gradient)
+    is pure/tested."""
     import cv2
-    if gray_roi.size == 0 or gray_roi.shape[1] < 3:
+    if gray_roi.size == 0 or gray_roi.shape[1] < 3 or gray_roi.shape[0] < 6:
         return None, 0.0
-    gx = cv2.Sobel(gray_roi, cv2.CV_32F, 1, 0, ksize=3)
-    prof = np.abs(gx).sum(axis=0)
-    if prof.size >= 5:
-        prof = np.convolve(prof, np.ones(5) / 5.0, mode="same")
-    col = int(np.argmax(prof))
-    strength = float(prof[col] / (prof.mean() + 1e-6))
-    return col, strength
+    gx = np.abs(cv2.Sobel(gray_roi, cv2.CV_32F, 1, 0, ksize=3))
+    return _edge_from_gradient(gx, min_edge_rows=max(3, gray_roi.shape[0] // 6))
 
 
 # ============================================================ 2. DoorTracker (openness -> cycles)
@@ -66,9 +79,9 @@ class DoorTracker:
     cycle the way the Pi's frozen baseline does). A cycle is emitted on return-to-closed with the four
     door timestamps + close_travel_s. Thresholds are hysteretic to reject jitter."""
 
-    def __init__(self, min_strength=2.0, open_th=0.50, near_open=0.90, close_th=0.10,
+    def __init__(self, min_strength=0.30, open_th=0.50, near_open=0.90, close_th=0.10,
                  ref_window=600, min_span_col=6.0):
-        self.min_strength = min_strength      # reject frames with no clear leaf edge
+        self.min_strength = min_strength      # min FRACTION of rows with a clear edge (door_edge_column strength)
         self.open_th = open_th                # openness rising past this = opening under way
         self.near_open = near_open            # reached this = fully open (open_full)
         self.close_th = close_th              # fell below this = fully closed (close_full)

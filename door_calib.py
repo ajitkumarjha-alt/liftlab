@@ -28,8 +28,9 @@ DOOR_ROI = [int(x) for x in os.environ.get("DOOR_ROI", "450,0,568,900").split(",
 # The scaled door_roi landed on the LEFT WALL (panel surface), not the leaf — the Pi's brightness
 # scalar tolerates a correlated-but-wrong ROI; edge geometry does NOT. Override in FRAME px and eyeball:
 DOOR_ROI_FRAME = os.environ.get("DOOR_ROI_FRAME", "")    # "x,y,w,h" in 704x576 frame px, used DIRECTLY
-# panel ROIs in FRAME (704x576) px — confirmed to read "22 ^" and AGREE (nudged off the clipping boxes)
-PANEL_ROIS_DEFAULT = "126,112,42,34;378,42,42,34"
+# panel ROIs in FRAME (704x576) px — CONFIRMED tight, both read "6 ^" / "22" and AGREE.
+# panel0 digit x137-147 arrow x150-158 ; panel1 digit x389-399 arrow x402-410 (within the boxes below)
+PANEL_ROIS_DEFAULT = "132,110,34,36;384,40,34,36"
 
 
 def _panel_rois():
