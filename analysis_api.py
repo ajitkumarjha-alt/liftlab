@@ -51,6 +51,10 @@ def _safe(*p):
             raise HTTPException(400, "bad name")
 
 
+BACKFILL_OPEN_PAD = float(os.environ.get("BACKFILL_OPEN_PAD_S", "5"))    # clock skew slack, open side
+BACKFILL_CLOSE_PAD = float(os.environ.get("BACKFILL_CLOSE_PAD_S", "25"))  # GPU processing lag, close side
+
+
 def _db():
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
@@ -59,6 +63,10 @@ def _db():
       direction TEXT, track_id INTEGER, received_at REAL)""")
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_transit "
                "ON transit_event (gateway_id,cam,track_id,direction,ts_bucket)")
+    try:
+        db.execute("ALTER TABLE transit_event ADD COLUMN cycle_id INTEGER")   # gw_event.id it belongs to
+    except sqlite3.OperationalError:
+        pass                                       # already added
     return db
 
 
@@ -91,42 +99,59 @@ def _gw_cols():
     return _GW_COLS
 
 
-def _backfill_gw_event(db, gw, cam, ts):
-    """Fill the NULL boarded/alighted on the gw_event whose door-open window contains this transit.
-    Recomputes from transit_event (idempotent SET). GUARDED: only writes if gw_event has the expected
-    wall-time columns + gw_source.camera; otherwise a safe no-op. Never touches door timing columns."""
+def _cam_forms(cam):
+    """gw_source.camera might be 'ch29' or '29' — match either."""
+    bare = cam[2:] if cam.startswith("ch") else cam
+    return list({cam, bare, "ch" + bare})
+
+
+def _match_cycle(db, cam, ts):
+    """The gw_event.id whose door-open window contains this transit's wall time. Compares as EPOCHS
+    (parsing the tz-aware ISO offset) — NOT strings: door_open_start_ts is local-offset ISO, a string
+    compare against a UTC ISO is meaningless. Pads the close side for the GPU's processing lag."""
+    forms = _cam_forms(cam)
+    qmarks = ",".join("?" * len(forms))
+    try:
+        rows = db.execute(
+            f"SELECT e.id id, e.door_open_start_ts o, e.door_close_full_ts c FROM gw_event e "
+            f"JOIN gw_source s ON s.id=e.source_id WHERE s.camera IN ({qmarks}) "
+            f"ORDER BY e.id DESC LIMIT 300", forms).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    for r in rows:
+        try:
+            o = datetime.fromisoformat(r["o"]).timestamp()
+            c = datetime.fromisoformat(r["c"]).timestamp()
+        except Exception:
+            continue
+        if o - BACKFILL_OPEN_PAD <= ts <= c + BACKFILL_CLOSE_PAD:
+            return r["id"]
+    return None
+
+
+def _backfill_gw_event(db, gw, cam, ts, track_id, direction, ts_bucket):
+    """Attribute this transit to its door cycle and recompute that gw_event's boarded/alighted from
+    ALL transits attributed to it (idempotent SET). GUARDED: only writes if gw_event has the expected
+    columns; else a safe no-op. Never touches the door-timing columns or the ingest."""
     global _BACKFILL_LOGGED
     cols = _gw_cols()
     need = {"door_open_start_ts", "door_close_full_ts", "boarded", "alighted", "source_id"}
     if not need.issubset(cols):
         if not _BACKFILL_LOGGED:
-            print(f"[analysis_api] gw_event backfill DISABLED: columns {sorted(cols)} lack {sorted(need - cols)} "
-                  f"— transits still stored + shown on /ops; paste the schema to finalize."); _BACKFILL_LOGGED = True
+            print(f"[analysis_api] backfill DISABLED: gw_event lacks {sorted(need - cols)}"); _BACKFILL_LOGGED = True
         return None
-    iso = datetime.fromtimestamp(ts, timezone.utc).isoformat()
-    try:
-        cyc = db.execute(
-            "SELECT e.id id, e.door_open_start_ts o, e.door_close_full_ts c FROM gw_event e "
-            "JOIN gw_source s ON s.id=e.source_id WHERE s.camera=? "
-            "AND e.door_open_start_ts<=? AND e.door_close_full_ts>=? ORDER BY e.id DESC LIMIT 1",
-            (cam, iso, iso)).fetchone()
-    except sqlite3.OperationalError as e:
-        if not _BACKFILL_LOGGED:
-            print(f"[analysis_api] gw_event backfill match query failed ({e}) — no-op; paste the schema."); _BACKFILL_LOGGED = True
-        return None
-    if not cyc:
-        return None                                # transit outside any known cycle window (a signal, kept)
-    try:
-        o_ep = datetime.fromisoformat(cyc["o"]).timestamp()
-        c_ep = datetime.fromisoformat(cyc["c"]).timestamp()
-    except Exception:
-        return None
-    b = db.execute("SELECT COUNT(*) FROM transit_event WHERE gateway_id=? AND cam=? AND direction='in' "
-                   "AND ts BETWEEN ? AND ?", (gw, cam, o_ep, c_ep)).fetchone()[0]
-    a = db.execute("SELECT COUNT(*) FROM transit_event WHERE gateway_id=? AND cam=? AND direction='out' "
-                   "AND ts BETWEEN ? AND ?", (gw, cam, o_ep, c_ep)).fetchone()[0]
-    db.execute("UPDATE gw_event SET boarded=?, alighted=? WHERE id=?", (b, a, cyc["id"]))
-    return (cyc["id"], b, a)
+    cid = _match_cycle(db, cam, ts)
+    if not _BACKFILL_LOGGED:
+        print(f"[analysis_api] backfill active: transit cam={cam} ts={ts:.0f} -> cycle_id={cid} "
+              f"(epoch match, pads open={BACKFILL_OPEN_PAD}s close={BACKFILL_CLOSE_PAD}s)"); _BACKFILL_LOGGED = True
+    if cid is None:
+        return None                                # no cycle window contains it (a signal, kept)
+    db.execute("UPDATE transit_event SET cycle_id=? WHERE gateway_id=? AND cam=? AND track_id=? "
+               "AND direction=? AND ts_bucket=?", (cid, gw, cam, track_id, direction, ts_bucket))
+    b = db.execute("SELECT COUNT(*) FROM transit_event WHERE cycle_id=? AND direction='in'", (cid,)).fetchone()[0]
+    a = db.execute("SELECT COUNT(*) FROM transit_event WHERE cycle_id=? AND direction='out'", (cid,)).fetchone()[0]
+    db.execute("UPDATE gw_event SET boarded=?, alighted=? WHERE id=?", (b, a, cid))
+    return (cid, b, a)
 
 
 # ---- transit ingest (Bearer, idempotent) ----
@@ -139,16 +164,34 @@ async def transit_ingest(gw: str, request: Request, authorization: str = Header(
     if not _SAFE.match(cam) or direction not in ("in", "out"):
         raise HTTPException(400, "bad transit")
     ts = float(d.get("ts", time.time()))
+    track_id = int(d.get("track_id", -1))
+    ts_bucket = int(ts)
     db = _db()
     # INSERT OR IGNORE on (gw,cam,track_id,direction, 1s bucket) -> a retry after preemption/network
     # is a no-op; two different people reusing a track_id later fall in a different bucket -> kept.
     db.execute("INSERT OR IGNORE INTO transit_event "
                "(gateway_id,cam,ts,ts_bucket,direction,track_id,received_at) VALUES (?,?,?,?,?,?,?)",
-               (gw, cam, ts, int(ts), direction, int(d.get("track_id", -1)), time.time()))
-    filled = _backfill_gw_event(db, gw, cam, ts)   # fill NULL boarded/alighted on the matching cycle
+               (gw, cam, ts, ts_bucket, direction, track_id, time.time()))
+    filled = _backfill_gw_event(db, gw, cam, ts, track_id, direction, ts_bucket)   # attribute + fill cycle
     db.commit()
     db.close()
     return {"ok": True, "gw_event": filled}
+
+
+# ---- one-shot: attribute already-stored transits to cycles + fill gw_event (run once after deploy) ----
+@analysis_router.post("/api/gw/{gw}/backfill_transits")
+def backfill_transits(gw: str, authorization: str = Header("")):
+    _auth_rw(gw, authorization)
+    db = _db()
+    rows = db.execute("SELECT cam,ts,track_id,direction,ts_bucket FROM transit_event "
+                      "WHERE gateway_id=? AND cycle_id IS NULL", (gw,)).fetchall()
+    matched = 0
+    for r in rows:
+        if _backfill_gw_event(db, gw, r["cam"], r["ts"], r["track_id"], r["direction"], r["ts_bucket"]):
+            matched += 1
+    db.commit()
+    db.close()
+    return {"processed": len(rows), "matched": matched}
 
 
 # ---- recent transits (Bearer) — for /ops / debugging ----
@@ -173,8 +216,8 @@ def _log_gw_event_schema():
         db = sqlite3.connect(DB_PATH)
         cols = [r[1] for r in db.execute("PRAGMA table_info(gw_event)").fetchall()]
         db.close()
-        print(f"[analysis_api] gw_event columns: {cols} "
-              f"(need the cycle wall-time window to backfill boarded/alighted; not writing gw_event yet)")
+        print(f"[analysis_api] gw_event columns: {cols} — backfill matches transits to the "
+              f"door_open_start_ts..door_close_full_ts window by EPOCH (tz-aware) and fills boarded/alighted")
     except Exception as e:
         print(f"[analysis_api] could not read gw_event schema: {e}")
 

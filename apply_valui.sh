@@ -69,7 +69,12 @@ if [ "$(systemctl is-active "$SVC")" != active ]; then
   exit 1
 fi
 
-PORT=$(systemctl cat "$SVC" 2>/dev/null | grep -oP '\-\-port\s+\K[0-9]+' | head -1); [ -n "$PORT" ] || PORT=9090
+# parse the REAL port (resolved ExecStart is most reliable; handle --port N and --port=N), else the
+# actually-listening socket; error rather than curl a dead 9090 (the verify was reading 000).
+PORT=$(systemctl show "$SVC" -p ExecStart --value 2>/dev/null | grep -oP '\-\-port[=\s]+\K[0-9]+' | head -1)
+[ -n "$PORT" ] || PORT=$(systemctl cat "$SVC" 2>/dev/null | grep -oP '\-\-port[=\s]+\K[0-9]+' | head -1)
+[ -n "$PORT" ] || PORT=$(ss -tlnp 2>/dev/null | grep -oP '127\.0\.0\.1:\K[0-9]+' | head -1)
+[ -n "$PORT" ] || { say "could not determine cloud port — routes may be fine; set PORT=<n> to verify"; PORT=9090; }
 BASE="http://127.0.0.1:$PORT"; code(){ curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$@"; }
 MODE=$(code "$BASE/api/gw/site-A/validation_mode/ch29"); PAGE=$(code "$BASE/validate")
 VITEM=$(code -X POST --data '{}' "$BASE/api/gw/site-A/validation_item/ch29")
