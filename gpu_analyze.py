@@ -113,7 +113,8 @@ def post_episode(ep, reason=""):
     try:
         st = http_post_json(f"{CLOUD}/api/gw/{GW}/validation_item/{CAM}",
                             {"ts_start": ep["ts_start"], "ts_end": ep["ts_end"],
-                             "machine_boarded": ep["b"], "machine_alighted": ep["a"], "images": ep["imgs"]})
+                             "machine_boarded": ep["b"], "machine_alighted": ep["a"], "images": ep["imgs"],
+                             "counting_version": counting.COUNTING_VERSION})   # verdict is valid only for this logic
         log(f"episode POST -> HTTP {st}")
     except Exception as e:
         log(f"episode POST FAILED: {type(e).__name__}: {getattr(e, 'code', '')} {str(e)[:120]}")

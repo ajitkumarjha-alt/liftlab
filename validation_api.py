@@ -43,6 +43,10 @@ ANALYSIS_TOKENS = {g.split(":", 1)[0]: g.split(":", 1)[1]
 MAX_IMGS = int(os.environ.get("VALIDATION_MAX_IMGS", "4"))
 MIN_VALIDATE_N = int(os.environ.get("MIN_VALIDATE_N", "20"))   # GO-LIVE refuses below this (load>=1
                                                               # reviews only; a 100%-on-n=1 is meaningless)
+# The counting logic verdicts must be valid against. MUST match counting.COUNTING_VERSION on the GPU.
+# Only verdicts made against THIS version count toward precision — when the logic changes, prior
+# verdicts (a different version) are superseded and validation restarts from n=0.
+CURRENT_COUNTING_VERSION = os.environ.get("COUNTING_VERSION", "2026-07-17-dwell-disp")
 _SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 validation_router = APIRouter()
@@ -63,6 +67,10 @@ def _db():
       n_images INTEGER DEFAULT 0, status TEXT DEFAULT 'pending',
       human_boarded INTEGER, human_alighted INTEGER, reviewer TEXT, reviewed_at REAL, created_at REAL);
     """)
+    try:
+        db.execute("ALTER TABLE validation_item ADD COLUMN counting_version TEXT")   # logic it was counted under
+    except sqlite3.OperationalError:
+        pass                                       # already added (old rows -> NULL -> superseded)
     return db
 
 
@@ -91,7 +99,9 @@ def _precision(db, gw, cam):
     r = db.execute(
         "SELECT COUNT(*) nr, COALESCE(SUM(CASE WHEN human_boarded=machine_boarded "
         "AND human_alighted=machine_alighted THEN 1 ELSE 0 END),0) ne "
-        "FROM validation_item WHERE gateway_id=? AND cam=? AND status='reviewed'", (gw, cam)).fetchone()
+        "FROM validation_item WHERE gateway_id=? AND cam=? AND status='reviewed' "
+        "AND counting_version=?",                  # ONLY verdicts against the CURRENT logic count
+        (gw, cam, CURRENT_COUNTING_VERSION)).fetchone()
     return (r["nr"] or 0, r["ne"] or 0)
 
 
@@ -117,9 +127,10 @@ async def validation_item(gw: str, cam: str, request: Request, authorization: st
     d = await request.json()
     cur = db.execute(
         "INSERT INTO validation_item (gateway_id,cam,ts_start,ts_end,machine_boarded,machine_alighted,"
-        "n_images,created_at) VALUES (?,?,?,?,?,?,?,?)",
+        "n_images,counting_version,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
         (gw, cam, float(d.get("ts_start", 0)), float(d.get("ts_end", 0)),
-         int(d.get("machine_boarded", 0)), int(d.get("machine_alighted", 0)), 0, time.time()))
+         int(d.get("machine_boarded", 0)), int(d.get("machine_alighted", 0)), 0,
+         d.get("counting_version"), time.time()))
     item_id = cur.lastrowid
     imgs = (d.get("images") or [])[:MAX_IMGS]
 
@@ -155,7 +166,8 @@ def validate_img(item: str, idx: str):
 # ---------------- operator: verdict + go-live ----------------
 def _provenance(cam, n_reviewed, n_exact):
     pct = round(100.0 * n_exact / n_reviewed) if n_reviewed else 0
-    return f"{cam}: {pct}% exact on n={n_reviewed}, validated {datetime.now(timezone.utc).date().isoformat()}"
+    return (f"{cam}: {pct}% exact on n={n_reviewed}, validated {datetime.now(timezone.utc).date().isoformat()} "
+            f"(counting {CURRENT_COUNTING_VERSION})")
 
 
 @validation_router.post("/validate/verdict")
