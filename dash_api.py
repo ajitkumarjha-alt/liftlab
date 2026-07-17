@@ -33,11 +33,22 @@ SNAP_STALE_S = float(os.environ.get("SNAP_STALE_S", "20"))
 HB_STALE_S = 120.0                          # analyzer heartbeat older than this = down
 IST = timezone(timedelta(hours=5, minutes=30))   # the building's clock; door ts are +05:30 local ISO
 
-# Door-close compliance spec per camera (from the sheet). observed vs assumption side by side.
+# Door-close + transfer compliance spec per camera (from the sheet). observed vs assumption side by side.
 # Only cameras with an entry get the headline compliance panel; others show observed-only.
+#   sheet_s / compliance_s / bank : door-close (2.31s = Bank C non-compliance line)
+#   transfer_sheet_s              : C26 passenger transfer, sheet assumes 1.50 s/person
 DOOR_SPECS = {
-    "ch29": {"sheet_s": 2.00, "compliance_s": 2.31, "bank": "C"},
+    "ch29": {"sheet_s": 2.00, "compliance_s": 2.31, "bank": "C", "transfer_sheet_s": 1.50},
 }
+
+# Comparability boundaries — data across these isn't directly comparable; charts MARK them and the
+# close-travel headline uses only the current (post-boundary) regime.
+CLOSE_TRAVEL_MAX_BOUNDARY = "2026-07-16T11:48:11+00:00"   # CLOSE_TRAVEL_MAX 10->30 (admits longer real closes)
+_BOUNDARY_EPOCH = datetime.fromisoformat(CLOSE_TRAVEL_MAX_BOUNDARY).timestamp()
+
+# Fixed peak windows (local hours). The PEAK TRAP: sheet coefficients describe a PEAK design
+# condition, not an all-day average — report both separately; the ratio is itself a finding.
+PEAK_WINDOWS = {"am_peak": (8, 10), "pm_peak": (18, 20)}
 
 # Fixed lift-camera fallback if channel_map is empty (the set the operator named).
 FALLBACK_CHANNELS = [16, 27, 29, 30, 32, 34, 37]
@@ -71,6 +82,28 @@ def _pctl(sorted_vals, q):
     if not sorted_vals:
         return None
     return sorted_vals[min(len(sorted_vals) - 1, int(q * len(sorted_vals)))]
+
+
+def _epoch(iso):
+    try:
+        return datetime.fromisoformat(iso).timestamp()   # tz-aware local ISO -> absolute epoch
+    except Exception:
+        return None
+
+
+def _local_hour(iso):
+    try:
+        return datetime.fromisoformat(iso).hour          # local hour (ts carry +05:30)
+    except Exception:
+        return None
+
+
+def _stats(cts):
+    cts = sorted(cts)
+    n = len(cts)
+    return {"n": n, "median": round(_pctl(cts, 0.5), 2) if n else None,
+            "p85": round(_pctl(cts, 0.85), 2) if n else None,
+            "min": round(cts[0], 2) if n else None, "max": round(cts[-1], 2) if n else None}
 
 
 def _cameras(db, gw):
@@ -145,6 +178,35 @@ def _door_by_cam(db, gw):
     return out
 
 
+def _transfer_by_cam(db, gw):
+    """C26 passenger transfer: (door_close_start - door_open_full) / (boarded+alighted), per person,
+    on rows where boarded/alighted are non-NULL. PROVISIONAL — depends on the transit counts (ch29 at
+    80% precision on n=66, re-validating under 11m), so it's only firm once the camera goes live."""
+    rows = _q(db, "SELECT s.camera cam, e.door_open_full_ts of, e.door_close_start_ts cs, "
+                  "e.boarded b, e.alighted a FROM gw_event e JOIN gw_source s ON s.id=e.source_id "
+                  "WHERE s.gateway_id=? AND e.boarded IS NOT NULL AND e.alighted IS NOT NULL", (gw,))
+    by = {}
+    for r in rows:
+        load = (r["b"] or 0) + (r["a"] or 0)
+        if load <= 0:
+            continue
+        o, c = _epoch(r["of"]), _epoch(r["cs"])
+        if o is None or c is None or c <= o:
+            continue
+        by.setdefault(r["cam"], []).append((c - o) / load)
+    return {cam: {**_stats(v), "provisional": True} for cam, v in by.items()}
+
+
+def _floor_coverage(db, gw):
+    """How many gw_event rows carry a floor label. NULL on all of them => the whole Tier-2 / per-floor
+    family (stops-per-floor, C17/C18 up-down, C21/C22 speed factors) is NOT AVAILABLE — say so, loudly."""
+    rows = _q(db, "SELECT COUNT(*) t, COUNT(e.floor) f FROM gw_event e "
+                  "JOIN gw_source s ON s.id=e.source_id WHERE s.gateway_id=?", (gw,))
+    if not rows:
+        return {"total": 0, "with_floor": 0}
+    return {"total": rows[0]["t"] or 0, "with_floor": rows[0]["f"] or 0}
+
+
 def _transit_by_cam(db, gw):
     today = _ist_today_epoch()
     rows = _q(db, "SELECT cam, direction, ts FROM transit_event WHERE gateway_id=?", (gw,))
@@ -193,6 +255,8 @@ def dash_data(gw: str):
     cams = _cameras(db, gw)
     door = _door_by_cam(db, gw)
     trans = _transit_by_cam(db, gw)
+    xfer = _transfer_by_cam(db, gw)
+    floor_cov = _floor_coverage(db, gw)
     ana = _analyzers(db, gw)
     val = _validations(db, gw)
     w = _latest(db, "watch_status", gw)
@@ -243,13 +307,101 @@ def dash_data(gw: str):
             "validation": val.get(cam),
         })
 
-    headline = [dict(door[cam]["spec"], cam=cam, median=door[cam]["median"],
-                     p85=door[cam]["p85"], n=door[cam]["n"])
-                for cam in door if door[cam].get("spec")]
+    headline = []
+    for cam in door:
+        if not door[cam].get("spec"):
+            continue
+        x = xfer.get(cam)
+        headline.append(dict(door[cam]["spec"], cam=cam, median=door[cam]["median"],
+                             p85=door[cam]["p85"], n=door[cam]["n"],
+                             transfer_median=(x or {}).get("median"), transfer_n=(x or {}).get("n"),
+                             transfer_provisional=True))
+
+    # NOT AVAILABLE (Tier-2 ceiling): floor is NULL on every row -> no per-floor family. Say it on the page.
+    unavailable = None
+    if floor_cov["with_floor"] == 0 and floor_cov["total"] > 0:
+        unavailable = {"reason": "needs floor attribution — not built",
+                       "detail": f"gw_event.floor is NULL on all {floor_cov['total']} rows",
+                       "blocks": ["stops per floor", "boardings/alightings per floor",
+                                  "C17/C18 probable up/down stops", "C21/C22 speed factors"],
+                       "unlock": "floor OCR (template-match the LED digits + direction arrow)"}
 
     return JSONResponse({"t": now, "gw": gw, "ist_today": _ist_today_str(),
                          "pi": pi, "relay": relay, "gpu": gpu,
-                         "cameras": out_cams, "headline": headline})
+                         "cameras": out_cams, "headline": headline,
+                         "floor_coverage": floor_cov, "unavailable": unavailable})
+
+
+@dash_router.get("/dash/{gw}/trends")
+def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1):
+    """Hour-of-day profile + window stats. cam='' -> FLEET (all lift cams). close-travel uses only the
+    current (post-CLOSE_TRAVEL_MAX-boundary) regime for comparability. Every number carries n."""
+    db = _db()
+    cam_filter = ""
+    args = [gw]
+    if cam:
+        cam_filter = " AND s.camera=?"
+        args.append(cam)
+    ev = _q(db, "SELECT e.door_open_start_ts os, e.door_open_full_ts of, e.door_close_start_ts cs, "
+                "e.close_travel_s ct, e.quality q, e.boarded b, e.alighted a "
+                "FROM gw_event e JOIN gw_source s ON s.id=e.source_id WHERE s.gateway_id=?" + cam_filter, args)
+    tr = _q(db, "SELECT ts, direction FROM transit_event WHERE gateway_id=?" +
+            (" AND cam=?" if cam else ""), ([gw, cam] if cam else [gw]))
+    db.close()
+
+    prof = {h: {"cycles": 0, "boarded": 0, "alighted": 0, "closes": [], "xfer": []} for h in range(24)}
+    days = set()
+    for r in ev:
+        h = _local_hour(r["os"])
+        if h is None:
+            continue
+        days.add((r["os"] or "")[:10])
+        prof[h]["cycles"] += 1                                   # every opening = demand (flagged included)
+        ep = _epoch(r["os"])
+        clean = (r["q"] is None or r["q"] == "ok")
+        if r["ct"] is not None and clean and ep is not None and ep >= _BOUNDARY_EPOCH:
+            prof[h]["closes"].append(float(r["ct"]))             # comparable regime only
+        load = (r["b"] or 0) + (r["a"] or 0)
+        o, c = _epoch(r["of"]), _epoch(r["cs"])
+        if load > 0 and o is not None and c is not None and c > o:
+            prof[h]["xfer"].append((c - o) / load)
+    for r in tr:
+        try:
+            h = datetime.fromtimestamp(r["ts"], IST).hour
+        except Exception:
+            continue
+        prof[h]["boarded" if r["direction"] == "in" else "alighted"] += 1
+
+    ndays = max(1, len(days))
+    profile = [{"hour": h, "cycles": prof[h]["cycles"],
+                "boarded": prof[h]["boarded"], "alighted": prof[h]["alighted"],
+                **{f"close_{k}": v for k, v in _stats(prof[h]["closes"]).items()}} for h in range(24)]
+
+    def window(lo, hi):
+        hrs = [h for h in range(24) if lo <= h < hi]
+        cyc = sum(prof[h]["cycles"] for h in hrs)
+        closes = [v for h in hrs for v in prof[h]["closes"]]
+        xfer = [v for h in hrs for v in prof[h]["xfer"]]
+        bo = sum(prof[h]["boarded"] for h in hrs); al = sum(prof[h]["alighted"] for h in hrs)
+        span = max(1, len(hrs))
+        return {"from": lo, "to": hi, "cycles": cyc, "cycles_per_hr": round(cyc / (span * ndays), 2),
+                "boarded": bo, "alighted": al, "riders_per_hr": round((bo + al) / (span * ndays), 2),
+                "close": _stats(closes), "transfer": {**_stats(xfer), "provisional": True},
+                "transits_per_cycle": round((bo + al) / cyc, 2) if cyc else None}
+
+    windows = {"all_day": window(0, 24), **{k: window(*v) for k, v in PEAK_WINDOWS.items()}}
+    if 0 <= from_h < to_h <= 24:
+        windows["custom"] = window(from_h, to_h)
+    # THE PEAK TRAP made explicit: peak-vs-all-day ratio (a finding in itself)
+    ad = windows["all_day"]["cycles_per_hr"] or 1
+    for k in list(windows):
+        if k != "all_day":
+            windows[k]["demand_ratio_vs_allday"] = round((windows[k]["cycles_per_hr"] or 0) / ad, 2)
+
+    return JSONResponse({"gw": gw, "cam": cam or "fleet", "n_days": ndays, "profile": profile,
+                         "windows": windows,
+                         "boundaries": {"close_travel_max": {"iso": CLOSE_TRAVEL_MAX_BOUNDARY, "epoch": _BOUNDARY_EPOCH,
+                                        "note": "CLOSE_TRAVEL_MAX 10->30s; close-travel here uses the post-boundary regime only"}}})
 
 
 @dash_router.get("/dash", response_class=HTMLResponse)
@@ -292,10 +444,12 @@ a{color:#0a6;text-decoration:none}a:hover{text-decoration:underline}
 .foot{margin-top:14px;font-size:12px}
 </style>
 <h1>liftlab · dash <span class=mut id=stamp></span></h1>
+<div class=tabs id=nav></div>
 <div class=strip id=strip></div>
 <div id=headline></div>
-<div class=tabs id=tabs></div>
-<div id=panel></div>
+<div id=unavail></div>
+<div id=camview><div class=tabs id=tabs></div><div id=panel></div></div>
+<div id=trendview style="display:none"></div>
 <div class=foot mut>deep views: <a href="/ops/__GW__">/ops</a> · <a href="/events">/events</a> ·
   <a href="/validate">/validate</a> · <a href="/pihealth/__GW__">/pihealth</a></div>
 <script>
@@ -336,14 +490,33 @@ function strip(d){
 function headline(d){
   if(!d.headline||!d.headline.length){document.getElementById('headline').innerHTML='';return;}
   var h=d.headline.map(function(x){
-    var obs=(x.median==null)?(x.cam+' door close: no clean close measured yet'):
+    var dl=(x.median==null)?(x.cam+' door close: no clean close measured yet'):
       (x.cam+' door close: observed median <b>'+x.median+'s</b> (p85 '+x.p85+'s, n='+x.n+')'
        +' · sheet assumes <b>'+x.sheet_s.toFixed(2)+'s</b>'
        +' · Bank '+esc(x.bank)+' non-compliant above <b>'+x.compliance_s.toFixed(2)+'s</b>'
        +' · <b class="'+((x.pct_exceed||0)>=50?'bad':'warn')+'">'+esc(x.pct_exceed)+'%</b> of observed closes exceed '+x.compliance_s.toFixed(2)+'s');
-    return '<div class="obs mono">'+obs+'</div>';
-  }).join('');
-  document.getElementById('headline').innerHTML='<div class=headline><h3 class=mut style="margin:0 0 6px;font-size:11px;letter-spacing:.1em;text-transform:uppercase">compliance — assumption beside observation</h3>'+h+'</div>';
+    var out='<div class="obs mono">'+dl+'</div>';
+    // C26 passenger transfer — beside door-close, same format. PROVISIONAL (transit precision).
+    if(x.transfer_sheet_s!=null){
+      var tl=(x.transfer_median==null)?(x.cam+' transfer: no counted cycles yet'):
+        (x.cam+' transfer: observed median <b>'+x.transfer_median+' s/person</b> (n='+x.transfer_n+')'
+         +' · sheet assumes <b>'+x.transfer_sheet_s.toFixed(2)+' s/person</b>');
+      out+='<div class="obs mono">'+tl+'</div>'
+        +'<div class=mut style="font-size:11px">transfer is PROVISIONAL — depends on the transit counts (ch29 80% precision on n=66, re-validating under 11m); firm once ch29 goes live.</div>';
+    }
+    return out;
+  }).join('<hr style="border:none;border-top:1px solid #eee;margin:8px 0">');
+  document.getElementById('headline').innerHTML='<div class=headline><h3 class=mut style="margin:0 0 6px;font-size:11px;letter-spacing:.1em;text-transform:uppercase">compliance — assumption beside observation, no verdict</h3>'+h+'</div>';
+}
+
+function unavail(d){
+  var u=d.unavailable;
+  if(!u){document.getElementById('unavail').innerHTML='';return;}
+  document.getElementById('unavail').innerHTML=
+    '<div class=card style="border-color:#b06a00;background:#fffaf0"><h3 style="color:#b06a00">not available — '+esc(u.reason)+'</h3>'
+    +'<div class=mut style="font-size:12px;margin-bottom:4px">'+esc(u.detail)+' · Tier-1 ceiling. These need per-floor data:</div>'
+    +'<ul style="margin:2px 0 4px 18px;font-size:13px">'+u.blocks.map(function(b){return '<li>'+esc(b)+'</li>'}).join('')+'</ul>'
+    +'<div class=mut style="font-size:12px">unlock: '+esc(u.unlock)+'</div></div>';
 }
 
 function tabs(d){
@@ -413,7 +586,72 @@ function panel(d){
     +'</div></div>';
 }
 
-function render(){ if(!DATA)return; strip(DATA); headline(DATA); tabs(DATA); panel(DATA); }
+var mode='cams', trCam='', TR=null;
+function nav(){
+  document.getElementById('nav').innerHTML=
+    '<div class="tab'+(mode==='cams'?' on':'')+'" onclick="setMode(\'cams\')">Cameras</div>'
+   +'<div class="tab'+(mode==='trends'?' on':'')+'" onclick="setMode(\'trends\')">Trends</div>';
+}
+function setMode(m){mode=m;
+  document.getElementById('camview').style.display=(m==='cams')?'':'none';
+  document.getElementById('trendview').style.display=(m==='trends')?'':'none';
+  nav(); if(m==='trends')loadTrends();
+}
+
+// ---- inline SVG charts (CSP-safe, no libs) ----
+function svgBars(title,hours,vals,color,ref,refLab){
+  var W=560,H=140,pad=30,bot=16, mx=Math.max.apply(null,vals.map(function(v){return v||0}).concat([1]));
+  var bw=(W-2*pad)/vals.length;
+  var bars=vals.map(function(v,i){var bh=(H-14-bot)*(v||0)/mx;return '<rect x="'+(pad+i*bw+0.5)+'" y="'+(H-bot-bh)+'" width="'+(bw-1)+'" height="'+bh+'" fill="'+color+'"></rect>';}).join('');
+  var labs=hours.map(function(h,i){return (h%3===0)?'<text x="'+(pad+i*bw+bw/2)+'" y="'+(H-4)+'" font-size="8" fill="#999" text-anchor="middle">'+h+'</text>':''}).join('');
+  var rl=''; if(ref!=null){var y=H-bot-(H-14-bot)*ref/mx;rl='<line x1="'+pad+'" x2="'+(W-pad)+'" y1="'+y+'" y2="'+y+'" stroke="#c0392b" stroke-dasharray="4 3"></line><text x="'+(W-pad)+'" y="'+(y-2)+'" font-size="9" fill="#c0392b" text-anchor="end">'+refLab+'</text>';}
+  return '<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto"><text x="'+pad+'" y="11" font-size="11" fill="#555">'+esc(title)+'</text>'+rl+bars+labs+'</svg>';
+}
+function svgLine(title,hours,vals,color,ref,refLab){
+  var W=560,H=150,pad=30,bot=16, real=vals.filter(function(v){return v!=null}), mx=Math.max.apply(null,real.concat([ref||1,1]));
+  var bw=(W-2*pad)/vals.length;
+  function xy(v,i){return [pad+i*bw+bw/2, H-bot-(H-14-bot)*v/mx];}
+  var pts=vals.map(function(v,i){return v==null?null:xy(v,i).join(',')}).filter(Boolean).join(' ');
+  var dots=vals.map(function(v,i){if(v==null)return '';var c=xy(v,i);return '<circle cx="'+c[0]+'" cy="'+c[1]+'" r="2" fill="'+color+'"></circle>';}).join('');
+  var rl=''; if(ref!=null){var y=H-bot-(H-14-bot)*ref/mx;rl='<line x1="'+pad+'" x2="'+(W-pad)+'" y1="'+y+'" y2="'+y+'" stroke="#c0392b" stroke-dasharray="4 3"></line><text x="'+(W-pad)+'" y="'+(y-2)+'" font-size="9" fill="#c0392b" text-anchor="end">'+refLab+'</text>';}
+  var labs=hours.map(function(h,i){return (h%3===0)?'<text x="'+(pad+i*bw+bw/2)+'" y="'+(H-4)+'" font-size="8" fill="#999" text-anchor="middle">'+h+'</text>':''}).join('');
+  return '<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto"><text x="'+pad+'" y="11" font-size="11" fill="#555">'+esc(title)+'</text>'+rl+'<polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.5"></polyline>'+dots+labs+'</svg>';
+}
+function winCard(name,w){
+  if(!w)return '';
+  var ratio=(w.demand_ratio_vs_allday!=null)?('  <b class="'+(w.demand_ratio_vs_allday>=1.3?'bad':'')+'">'+w.demand_ratio_vs_allday+'× all-day</b>'):'';
+  return '<div class=card><h3>'+esc(name)+' <span class=mut>'+w.from+':00–'+w.to+':00</span></h3>'
+    +kv('cycles/hr',w.cycles_per_hr+ratio)
+    +kv('close med / p85',(w.close.median==null?'—':w.close.median+'s')+' / '+(w.close.p85==null?'—':w.close.p85+'s')+' (n='+w.close.n+')')
+    +kv('transfer',(w.transfer.median==null?'—':w.transfer.median+' s/pp')+' (n='+w.transfer.n+') *')
+    +kv('riders/hr',w.riders_per_hr)
+    +kv('transits/cycle',w.transits_per_cycle==null?'—':w.transits_per_cycle)+'</div>';
+}
+function trCams(){
+  var cams=(DATA&&DATA.cameras)?DATA.cameras.map(function(c){return c.cam}):[];
+  return '<div class=tabs style="margin-bottom:6px">'
+    +['',].concat(cams).map(function(c){var lbl=c||'fleet';
+       return '<div class="tab'+(trCam===c?' on':'')+'" onclick="trCam=\''+c+'\';loadTrends()">'+esc(lbl)+'</div>';}).join('')+'</div>';
+}
+function renderTrends(){
+  if(!TR){document.getElementById('trendview').innerHTML=trCams()+'<div class=mut>loading…</div>';return;}
+  var prof=TR.profile, hours=prof.map(function(p){return p.hour}), W=TR.windows;
+  var bd=TR.boundaries.close_travel_max.iso.slice(0,10);
+  var h=trCams()
+    +'<div class=mut style="font-size:12px;margin:2px 0 6px">'+esc(TR.cam)+' · '+TR.n_days+' day(s) · close-travel uses the post-'+bd+' regime only (CLOSE_TRAVEL_MAX comparability boundary)</div>'
+    +'<div class=strip>'+winCard('all-day',W.all_day)+winCard('AM peak',W.am_peak)+winCard('PM peak',W.pm_peak)+'</div>'
+    +'<div class=mut style="font-size:11px;margin:2px 0 8px">* transfer PROVISIONAL (transit precision, re-validating). <b>THE PEAK TRAP</b>: the sheet coefficients describe a PEAK design condition, not an all-day average — peak &amp; all-day are shown SEPARATELY; the ratio is itself a finding.</div>'
+    +'<div class=card>'+svgBars('cycles / hour-of-day — the demand curve',hours,prof.map(function(p){return p.cycles}),'#127a3d',null,'')+'</div>'
+    +'<div class=card>'+svgBars('riders (boardings+alightings) / hour-of-day',hours,prof.map(function(p){return p.boarded+p.alighted}),'#2a6db0',null,'')+'</div>'
+    +'<div class=card>'+svgLine('close-travel median / hour-of-day (s)',hours,prof.map(function(p){return p.close_median}),'#b06a00',2.31,'2.31 Bank C')+'</div>';
+  document.getElementById('trendview').innerHTML=h;
+}
+function loadTrends(){
+  renderTrends();  // show selector immediately
+  fetch('/dash/'+GW+'/trends'+(trCam?('?cam='+trCam):'')).then(function(r){return r.json()}).then(function(t){TR=t;renderTrends();}).catch(function(){});
+}
+
+function render(){ if(!DATA)return; nav(); strip(DATA); headline(DATA); unavail(DATA); if(mode==='cams'){tabs(DATA); panel(DATA);} }
 function load(){
   fetch('/dash/'+GW+'/data').then(function(r){return r.json()}).then(function(d){
     DATA=d; document.getElementById('stamp').textContent='· '+d.ist_today+' · updated '+new Date().toLocaleTimeString();
