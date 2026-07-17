@@ -457,22 +457,25 @@ def main():
                         last_transit_ts = t.offset_s
                     except Exception as e:
                         log(f"transit POST failed (no double-count on retry): {e}")
-                    if val_state == "validating":  # capture THIS frame into the door-open episode
-                        now = t.offset_s
-                        if episode and (now - episode["ts_end"] > EPISODE_GAP_S
-                                        or now - episode["ts_start"] > EPISODE_MAX_S):
-                            post_episode(episode, "gap/max"); episode = None
-                        if episode is None:
-                            episode = {"ts_start": now, "ts_end": now, "b": 0, "a": 0, "imgs": [],
-                                       # seed the detection audit from the run-up frames (people are often
-                                       # visible before anyone crosses); then accumulate for the whole open.
-                                       "det_counts": [n for n, _, _ in recent_dets],
-                                       "ids": set(i for _, idt, _ in recent_dets for i in idt),
-                                       "confs": [c for _, _, cfs in recent_dets for c in cfs]}
-                            log(f"episode opened at {now:.0f}")
-                        episode["ts_end"] = now
-                        episode["b" if t.direction == "in" else "a"] += 1
-                        for j in capture_seq(recent, VAL_SEQ_PER_TRANSIT):   # sequence -> direction
+                    # EPISODE = the door-open record, built in BOTH modes. VALIDATING -> attach imagery +
+                    # the detection audit for review (cloud stores 'pending'). LIVE -> NO imagery, no audit
+                    # (the counts are validated -> cloud stores 'auto'); a live camera never makes a review item.
+                    now = t.offset_s
+                    if episode and (now - episode["ts_end"] > EPISODE_GAP_S
+                                    or now - episode["ts_start"] > EPISODE_MAX_S):
+                        post_episode(episode, "gap/max"); episode = None
+                    if episode is None:
+                        _validating = val_state == "validating"
+                        episode = {"ts_start": now, "ts_end": now, "b": 0, "a": 0, "imgs": [],
+                                   # seed the detection audit from the run-up frames — validating only
+                                   "det_counts": [n for n, _, _ in recent_dets] if _validating else [],
+                                   "ids": set(i for _, idt, _ in recent_dets for i in idt) if _validating else set(),
+                                   "confs": [c for _, _, cfs in recent_dets for c in cfs] if _validating else []}
+                        log(f"episode opened at {now:.0f} ({val_state})")
+                    episode["ts_end"] = now
+                    episode["b" if t.direction == "in" else "a"] += 1
+                    if val_state == "validating":   # imagery ONLY when validating (privacy + no review when live)
+                        for j in capture_seq(recent, VAL_SEQ_PER_TRANSIT):
                             if len(episode["imgs"]) < VAL_MAX_IMGS:
                                 episode["imgs"].append(j)
             b, a = ctr.counts()

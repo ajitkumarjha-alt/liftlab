@@ -150,10 +150,20 @@ async def validation_item(gw: str, cam: str, request: Request, authorization: st
     _auth_rw(gw, authorization)
     _safe(gw, cam)
     db = _db()
-    if _state(db, gw, cam) != "validating":
-        db.close()
-        return {"skip": True, "state": "live"}        # confirmed camera: don't accept images
     d = await request.json()
+    if _state(db, gw, cam) != "validating":
+        # LIVE (validated under the CURRENT logic): the counts are trusted, so store an 'auto' record —
+        # counted, NO imagery, provenance is the camera's recorded precision — and NEVER a pending review
+        # item. The transits themselves are already in transit_event/gw_event; this is the door-open audit.
+        db.execute(
+            "INSERT INTO validation_item (gateway_id,cam,ts_start,ts_end,machine_boarded,machine_alighted,"
+            "n_images,counting_version,status,created_at) VALUES (?,?,?,?,?,?,0,?,'auto',?)",
+            (gw, cam, float(d.get("ts_start", 0)), float(d.get("ts_end", 0)),
+             int(d.get("machine_boarded", 0)), int(d.get("machine_alighted", 0)),
+             d.get("counting_version"), time.time()))
+        db.commit()
+        db.close()
+        return {"stored": "auto", "state": "live"}
     cur = db.execute(
         "INSERT INTO validation_item (gateway_id,cam,ts_start,ts_end,machine_boarded,machine_alighted,"
         "n_images,counting_version,det_max,det_mean,distinct_ids,det_frames,conf_min,conf_mean,conf_max,created_at) "
@@ -272,6 +282,20 @@ def validate_page():
     if stale:
         db.execute("UPDATE validation_item SET status='superseded' WHERE status='pending' AND "
                    "(counting_version IS NULL OR counting_version!=?)", (CURRENT_COUNTING_VERSION,))
+        db.commit()
+    # LIVE cameras must NOT have pending review items — they were counted by the validated logic. Any
+    # pending left over from before go-live (or a race) -> 'auto' + drop images (privacy). Self-heals the
+    # queue: a go-live purges its camera's pending here on the next load.
+    live_pending = db.execute(
+        "SELECT vi.id id FROM validation_item vi JOIN camera_validation cv "
+        "ON cv.gateway_id=vi.gateway_id AND cv.cam=vi.cam "
+        "WHERE vi.status='pending' AND cv.state='live' AND cv.counting_version=? AND vi.counting_version=?",
+        (CURRENT_COUNTING_VERSION, CURRENT_COUNTING_VERSION)).fetchall()
+    if live_pending:
+        ids = [r["id"] for r in live_pending]
+        for i in ids:
+            shutil.rmtree(IMG_DIR / str(i), ignore_errors=True)
+        db.execute("UPDATE validation_item SET status='auto' WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)
         db.commit()
     # AUTO-EXPIRE pending episodes whose IMAGERY IS GONE — un-reviewable by construction, so never show a
     # broken <img>. Images are deleted post-verdict/at go-live (privacy); a re-queue, an upload failure,
