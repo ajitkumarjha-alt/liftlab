@@ -282,6 +282,7 @@ class _Runner:
         # held/blocked/reopened) fail the gates -> a systematic hole exactly where MEP-02 needs it.
         self.rejected = []                # in-window distinct rejected openings: (open_start, close_full, reason)
         self.rej_counts = {}              # cumulative reason -> count (never pruned; survives window slide)
+        self.recent_rejections = deque(maxlen=12)   # last N with DIAGNOSTIC values -> status() -> `watch_local status`
         # occupancy (LOAD proxy) — parallel sampler, door pipeline untouched
         self.occ = None                   # CabinCounter (onnx) or None if uncalibrated
         self.occ_samples = deque()        # (offset, cabin_count) while doors-open
@@ -360,6 +361,9 @@ class _Runner:
             "cycles_rejected": sum(self.rej_counts.values()),
             "cycles_rejected_by_reason": dict(self.rej_counts),
             "opens_detected": len(self.cycles) + sum(self.rej_counts.values()),
+            # last few rejections WITH their measured values, so (a) held vs (c) baseline-drift is
+            # readable straight off `watch_local.py status 29` (the child stderr log is the other copy).
+            "recent_rejections": list(self.recent_rejections),
             # last few full cycle timings so CORRECTNESS is eyeball-able off the Pi
             # status file (not just the tier1 aggregates): check close_travel_s ~2-2.5s,
             # dwell_s sane — a stable loop emitting nonsense cycles fails differently
@@ -578,20 +582,39 @@ class _Runner:
             reason = _reject_reason(c)
             if reason is None and _straddles_hole(c, tl.holes):
                 reason = "data_hole"
+            post_med = None
             if reason is None:
-                # the door must have RETURNED TO CLOSED after the close (not a mid-wobble dip):
+                # the door must have RETURNED TO CLOSED after the close (not a mid-wobble dip). NOTE the
+                # SETTLE gate above guarantees the full [close, close+SETTLE] post-window is IN this window
+                # -> a window-boundary artifact (close in the next window) can NEVER produce this reason;
+                # it is only (a) door genuinely still open, or (c) baseline drift (closed_floor gone stale).
                 post = raws[(offs > c.close_full_s) & (offs <= c.close_full_s + SETTLE_S)]
-                if len(post) >= 3 and float(np.median(post)) > self.closed_floor + MOTION_FLOOR:
-                    reason = "not_returned_closed"             # reopened / never settled shut (messy peak)
+                if len(post) >= 3:
+                    post_med = float(np.median(post))
+                    if post_med > self.closed_floor + MOTION_FLOOR:
+                        reason = "not_returned_closed"
             if reason is not None:
                 if not any(_overlaps(c.open_start_s, c.close_full_s, ro, rc) for ro, rc, _ in self.rejected):
                     self.rejected.append((c.open_start_s, c.close_full_s, reason))
                     self.rej_counts[reason] = self.rej_counts.get(reason, 0) + 1
-                    wt = cycle_wall_times(tl, c)["door_open_start"]
-                    self._log(f"[watch ch{self.channel}] cycle REJECT {reason}: "
-                              f"open_travel={c.open_travel_s:.2f} close_travel={c.close_travel_s:.2f} "
-                              f"transfer={c.transfer_s:.2f} plateau={c.plateau:.3f} residual={c.residual:.3f} "
-                              f"@ {wt.strftime('%H:%M:%S')}")
+                    win0 = float(offs[0])
+                    diag = {"reason": reason,
+                            "open_wall": cycle_wall_times(tl, c)["door_open_start"].strftime("%H:%M:%S"),
+                            "open_travel_s": round(c.open_travel_s, 2), "close_travel_s": round(c.close_travel_s, 2),
+                            "transfer_s": round(c.transfer_s, 2),
+                            "open_into_win_s": round(c.open_start_s - win0, 1),      # position in the window
+                            "close_before_win_end_s": round(newest - c.close_full_s, 1),
+                            "win_span_s": round(newest - win0, 1)}
+                    if reason == "not_returned_closed":
+                        # the discriminator: how far ABOVE the closed baseline the "closed" door reads.
+                        # small excess (~MOTION_FLOOR) = baseline DRIFT (c); large = door genuinely HELD (a).
+                        diag.update({"post_med": round(post_med, 1) if post_med is not None else None,
+                                     "closed_floor": round(self.closed_floor, 1),
+                                     "threshold": round(self.closed_floor + MOTION_FLOOR, 1),
+                                     "excess_over_floor": round(post_med - self.closed_floor, 1) if post_med is not None else None,
+                                     "cur_raw": round(float(raws[-1]), 1)})
+                    self.recent_rejections.append(diag)
+                    self._log(f"[watch ch{self.channel}] cycle REJECT {diag}")
                 continue
             # re-measure segment-locally -> deterministic close, then commit the INTERVAL
             commit = self._seg_remeasure(c.open_start_s - SEG_PAD_S, c.close_full_s + SEG_PAD_S)
