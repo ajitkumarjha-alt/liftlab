@@ -225,14 +225,28 @@ def validate_page():
     for c in db.execute("SELECT gateway_id,cam,state,provenance FROM camera_validation ORDER BY gateway_id,cam").fetchall():
         nr, ne = _precision(db, c["gateway_id"], c["cam"])   # derived truth
         cams.append({**dict(c), "n_reviewed": nr, "n_exact": ne})
-    # NEWEST first so the multi-frame episodes surface (old single-image overnight ones were burying
-    # them past the 50-item window, so every reviewable item looked like it had one image).
-    pend = db.execute("SELECT * FROM validation_item WHERE status='pending' ORDER BY id DESC LIMIT 50").fetchall()
+    # PURGE superseded pending: an episode from a DIFFERENT counting version can't be judged for the
+    # current logic and can't count -> presenting it wastes clicks. Mark superseded + delete its
+    # resident images (privacy), so it never appears for review again.
+    stale = db.execute("SELECT id FROM validation_item WHERE status='pending' AND "
+                       "(counting_version IS NULL OR counting_version!=?)", (CURRENT_COUNTING_VERSION,)).fetchall()
+    for r in stale:
+        shutil.rmtree(IMG_DIR / str(r["id"]), ignore_errors=True)
+    if stale:
+        db.execute("UPDATE validation_item SET status='superseded' WHERE status='pending' AND "
+                   "(counting_version IS NULL OR counting_version!=?)", (CURRENT_COUNTING_VERSION,))
+        db.commit()
+    # only CURRENT-version episodes are reviewable; newest first
+    pend = db.execute("SELECT * FROM validation_item WHERE status='pending' AND counting_version=? "
+                      "ORDER BY id DESC LIMIT 50", (CURRENT_COUNTING_VERSION,)).fetchall()
+    npend = db.execute("SELECT COUNT(*) FROM validation_item WHERE status='pending' AND counting_version=?",
+                       (CURRENT_COUNTING_VERSION,)).fetchone()[0]
+    nsup = len(stale)
     db.close()
-    return HTMLResponse(_render(cams, pend))
+    return HTMLResponse(_render(cams, pend, npend, nsup))
 
 
-def _render(cams, pend):
+def _render(cams, pend, npend=0, nsup=0):
     css = """<style>body{margin:0;background:#f6f8fa;color:#1c2429;font:14px/1.5 system-ui,sans-serif}
     header{padding:12px 18px;border-bottom:1px solid #e3e8ec;background:#fff}h1{font-size:16px;margin:0}
     .wrap{max-width:1000px;margin:0 auto;padding:16px}h2{font-size:13px;text-transform:uppercase;color:#6b7a84;letter-spacing:.05em;margin:18px 4px 8px}
@@ -271,11 +285,17 @@ def _render(cams, pend):
                   f'boarded <input type=number name=human_boarded value="{it["machine_boarded"]}"> '
                   f'alighted <input type=number name=human_alighted value="{it["machine_alighted"]}"> '
                   f'<button class=ok type=submit>OK / submit</button></form></div>')
+    empty = (f"<p>nothing to review under counting <b>{CURRENT_COUNTING_VERSION}</b> yet — "
+             f"episodes arrive per door-open from the redeployed GPU. Wait for the queue to fill; "
+             f"don't click into the void.</p>")
+    sup_note = f" · {nsup} superseded (older logic) purged this load" if nsup else ""
     return (f"<!doctype html><meta charset=utf-8><title>validate</title>"
             f"<meta name=viewport content='width=device-width,initial-scale=1'>{css}"
-            f"<header><h1>liftlab · validation</h1></header><div class=wrap>"
+            f"<header><h1>liftlab · validation</h1>"
+            f"<div class=sub style='font:12px ui-monospace,monospace;color:#6b7a84'>reviewing under counting "
+            f"<b>{CURRENT_COUNTING_VERSION}</b> · {npend} episodes pending{sup_note}</div></header><div class=wrap>"
             f"<h2>Cameras</h2>{cam_rows or '<p>no cameras yet</p>'}"
-            f"<h2>Pending review ({len(pend)})</h2>{items or '<p>nothing to review — machine is caught up.</p>'}"
+            f"<h2>Pending review ({npend} on current logic)</h2>{items or empty}"
             f"</div>")
 
 
