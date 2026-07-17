@@ -24,9 +24,13 @@ $PY -m py_compile /tmp/events_api.py || { say "compile failed — aborting"; exi
 # HERE, ingest untouched. Uses a temp copy so $APP/events_api.py is not swapped until smoke passes.
 TMPDIR_S=$(mktemp -d)
 cp /tmp/events_api.py "$TMPDIR_S/events_api.py"
-if ! ( cd "$TMPDIR_S" && sudo -u "$OWNER" $PY -c "from fastapi import FastAPI
+chmod 755 "$TMPDIR_S"; chmod 644 "$TMPDIR_S/events_api.py"   # OWNER (non-root) must be able to READ it
+# sudo resets cwd AND strips the env, so a bare `cd` or inherited PYTHONPATH won't reach the child —
+# pass PYTHONPATH via `env` explicitly (same pattern apply_analysis/apply_watch use). Temp dir first so
+# the NEW events_api wins; $APP on the path so any sibling import still resolves.
+if ! sudo -u "$OWNER" env PYTHONPATH="$TMPDIR_S:$APP" $PY -c "from fastapi import FastAPI
 import events_api
-a=FastAPI(); a.include_router(events_api.events_router); a.openapi(); print('smoke ok')" ); then
+a=FastAPI(); a.include_router(events_api.events_router); a.openapi(); print('smoke ok')"; then
   say "SMOKE-IMPORT FAILED — NOT replacing events_api.py, ingest untouched. Fix the error above."
   rm -rf "$TMPDIR_S"; exit 1
 fi
