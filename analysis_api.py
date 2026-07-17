@@ -99,6 +99,23 @@ def pull_segment(gw: str, cam: str, fname: str, authorization: str = Header(""))
                     headers={"Cache-Control": "no-store, no-cache, max-age=0"})
 
 
+# ---- OCR templates: ONE cloud source of truth (Bearer). Neither box has scp scopes, so the floor-OCR
+# templates are BUILT on the cloud (door_calib --build) into TEMPLATES_DIR and FETCHED by the GPU with
+# the analysis token — same scheme as the segment pull, and the same answer as the zones store. ----
+TEMPLATES_DIR = Path(os.environ.get("TEMPLATES_DIR", "/var/lib/liftlab/templates"))
+
+
+@analysis_router.get("/api/gw/{gw}/templates/{cam}")
+def get_templates(gw: str, cam: str, authorization: str = Header("")):
+    _auth_rw(gw, authorization)
+    _safe(gw, cam)
+    f = TEMPLATES_DIR / gw / f"{cam}.npz"
+    if not f.exists():
+        raise HTTPException(404, "no templates built for this camera yet (run door_calib --build)")
+    return Response(content=f.read_bytes(), media_type="application/octet-stream",
+                    headers={"Cache-Control": "no-store, no-cache, max-age=0"})
+
+
 _GW_COLS = None
 _BACKFILL_LOGGED = False
 

@@ -156,24 +156,30 @@ def ncc(a, b):
     return float((a * b).sum() / d) if d > 1e-6 else 0.0
 
 
-class FloorReader:
-    """Template-match the LED indicator on the WHOLE panel crop. The alphabet is OPEN — any glyph the
-    operator labelled (0-9 AND letters: P1/P2/P3, G, B, LG — a digits-only classifier fails exactly on
-    the lobby/parking floors, which is where the RTT lobby anchor lives). floor is a STRING, not an int.
-    The panel is SEGMENTED on the dark gaps; the RIGHTMOST glyph is the arrow (always present -> travel
-    direction, free for C17/C18), the rest are the floor label. Reads BOTH panels and requires
-    AGREEMENT — disagreement discarded (a confidence no single-panel OCR gets)."""
+BLANK = "blank"
 
-    def __init__(self, templates, min_score=0.55, min_glyph_w=3, gap_frac=0.35, max_glyphs=4,
-                 arrow_labels=ARROWS):
+
+class FloorReader:
+    """FIXED-PITCH GEOMETRIC CELLS — NO segmentation. HEVC at 0.4 Mbps smears the 1-2px gap between
+    adjacent digits, so gap-finding fails on two-digit floors (which is most of a 44-floor tower). But
+    an LED dot-matrix is fixed-pitch by construction: cell positions are KNOWN, not hunted. digit_cells
+    are (x,y,w,h) sub-ROIs WITHIN the panel, left-to-right; arrow_cell likewise. Each cell is cropped
+    BLINDLY and matched; an empty cell matches the learned 'blank' template (single-digit floor ->
+    left cell blank). floor is the STRING of non-blank cell glyphs (OPEN alphabet: digits AND letters
+    P/G/etc). Reads BOTH panels, AGREE-OR-DISCARD. arrow (always present, rightmost) -> direction."""
+
+    def __init__(self, templates, digit_cells, arrow_cell, min_score=0.55, blank_range=40,
+                 arrow_labels=ARROWS, blank_label=BLANK):
         self.templates = {k: np.asarray(v, dtype=np.float32) for k, v in templates.items()}
-        self.arrow_labels = tuple(a for a in arrow_labels if a in self.templates)
-        self.glyph_labels = tuple(k for k in self.templates if k not in self.arrow_labels)  # digits + letters
+        self.digit_cells = list(digit_cells)
+        self.arrow_cell = arrow_cell
         self.min_score = min_score
-        self.min_glyph_w = min_glyph_w        # a bright run narrower than this is noise, not a glyph
-        self.gap_frac = gap_frac              # column brighter than lo+gap_frac*(hi-lo) counts as "lit"
-        self.max_glyphs = max_glyphs          # floor(1-2) + arrow -> up to ~4; more = smear, discard
-        self._tsz = next(iter(self.templates.values())).shape if self.templates else (16, 12)
+        self.blank_range = blank_range        # a cell with max-min brightness below this is BLANK (unlit
+        self.blank_label = blank_label        #   padding cell of a single-digit floor). NCC can't match a
+        self.arrow_labels = tuple(a for a in arrow_labels if a in self.templates)   # flat/dark cell (0 variance).
+        self.glyph_labels = tuple(k for k in self.templates
+                                  if k not in self.arrow_labels and k != self.blank_label)   # lit glyphs only
+        self._tsz = next(iter(self.templates.values())).shape if self.templates else (16, 10)
 
     def _match(self, cell_img, labels):
         import cv2
@@ -189,45 +195,34 @@ class FloorReader:
                     best, bs = lab, s
         return best, bs
 
-    def segment_glyphs(self, reg_gray):
-        """Column-brightness projection -> runs of lit columns = glyphs (variable count, any position)."""
-        col = reg_gray.astype(np.float32).mean(axis=0)
-        rng = float(col.max() - col.min())
-        if rng < 1e-3:
-            return []
-        thr = float(col.min()) + self.gap_frac * rng
-        on = col > thr
-        runs, i, n = [], 0, len(on)
-        while i < n:
-            if on[i]:
-                j = i
-                while j < n and on[j]:
-                    j += 1
-                if j - i >= self.min_glyph_w:
-                    runs.append((i, j))
-                i = j
-            else:
-                i += 1
-        return runs
-
     def read_panel(self, panel_gray):
-        runs = self.segment_glyphs(panel_gray)
-        if len(runs) < 2 or len(runs) > self.max_glyphs:
-            return None                              # need floor-glyph(s) + the (always-present) arrow
-        ax0, ax1 = runs[-1]                          # rightmost glyph = the arrow
-        arrow, arr_s = self._match(panel_gray[:, ax0:ax1], self.arrow_labels)
-        direction = arrow if (arrow is not None and arr_s >= self.min_score) else None
-        chars, scores = [], [arr_s if direction else self.min_score]
-        for (x0, x1) in runs[:-1]:
-            lab, s = self._match(panel_gray[:, x0:x1], self.glyph_labels)
+        chars, scores = [], []
+        for cell in self.digit_cells:                # blind fixed-cell crop, no gap-finding
+            ci = crop(panel_gray, cell)
+            if ci.size == 0:
+                return None
+            if (int(ci.max()) - int(ci.min())) < self.blank_range:
+                continue                             # BLANK padding cell (single-digit floor) -> skip
+            lab, s = self._match(ci, self.glyph_labels)
             if lab is None or s < self.min_score:
-                return None                          # a floor glyph we can't confidently name -> discard
-            chars.append(lab)
+                return None                          # a lit cell we can't confidently name -> discard panel
             scores.append(s)
+            chars.append(lab)                        # non-blank cells, left-to-right = the floor string
         if not chars:
             return None
-        return {"floor": "".join(chars), "direction": direction,   # floor is a STRING ("25","P3","G")
-                "score": round(min(scores), 3), "n_glyphs": len(runs)}
+        direction = None
+        if self.arrow_labels:
+            arrow, arr_s = self._match(crop(panel_gray, self.arrow_cell), self.arrow_labels)
+            if arrow is not None and arr_s >= self.min_score:
+                direction, _ = arrow, scores.append(arr_s)
+        return {"floor": "".join(chars), "direction": direction,   # STRING: "25","P3","G"
+                "score": round(min(scores), 3), "n_cells": len(self.digit_cells)}
+
+    @staticmethod
+    def column_profile(reg_gray):
+        """Per-column mean brightness — the diagnostic that settles whether a gap survives HEVC. A clean
+        two-digit crop shows two bright humps with a dip between; a smeared one shows one broad hump."""
+        return reg_gray.astype(np.float32).mean(axis=0)
 
     def reconcile(self, panel_reads):
         """AGREE-OR-DISCARD across the two panels. Both read + agree on floor -> confident (mean score,
@@ -344,24 +339,42 @@ def _label_to_glyphs(label):
     return glyphs
 
 
-def build_templates(labeled_panels, min_glyph_w=3, gap_frac=0.35, tsz=(16, 12)):
-    """labeled_panels: list of (gray panel crop, label_str). Segment each panel, map the glyph runs
-    left-to-right to the label's glyphs (last = arrow), accumulate per glyph, return {label: mean
-    template}. A crop whose run-count != label-glyph-count is a MIS-SEGMENTATION -> skipped (not a
-    clean example), and how many were used/skipped is returned so calibration is honest."""
+def build_templates(labeled_panels, digit_cells, arrow_cell, tsz=(16, 10),
+                    align="right", blank_label=BLANK):
+    """FIXED-CELL builder (no segmentation). labeled_panels: (gray panel, label_str). For each: parse
+    the label -> floor chars + arrow, ALIGN the chars into the fixed digit_cells (right-aligned pads the
+    LEFT cells with 'blank'), crop each cell BLINDLY and accumulate under its char (or 'blank'), crop
+    arrow_cell under the arrow. Learns every glyph AND 'blank' from known positions -> two-digit floors
+    no longer fail. A label with more floor chars than cells is skipped (honest stats)."""
     import cv2
-    seg = FloorReader({"_": np.zeros(tsz)}, min_glyph_w=min_glyph_w, gap_frac=gap_frac)
     acc, used, skipped = {}, 0, 0
+    n = len(digit_cells)
+
+    def _cell_labels(chars):
+        pad = n - len(chars)
+        if align == "left":
+            return chars + [blank_label] * pad
+        if align == "center":
+            l = pad // 2
+            return [blank_label] * l + chars + [blank_label] * (pad - l)
+        return [blank_label] * pad + chars              # right-aligned (default)
+
     for panel, label in labeled_panels:
         glyphs = _label_to_glyphs(label)
-        runs = seg.segment_glyphs(panel)
-        if len(runs) != len(glyphs) or not glyphs:
+        arrow = glyphs[-1] if glyphs and glyphs[-1] in ARROWS else None
+        floor_chars = glyphs[:-1] if arrow else glyphs
+        if not floor_chars or len(floor_chars) > n:
             skipped += 1
             continue
         used += 1
-        for (x0, x1), g in zip(runs, glyphs):
-            cell = cv2.resize(panel[:, x0:x1], (tsz[1], tsz[0])).astype(np.float32)
-            acc.setdefault(g, []).append(cell)
+        for cell, g in zip(digit_cells, _cell_labels(floor_chars)):
+            if g == blank_label:
+                continue                             # blank padding cell -> nothing to learn (reader detects by brightness)
+            c = cv2.resize(crop(panel, cell), (tsz[1], tsz[0])).astype(np.float32)
+            acc.setdefault(g, []).append(c)
+        if arrow:
+            c = cv2.resize(crop(panel, arrow_cell), (tsz[1], tsz[0])).astype(np.float32)
+            acc.setdefault(arrow, []).append(c)
     templates = {g: np.mean(v, axis=0) for g, v in acc.items()}
     return templates, {"used": used, "skipped": skipped, "glyphs": {g: len(v) for g, v in acc.items()}}
 
@@ -372,6 +385,18 @@ def save_templates(templates, path):
 
 def load_templates(path):
     d = np.load(path)
+    return {k: d[k] for k in d.files}
+
+
+def fetch_templates(url, headers=None, timeout=15):
+    """Fetch a templates.npz over HTTP (Bearer) and load it. The GPU box has NO scp scopes, so it PULLS
+    the cloud-built templates the same way it pulls segments (analysis token) — one cloud source of
+    truth, the same answer as the zones store."""
+    import io as _io
+    import requests
+    r = requests.get(url, headers=headers or {}, timeout=timeout)
+    r.raise_for_status()
+    d = np.load(_io.BytesIO(r.content))
     return {k: d[k] for k in d.files}
 
 

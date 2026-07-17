@@ -28,9 +28,21 @@ DOOR_ROI = [int(x) for x in os.environ.get("DOOR_ROI", "450,0,568,900").split(",
 # The scaled door_roi landed on the LEFT WALL (panel surface), not the leaf — the Pi's brightness
 # scalar tolerates a correlated-but-wrong ROI; edge geometry does NOT. Override in FRAME px and eyeball:
 DOOR_ROI_FRAME = os.environ.get("DOOR_ROI_FRAME", "")    # "x,y,w,h" in 704x576 frame px, used DIRECTLY
-# panel ROIs in FRAME (704x576) px — CONFIRMED tight, both read "6 ^" / "22" and AGREE.
-# panel0 digit x137-147 arrow x150-158 ; panel1 digit x389-399 arrow x402-410 (within the boxes below)
-PANEL_ROIS_DEFAULT = "132,110,34,36;384,40,34,36"
+# panel ROIs in FRAME (704x576) px — CONFIRMED tight, both agree frame-for-frame.
+PANEL_ROIS_DEFAULT = "124,116,51,92;379,44,40,89"
+# FIXED-PITCH cells WITHIN the panel0 crop (x relative to the panel's left edge). No gap segmentation:
+# HEVC smears the 1-2px inter-digit gap, so we crop known cell positions instead. Measure off the
+# _calib_p0 ruler (absolute frame px) minus the panel origin. Set DIGIT_CELLS + ARROW_CELL for --build.
+TEMPLATES_DIR = os.environ.get("TEMPLATES_DIR", "/var/lib/liftlab/templates")
+
+
+def _parse_cells(s):
+    out = []
+    for part in (s or "").split(";"):
+        part = part.strip()
+        if part:
+            out.append(tuple(int(v) for v in part.split(",")))
+    return out
 
 
 def _panel_rois():
@@ -151,13 +163,19 @@ def main():
             raise SystemExit("need _calib_crop_*.png (run --collect first) and --labels '7^,8^,...' (or LABELS env)")
         if len(crops) != len(labels):
             raise SystemExit(f"{len(crops)} crops but {len(labels)} labels — must be 1:1 row-major (relabel the montage)")
+        dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
+        acell = _parse_cells(os.environ.get("ARROW_CELL", ""))
+        if not dcells or not acell:
+            raise SystemExit("FIXED CELLS required (no segmentation): DIGIT_CELLS='x,y,w,h;x,y,w,h' ARROW_CELL='x,y,w,h' "
+                             "— WITHIN-PANEL px (read off _calib_p0 ruler, subtract the panel's left x). Left-to-right.")
         labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in zip(crops, labels)]
-        tpl, stats = gd.build_templates(labeled)
-        outp = os.environ.get("TEMPLATES_OUT", f"/tmp/templates_{CAM}.npz")
+        tpl, stats = gd.build_templates(labeled, dcells, acell[0], align=os.environ.get("ALIGN", "right"))
+        outp = os.environ.get("TEMPLATES_OUT", os.path.join(TEMPLATES_DIR, GW, f"{CAM}.npz"))
+        os.makedirs(os.path.dirname(outp), exist_ok=True)
         gd.save_templates(tpl, outp)
         print(f"[build] {stats}")
-        print(f"[build] wrote {len(tpl)} glyph templates -> {outp}")
-        print(f"[build] place it where the GPU reads it (GPU_DOOR_TEMPLATES env) — scp for now, zones store later.")
+        print(f"[build] wrote {len(tpl)} templates -> {outp}")
+        print(f"[build] the GPU fetches it (no scp needed): GET {CLOUD}/api/gw/{GW}/templates/{CAM}  (Bearer analysis token)")
         return
 
     fr = newest_frame()
