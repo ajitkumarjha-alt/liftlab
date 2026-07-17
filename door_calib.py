@@ -24,9 +24,12 @@ CLOUD = os.environ.get("CLOUD_URL", "https://lift.gargi.online").rstrip("/")
 LIVE_DIR = Path(os.environ.get("LIVE_DIR", "/dev/shm/liftlab-live"))
 SNAP_DIR = Path(os.environ.get("SNAP_DIR", "/run/liftlab-snap"))
 CALIB_WH = (int(os.environ.get("CALIB_W", "1920")), int(os.environ.get("CALIB_H", "1080")))
-DOOR_ROI = [int(x) for x in os.environ.get("DOOR_ROI", "450,0,568,900").split(",")]      # CALIB space
-# panel ROIs are in FRAME (704x576) pixels — confirmed to read "25 v" on the sub
-PANEL_ROIS_DEFAULT = "120,108,40,30;375,38,40,30"
+DOOR_ROI = [int(x) for x in os.environ.get("DOOR_ROI", "450,0,568,900").split(",")]      # CALIB space (scaled)
+# The scaled door_roi landed on the LEFT WALL (panel surface), not the leaf — the Pi's brightness
+# scalar tolerates a correlated-but-wrong ROI; edge geometry does NOT. Override in FRAME px and eyeball:
+DOOR_ROI_FRAME = os.environ.get("DOOR_ROI_FRAME", "")    # "x,y,w,h" in 704x576 frame px, used DIRECTLY
+# panel ROIs in FRAME (704x576) px — confirmed to read "22 ^" and AGREE (nudged off the clipping boxes)
+PANEL_ROIS_DEFAULT = "126,112,42,34;378,42,42,34"
 
 
 def _panel_rois():
@@ -80,18 +83,35 @@ def newest_frame():
     return _newest_frame_http()
 
 
-def _ruler(crop_bgr, factor=12):
-    """Upscale a panel crop and draw a labelled 5-px grid (in SOURCE coords) so the operator can read
-    off digit-cell x/y boundaries to define digit_cells within the panel."""
+def _ruler(crop_bgr, factor=12, step=5, x0=0, y0=0):
+    """Upscale a crop + draw a labelled grid in SOURCE (frame) coords so the operator reads exact
+    x/y boundaries. x0/y0 offset the labels to the crop's position in the full frame (so the numbers
+    are absolute frame px, ready to type into DOOR_ROI_FRAME / PANEL_ROIS)."""
     import cv2
     h, w = crop_bgr.shape[:2]
     big = cv2.resize(crop_bgr, (w * factor, h * factor), interpolation=cv2.INTER_NEAREST)
-    for x in range(0, w + 1, 5):
+    for x in range(0, w + 1, step):
         cv2.line(big, (x * factor, 0), (x * factor, h * factor), (0, 200, 0), 1)
-        cv2.putText(big, str(x), (x * factor + 1, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 200, 0), 1)
-    for y in range(0, h + 1, 5):
+        cv2.putText(big, str(x0 + x), (x * factor + 1, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 200, 0), 1)
+    for y in range(0, h + 1, step):
         cv2.line(big, (0, y * factor), (w * factor, y * factor), (0, 120, 0), 1)
+        cv2.putText(big, str(y0 + y), (1, y * factor + 9), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 120, 0), 1)
     return big
+
+
+def _frame_grid(img, step=40):
+    """Faint labelled coordinate grid on the full frame, so the leaf seam (~x340-380) and the door
+    box can be read off directly."""
+    import cv2
+    out = img.copy()
+    H, W = out.shape[:2]
+    for x in range(0, W, step):
+        cv2.line(out, (x, 0), (x, H), (60, 60, 60), 1)
+        cv2.putText(out, str(x), (x + 1, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 60), 1)
+    for y in range(0, H, step):
+        cv2.line(out, (0, y), (W, y), (60, 60, 60), 1)
+        cv2.putText(out, str(y), (1, y + 9), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 60), 1)
+    return out
 
 
 def main():
@@ -106,16 +126,25 @@ def main():
     if fr is None:
         raise SystemExit(f"no frame: no segments in {LIVE_DIR/GW/CAM} and HTTP fallback empty")
     H, W = fr.shape[:2]
-    droi = gd.scale_roi(DOOR_ROI, CALIB_WH, (W, H))
+    if DOOR_ROI_FRAME:
+        droi = tuple(int(v) for v in DOOR_ROI_FRAME.split(","))    # frame px, used DIRECTLY (nudgeable)
+        dsrc = f"DOOR_ROI_FRAME={droi}"
+    else:
+        droi = gd.scale_roi(DOOR_ROI, CALIB_WH, (W, H))            # scaled (lands on the wall — override it)
+        dsrc = f"scaled from calib {DOOR_ROI} -> {droi}  (WRONG surface: set DOOR_ROI_FRAME to the leaf)"
     prois = _panel_rois()
-    ann = gd.overlay_rois(fr, [droi] + list(prois), ["door"] + [f"p{i}" for i in range(len(prois))])
+    ann = _frame_grid(gd.overlay_rois(fr, [tuple(droi)] + list(prois),
+                                      ["door"] + [f"p{i}" for i in range(len(prois))]))
     cv2.imwrite(str(outdir / "_calib_frame.jpg"), ann)
+    cv2.imwrite(str(outdir / "_calib_door.jpg"),
+                _ruler(gd.crop(fr, droi), factor=3, step=20, x0=droi[0], y0=droi[1]))
     for i, pr in enumerate(prois):
-        cv2.imwrite(str(outdir / f"_calib_p{i}.jpg"), _ruler(gd.crop(fr, pr)))
-    print(f"[calib] frame {W}x{H}; door_roi(scaled)={droi}; panels(frame px)={prois}")
-    print(f"[calib] view:  {CLOUD}/snap/{GW}/_calib_frame.jpg")
+        cv2.imwrite(str(outdir / f"_calib_p{i}.jpg"), _ruler(gd.crop(fr, pr), x0=pr[0], y0=pr[1]))
+    print(f"[calib] frame {W}x{H}; door_roi={droi}  [{dsrc}]; panels(frame px)={prois}")
+    print(f"[calib] view:  {CLOUD}/snap/{GW}/_calib_frame.jpg   (40px grid -> find the leaf seam, read the door box)")
+    print(f"[calib]        {CLOUD}/snap/{GW}/_calib_door.jpg    (door_roi crop, ruler in absolute frame px)")
     for i in range(len(prois)):
-        print(f"[calib]        {CLOUD}/snap/{GW}/_calib_p{i}.jpg   (ruler in SOURCE px -> read digit-cell x/y)")
+        print(f"[calib]        {CLOUD}/snap/{GW}/_calib_p{i}.jpg   (panel{i}, ruler in absolute frame px)")
 
     if a.collect:
         # montage of panel crops over time (upscaled) -> read floors off ONE viewable image
