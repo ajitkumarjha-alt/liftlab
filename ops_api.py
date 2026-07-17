@@ -90,6 +90,23 @@ def snap_jpg(gw: str, cam: str):
                     headers={"Cache-Control": "no-store, no-cache, max-age=0"})
 
 
+# DURABLE calibration files (door_calib writes crops + renders here — NOT /run tmpfs, which only holds
+# the ephemeral live snapshots and got wiped on a service restart, taking the --build source crops with
+# it). Read-only serve, behind Caddy basicauth like /snap.
+CALIB_DIR = Path(os.environ.get("CALIB_DIR", "/var/lib/liftlab/calib"))
+_CT_CALIB = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+
+
+@ops_router.get("/calib/{gw}/{cam}/{fname}")
+def calib_file(gw: str, cam: str, fname: str):
+    _safe(gw, cam, fname)
+    f = CALIB_DIR / gw / cam / fname
+    if not f.exists():
+        raise HTTPException(404, "no calib file (run door_calib on the cloud)")
+    return Response(f.read_bytes(), media_type=_CT_CALIB.get(f.suffix.lower(), "application/octet-stream"),
+                    headers={"Cache-Control": "no-store, no-cache, max-age=0"})
+
+
 SNAP_STALE_S = float(os.environ.get("SNAP_STALE_S", "20"))   # NVR->Pi->2s HLS cut->upload->decode
                                                             # is 6-12s normally; only flag past 20s
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """door/floor CALIBRATION (steps 1-2). RUNS ON liftlab-cloud (no token, no network hop): reads the
-segments already in /dev/shm/liftlab-live/site-A/ch29/ and writes web-viewable crops into the snap
-dir, so the output appears at lift.gargi.online/snap/site-A/_calib_*.jpg . Names are '_'-prefixed:
-directly servable but EXCLUDED from the /ops grid. Read-only; posts nothing; never touches gw_event.
+segments already in /dev/shm/liftlab-live/site-A/ch29/ and writes crops + renders to the DURABLE calib
+dir (/var/lib/liftlab/calib, NOT /run tmpfs — the --build source crops must survive a service restart),
+served read-only at lift.gargi.online/calib/site-A/ch29/_calib_*.jpg . Posts nothing; never touches gw_event.
 
   sudo -E /opt/liftlab-analysis/.venv/bin/python door_calib.py                 # confirm ROIs (1 frame)
   sudo -E /opt/liftlab-analysis/.venv/bin/python door_calib.py --collect 40    # montage over 40 frames
 Override boxes:  PANEL_ROIS="x,y,w,h;x,y,w,h"   DOOR_ROI="450,0,568,900"  (door_roi is CALIB space)
-View:  https://lift.gargi.online/snap/site-A/_calib_frame.jpg  (and _calib_p0 / _calib_p1 / _calib_glyphs)
+View:  https://lift.gargi.online/calib/site-A/ch29/_calib_frame.jpg  (and _calib_p0 / _calib_p1 / _calib_glyphs)
 """
 import argparse
 import glob
@@ -22,7 +22,9 @@ GW = os.environ.get("GW", "site-A")
 CAM = os.environ.get("CAM", "ch29")
 CLOUD = os.environ.get("CLOUD_URL", "https://lift.gargi.online").rstrip("/")
 LIVE_DIR = Path(os.environ.get("LIVE_DIR", "/dev/shm/liftlab-live"))
-SNAP_DIR = Path(os.environ.get("SNAP_DIR", "/run/liftlab-snap"))
+# DURABLE calibration dir — NOT /run (tmpfs): the --build source crops must survive a service restart
+# (an apply_* deploy wiped them from RAM once). Served (read-only) at /calib/{gw}/{cam}/ by ops_api.
+CALIB_DIR = Path(os.environ.get("CALIB_DIR", "/var/lib/liftlab/calib"))
 CALIB_WH = (int(os.environ.get("CALIB_W", "1920")), int(os.environ.get("CALIB_H", "1080")))
 DOOR_ROI = [int(x) for x in os.environ.get("DOOR_ROI", "450,0,568,900").split(",")]      # CALIB space (scaled)
 # The scaled door_roi landed on the LEFT WALL (panel surface), not the leaf — the Pi's brightness
@@ -153,7 +155,7 @@ def main():
     ap.add_argument("--labels", default="", help="row-major floor labels, e.g. '7^,8^,12^,...,P3v,6v'")
     a = ap.parse_args()
     nframes = max(a.collect, a.frames)
-    outdir = SNAP_DIR / GW
+    outdir = CALIB_DIR / GW / CAM           # DURABLE (survives restart); served at /calib/{gw}/{cam}/
     outdir.mkdir(parents=True, exist_ok=True)
 
     if a.build:
@@ -197,10 +199,10 @@ def main():
     for i, pr in enumerate(prois):
         cv2.imwrite(str(outdir / f"_calib_p{i}.jpg"), _ruler(gd.crop(fr, pr), x0=pr[0], y0=pr[1]))
     print(f"[calib] frame {W}x{H}; door_roi={droi}  [{dsrc}]; panels(frame px)={prois}")
-    print(f"[calib] view:  {CLOUD}/snap/{GW}/_calib_frame.jpg   (40px grid -> find the leaf seam, read the door box)")
-    print(f"[calib]        {CLOUD}/snap/{GW}/_calib_door.jpg    (door_roi crop, ruler in absolute frame px)")
+    print(f"[calib] view:  {CLOUD}/calib/{GW}/{CAM}/_calib_frame.jpg   (40px grid -> find the leaf seam, read the door box)")
+    print(f"[calib]        {CLOUD}/calib/{GW}/{CAM}/_calib_door.jpg    (door_roi crop, ruler in absolute frame px)")
     for i in range(len(prois)):
-        print(f"[calib]        {CLOUD}/snap/{GW}/_calib_p{i}.jpg   (panel{i}, ruler in absolute frame px)")
+        print(f"[calib]        {CLOUD}/calib/{GW}/{CAM}/_calib_p{i}.jpg   (panel{i}, ruler in absolute frame px)")
 
     if nframes:
         # Time-ordered montages over N distinct segments. Panels -> read the floors. DOOR -> the leaf
@@ -229,11 +231,11 @@ def main():
             m = _montage(ts, cols=5, factor=8)
             if m is not None:
                 cv2.imwrite(str(outdir / f"_calib_glyphs{i}.jpg"), m)
-                print(f"[calib] panel{i}: {len(ts)} crops -> {CLOUD}/snap/{GW}/_calib_glyphs{i}.jpg  (floors row-major)")
+                print(f"[calib] panel{i}: {len(ts)} crops -> {CLOUD}/calib/{GW}/{CAM}/_calib_glyphs{i}.jpg  (floors row-major)")
         md = _montage(doors, cols=6, factor=2)
         if md is not None:
             cv2.imwrite(str(outdir / "_calib_doormap.jpg"), md)
-            print(f"[calib] door: {len(doors)} crops -> {CLOUD}/snap/{GW}/_calib_doormap.jpg  "
+            print(f"[calib] door: {len(doors)} crops -> {CLOUD}/calib/{GW}/{CAM}/_calib_doormap.jpg  "
                   f"(edge should SWEEP columns shut<->open; if it never moves, the box is on a fixed jamb/wall)")
 
 
