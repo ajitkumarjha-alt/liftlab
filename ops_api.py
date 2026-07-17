@@ -242,9 +242,11 @@ function proc(an){
   var bud=an.seg_budget_ms||2000,ratio=an.proc_ms/bud;
   var c=ratio>=1?'bad':ratio>=0.8?'warn':'ok';
   var bound=(an.fetch_ms!=null&&an.track_ms!=null)?(an.fetch_ms>an.track_ms?'fetch-bound':'compute-bound'):'';
-  var out=kv('proc/seg',Math.round(an.proc_ms)+'ms / '+Math.round(bud)+'ms  ('+ratio.toFixed(2)+'x '+(ratio>=1?'OVER':'ok')+')',c);
+  var out=kv('throughput/seg',Math.round(an.proc_ms)+'ms / '+Math.round(bud)+'ms  ('+ratio.toFixed(2)+'x '+(ratio>=1?'OVER':'ok')+')'+(an.analyze_fps?'  @'+an.analyze_fps+'fps':''),c);
   if(an.fetch_ms!=null)
     out+=kv('  └ fetch/decode/track',Math.round(an.fetch_ms)+' / '+Math.round(an.decode_ms||0)+' / '+Math.round(an.track_ms||0)+'ms  '+bound);
+  if(an.connect_ms!=null)  // connect~0 = keep-alive working (the 952ms handshake fix); high = still handshaking
+    out+=kv('  └ fetch = connect+transfer',Math.round(an.connect_ms)+' + '+Math.round(an.transfer_ms||0)+'ms',(an.connect_ms>200?'warn':'ok'));
   // drop rate is the gate's verdict: computed here from stored counters (works even for old rows)
   var tot=(an.segments||0)+(an.dropped||0);
   var dfrac=an.drop_frac!=null?an.drop_frac:(tot?an.dropped/tot:0);

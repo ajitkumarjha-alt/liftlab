@@ -42,7 +42,13 @@ VAL_SEQ_PER_TRANSIT = int(os.environ.get("VAL_SEQ_PER_TRANSIT", "3"))  # frames 
 FRAME_BUF = int(os.environ.get("FRAME_BUF", "40"))        # ring of recent frames (~1.6s @25fps)
 MAX_BEHIND = int(os.environ.get("MAX_BEHIND", "3"))        # if >this new segs queued, jump to live edge
 HEARTBEAT_S = float(os.environ.get("HEARTBEAT_S", "30"))   # analyzer heartbeat to the cloud
-SEG_BUDGET_MS = float(os.environ.get("SEG_DUR_S", "2")) * 1000   # real-time budget: one segment's worth of wall time
+SEG_DUR_S = float(os.environ.get("SEG_DUR_S", "2"))
+SEG_BUDGET_MS = SEG_DUR_S * 1000                 # real-time budget: one segment's worth of wall time
+PREFETCH_N = int(os.environ.get("PREFETCH_N", "2"))   # fetch this many segments AHEAD while tracking (overlap)
+# ANALYZE_FPS: subsample decoded frames before tracking. 0/unset = process EVERY frame (~25fps, current
+# behavior). The 7-cam fleet needs ~10fps/cam to fit the GPU (see re-bench). CHANGING THIS CHANGES WHAT
+# GETS COUNTED (tracking continuity / dwell) -> it is a COUNTING_VERSION bump; don't touch mid-validation.
+ANALYZE_FPS = float(os.environ.get("ANALYZE_FPS", "0"))
 CALIB_W, CALIB_H = 1920, 1080
 ZONE_CABIN = [[630, 870], [932, 747], [1042, 733], [1308, 1056], [587, 1056], [548, 914]]
 ZONE_LANDING = [[514, 394], [834, 322], [722, 529], [732, 684], [761, 776], [618, 827]]
@@ -54,10 +60,43 @@ def log(m):
     print(f"[gpu-analyze] {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {m}", flush=True)
 
 
+# Pooled keep-alive session: urllib does a fresh TCP+TLS handshake PER segment (~3-4 RTTs of setup
+# before a byte moves) — that is the 952ms fetch. requests.Session reuses the connection, so connect
+# collapses to ~0 after the first. Degrade to urllib if requests is somehow absent (never crash the run).
+try:
+    import requests as _requests
+    _SESSION = _requests.Session()
+    _SESSION.headers.update(HDRS)
+    _HAS_SESSION = True
+except Exception:
+    _SESSION = None
+    _HAS_SESSION = False
+
+
 def http_get(url, timeout=15):
+    return http_get_timed(url, timeout)[0]
+
+
+def http_get_timed(url, timeout=15):
+    """Fetch bytes + split the cost: (body, connect_ms, transfer_ms). connect_ms = time to response
+    headers (TCP+TLS+TTFB) — with keep-alive it drops to ~0 on a reused connection, which is the whole
+    point; transfer_ms = body read. Non-2xx -> urllib.error.HTTPError so the caller's 404 path is unchanged."""
+    if _HAS_SESSION:
+        t0 = time.time()
+        r = _SESSION.get(url, timeout=timeout, stream=True)   # returns once headers are in
+        t1 = time.time()
+        if r.status_code >= 400:
+            code = r.status_code
+            r.close()
+            raise urllib.error.HTTPError(url, code, "http error", None, None)
+        body = r.content                                       # read the body
+        t2 = time.time()
+        return body, (t1 - t0) * 1000, (t2 - t1) * 1000
+    t0 = time.time()
     req = urllib.request.Request(url, headers=HDRS)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    with urllib.request.urlopen(req, timeout=timeout) as r:   # no pooling: whole fetch counts as transfer
+        body = r.read()
+    return body, 0.0, (time.time() - t0) * 1000
 
 
 def http_post_json(url, obj, timeout=10):
@@ -242,11 +281,24 @@ def main():
     # is attributable — at ~7% GPU util the cost is FETCH (cross-region pull + retention window), NOT
     # compute, and fetch is fixable (deeper cloud retention + prefetch) while compute is not. drop_frac
     # / drop_rate quantify how often a 2s segment is lost (mid-close = a silently wrong door event).
-    proc_times = deque(maxlen=60)                 # rolling per-segment TOTAL ms (fetch+decode+track+post)
-    fetch_times = deque(maxlen=60)                # rolling cross-region pull ms  (the suspected bottleneck)
+    proc_times = deque(maxlen=60)                 # rolling per-segment NON-OVERLAPPED wall ms (the throughput cost)
+    fetch_times = deque(maxlen=60)                # rolling fetch DURATION ms (overlapped w/ track via prefetch)
+    connect_times = deque(maxlen=60)              # rolling connect ms (TCP+TLS+TTFB) — ~0 with keep-alive = fixed
+    transfer_times = deque(maxlen=60)             # rolling body-transfer ms
     decode_times = deque(maxlen=60)               # rolling HEVC decode ms
     track_times = deque(maxlen=60)                # rolling YOLO track ms         (the only true GPU-compute cost)
     last_timing_log = 0.0
+    from concurrent.futures import ThreadPoolExecutor
+    fetch_ex = ThreadPoolExecutor(max_workers=max(2, PREFETCH_N + 1), thread_name_prefix="prefetch")
+    prefetched = {}                               # name -> Future(http_get_timed) — fetch N+1 while tracking N
+    def _prefetch(nm):
+        if nm not in prefetched:
+            prefetched[nm] = fetch_ex.submit(http_get_timed, f"{BASE}/{nm}")
+    log(f"fetch: {'pooled keep-alive (requests)' if _HAS_SESSION else 'urllib (NO pooling)'}, "
+        f"prefetch={PREFETCH_N} ahead; analyze_fps={'all(~25)' if ANALYZE_FPS<=0 else ANALYZE_FPS}")
+    if ANALYZE_FPS > 0:
+        log(f"WARNING: ANALYZE_FPS={ANALYZE_FPS} subsamples frames -> changes what gets counted. "
+            f"COUNTING_VERSION must reflect this (comparability boundary); current={counting.COUNTING_VERSION}")
     log(f"validation mode: {val_state}")
 
     def _mean(d):
@@ -263,8 +315,9 @@ def main():
                             "rej_in": rej_in, "rej_out": rej_out,
                             "rej_hist": ",".join(str(x) for x in rej_hist),
                             "proc_ms": _mean(proc_times), "fetch_ms": _mean(fetch_times),
+                            "connect_ms": _mean(connect_times), "transfer_ms": _mean(transfer_times),
                             "decode_ms": _mean(decode_times), "track_ms": _mean(track_times),
-                            "seg_budget_ms": SEG_BUDGET_MS,
+                            "seg_budget_ms": SEG_BUDGET_MS, "analyze_fps": ANALYZE_FPS or None,
                             # the two gate numbers (since process start): fraction of segments lost, and
                             # a per-hour drop rate. dropped mid-close = a lost/wrong door event.
                             "drop_frac": round(dropped / _tot, 4) if _tot else 0.0,
@@ -294,10 +347,16 @@ def main():
         if time.time() - last_drop_log > 60:
             log(f"segment lag={lag} behind live, dropped_total={dropped} (skipped-to-live + pruned)")
             last_drop_log = time.time()
-        for name in new:
-            seg_t0 = time.time()                  # wall clock for the WHOLE segment (fetch+decode+track+post)
+        for s in new[:PREFETCH_N]:                # PRIME the pipeline: kick the first fetches concurrently
+            _prefetch(s)
+        for idx, name in enumerate(new):
+            nxt = idx + PREFETCH_N                 # keep the pipeline full: fetch PREFETCH_N ahead
+            if nxt < len(new):
+                _prefetch(new[nxt])
+            seg_t0 = time.time()                  # measured AFTER prefetch: captures NON-OVERLAPPED work
+            _prefetch(name)                        # (no-op if already prefetched)
             try:
-                data = http_get(f"{BASE}/{name}")
+                data, connect_ms, transfer_ms = prefetched.pop(name).result()
             except urllib.error.HTTPError as e:
                 if e.code == 404:                 # pruned off the rolling window before we fetched it
                     seen.add(name); dropped += 1
@@ -305,7 +364,7 @@ def main():
                 log(f"segment {name} HTTP {e.code}"); continue
             except Exception as e:
                 log(f"segment {name} fetch failed: {type(e).__name__}: {e}"); continue
-            fetch_ms = (time.time() - seg_t0) * 1000        # cross-region pull cost
+            fetch_ms = connect_ms + transfer_ms   # fetch DURATION (ran overlapped w/ the prior track)
             dec_t0 = time.time()
             frames = decode_segment(data)
             decode_ms = (time.time() - dec_t0) * 1000       # HEVC decode cost
@@ -321,7 +380,14 @@ def main():
             before = len(ctr.transits)
             seg_wall = time.time()                # approx wall time of this segment's arrival
             n_fr = len(frames)
+            # ANALYZE_FPS subsampling: track every `stride`-th frame. 0/unset -> stride 1 (all frames,
+            # current behavior). Cuts the dominant track cost ~proportionally to enable the 7-cam fleet.
+            stride = 1
+            if ANALYZE_FPS > 0 and n_fr > 0:
+                stride = max(1, round((n_fr / SEG_DUR_S) / ANALYZE_FPS))
             for i, fr in enumerate(frames):
+                if i % stride != 0:
+                    continue                      # subsampled out (analyze_fps); keeps decode, skips track
                 if val_state == "validating":
                     recent.append(fr)             # buffer frames so a transit can grab a sequence
                 tr_t0 = time.time()
@@ -380,20 +446,23 @@ def main():
             b, a = ctr.counts()
             if len(ctr.transits) > before:
                 log(f"{name}: +{len(ctr.transits)-before} transits (cum boarded={b} alighted={a}, posted={posted})")
-            seg_ms = (time.time() - seg_t0) * 1000
+            seg_ms = (time.time() - seg_t0) * 1000          # NON-OVERLAPPED wall: max(fetch_wait, 0)+decode+track+post
             proc_times.append(seg_ms); track_times.append(track_ms)
             fetch_times.append(fetch_ms); decode_times.append(decode_ms)
+            connect_times.append(connect_ms); transfer_times.append(transfer_ms)
             if time.time() - last_timing_log > 30 and proc_times:
                 pm = sum(proc_times) / len(proc_times); tm = sum(track_times) / len(track_times)
                 fm = sum(fetch_times) / len(fetch_times); dm = sum(decode_times) / len(decode_times)
+                cm = sum(connect_times) / len(connect_times); xm = sum(transfer_times) / len(transfer_times)
                 ratio = pm / SEG_BUDGET_MS
                 _tot = segments + dropped
                 dfrac = dropped / _tot if _tot else 0.0
                 verdict = "OVER-BUDGET (cannot keep pace)" if ratio > 1.0 else "within budget"
-                bound = "FETCH-bound (fixable: retention+prefetch)" if fm > tm else "COMPUTE-bound (GPU)"
-                log(f"seg timing: avg_total={pm:.0f}ms [fetch={fm:.0f} decode={dm:.0f} track={tm:.0f}] "
-                    f"vs budget={SEG_BUDGET_MS:.0f}ms -> {ratio:.2f}x {verdict}; {bound}; "
-                    f"drop_frac={dfrac:.3%} dropped_total={dropped}")
+                bound = "FETCH-bound" if fm > tm else "COMPUTE-bound (GPU)"
+                # fetch split proves the fix: connect~0 => keep-alive working, cost is transfer; connect high => still handshaking
+                log(f"seg timing: throughput={pm:.0f}ms (was fetch+track serial) [decode={dm:.0f} track={tm:.0f} n={n_fr}fr] "
+                    f"vs budget={SEG_BUDGET_MS:.0f}ms -> {ratio:.2f}x {verdict}; {bound} "
+                    f"fetch={fm:.0f}ms[connect={cm:.0f} transfer={xm:.0f}]; drop_frac={dfrac:.3%} dropped_total={dropped}")
                 last_timing_log = time.time()
             seen.add(name)
         # close a stale validation episode (door shut) + refresh this cam's mode periodically
