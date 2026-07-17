@@ -157,21 +157,22 @@ def ncc(a, b):
 
 
 class FloorReader:
-    """Template-match the LED indicator. Floors are 1-2 (or more) digits, so digit cells are NOT fixed:
-    the digit_region is SEGMENTED on the dark gaps between glyphs (column-brightness projection) and
-    each glyph run is classified — so 6, 22, 42 all read. arrow_cell is a fixed rightmost sub-ROI.
-    Reads BOTH panels and requires AGREEMENT — disagreement is discarded (a confidence no single-panel
-    OCR gets). arrow -> travel direction. digit_region/arrow_cell are (x,y,w,h) WITHIN a panel crop."""
+    """Template-match the LED indicator on the WHOLE panel crop. The alphabet is OPEN — any glyph the
+    operator labelled (0-9 AND letters: P1/P2/P3, G, B, LG — a digits-only classifier fails exactly on
+    the lobby/parking floors, which is where the RTT lobby anchor lives). floor is a STRING, not an int.
+    The panel is SEGMENTED on the dark gaps; the RIGHTMOST glyph is the arrow (always present -> travel
+    direction, free for C17/C18), the rest are the floor label. Reads BOTH panels and requires
+    AGREEMENT — disagreement discarded (a confidence no single-panel OCR gets)."""
 
-    def __init__(self, templates, digit_region, arrow_cell=None, min_score=0.55,
-                 min_glyph_w=3, gap_frac=0.35, max_digits=3):
+    def __init__(self, templates, min_score=0.55, min_glyph_w=3, gap_frac=0.35, max_glyphs=4,
+                 arrow_labels=ARROWS):
         self.templates = {k: np.asarray(v, dtype=np.float32) for k, v in templates.items()}
-        self.digit_region = digit_region
-        self.arrow_cell = arrow_cell
+        self.arrow_labels = tuple(a for a in arrow_labels if a in self.templates)
+        self.glyph_labels = tuple(k for k in self.templates if k not in self.arrow_labels)  # digits + letters
         self.min_score = min_score
         self.min_glyph_w = min_glyph_w        # a bright run narrower than this is noise, not a glyph
         self.gap_frac = gap_frac              # column brighter than lo+gap_frac*(hi-lo) counts as "lit"
-        self.max_digits = max_digits          # >this many runs -> not a clean read, discard
+        self.max_glyphs = max_glyphs          # floor(1-2) + arrow -> up to ~4; more = smear, discard
         self._tsz = next(iter(self.templates.values())).shape if self.templates else (16, 12)
 
     def _match(self, cell_img, labels):
@@ -189,8 +190,7 @@ class FloorReader:
         return best, bs
 
     def segment_glyphs(self, reg_gray):
-        """Column-brightness projection -> runs of lit columns = glyphs (variable count). Robust to
-        1 vs 2 digits and to the glyphs' horizontal position within the region."""
+        """Column-brightness projection -> runs of lit columns = glyphs (variable count, any position)."""
         col = reg_gray.astype(np.float32).mean(axis=0)
         rng = float(col.max() - col.min())
         if rng < 1e-3:
@@ -211,29 +211,23 @@ class FloorReader:
         return runs
 
     def read_panel(self, panel_gray):
-        reg = crop(panel_gray, self.digit_region)
-        runs = self.segment_glyphs(reg)
-        if not runs or len(runs) > self.max_digits:
-            return None                              # unread (no glyph / smeared into >max_digits) -> discard
-        digits, scores = "", []
-        for (x0, x1) in runs:
-            lab, s = self._match(reg[:, x0:x1], DIGITS)
+        runs = self.segment_glyphs(panel_gray)
+        if len(runs) < 2 or len(runs) > self.max_glyphs:
+            return None                              # need floor-glyph(s) + the (always-present) arrow
+        ax0, ax1 = runs[-1]                          # rightmost glyph = the arrow
+        arrow, arr_s = self._match(panel_gray[:, ax0:ax1], self.arrow_labels)
+        direction = arrow if (arrow is not None and arr_s >= self.min_score) else None
+        chars, scores = [], [arr_s if direction else self.min_score]
+        for (x0, x1) in runs[:-1]:
+            lab, s = self._match(panel_gray[:, x0:x1], self.glyph_labels)
             if lab is None or s < self.min_score:
-                return None                          # a glyph we can't confidently name -> discard panel
-            digits += lab
+                return None                          # a floor glyph we can't confidently name -> discard
+            chars.append(lab)
             scores.append(s)
-        direction = None
-        if self.arrow_cell is not None:
-            direction, ds = self._match(crop(panel_gray, self.arrow_cell), ARROWS)
-            if direction is None or ds < self.min_score:
-                direction = None                     # floor still usable without a confident arrow
-            else:
-                scores.append(ds)
-        try:
-            floor = int(digits)
-        except ValueError:
+        if not chars:
             return None
-        return {"floor": floor, "direction": direction, "score": round(min(scores), 3), "n_digits": len(runs)}
+        return {"floor": "".join(chars), "direction": direction,   # floor is a STRING ("25","P3","G")
+                "score": round(min(scores), 3), "n_glyphs": len(runs)}
 
     def reconcile(self, panel_reads):
         """AGREE-OR-DISCARD across the two panels. Both read + agree on floor -> confident (mean score,
@@ -249,6 +243,136 @@ class FloorReader:
         direction = dirs[0] if dirs and all(d == dirs[0] for d in dirs) else None
         return {"floor": reads[0]["floor"], "direction": direction,
                 "confidence": round(min(r["score"] for r in reads), 3), "panels": len(reads), "agree": True}
+
+
+# ============================================================ floor TRACE -> Tier 2 (stops + speed)
+class FloorTracker:
+    """Floor read EVERY frame -> a floor-vs-time TRACE. Tier 2 falls out of the same instrument, no
+    door event needed: a STOP is the lift DWELLING at a floor >= dwell_s (25^ x4 in the montage);
+    stops_per_floor is the per-floor demand; the SPEED between consecutive stops (floors/second) is the
+    C21/C22 speed factor. floor labels are strings; _idx maps them to a physical index (numeric via int,
+    others via floor_order, e.g. ['LG','G','1','2',...])."""
+
+    def __init__(self, dwell_s=2.0, floor_order=None):
+        self.dwell_s = dwell_s
+        self.floor_order = list(floor_order) if floor_order else None
+        self._cur = None
+        self._arr = None
+        self._last = None
+        self._dir = None                       # arrow seen while AT the current floor (up-stop vs down-stop)
+        self._last_stop = None
+        self.occupancies = []
+        self.stops = []
+        self.segments = []
+        self.stops_per_floor = {}
+
+    def _idx(self, floor):
+        if self.floor_order and floor in self.floor_order:
+            return self.floor_order.index(floor)
+        try:
+            return int(floor)
+        except (TypeError, ValueError):
+            return None
+
+    def _record_stop(self, occ):
+        """A resolved dwell -> a stop, plus stops_per_floor and the SPEED segment from the previous stop
+        (C21/C22). Shared by update() (leaving a floor) and flush() (the floor sat on now)."""
+        self.stops.append(occ)
+        self.stops_per_floor[occ["floor"]] = self.stops_per_floor.get(occ["floor"], 0) + 1
+        if self._last_stop is not None:
+            i0, i1 = self._idx(self._last_stop["floor"]), self._idx(occ["floor"])
+            dt = occ["arrive_t"] - self._last_stop["depart_t"]
+            if i0 is not None and i1 is not None and dt > 0:
+                self.segments.append({"from": self._last_stop["floor"], "to": occ["floor"],
+                                      "n_floors": abs(i1 - i0), "travel_s": round(dt, 2),
+                                      "floors_per_s": round(abs(i1 - i0) / dt, 3),
+                                      "direction": "up" if i1 > i0 else "down"})
+        self._last_stop = occ
+
+    def update(self, t, floor, direction=None):
+        """One frame. Returns a STOP dict when a dwell resolves into a stop, else None."""
+        if floor is None:
+            return None
+        if self._cur is None:
+            self._cur, self._arr, self._last, self._dir = floor, t, t, direction
+            return None
+        if floor == self._cur:
+            self._last = t
+            if direction:
+                self._dir = direction                       # remember the arrow shown while stopped here
+            return None
+        dwell = self._last - self._arr                      # occupancy of the floor we're leaving
+        occ = {"floor": self._cur, "arrive_t": round(self._arr, 2), "depart_t": round(self._last, 2),
+               "dwell_s": round(dwell, 2), "direction": self._dir}   # up-stop vs down-stop for C17/C18
+        self.occupancies.append(occ)
+        stop = None
+        if dwell >= self.dwell_s:                           # DWELLED -> a stop (no door event needed)
+            self._record_stop(occ)
+            stop = occ
+        self._cur, self._arr, self._last, self._dir = floor, t, t, direction
+        return stop
+
+    def flush(self, t=None):
+        """Close the CURRENT occupancy as a stop if it's dwelled long enough — for status/shutdown, so
+        the floor the lift is sitting on right now isn't invisible until it next moves. Idempotent."""
+        if self._cur is None:
+            return None
+        tt = self._last if t is None else t
+        dwell = tt - self._arr
+        already = self.stops and self.stops[-1]["floor"] == self._cur and self.stops[-1]["arrive_t"] == round(self._arr, 2)
+        if dwell >= self.dwell_s and not already:
+            occ = {"floor": self._cur, "arrive_t": round(self._arr, 2), "depart_t": round(tt, 2),
+                   "dwell_s": round(dwell, 2), "direction": self._dir}
+            self._record_stop(occ)
+            return occ
+        return None
+
+
+# ============================================================ template building (on-box, open alphabet)
+def _label_to_glyphs(label):
+    """'12^' -> ['1','2','up'] ; 'P3v' -> ['P','3','down'] ; '6v' -> ['6','down']. Trailing ^/v is the
+    arrow; the rest are floor glyphs (digits AND letters). OPEN alphabet — whatever the operator typed."""
+    arrow = None
+    body = label.strip()
+    if body.endswith("^"):
+        arrow, body = "up", body[:-1]
+    elif body[-1:] in ("v", "V"):
+        arrow, body = "down", body[:-1]
+    glyphs = list(body.strip())
+    if arrow:
+        glyphs.append(arrow)
+    return glyphs
+
+
+def build_templates(labeled_panels, min_glyph_w=3, gap_frac=0.35, tsz=(16, 12)):
+    """labeled_panels: list of (gray panel crop, label_str). Segment each panel, map the glyph runs
+    left-to-right to the label's glyphs (last = arrow), accumulate per glyph, return {label: mean
+    template}. A crop whose run-count != label-glyph-count is a MIS-SEGMENTATION -> skipped (not a
+    clean example), and how many were used/skipped is returned so calibration is honest."""
+    import cv2
+    seg = FloorReader({"_": np.zeros(tsz)}, min_glyph_w=min_glyph_w, gap_frac=gap_frac)
+    acc, used, skipped = {}, 0, 0
+    for panel, label in labeled_panels:
+        glyphs = _label_to_glyphs(label)
+        runs = seg.segment_glyphs(panel)
+        if len(runs) != len(glyphs) or not glyphs:
+            skipped += 1
+            continue
+        used += 1
+        for (x0, x1), g in zip(runs, glyphs):
+            cell = cv2.resize(panel[:, x0:x1], (tsz[1], tsz[0])).astype(np.float32)
+            acc.setdefault(g, []).append(cell)
+    templates = {g: np.mean(v, axis=0) for g, v in acc.items()}
+    return templates, {"used": used, "skipped": skipped, "glyphs": {g: len(v) for g, v in acc.items()}}
+
+
+def save_templates(templates, path):
+    np.savez(path, **{k: v.astype(np.float32) for k, v in templates.items()})
+
+
+def load_templates(path):
+    d = np.load(path)
+    return {k: d[k] for k in d.files}
 
 
 # ============================================================ calibration helpers (step 1/2)

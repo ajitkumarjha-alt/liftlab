@@ -137,10 +137,28 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--collect", type=int, default=0)
     ap.add_argument("--frames", type=int, default=0, help="collect N frames -> door + panel montages")
+    ap.add_argument("--build", action="store_true", help="build templates.npz from collected crops + --labels")
+    ap.add_argument("--labels", default="", help="row-major floor labels, e.g. '7^,8^,12^,...,P3v,6v'")
     a = ap.parse_args()
     nframes = max(a.collect, a.frames)
     outdir = SNAP_DIR / GW
     outdir.mkdir(parents=True, exist_ok=True)
+
+    if a.build:
+        labels = [x.strip() for x in (a.labels or os.environ.get("LABELS", "")).split(",") if x.strip()]
+        crops = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
+        if not crops or not labels:
+            raise SystemExit("need _calib_crop_*.png (run --collect first) and --labels '7^,8^,...' (or LABELS env)")
+        if len(crops) != len(labels):
+            raise SystemExit(f"{len(crops)} crops but {len(labels)} labels — must be 1:1 row-major (relabel the montage)")
+        labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in zip(crops, labels)]
+        tpl, stats = gd.build_templates(labeled)
+        outp = os.environ.get("TEMPLATES_OUT", f"/tmp/templates_{CAM}.npz")
+        gd.save_templates(tpl, outp)
+        print(f"[build] {stats}")
+        print(f"[build] wrote {len(tpl)} glyph templates -> {outp}")
+        print(f"[build] place it where the GPU reads it (GPU_DOOR_TEMPLATES env) — scp for now, zones store later.")
+        return
 
     fr = newest_frame()
     if fr is None:
@@ -172,7 +190,9 @@ def main():
         # travel band (or, if the box is on a fixed jamb/wall, the edge NEVER moves — which is the test).
         panels = {i: [] for i in range(len(prois))}
         doors = []
-        seen = set()
+        seen = set(); n = 0
+        for gp in glob.glob(str(outdir / "_calib_crop_*.png")):
+            os.remove(gp)          # fresh run -> fresh crops (crop index must match the montage order)
         for _ in range(nframes):
             seg = _newest_seg()
             if seg and seg not in seen:
@@ -182,6 +202,10 @@ def main():
                     for i, pr in enumerate(prois):
                         panels[i].append(gd.crop(f2, pr))
                     doors.append(gd.crop(f2, droi))
+                    # save panel0 RAW grayscale crop in montage order -> --build pairs it with a label
+                    cv2.imwrite(str(outdir / f"_calib_crop_{n:03d}.png"),
+                                cv2.cvtColor(gd.crop(f2, prois[0]), cv2.COLOR_BGR2GRAY))
+                    n += 1
             time.sleep(2)          # ~one per 2s segment -> N*2s of coverage (catches a door cycle)
         for i, ts in panels.items():
             m = _montage(ts, cols=5, factor=8)
