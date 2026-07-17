@@ -32,6 +32,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Form, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 DB_PATH = os.environ.get("GATEWAY_DB", "./gateway.db")
 IMG_DIR = Path(os.environ.get("VALIDATION_IMG_DIR", "/var/lib/liftlab/validation_img"))
@@ -110,15 +111,19 @@ async def validation_item(gw: str, cam: str, request: Request, authorization: st
          int(d.get("machine_boarded", 0)), int(d.get("machine_alighted", 0)), 0, time.time()))
     item_id = cur.lastrowid
     imgs = (d.get("images") or [])[:MAX_IMGS]
-    dstdir = IMG_DIR / str(item_id)
-    dstdir.mkdir(parents=True, exist_ok=True)
-    n = 0
-    for i, b64 in enumerate(imgs):
-        try:
-            (dstdir / f"{i}.jpg").write_bytes(base64.b64decode(b64))
-            n += 1
-        except Exception:
-            pass
+
+    def _write_imgs():                             # base64-decode + write OFF the event loop so the
+        dstdir = IMG_DIR / str(item_id)            # image POST can't stall the door-event ingest
+        dstdir.mkdir(parents=True, exist_ok=True)
+        w = 0
+        for i, b64 in enumerate(imgs):
+            try:
+                (dstdir / f"{i}.jpg").write_bytes(base64.b64decode(b64))
+                w += 1
+            except Exception:
+                pass
+        return w
+    n = await run_in_threadpool(_write_imgs)
     db.execute("UPDATE validation_item SET n_images=? WHERE id=?", (n, item_id))
     db.commit()
     db.close()

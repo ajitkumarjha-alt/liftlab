@@ -19,6 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 
 import numpy as np
 
@@ -36,7 +37,9 @@ STATE_DIR = os.environ.get("STATE_DIR", "/var/lib/liftlab-gpu")
 VAL_POLL_S = float(os.environ.get("VAL_POLL_S", "30"))     # how often to re-check this cam's mode
 EPISODE_GAP_S = float(os.environ.get("EPISODE_GAP_S", "8"))  # transits >this apart = different opening
 EPISODE_MAX_S = float(os.environ.get("EPISODE_MAX_S", "25"))  # force-close an episode this long (safety)
-VAL_MAX_IMGS = int(os.environ.get("VAL_MAX_IMGS", "4"))
+VAL_MAX_IMGS = int(os.environ.get("VAL_MAX_IMGS", "8"))    # per-episode image cap (room for a few transits)
+VAL_SEQ_PER_TRANSIT = int(os.environ.get("VAL_SEQ_PER_TRANSIT", "3"))  # frames spanning EACH crossing
+FRAME_BUF = int(os.environ.get("FRAME_BUF", "40"))        # ring of recent frames (~1.6s @25fps)
 MAX_BEHIND = int(os.environ.get("MAX_BEHIND", "3"))        # if >this new segs queued, jump to live edge
 CALIB_W, CALIB_H = 1920, 1080
 ZONE_CABIN = [[630, 870], [932, 747], [1042, 733], [1308, 1056], [587, 1056], [548, 914]]
@@ -79,6 +82,22 @@ def jpeg_b64(fr, width=480):
         fr = cv2.resize(fr, (width, int(h * width / w)))
     ok, buf = cv2.imencode(".jpg", fr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
     return base64.b64encode(buf.tobytes()).decode() if ok else None
+
+
+def capture_seq(recent, k):
+    """k frames evenly spanning the recent-frame ring (first..crossing) so MOVEMENT — hence
+    DIRECTION — is visible. A single still can't distinguish boarding from alighting; a sequence
+    can (person moving toward the cabin vs toward the landing)."""
+    n = len(recent)
+    if n == 0:
+        return []
+    idxs = list(range(n)) if n <= k else [round(x * (n - 1) / (k - 1)) for x in range(k)]
+    out = []
+    for i in idxs:
+        j = jpeg_b64(recent[i])
+        if j:
+            out.append(j)
+    return out
 
 
 def post_episode(ep, reason=""):
@@ -182,6 +201,7 @@ def main():
     val_state = get_val_state()
     last_val_poll = time.time()
     episode = None                                # current door-open episode being validated
+    recent = deque(maxlen=FRAME_BUF)              # ring of recent frames -> multi-frame capture
     dropped = 0                                   # segments never processed (pruned/lag) — running count
     last_drop_log = time.time()
     log(f"validation mode: {val_state}")
@@ -227,6 +247,8 @@ def main():
             seg_wall = time.time()                # approx wall time of this segment's arrival
             n_fr = len(frames)
             for i, fr in enumerate(frames):
+                if val_state == "validating":
+                    recent.append(fr)             # buffer frames so a transit can grab a sequence
                 dets = det.track(fr)
                 pre = len(ctr.transits)
                 ctr.update(dets, offset_s=seg_wall - (n_fr - i) * 0.04)   # ~25fps back-stamp
@@ -247,9 +269,8 @@ def main():
                             log(f"episode opened at {now:.0f}")
                         episode["ts_end"] = now
                         episode["b" if t.direction == "in" else "a"] += 1
-                        if len(episode["imgs"]) < VAL_MAX_IMGS:
-                            j = jpeg_b64(fr)
-                            if j:
+                        for j in capture_seq(recent, VAL_SEQ_PER_TRANSIT):   # sequence -> direction
+                            if len(episode["imgs"]) < VAL_MAX_IMGS:
                                 episode["imgs"].append(j)
             b, a = ctr.counts()
             if len(ctr.transits) > before:
