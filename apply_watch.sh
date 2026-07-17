@@ -88,9 +88,29 @@ sudo -u "$OWNER" "$AGENT_PY" /tmp/watch_channel_graft.py || { say "graft step fa
 systemctl restart "$SERVICE"; sleep 4
 AC=$(systemctl is-active "$SERVICE"); VER=$(grep -oE 'VERSION = "[0-9.]+"' "$AGENT" | head -1)
 say "AFTER: agent active=$AC  version=$VER"
-if [ "$AC" = active ] && echo "$VER" | grep -q '0.7.0'; then
-  say "RESULT: PASS — watch_channel live (subprocess, token-stripped child), VERSION 0.7.0."
+
+# THE ACTUAL WATCH runs under its OWN service (liftlab-watch: watch_local.py -> continuous_scheduler
+# CHILD). Restarting the AGENT does NOT reload that child — the freshly installed continuous_scheduler.py
+# would sit on disk unused (install-without-restart, same trap as apply_gpu MainPID 72417). So restart
+# liftlab-watch and ASSERT its MainPID changed; a restart that doesn't take looks like success.
+WSVC="${WATCH_SVC:-liftlab-watch}"
+if systemctl cat "$WSVC" >/dev/null 2>&1; then
+  WOLD=$(systemctl show -p MainPID --value "$WSVC" 2>/dev/null || echo 0)
+  systemctl restart "$WSVC"; sleep 6                 # child re-seeds from the PERSISTED baseline (no doors-shut needed)
+  WAC=$(systemctl is-active "$WSVC"); WNEW=$(systemctl show -p MainPID --value "$WSVC" 2>/dev/null || echo 0)
+  say "watch reload: $WSVC active=$WAC  MainPID $WOLD -> $WNEW"
+  if [ "$WAC" != active ]; then
+    say "RESULT: FAIL — $WSVC not active after restart; journalctl -u $WSVC -n 40"; exit 1
+  fi
+  if [ -z "$WNEW" ] || [ "$WNEW" = 0 ] || [ "$WNEW" = "$WOLD" ]; then
+    say "RESULT: FAIL — $WSVC restart did NOT take (MainPID $WOLD -> $WNEW). The OLD continuous_scheduler is still running."; exit 1
+  fi
+  say "RESULT: PASS — new watch process $WNEW live (old $WOLD replaced) -> new continuous_scheduler.py loaded."
+  say "  Verify telemetry: $AGENT_PY $AGENT_DIR/watch_local.py status 29  (expect opens_detected/cycles_rejected), or /pihealth."
+elif [ "$AC" = active ] && echo "$VER" | grep -q '0.7.0'; then
+  say "NOTE: no liftlab-watch.service — assuming the AGENT dispatches the watch (legacy). Agent restarted above."
+  say "RESULT: PASS — agent live, VERSION 0.7.0. If the watch runs elsewhere, restart it + confirm its PID changed."
 else
   say "RESULT: CHECK above. Rollback: restore newest $AGENT.bak.*; rm $AGENT_DIR/{watch_manager.py,watch_runtime.conf} $B4_DIR/{continuous_scheduler,onvif_resolve}.py; systemctl restart $SERVICE"
-  journalctl -u "$SERVICE" -n 20 --no-pager | sed 's/^/[watch]   /'
+  journalctl -u "$SERVICE" -n 20 --no-pager | sed 's/^/[watch]   /'; exit 1
 fi
