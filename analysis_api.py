@@ -67,6 +67,10 @@ def _db():
         db.execute("ALTER TABLE transit_event ADD COLUMN cycle_id INTEGER")   # gw_event.id it belongs to
     except sqlite3.OperationalError:
         pass                                       # already added
+    db.execute("""CREATE TABLE IF NOT EXISTS analyzer_status (
+      gateway_id TEXT, cam TEXT, ts REAL, counting_version TEXT, uptime_s REAL,
+      segments INTEGER, dropped INTEGER, posted INTEGER, last_transit_ts REAL, mode TEXT,
+      PRIMARY KEY (gateway_id, cam))""")
     return db
 
 
@@ -176,6 +180,25 @@ async def transit_ingest(gw: str, request: Request, authorization: str = Header(
     db.commit()
     db.close()
     return {"ok": True, "gw_event": filled}
+
+
+# ---- GPU analyzer heartbeat (Bearer) — so a DEAD worker is visible on /ops, not silent ----
+@analysis_router.post("/api/gw/{gw}/analyzer_status")
+async def analyzer_status_ingest(gw: str, request: Request, authorization: str = Header("")):
+    _auth_rw(gw, authorization)
+    d = await request.json()
+    db = _db()
+    db.execute(
+        "INSERT INTO analyzer_status (gateway_id,cam,ts,counting_version,uptime_s,segments,dropped,"
+        "posted,last_transit_ts,mode) VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(gateway_id,cam) DO UPDATE SET ts=excluded.ts, counting_version=excluded.counting_version,"
+        "uptime_s=excluded.uptime_s, segments=excluded.segments, dropped=excluded.dropped, "
+        "posted=excluded.posted, last_transit_ts=excluded.last_transit_ts, mode=excluded.mode",
+        (gw, str(d.get("cam", "")), time.time(), d.get("counting_version"), d.get("uptime_s"),
+         d.get("segments"), d.get("dropped"), d.get("posted"), d.get("last_transit_ts"), d.get("mode")))
+    db.commit()
+    db.close()
+    return {"ok": True}
 
 
 # ---- one-shot: attribute already-stored transits to cycles + fill gw_event (run once after deploy) ----

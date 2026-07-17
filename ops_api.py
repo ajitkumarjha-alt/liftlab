@@ -155,12 +155,19 @@ def ops_data(gw: str):
             validation[r["cam"]] = dict(r)
     except sqlite3.OperationalError:
         pass                                       # camera_validation not created yet
+    analyzer = None
+    try:
+        a = db.execute("SELECT * FROM analyzer_status WHERE gateway_id=? ORDER BY ts DESC LIMIT 1", (gw,)).fetchone()
+        analyzer = dict(a) if a else None
+    except sqlite3.OperationalError:
+        pass                                       # analyzer never reported (GPU down or not deployed)
     out = {
         "t": time.time(),
         "watch": watch,
         "relay": relay,
         "transit": transit,
         "validation": validation,
+        "analyzer": analyzer,
         "relay_series": _series(db, "relay_status", "ts,sum_delivered_mbps,soc_temp,door_fps,streams_delivering", gw),
         "watch_series": _series(db, "watch_status", "ts,signal_fps,soc_temp", gw),
     }
@@ -197,6 +204,7 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)
 <div class=wrap>
   <h2>Live cameras <span class=pill id=camcount></span></h2>
   <div class=grid id=grid></div>
+  <h2>GPU analyzer</h2><div class=cards id=analyzer></div>
   <h2>Transit (GPU) <span class=pill>boarded / alighted</span></h2><div class=cards id=transit></div>
   <h2>Door watch</h2><div class=cards id=watch></div>
   <h2>Relay</h2><div class=cards id=relay></div>
@@ -227,7 +235,18 @@ function tickGrid(){fetch('/ops/'+GW+'/snapmeta').then(function(r){return r.json
 function kv(k,v,c){return '<div class=kv><span>'+k+'</span><b class="'+(c||'')+'">'+esc(v)+'</b></div>'}
 function drawData(d){
   document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString();
-  var w=d.watch||{},r=d.relay||{},tr=d.transit,val=d.validation||{};
+  var w=d.watch||{},r=d.relay||{},tr=d.transit,val=d.validation||{},an=d.analyzer;
+  var anhtml;
+  if(!an){anhtml='<div class=card><h3>GPU analyzer</h3><div class="big bad">no heartbeat</div>'
+    +'<div class=kv><span>never reported — worker down or not deployed</span></div></div>';}
+  else{var hbage=Math.round(d.t-an.ts),down=hbage>120,ttage=an.last_transit_ts?Math.round(d.t-an.last_transit_ts):null;
+    anhtml='<div class=card><h3>GPU analyzer</h3><div class="big '+(down?'bad':'ok')+'">'+(down?'DOWN':'up')+'</div>'
+      +kv('heartbeat',hbage+'s ago',cls(hbage,60,120))
+      +kv('counting',esc(an.counting_version))+kv('mode',esc(an.mode))
+      +kv('segments / dropped',esc(an.segments)+' / '+esc(an.dropped))
+      +kv('last transit',ttage==null?'—':ttage+'s ago')
+      +kv('uptime',an.uptime_s?Math.round(an.uptime_s/60)+'m':'—')+'</div>';}
+  document.getElementById('analyzer').innerHTML=anhtml;
   var vcards=Object.keys(val).sort().map(function(cam){var v=val[cam];
     var pct=v.n_reviewed?Math.round(100*v.n_exact/v.n_reviewed):0;
     var prov=v.provenance||(v.n_reviewed?(v.n_reviewed+' reviewed, '+pct+'% exact'):'not reviewed');

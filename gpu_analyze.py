@@ -41,6 +41,7 @@ VAL_MAX_IMGS = int(os.environ.get("VAL_MAX_IMGS", "8"))    # per-episode image c
 VAL_SEQ_PER_TRANSIT = int(os.environ.get("VAL_SEQ_PER_TRANSIT", "3"))  # frames spanning EACH crossing
 FRAME_BUF = int(os.environ.get("FRAME_BUF", "40"))        # ring of recent frames (~1.6s @25fps)
 MAX_BEHIND = int(os.environ.get("MAX_BEHIND", "3"))        # if >this new segs queued, jump to live edge
+HEARTBEAT_S = float(os.environ.get("HEARTBEAT_S", "30"))   # analyzer heartbeat to the cloud
 CALIB_W, CALIB_H = 1920, 1080
 ZONE_CABIN = [[630, 870], [932, 747], [1042, 733], [1308, 1056], [587, 1056], [548, 914]]
 ZONE_LANDING = [[514, 394], [834, 322], [722, 529], [732, 684], [761, 776], [618, 827]]
@@ -204,12 +205,27 @@ def main():
     episode = None                                # current door-open episode being validated
     recent = deque(maxlen=FRAME_BUF)              # ring of recent frames -> multi-frame capture
     dropped = 0                                   # segments never processed (pruned/lag) — running count
+    segments = 0                                  # segments decoded + processed
+    last_transit_ts = 0.0
+    started = time.time()
     last_drop_log = time.time()
+    last_hb = 0.0
     log(f"validation mode: {val_state}")
+
+    def heartbeat():                              # so a DEAD worker is visible on /ops, not silent
+        try:
+            http_post_json(f"{CLOUD}/api/gw/{GW}/analyzer_status",
+                           {"cam": CAM, "counting_version": counting.COUNTING_VERSION,
+                            "uptime_s": time.time() - started, "segments": segments, "dropped": dropped,
+                            "posted": posted, "last_transit_ts": last_transit_ts, "mode": val_state})
+        except Exception as e:
+            log(f"heartbeat POST failed: {e}")
 
     while True:
         segs = playlist_segments()
         new = [s for s in segs if s not in seen]
+        if time.time() - last_hb > HEARTBEAT_S:   # heartbeat even when idle (no traffic != dead)
+            heartbeat(); last_hb = time.time()
         if not new:
             if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
                 post_episode(episode, "gap"); episode = None
@@ -239,6 +255,7 @@ def main():
             frames = decode_segment(data)
             if not frames:
                 seen.add(name); continue
+            segments += 1
             if ctr is None:
                 H, W = frames[0].shape[:2]
                 sx, sy = W / CALIB_W, H / CALIB_H
@@ -258,6 +275,7 @@ def main():
                         http_post_json(f"{CLOUD}/api/gw/{GW}/transit",
                                        {"cam": CAM, "ts": t.offset_s, "direction": t.direction, "track_id": t.track_id})
                         posted += 1
+                        last_transit_ts = t.offset_s
                     except Exception as e:
                         log(f"transit POST failed (no double-count on retry): {e}")
                     if val_state == "validating":  # capture THIS frame into the door-open episode
