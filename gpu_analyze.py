@@ -110,12 +110,23 @@ def post_episode(ep, reason=""):
     if ep["b"] + ep["a"] == 0:
         log(f"episode closed EMPTY (0 transits, {reason}) — not posting")
         return
+    dc = ep.get("det_counts") or []
+    det_max = max(dc) if dc else 0                          # most people YOLO saw in any single frame
+    det_mean = sum(dc) / len(dc) if dc else 0.0
+    n_ids = len(ep.get("ids") or ())                        # distinct tracks the tracker established
     log(f"episode attempt ({reason}): boarded={ep['b']} alighted={ep['a']} imgs={len(ep['imgs'])} "
         f"span={ep['ts_end'] - ep['ts_start']:.0f}s")
+    # DETECTION AUDIT: the counted transits can only be as good as what YOLO+tracker saw. If a crowd of
+    # five shows det_max=2, the people were never detected (occlusion); if det_max=5 but distinct_ids=2,
+    # the tracker merged them. Either way it's a detection problem, not a guard-tuning one.
+    log(f"episode dets: per-frame max={det_max} mean={det_mean:.1f} over {len(dc)} frames; "
+        f"distinct track_ids={n_ids}")
     try:
         st = http_post_json(f"{CLOUD}/api/gw/{GW}/validation_item/{CAM}",
                             {"ts_start": ep["ts_start"], "ts_end": ep["ts_end"],
                              "machine_boarded": ep["b"], "machine_alighted": ep["a"], "images": ep["imgs"],
+                             "det_max": det_max, "det_mean": round(det_mean, 1), "distinct_ids": n_ids,
+                             "det_frames": len(dc),
                              "counting_version": counting.COUNTING_VERSION})   # verdict is valid only for this logic
         log(f"episode POST -> HTTP {st}")
     except Exception as e:
@@ -205,6 +216,7 @@ def main():
     last_val_poll = time.time()
     episode = None                                # current door-open episode being validated
     recent = deque(maxlen=FRAME_BUF)              # ring of recent frames -> multi-frame capture
+    recent_dets = deque(maxlen=FRAME_BUF)         # parallel ring: (n_dets, id_tuple) per frame -> detection audit
     dropped = 0                                   # segments never processed (pruned/lag) — running count
     segments = 0                                  # segments decoded + processed
     last_transit_ts = 0.0
@@ -294,6 +306,12 @@ def main():
                 tr_t0 = time.time()
                 dets = det.track(fr)
                 track_ms += (time.time() - tr_t0) * 1000     # YOLO inference — the cost that must fit the budget
+                if val_state == "validating":                # DETECTION AUDIT: what did YOLO actually see?
+                    ids = tuple(d.track_id for d in dets)
+                    recent_dets.append((len(dets), ids))     # run-up buffer -> seeds an episode opened later
+                    if episode is not None:
+                        episode["det_counts"].append(len(dets))
+                        episode["ids"].update(ids)
                 pre = len(ctr.transits)
                 pre_rej = len(ctr.rejections)
                 ctr.update(dets, offset_s=seg_wall - (n_fr - i) * 0.04)   # ~25fps back-stamp
@@ -324,7 +342,11 @@ def main():
                                         or now - episode["ts_start"] > EPISODE_MAX_S):
                             post_episode(episode, "gap/max"); episode = None
                         if episode is None:
-                            episode = {"ts_start": now, "ts_end": now, "b": 0, "a": 0, "imgs": []}
+                            episode = {"ts_start": now, "ts_end": now, "b": 0, "a": 0, "imgs": [],
+                                       # seed the detection audit from the run-up frames (people are often
+                                       # visible before anyone crosses); then accumulate for the whole open.
+                                       "det_counts": [n for n, _ in recent_dets],
+                                       "ids": set(i for _, idt in recent_dets for i in idt)}
                             log(f"episode opened at {now:.0f}")
                         episode["ts_end"] = now
                         episode["b" if t.direction == "in" else "a"] += 1
