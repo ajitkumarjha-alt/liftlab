@@ -145,6 +145,22 @@ class Transit:
 
 
 @dataclass
+class Rejection:
+    """A track that entered the destination zone but was NOT counted — the guard's audit trail.
+    achieved_frac is the FURTHEST the foot travelled during the attempt, as a fraction of the
+    zone separation (the same scale as disp_frac). So `reason='displacement', achieved_frac=0.24`
+    means "a crossing that moved 24% of the gap, killed because disp_frac=0.35". Collect these and
+    the disp_frac / min_frames thresholds can be chosen from the real distribution, not guessed."""
+    track_id: int
+    origin: str          # 'landing' | 'cabin'
+    dest: str
+    reason: str          # 'displacement' (moved too little) | 'dwell' (too few frames in dest)
+    achieved_frac: float
+    dwell_frames: int    # max consecutive frames the track dwelled in the destination
+    offset_s: float
+
+
+@dataclass
 class ZoneCounter:
     """Ordered A->B transit counter with dwell + displacement guards. A count requires: dwell
     min_frames in the ORIGIN (arm), then dwell min_frames in the DESTINATION, AND the foot moved at
@@ -155,6 +171,7 @@ class ZoneCounter:
     zone_cabin: Zone
     min_frames: int = 2
     disp_frac: float = 0.35            # min foot travel to count, as a fraction of the zone separation
+    attempt_stale_s: float = 6.0       # a crossing-attempt whose track vanishes this long -> resolve as rejected
 
     def __post_init__(self):
         self.zone_landing = as_zone(self.zone_landing)
@@ -164,7 +181,9 @@ class ZoneCounter:
 
     _streak: dict[int, tuple[str, int]] = field(default_factory=dict)   # tid -> (zone, count)
     _armed: dict[int, tuple[str, tuple]] = field(default_factory=dict)  # tid -> (origin zone, foot)
+    _attempt: dict[int, dict] = field(default_factory=dict)            # tid -> in-progress crossing attempt
     transits: list[Transit] = field(default_factory=list)
+    rejections: list[Rejection] = field(default_factory=list)          # would-be crossings the guards killed
 
     def _zone_of(self, det: Detection) -> str | None:
         f = det.foot
@@ -174,11 +193,27 @@ class ZoneCounter:
             return "landing"
         return None
 
+    def _flush_attempt(self, tid: int) -> None:
+        """A crossing attempt ended (track left the zones or vanished) without being counted.
+        Record WHY and how far it got, so rejected crossings become data, not silence."""
+        att = self._attempt.pop(tid, None)
+        if att is None:
+            return
+        reason = "dwell" if att["dwell"] < self.min_frames else "displacement"
+        self.rejections.append(Rejection(tid, att["origin"], att["dest"], reason,
+                                          att["frac"], att["dwell"], att["offset"]))
+
     def update(self, dets: list[Detection], offset_s: float) -> None:
+        # resolve attempts whose track the detector lost mid-crossing (never returned to origin/None)
+        for tid in list(self._attempt):
+            if offset_s - self._attempt[tid]["offset"] > self.attempt_stale_s:
+                self._flush_attempt(tid)
+
         for d in dets:
             z = self._zone_of(d)
             if z is None:
-                # outside both zones: keep arming state, reset streak
+                # outside both zones: the track left -> any crossing attempt is abandoned (logged)
+                self._flush_attempt(d.track_id)
                 self._streak.pop(d.track_id, None)
                 continue
 
@@ -193,17 +228,39 @@ class ZoneCounter:
                 continue
             origin, armed_foot = armed
 
+            if z == origin:
+                # back in / still in the origin zone: a destination attempt is abandoned (logged)
+                self._flush_attempt(d.track_id)
+                continue
+
+            # z != origin: the track is IN the destination zone -> a crossing attempt is underway.
+            # Track its best (max) progress so a rejected crossing carries the frac it achieved.
+            disp = _dist(d.foot, armed_foot)
+            frac = disp / self._sep if self._sep else 0.0
+            att = self._attempt.get(d.track_id)
+            if att is None:
+                self._attempt[d.track_id] = {"origin": origin, "dest": z,
+                                             "frac": frac, "dwell": count, "offset": offset_s}
+            else:
+                att["dest"] = z
+                if frac > att["frac"]:
+                    att["frac"] = frac
+                if count > att["dwell"]:
+                    att["dwell"] = count
+                att["offset"] = offset_s
+
             # DWELL: min_frames in the destination (a single boundary-jitter frame no longer counts).
             # DISPLACEMENT: the foot must have actually travelled across, not oscillated in place.
-            if z != origin and count >= self.min_frames:
-                if _dist(d.foot, armed_foot) < self._min_disp:
-                    continue                                   # barely moved -> flicker, not a crossing
+            if count >= self.min_frames:
+                if disp < self._min_disp:
+                    continue                                   # barely moved -> flicker; logged on abandonment
                 if origin == "landing" and z == "cabin":
                     self.transits.append(Transit(d.track_id, "in", offset_s))
                 elif origin == "cabin" and z == "landing":
                     self.transits.append(Transit(d.track_id, "out", offset_s))
                 else:
                     continue
+                self._attempt.pop(d.track_id, None)            # counted -> not a rejection
                 # re-arm at the new position so a genuine return trip is still countable
                 self._armed[d.track_id] = (z, d.foot)
                 self._streak[d.track_id] = (z, 1)

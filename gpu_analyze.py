@@ -210,6 +210,11 @@ def main():
     started = time.time()
     last_drop_log = time.time()
     last_hb = 0.0
+    # rejected-crossing telemetry: would-be crossings the guards killed, so disp_frac/min_frames can be
+    # tuned from the real distribution. rej_hist buckets the achieved frac in 0.05 steps [0..0.35, then .35+].
+    rej_disp = 0                                  # rejected: reached dest + dwelled, but moved < disp_frac
+    rej_dwell = 0                                 # rejected: too few frames in dest (fast walk-through / lost track)
+    rej_hist = [0] * 8                            # frac buckets: [0,.05)…[.30,.35) then [.35,∞)
     log(f"validation mode: {val_state}")
 
     def heartbeat():                              # so a DEAD worker is visible on /ops, not silent
@@ -217,7 +222,9 @@ def main():
             http_post_json(f"{CLOUD}/api/gw/{GW}/analyzer_status",
                            {"cam": CAM, "counting_version": counting.COUNTING_VERSION,
                             "uptime_s": time.time() - started, "segments": segments, "dropped": dropped,
-                            "posted": posted, "last_transit_ts": last_transit_ts, "mode": val_state})
+                            "posted": posted, "last_transit_ts": last_transit_ts, "mode": val_state,
+                            "rej_disp": rej_disp, "rej_dwell": rej_dwell,
+                            "rej_hist": ",".join(str(x) for x in rej_hist)})
         except Exception as e:
             log(f"heartbeat POST failed: {e}")
 
@@ -269,7 +276,17 @@ def main():
                     recent.append(fr)             # buffer frames so a transit can grab a sequence
                 dets = det.track(fr)
                 pre = len(ctr.transits)
+                pre_rej = len(ctr.rejections)
                 ctr.update(dets, offset_s=seg_wall - (n_fr - i) * 0.04)   # ~25fps back-stamp
+                for rj in ctr.rejections[pre_rej:]:   # would-be crossings the guards killed
+                    bi = min(int(rj.achieved_frac / 0.05 + 1e-9), 7)   # +eps: 0.35/0.05 is 6.999… in float
+                    rej_hist[bi] += 1
+                    if rj.reason == "displacement":
+                        rej_disp += 1
+                    else:
+                        rej_dwell += 1
+                    log(f"REJECT {rj.reason} tid={rj.track_id} {rj.origin}->{rj.dest} "
+                        f"frac={rj.achieved_frac:.2f} dwell={rj.dwell_frames}")
                 for t in ctr.transits[pre:]:      # transits detected ON this frame
                     try:                          # POST the count (both modes; idempotent, cloud dedups)
                         http_post_json(f"{CLOUD}/api/gw/{GW}/transit",

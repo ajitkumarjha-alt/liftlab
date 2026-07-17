@@ -233,6 +233,28 @@ function drawGrid(meta){
 }
 function tickGrid(){fetch('/ops/'+GW+'/snapmeta').then(function(r){return r.json()}).then(drawGrid).catch(function(){});}
 function kv(k,v,c){return '<div class=kv><span>'+k+'</span><b class="'+(c||'')+'">'+esc(v)+'</b></div>'}
+function rejcard(an){
+  // Distribution of would-be crossings the guards KILLED, by the frac of the gap the foot achieved.
+  // Lets disp_frac (guard=0.35) be chosen from data: amber buckets .20–.35 are crossings that would be
+  // RECOVERED by lowering the threshold; the .35+ bucket is real crossings lost to the dwell guard.
+  if(an.rej_disp==null&&an.rej_dwell==null)return '';           // pre-rejection-telemetry worker
+  var parts=(an.rej_hist||'').split(',').map(function(x){return +x||0});
+  while(parts.length<8)parts.push(0);
+  var mx=Math.max.apply(null,parts.concat([1]));
+  var labs=['.00','.05','.10','.15','.20','.25','.30','.35+'];
+  var bars=parts.map(function(c,i){
+    var h=Math.round(4+40*c/mx);
+    var col=i>=7?'#8a8a8a':(i>=4?'#e0a800':'#c0392b');         // <.20 red (flicker), .20–.35 amber (recoverable), .35+ grey (dwell-lost)
+    return '<div style="display:flex;flex-direction:column;align-items:center;justify-content:flex-end">'
+      +'<span style="font-size:10px;line-height:1">'+c+'</span>'
+      +'<div style="width:15px;height:'+h+'px;background:'+col+';margin-top:2px"></div>'
+      +'<span style="font-size:9px;opacity:.65;margin-top:1px">'+labs[i]+'</span></div>';
+  }).join('');
+  return '<div class=card><h3>rejected crossings</h3>'
+    +'<div style="font-size:11px;opacity:.75;margin-bottom:4px">frac of gap achieved (guard=0.35)</div>'
+    +'<div style="display:flex;gap:3px;align-items:flex-end;height:66px">'+bars+'</div>'
+    +kv('displacement / dwell',esc(an.rej_disp)+' / '+esc(an.rej_dwell))+'</div>';
+}
 function drawData(d){
   document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString();
   var w=d.watch||{},r=d.relay||{},tr=d.transit,val=d.validation||{},an=d.analyzer;
@@ -245,7 +267,8 @@ function drawData(d){
       +kv('counting',esc(an.counting_version))+kv('mode',esc(an.mode))
       +kv('segments / dropped',esc(an.segments)+' / '+esc(an.dropped))
       +kv('last transit',ttage==null?'—':ttage+'s ago')
-      +kv('uptime',an.uptime_s?Math.round(an.uptime_s/60)+'m':'—')+'</div>';}
+      +kv('uptime',an.uptime_s?Math.round(an.uptime_s/60)+'m':'—')+'</div>'
+      +rejcard(an);}
   document.getElementById('analyzer').innerHTML=anhtml;
   var vcards=Object.keys(val).sort().map(function(cam){var v=val[cam];
     var pct=v.n_reviewed?Math.round(100*v.n_exact/v.n_reviewed):0;
