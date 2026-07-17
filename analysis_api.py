@@ -255,15 +255,19 @@ def recent_transits(gw: str, authorization: str = Header(""), n: int = 50):
 
 
 def _log_gw_event_schema():
-    """Log gw_event's columns once, so we can fill boarded/alighted CORRECTLY later (not on a guess)."""
+    """Log gw_event's columns once. ALWAYS prints the RESOLVED DB_PATH: this runs at MODULE IMPORT,
+    so the apply script's smoke-import (no GATEWAY_DB set) opens ./gateway.db and prints columns:[]
+    — that is the SMOKE TEST speaking, not the running service. The path makes which process obvious;
+    columns:[] on ./gateway.db is expected and harmless (the live service resolves the real DB)."""
     try:
         db = sqlite3.connect(DB_PATH)
         cols = [r[1] for r in db.execute("PRAGMA table_info(gw_event)").fetchall()]
         db.close()
-        print(f"[analysis_api] gw_event columns: {cols} — backfill matches transits to the "
-              f"door_open_start_ts..door_close_full_ts window by EPOCH (tz-aware) and fills boarded/alighted")
+        note = "" if cols else "  (EMPTY — this is the smoke-import on ./gateway.db, not the live service)"
+        print(f"[analysis_api] gw_event columns @ DB_PATH={DB_PATH!r}: {cols}{note} — backfill matches "
+              f"transits to the door window by EPOCH (tz-aware) and fills boarded/alighted")
     except Exception as e:
-        print(f"[analysis_api] could not read gw_event schema: {e}")
+        print(f"[analysis_api] could not read gw_event schema @ DB_PATH={DB_PATH!r}: {e}")
 
 
 _log_gw_event_schema()
