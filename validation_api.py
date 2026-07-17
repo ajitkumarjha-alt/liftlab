@@ -273,17 +273,29 @@ def validate_page():
         db.execute("UPDATE validation_item SET status='superseded' WHERE status='pending' AND "
                    "(counting_version IS NULL OR counting_version!=?)", (CURRENT_COUNTING_VERSION,))
         db.commit()
-    # only CURRENT-version episodes are reviewable; newest first
+    # AUTO-EXPIRE pending episodes whose IMAGERY IS GONE — un-reviewable by construction, so never show a
+    # broken <img>. Images are deleted post-verdict/at go-live (privacy); a re-queue, an upload failure,
+    # or a tmpfs clear can leave a pending row pointing at files that no longer exist. Scope, not serving:
+    # an episode is only reviewable if its snapshot files are actually on disk RIGHT NOW.
+    missing = [r["id"] for r in db.execute(
+        "SELECT id FROM validation_item WHERE status='pending' AND counting_version=?",
+        (CURRENT_COUNTING_VERSION,)).fetchall()
+        if not (IMG_DIR / str(r["id"])).is_dir() or not any((IMG_DIR / str(r["id"])).glob("*.jpg"))]
+    if missing:
+        db.execute("UPDATE validation_item SET status='no_imagery' WHERE id IN (%s)"
+                   % ",".join("?" * len(missing)), missing)
+        db.commit()
+    # only CURRENT-version episodes WITH imagery on disk are reviewable; newest first
     pend = db.execute("SELECT * FROM validation_item WHERE status='pending' AND counting_version=? "
                       "ORDER BY id DESC LIMIT 50", (CURRENT_COUNTING_VERSION,)).fetchall()
     npend = db.execute("SELECT COUNT(*) FROM validation_item WHERE status='pending' AND counting_version=?",
                        (CURRENT_COUNTING_VERSION,)).fetchone()[0]
     nsup = len(stale)
     db.close()
-    return HTMLResponse(_render(cams, pend, npend, nsup))
+    return HTMLResponse(_render(cams, pend, npend, nsup, len(missing)))
 
 
-def _render(cams, pend, npend=0, nsup=0):
+def _render(cams, pend, npend=0, nsup=0, nmiss=0):
     css = """<style>body{margin:0;background:#f6f8fa;color:#1c2429;font:14px/1.5 system-ui,sans-serif}
     header{padding:12px 18px;border-bottom:1px solid #e3e8ec;background:#fff}h1{font-size:16px;margin:0}
     .wrap{max-width:1000px;margin:0 auto;padding:16px}h2{font-size:13px;text-transform:uppercase;color:#6b7a84;letter-spacing:.05em;margin:18px 4px 8px}
@@ -336,6 +348,7 @@ def _render(cams, pend, npend=0, nsup=0):
              f"episodes arrive per door-open from the redeployed GPU. Wait for the queue to fill; "
              f"don't click into the void.</p>")
     sup_note = f" · {nsup} superseded (older logic) purged this load" if nsup else ""
+    sup_note += f" · {nmiss} expired (imagery gone) this load" if nmiss else ""
     return (f"<!doctype html><meta charset=utf-8><title>validate</title>"
             f"<meta name=viewport content='width=device-width,initial-scale=1'>{css}"
             f"<header><h1>liftlab · validation</h1>"
