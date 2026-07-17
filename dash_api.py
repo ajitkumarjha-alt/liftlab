@@ -53,6 +53,11 @@ PEAK_WINDOWS = {"am_peak": (8, 10), "pm_peak": (18, 20)}
 # Fixed lift-camera fallback if channel_map is empty (the set the operator named).
 FALLBACK_CHANNELS = [16, 27, 29, 30, 32, 34, 37]
 
+# The GPU's PROCESSING frame size per camera (the sub resolution). The /snap jpg is DOWNSCALED for the
+# web grid, so /calibrate must emit coords in THIS space, not snapshot px. Override per-cam via ?fw=&fh=.
+FRAME_SIZES = {"ch29": (704, 576), "ch16": (1280, 720)}
+FRAME_SIZE_DEFAULT = (704, 576)
+
 dash_router = APIRouter()
 
 
@@ -664,12 +669,17 @@ load(); setInterval(load, 15000);
 
 # ============================================================ /calibrate — draw ROIs on a live frame
 @dash_router.get("/calibrate", response_class=HTMLResponse)
-def calibrate_page(cam: str = "ch29"):
+def calibrate_page(cam: str = "ch29", fw: int = 0, fh: int = 0):
     """Click-and-drag the door_roi + two panel ROIs (rects) and the cabin/landing zones (polygons) on
     a LIVE frame; live-outputs the config (DOOR_ROI_FRAME / PANEL_ROIS + a camera_zones.json snippet) to
-    paste — no more guessing coords in a terminal. Two minutes per camera instead of forty. (Save-to-
-    zones lands with the detector, once the zones-distribution target is settled.)"""
-    return _CALIB_PAGE.replace("__GW__", os.environ.get("DASH_GW", "site-A")).replace("__CAM__", cam)
+    paste — no more guessing coords in a terminal. The canvas works in the GPU's FRAME space (the /snap
+    jpg is downscaled), so emitted coords are correct; both sizes are printed to verify. (Save-to-zones
+    lands with the detector, once the zones-distribution target is settled.)"""
+    w, h = FRAME_SIZES.get(cam, FRAME_SIZE_DEFAULT)
+    if fw > 0 and fh > 0:
+        w, h = fw, fh
+    return (_CALIB_PAGE.replace("__GW__", os.environ.get("DASH_GW", "site-A"))
+            .replace("__CAM__", cam).replace("__FW__", str(w)).replace("__FH__", str(h)))
 
 
 _CALIB_PAGE = r"""<!doctype html><meta charset=utf-8><title>liftlab · calibrate</title>
@@ -681,6 +691,7 @@ h1{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:#aaa;margi
 .tool{display:inline-block;padding:5px 10px;margin:2px;border:2px solid #444;border-radius:6px;cursor:pointer;font-size:13px}
 .tool.on{border-color:#fff;font-weight:600}
 button{background:#333;color:#eee;border:1px solid #555;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:13px}
+button.on{border-color:#fff;background:#2a4}
 #wrap{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start}
 canvas{border:1px solid #444;max-width:100%;image-rendering:pixelated;cursor:crosshair}
 #side{min-width:320px;flex:1}
@@ -689,12 +700,17 @@ input[type=number]{width:56px;background:#222;color:#eee;border:1px solid #555;b
 textarea{width:100%;height:180px;background:#0a0a0a;color:#7fdca0;border:1px solid #444;border-radius:6px;
          font-family:var(--mono);font-size:12px;padding:8px;box-sizing:border-box}
 .hint{color:#888;font-size:12px;margin:6px 0}
+#sizebar{font-family:var(--mono);font-size:12px;margin:4px 0;padding:4px 8px;border-radius:5px;background:#1a1a1a}
 </style>
 <h1>liftlab · calibrate <span id=cam style=color:#888></span></h1>
+<div id=sizebar>frame …</div>
 <div id=tools></div>
 <div class=hint>rect tools: <b>drag</b> to draw · drag the box to move · drag the bottom-right handle to resize · or type numbers.
-&nbsp; polygon tools: <b>click</b> to add points · drag a point to move · Undo/Clear below.
-&nbsp; <button onclick=refresh()>↻ refresh frame</button></div>
+&nbsp; polygon tools: <b>click</b> to add points · drag a point to move.</div>
+<div class=hint>frame: <button onclick=refresh()>↻ live</button>
+  <button onclick="pinN('A')">pin A (e.g. shut)</button> <button onclick="pinN('B')">pin B (e.g. open)</button>
+  &nbsp; view: <span id=views></span>
+  &nbsp; A/B blend shows BOTH leaf edges at once — drag door_roi to span them = the leaf-travel band.</div>
 <div id=wrap>
   <canvas id=cv></canvas>
   <div id=side>
@@ -703,14 +719,16 @@ textarea{width:100%;height:180px;background:#0a0a0a;color:#7fdca0;border:1px sol
     <textarea id=out readonly></textarea>
     <div style=margin-top:6px><button onclick=copyout()>copy config</button>
       <span id=copied style="color:#7fdca0;font-size:12px"></span></div>
-    <div class=hint>Paste DOOR_ROI_FRAME / PANEL_ROIS into the door_calib / GPU_DOOR env, and the
-      zone_cabin/zone_landing polygons into camera_zones.json (frame 704×576).</div>
+    <div class=hint>Coords are in the GPU FRAME space (printed above), not snapshot px. Paste
+      DOOR_ROI_FRAME / PANEL_ROIS into door_calib / GPU_DOOR, polygons into camera_zones.json.</div>
   </div>
 </div>
 <script>
-var GW="__GW__", CAM="__CAM__";
+var GW="__GW__", CAM="__CAM__", FW=__FW__, FH=__FH__;   // FW/FH = the GPU's PROCESSING frame size
 document.getElementById('cam').textContent="· "+CAM;
 var cv=document.getElementById('cv'), ctx=cv.getContext('2d'), img=new Image();
+cv.width=FW; cv.height=FH;                               // canvas INTRINSIC = frame space -> coords correct
+var natW=0, natH=0, bgA=null, bgB=null, view='live';
 var S={door_roi:null,panel0:null,panel1:null,cabin:[],landing:[]};
 var COLORS={door_roi:'#4aa3ff',panel0:'#2ec27e',panel1:'#12b5b5',cabin:'#e0a800',landing:'#b07be0'};
 var RECTS=['door_roi','panel0','panel1'], POLYS=['cabin','landing'];
@@ -721,14 +739,27 @@ function tools(){
     return '<span class="tool'+(t===tool?' on':'')+'" style="color:'+COLORS[t]+'" onclick="pick(\''+t+'\')">'+t+'</span>';
   }).join('')+' &nbsp;<span class=tool style="border-color:#666" onclick="pick(\'\')">pan/none</span>';
 }
+function views(){
+  var opts=[['live','live']]; if(bgA)opts.push(['A','A']); if(bgB)opts.push(['B','B']); if(bgA&&bgB)opts.push(['blend','A|B blend']);
+  document.getElementById('views').innerHTML=opts.map(function(o){
+    return '<button class="'+(view===o[0]?'on':'')+'" onclick="setView(\''+o[0]+'\')">'+o[1]+'</button>';}).join(' ');
+}
+function setView(v){view=v;views();render();}
 function pick(t){tool=t;tools();syncNums();}
-function refresh(){ img.src='/snap/'+GW+'/'+CAM+'.jpg?t='+Date.now(); }
-img.onload=function(){ cv.width=img.naturalWidth; cv.height=img.naturalHeight; render(); output(); };
-img.onerror=function(){ ctx.fillStyle='#400';ctx.fillRect(0,0,cv.width||400,cv.height||300);
+function refresh(){ view='live'; img.src='/snap/'+GW+'/'+CAM+'.jpg?t='+Date.now(); }
+function snap(){var c=document.createElement('canvas');c.width=FW;c.height=FH;c.getContext('2d').drawImage(img,0,0,FW,FH);return c;}
+function pinN(which){ if(!natW){return;} if(which==='A')bgA=snap(); else bgB=snap(); view=which; views(); render(); }
+
+img.onload=function(){ natW=img.naturalWidth; natH=img.naturalHeight;
+  var sc=(FW/natW).toFixed(2);
+  var warn=(natW!==FW)?('<span style="color:#e0a800"> — snapshot is downscaled; coords are UPSCALED ×'+sc+' to the frame</span>'):' (snapshot == frame)';
+  document.getElementById('sizebar').innerHTML='snapshot '+natW+'×'+natH+' &nbsp;→&nbsp; GPU frame <b>'+FW+'×'+FH+'</b> (emitting coords in frame space)'+warn;
+  render(); output(); };
+img.onerror=function(){ ctx.fillStyle='#400';ctx.fillRect(0,0,FW,FH);
   ctx.fillStyle='#fff';ctx.fillText('no /snap/'+GW+'/'+CAM+'.jpg — is the snapshot running?',10,20); };
 
 function toSrc(e){var r=cv.getBoundingClientRect();
-  return [Math.round((e.clientX-r.left)*cv.width/r.width), Math.round((e.clientY-r.top)*cv.height/r.height)];}
+  return [Math.round((e.clientX-r.left)*FW/r.width), Math.round((e.clientY-r.top)*FH/r.height)];}   // -> FRAME px
 function nearVtx(poly,p){for(var i=0;i<poly.length;i++){if(Math.abs(poly[i][0]-p[0])<8&&Math.abs(poly[i][1]-p[1])<8)return i;}return -1;}
 
 cv.addEventListener('mousedown',function(e){
@@ -753,26 +784,33 @@ window.addEventListener('mouseup',function(){if(mode){mode=null;syncNums();outpu
 function undo(){ if(POLYS.indexOf(tool)>=0){S[tool].pop();render();output();} }
 function clr(){ if(RECTS.indexOf(tool)>=0)S[tool]=null; else S[tool]=[]; render();output();syncNums(); }
 
+function drawBg(){
+  ctx.clearRect(0,0,FW,FH);
+  if(view==='A'&&bgA){ctx.drawImage(bgA,0,0);}
+  else if(view==='B'&&bgB){ctx.drawImage(bgB,0,0);}
+  else if(view==='blend'&&bgA&&bgB){ctx.globalAlpha=1;ctx.drawImage(bgA,0,0);ctx.globalAlpha=0.5;ctx.drawImage(bgB,0,0);ctx.globalAlpha=1;}
+  else if(natW){ctx.drawImage(img,0,0,FW,FH);}          // live snapshot stretched to frame space
+}
 function render(){
-  ctx.drawImage(img,0,0);
+  drawBg();
   RECTS.forEach(function(t){var r=S[t]; if(!r)return;
     ctx.strokeStyle=COLORS[t]; ctx.lineWidth=(t===tool?2:1);
     ctx.strokeRect(r.x+0.5,r.y+0.5,r.w,r.h);
-    ctx.fillStyle=COLORS[t]; ctx.font='9px monospace'; ctx.fillText(t,r.x+1,r.y-2>8?r.y-2:r.y+9);
-    if(t===tool){ctx.fillRect(r.x+r.w-3,r.y+r.h-3,6,6);}   // resize handle
+    ctx.fillStyle=COLORS[t]; ctx.font='10px monospace'; ctx.fillText(t,r.x+1,r.y-2>10?r.y-2:r.y+10);
+    if(t===tool){ctx.fillRect(r.x+r.w-3,r.y+r.h-3,6,6);}
   });
   POLYS.forEach(function(t){var pl=S[t]; if(!pl.length)return;
     ctx.strokeStyle=COLORS[t]; ctx.lineWidth=(t===tool?2:1); ctx.beginPath();
     pl.forEach(function(pt,i){ i?ctx.lineTo(pt[0],pt[1]):ctx.moveTo(pt[0],pt[1]); });
     if(pl.length>2)ctx.closePath(); ctx.stroke();
     ctx.fillStyle=COLORS[t]; pl.forEach(function(pt){ctx.fillRect(pt[0]-2,pt[1]-2,4,4);});
-    ctx.font='9px monospace'; ctx.fillText(t,pl[0][0]+2,pl[0][1]-2);
+    ctx.font='10px monospace'; ctx.fillText(t,pl[0][0]+2,pl[0][1]-2);
   });
 }
 function syncNums(){
   if(RECTS.indexOf(tool)<0){document.getElementById('nums').innerHTML='';return;}
   var r=S[tool]||{x:0,y:0,w:0,h:0};
-  document.getElementById('nums').innerHTML=tool+':&nbsp; '
+  document.getElementById('nums').innerHTML=tool+' (frame px):&nbsp; '
     +['x','y','w','h'].map(function(k){return '<label>'+k+'<input type=number id=n_'+k+' value="'+r[k]+'"></label>';}).join('');
   ['x','y','w','h'].forEach(function(k){var el=document.getElementById('n_'+k);
     el.oninput=function(){ if(!S[tool])S[tool]={x:0,y:0,w:1,h:1}; S[tool][k]=parseInt(el.value||0,10); render();output(); };});
@@ -780,12 +818,15 @@ function syncNums(){
 function output(){
   function rc(r){return r?(r.x+','+r.y+','+r.w+','+r.h):'—';}
   function poly(pl){return '['+pl.map(function(p){return '['+p[0]+','+p[1]+']';}).join(',')+']';}
+  var key=CAM.replace(/^ch/,'');
   var pr=[S.panel0,S.panel1].filter(Boolean).map(rc).join(';');
   var t=''
+    +'# frame '+FW+'x'+FH+' (GPU processing size)\n'
     +'DOOR_ROI_FRAME="'+rc(S.door_roi)+'"\n'
     +'PANEL_ROIS="'+pr+'"\n\n'
-    +'# camera_zones.json  ("'+CAM.replace(/^ch/,'')+'", frame '+cv.width+'x'+cv.height+'):\n'
-    +'"'+CAM.replace(/^ch/,'')+'": {\n'
+    +'# camera_zones.json  ("'+key+'", frame '+FW+'x'+FH+'):\n'
+    +'"'+key+'": {\n'
+    +'  "frame_wh": ['+FW+','+FH+'],\n'
     +'  "door_roi_frame": ['+(S.door_roi?[S.door_roi.x,S.door_roi.y,S.door_roi.w,S.door_roi.h].join(','):'')+'],\n'
     +'  "zone_cabin": '+poly(S.cabin)+',\n'
     +'  "zone_landing": '+poly(S.landing)+'\n}';
@@ -794,5 +835,5 @@ function output(){
 function copyout(){var o=document.getElementById('out');o.select();document.execCommand('copy');
   var c=document.getElementById('copied');c.textContent='copied';setTimeout(function(){c.textContent='';},1500);}
 
-tools(); syncNums(); refresh();
+tools(); views(); syncNums(); refresh();
 </script>"""
