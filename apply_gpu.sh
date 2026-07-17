@@ -34,14 +34,23 @@ sed -e "s|__USER__|$LABUSER|" -e "s|__VENVPY__|$VENVPY|" -e "s|__APPDIR__|$APPDI
     /tmp/liftlab-gpu.service > /etc/systemd/system/liftlab-gpu.service
 # ensure counting.py is importable: run from APPDIR
 sed -i "s|ExecStart=$VENVPY $APPDIR/gpu_analyze.py|WorkingDirectory=$APPDIR\nExecStart=$VENVPY $APPDIR/gpu_analyze.py|" /etc/systemd/system/liftlab-gpu.service
+OLDPID=$(systemctl show -p MainPID --value liftlab-gpu 2>/dev/null || echo 0)
 systemctl daemon-reload
-systemctl enable --now liftlab-gpu >/dev/null 2>&1 || systemctl restart liftlab-gpu
+systemctl enable liftlab-gpu >/dev/null 2>&1 || true    # boot-persist; --now is a NO-OP if already running, so do NOT rely on it
+systemctl restart liftlab-gpu                            # ALWAYS restart so the freshly-installed code actually loads
 sleep 4
 AC=$(systemctl is-active liftlab-gpu)
-say "liftlab-gpu = $AC (enabled -> survives preemption/reboot)"
-if [ "$AC" = active ]; then
-  say "RESULT: PASS. Follow: journalctl -u liftlab-gpu -f   (expect 'start:' then 'frame WxH -> zones scaled' then transit lines)"
-  say "Counts appear on https://lift.gargi.online/ops/site-A (Transit card) as riders cross."
-else
-  say "RESULT: CHECK — journalctl -u liftlab-gpu -n 40  (token? model path? cuda?)"; exit 1
+NEWPID=$(systemctl show -p MainPID --value liftlab-gpu 2>/dev/null || echo 0)
+say "liftlab-gpu = $AC  (MainPID $OLDPID -> $NEWPID)"
+if [ "$AC" != active ]; then
+  say "RESULT: CHECK — service not active. journalctl -u liftlab-gpu -n 40  (token? model path? cuda?)"; exit 1
 fi
+# An install that doesn't take is WORSE than a failed one — it looks like success while the old code runs.
+if [ -z "$NEWPID" ] || [ "$NEWPID" = 0 ] || [ "$NEWPID" = "$OLDPID" ]; then
+  say "RESULT: FAIL — restart did NOT take (PID unchanged: $OLDPID -> $NEWPID). The OLD code is still running."
+  say "  journalctl -u liftlab-gpu -n 40"; exit 1
+fi
+say "RESULT: PASS — new process $NEWPID is live (old $OLDPID replaced)."
+say "  Follow: journalctl -u liftlab-gpu -f   (expect 'start:', 'frame WxH -> zones scaled', 'seg timing:', transit/REJECT lines)"
+say "  Verify GPU: nvidia-smi  (python $NEWPID holding memory + non-zero GPU-Util = actually on the L4)"
+say "  Counts + rejection histogram + per-segment timing on https://lift.gargi.online/ops/site-A"

@@ -233,6 +233,14 @@ function drawGrid(meta){
 }
 function tickGrid(){fetch('/ops/'+GW+'/snapmeta').then(function(r){return r.json()}).then(drawGrid).catch(function(){});}
 function kv(k,v,c){return '<div class=kv><span>'+k+'</span><b class="'+(c||'')+'">'+esc(v)+'</b></div>'}
+function proc(an){
+  // per-segment processing time vs the real-time budget. >1.0x = can't keep pace with even one camera.
+  if(an.proc_ms==null)return '';
+  var bud=an.seg_budget_ms||2000,ratio=an.proc_ms/bud;
+  var c=ratio>=1?'bad':ratio>=0.8?'warn':'ok';
+  return kv('proc/seg',Math.round(an.proc_ms)+'ms / '+Math.round(bud)+'ms budget  ('+ratio.toFixed(2)+'x)',c)
+    +kv('  └ track/seg',an.track_ms!=null?Math.round(an.track_ms)+'ms YOLO':'—');
+}
 function rejcard(an){
   // Distribution of would-be crossings the guards KILLED, by the frac of the gap the foot achieved.
   // Lets disp_frac (guard=0.35) be chosen from data: amber buckets .20–.35 are crossings that would be
@@ -253,7 +261,8 @@ function rejcard(an){
   return '<div class=card><h3>rejected crossings</h3>'
     +'<div style="font-size:11px;opacity:.75;margin-bottom:4px">frac of gap achieved (guard=0.35)</div>'
     +'<div style="display:flex;gap:3px;align-items:flex-end;height:66px">'+bars+'</div>'
-    +kv('displacement / dwell',esc(an.rej_disp)+' / '+esc(an.rej_dwell))+'</div>';
+    +kv('displacement / dwell',esc(an.rej_disp)+' / '+esc(an.rej_dwell))
+    +kv('boarding / alighting rej',esc(an.rej_in)+' / '+esc(an.rej_out))+'</div>';
 }
 function drawData(d){
   document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString();
@@ -265,7 +274,8 @@ function drawData(d){
     anhtml='<div class=card><h3>GPU analyzer</h3><div class="big '+(down?'bad':'ok')+'">'+(down?'DOWN':'up')+'</div>'
       +kv('heartbeat',hbage+'s ago',cls(hbage,60,120))
       +kv('counting',esc(an.counting_version))+kv('mode',esc(an.mode))
-      +kv('segments / dropped',esc(an.segments)+' / '+esc(an.dropped))
+      +kv('segments / dropped',esc(an.segments)+' / '+esc(an.dropped),cls(an.dropped,1,1))
+      +proc(an)
       +kv('last transit',ttage==null?'—':ttage+'s ago')
       +kv('uptime',an.uptime_s?Math.round(an.uptime_s/60)+'m':'—')+'</div>'
       +rejcard(an);}

@@ -42,6 +42,7 @@ VAL_SEQ_PER_TRANSIT = int(os.environ.get("VAL_SEQ_PER_TRANSIT", "3"))  # frames 
 FRAME_BUF = int(os.environ.get("FRAME_BUF", "40"))        # ring of recent frames (~1.6s @25fps)
 MAX_BEHIND = int(os.environ.get("MAX_BEHIND", "3"))        # if >this new segs queued, jump to live edge
 HEARTBEAT_S = float(os.environ.get("HEARTBEAT_S", "30"))   # analyzer heartbeat to the cloud
+SEG_BUDGET_MS = float(os.environ.get("SEG_DUR_S", "2")) * 1000   # real-time budget: one segment's worth of wall time
 CALIB_W, CALIB_H = 1920, 1080
 ZONE_CABIN = [[630, 870], [932, 747], [1042, 733], [1308, 1056], [587, 1056], [548, 914]]
 ZONE_LANDING = [[514, 394], [834, 322], [722, 529], [732, 684], [761, 776], [618, 827]]
@@ -214,7 +215,14 @@ def main():
     # tuned from the real distribution. rej_hist buckets the achieved frac in 0.05 steps [0..0.35, then .35+].
     rej_disp = 0                                  # rejected: reached dest + dwelled, but moved < disp_frac
     rej_dwell = 0                                 # rejected: too few frames in dest (fast walk-through / lost track)
+    rej_in = 0                                    # rejected would-be BOARDINGS (landing->cabin)
+    rej_out = 0                                   # rejected would-be ALIGHTINGS (cabin->landing)
     rej_hist = [0] * 8                            # frac buckets: [0,.05)…[.30,.35) then [.35,∞)
+    # per-segment processing time vs the real-time budget (SEG_BUDGET_MS). If total > budget sustained,
+    # one L4 cannot keep pace with even one camera -> the drop counter climbs and the 7-cam plan breaks.
+    proc_times = deque(maxlen=40)                 # rolling per-segment total ms (fetch+decode+track+post)
+    track_times = deque(maxlen=40)                # rolling per-segment YOLO track ms (the dominant cost)
+    last_timing_log = 0.0
     log(f"validation mode: {val_state}")
 
     def heartbeat():                              # so a DEAD worker is visible on /ops, not silent
@@ -224,7 +232,11 @@ def main():
                             "uptime_s": time.time() - started, "segments": segments, "dropped": dropped,
                             "posted": posted, "last_transit_ts": last_transit_ts, "mode": val_state,
                             "rej_disp": rej_disp, "rej_dwell": rej_dwell,
-                            "rej_hist": ",".join(str(x) for x in rej_hist)})
+                            "rej_in": rej_in, "rej_out": rej_out,
+                            "rej_hist": ",".join(str(x) for x in rej_hist),
+                            "proc_ms": round(sum(proc_times) / len(proc_times), 1) if proc_times else None,
+                            "track_ms": round(sum(track_times) / len(track_times), 1) if track_times else None,
+                            "seg_budget_ms": SEG_BUDGET_MS})
         except Exception as e:
             log(f"heartbeat POST failed: {e}")
 
@@ -250,6 +262,7 @@ def main():
             log(f"segment lag={lag} behind live, dropped_total={dropped} (skipped-to-live + pruned)")
             last_drop_log = time.time()
         for name in new:
+            seg_t0 = time.time()                  # wall clock for the WHOLE segment (fetch+decode+track+post)
             try:
                 data = http_get(f"{BASE}/{name}")
             except urllib.error.HTTPError as e:
@@ -259,10 +272,14 @@ def main():
                 log(f"segment {name} HTTP {e.code}"); continue
             except Exception as e:
                 log(f"segment {name} fetch failed: {type(e).__name__}: {e}"); continue
+            fetch_ms = (time.time() - seg_t0) * 1000        # cross-region pull cost
+            dec_t0 = time.time()
             frames = decode_segment(data)
+            decode_ms = (time.time() - dec_t0) * 1000       # HEVC decode cost
             if not frames:
                 seen.add(name); continue
             segments += 1
+            track_ms = 0.0
             if ctr is None:
                 H, W = frames[0].shape[:2]
                 sx, sy = W / CALIB_W, H / CALIB_H
@@ -274,7 +291,9 @@ def main():
             for i, fr in enumerate(frames):
                 if val_state == "validating":
                     recent.append(fr)             # buffer frames so a transit can grab a sequence
+                tr_t0 = time.time()
                 dets = det.track(fr)
+                track_ms += (time.time() - tr_t0) * 1000     # YOLO inference — the cost that must fit the budget
                 pre = len(ctr.transits)
                 pre_rej = len(ctr.rejections)
                 ctr.update(dets, offset_s=seg_wall - (n_fr - i) * 0.04)   # ~25fps back-stamp
@@ -285,6 +304,10 @@ def main():
                         rej_disp += 1
                     else:
                         rej_dwell += 1
+                    if rj.origin == "landing":    # landing->cabin would have been a BOARDING
+                        rej_in += 1
+                    else:
+                        rej_out += 1
                     log(f"REJECT {rj.reason} tid={rj.track_id} {rj.origin}->{rj.dest} "
                         f"frac={rj.achieved_frac:.2f} dwell={rj.dwell_frames}")
                 for t in ctr.transits[pre:]:      # transits detected ON this frame
@@ -311,6 +334,16 @@ def main():
             b, a = ctr.counts()
             if len(ctr.transits) > before:
                 log(f"{name}: +{len(ctr.transits)-before} transits (cum boarded={b} alighted={a}, posted={posted})")
+            seg_ms = (time.time() - seg_t0) * 1000
+            proc_times.append(seg_ms); track_times.append(track_ms)
+            if time.time() - last_timing_log > 30 and proc_times:
+                pm = sum(proc_times) / len(proc_times); tm = sum(track_times) / len(track_times)
+                ratio = pm / SEG_BUDGET_MS
+                verdict = "OVER-BUDGET (cannot keep pace)" if ratio > 1.0 else "within budget"
+                log(f"seg timing: last[fetch={fetch_ms:.0f} decode={decode_ms:.0f} track={track_ms:.0f} n={n_fr}fr] "
+                    f"avg_total={pm:.0f}ms avg_track={tm:.0f}ms vs budget={SEG_BUDGET_MS:.0f}ms "
+                    f"-> {ratio:.2f}x {verdict}; dropped_total={dropped}")
+                last_timing_log = time.time()
             seen.add(name)
         # close a stale validation episode (door shut) + refresh this cam's mode periodically
         if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:

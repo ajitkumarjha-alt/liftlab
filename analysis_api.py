@@ -71,8 +71,11 @@ def _db():
       gateway_id TEXT, cam TEXT, ts REAL, counting_version TEXT, uptime_s REAL,
       segments INTEGER, dropped INTEGER, posted INTEGER, last_transit_ts REAL, mode TEXT,
       rej_disp INTEGER, rej_dwell INTEGER, rej_hist TEXT,
+      rej_in INTEGER, rej_out INTEGER, proc_ms REAL, track_ms REAL, seg_budget_ms REAL,
       PRIMARY KEY (gateway_id, cam))""")
-    for col, typ in (("rej_disp", "INTEGER"), ("rej_dwell", "INTEGER"), ("rej_hist", "TEXT")):
+    for col, typ in (("rej_disp", "INTEGER"), ("rej_dwell", "INTEGER"), ("rej_hist", "TEXT"),
+                     ("rej_in", "INTEGER"), ("rej_out", "INTEGER"),
+                     ("proc_ms", "REAL"), ("track_ms", "REAL"), ("seg_budget_ms", "REAL")):
         try:
             db.execute(f"ALTER TABLE analyzer_status ADD COLUMN {col} {typ}")   # migrate pre-existing table
         except sqlite3.OperationalError:
@@ -196,14 +199,18 @@ async def analyzer_status_ingest(gw: str, request: Request, authorization: str =
     db = _db()
     db.execute(
         "INSERT INTO analyzer_status (gateway_id,cam,ts,counting_version,uptime_s,segments,dropped,"
-        "posted,last_transit_ts,mode,rej_disp,rej_dwell,rej_hist) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "posted,last_transit_ts,mode,rej_disp,rej_dwell,rej_hist,rej_in,rej_out,proc_ms,track_ms,seg_budget_ms) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(gateway_id,cam) DO UPDATE SET ts=excluded.ts, counting_version=excluded.counting_version,"
         "uptime_s=excluded.uptime_s, segments=excluded.segments, dropped=excluded.dropped, "
         "posted=excluded.posted, last_transit_ts=excluded.last_transit_ts, mode=excluded.mode, "
-        "rej_disp=excluded.rej_disp, rej_dwell=excluded.rej_dwell, rej_hist=excluded.rej_hist",
+        "rej_disp=excluded.rej_disp, rej_dwell=excluded.rej_dwell, rej_hist=excluded.rej_hist, "
+        "rej_in=excluded.rej_in, rej_out=excluded.rej_out, proc_ms=excluded.proc_ms, "
+        "track_ms=excluded.track_ms, seg_budget_ms=excluded.seg_budget_ms",
         (gw, str(d.get("cam", "")), time.time(), d.get("counting_version"), d.get("uptime_s"),
          d.get("segments"), d.get("dropped"), d.get("posted"), d.get("last_transit_ts"), d.get("mode"),
-         d.get("rej_disp"), d.get("rej_dwell"), d.get("rej_hist")))
+         d.get("rej_disp"), d.get("rej_dwell"), d.get("rej_hist"),
+         d.get("rej_in"), d.get("rej_out"), d.get("proc_ms"), d.get("track_ms"), d.get("seg_budget_ms")))
     db.commit()
     db.close()
     return {"ok": True}
