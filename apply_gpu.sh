@@ -8,6 +8,9 @@
 #   sudo ANALYSIS_TOKEN=site-A:<read-only-token> bash /tmp/apply_gpu.sh
 set -uo pipefail
 say(){ echo "[apply-gpu] $*"; }
+# --- staleness tell: the OLD script cannot print this. If you do NOT see this REV line and a
+#     'MainPID X -> Y' line at the end, you ran a cached /tmp copy — re-curl apply_gpu.sh. ---
+say "REV=restart-verify-3  (ALWAYS restarts liftlab-gpu, then ASSERTS MainPID changed; else FAILs)"
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo ANALYSIS_TOKEN=... bash $0"; exit 2; }
 for f in gpu_analyze.py counting.py liftlab-gpu.service; do [ -f "/tmp/$f" ] || { echo "missing /tmp/$f"; exit 2; }; done
 : "${ANALYSIS_TOKEN:?pass ANALYSIS_TOKEN=site-A:<read-only-token> (minted on the cloud by apply_analysis.sh)}"

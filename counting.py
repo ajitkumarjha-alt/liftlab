@@ -45,6 +45,7 @@ class Detection:
     x2: float
     y2: float
     track_id: int
+    conf: float = 1.0          # detector confidence; carried for the detection audit, NOT used in counting
 
     @property
     def foot(self) -> tuple[float, float]:
@@ -77,10 +78,12 @@ class YoloDetector:
         r = self.model.track(frame, **kw)[0]
         if r.boxes is None or r.boxes.id is None:
             return []
+        n = len(r.boxes.id)
+        confs = (r.boxes.conf.cpu().numpy() if r.boxes.conf is not None else [1.0] * n)
         out = []
-        for box, tid in zip(r.boxes.xyxy.cpu().numpy(),
-                            r.boxes.id.cpu().numpy().astype(int)):
-            out.append(Detection(*box.tolist(), track_id=int(tid)))
+        for box, tid, cf in zip(r.boxes.xyxy.cpu().numpy(),
+                                r.boxes.id.cpu().numpy().astype(int), confs):
+            out.append(Detection(*box.tolist(), track_id=int(tid), conf=float(cf)))
         return out
 
 

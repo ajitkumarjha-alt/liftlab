@@ -69,7 +69,8 @@ def _db():
     """)
     for col, typ in (("counting_version", "TEXT"),         # logic it was counted under
                      ("det_max", "INTEGER"), ("det_mean", "REAL"),   # detection audit: what YOLO+tracker saw
-                     ("distinct_ids", "INTEGER"), ("det_frames", "INTEGER")):
+                     ("distinct_ids", "INTEGER"), ("det_frames", "INTEGER"),
+                     ("conf_min", "REAL"), ("conf_mean", "REAL"), ("conf_max", "REAL")):
         try:
             db.execute(f"ALTER TABLE validation_item ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
@@ -130,12 +131,13 @@ async def validation_item(gw: str, cam: str, request: Request, authorization: st
     d = await request.json()
     cur = db.execute(
         "INSERT INTO validation_item (gateway_id,cam,ts_start,ts_end,machine_boarded,machine_alighted,"
-        "n_images,counting_version,det_max,det_mean,distinct_ids,det_frames,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "n_images,counting_version,det_max,det_mean,distinct_ids,det_frames,conf_min,conf_mean,conf_max,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (gw, cam, float(d.get("ts_start", 0)), float(d.get("ts_end", 0)),
          int(d.get("machine_boarded", 0)), int(d.get("machine_alighted", 0)), 0,
          d.get("counting_version"), d.get("det_max"), d.get("det_mean"),
-         d.get("distinct_ids"), d.get("det_frames"), time.time()))
+         d.get("distinct_ids"), d.get("det_frames"),
+         d.get("conf_min"), d.get("conf_mean"), d.get("conf_max"), time.time()))
     item_id = cur.lastrowid
     imgs = (d.get("images") or [])[:MAX_IMGS]
 
@@ -286,8 +288,12 @@ def _render(cams, pend, npend=0, nsup=0):
         dm = it["det_max"]
         da = ""                                        # detection audit: what YOLO+tracker saw vs the image
         if dm is not None:
+            conf = ""
+            if it["conf_mean"] is not None:
+                conf = (f' · conf {it["conf_min"]:.2f}/{it["conf_mean"]:.2f}/{it["conf_max"]:.2f} '
+                        f'(min/mean/max)')
             da = (f'<div class=da style="font-size:12px;opacity:.8">YOLO saw: max <b>{dm}</b> person(s)/frame · '
-                  f'<b>{it["distinct_ids"]}</b> distinct track(s) over {it["det_frames"] or 0} frames — '
+                  f'<b>{it["distinct_ids"]}</b> distinct track(s) over {it["det_frames"] or 0} frames{conf} — '
                   f'if the image shows more people than this, they were never detected</div>')
         items += (f'<div class=item><div class=mc>{it["cam"]} · machine: <b>boarded {it["machine_boarded"]}'
                   f' / alighted {it["machine_alighted"]}</b></div>{da}<div class=imgs>{imgs or "(no images)"}</div>'
