@@ -234,12 +234,23 @@ function drawGrid(meta){
 function tickGrid(){fetch('/ops/'+GW+'/snapmeta').then(function(r){return r.json()}).then(drawGrid).catch(function(){});}
 function kv(k,v,c){return '<div class=kv><span>'+k+'</span><b class="'+(c||'')+'">'+esc(v)+'</b></div>'}
 function proc(an){
-  // per-segment processing time vs the real-time budget. >1.0x = can't keep pace with even one camera.
+  // THE OWNERSHIP GATE: can the GPU process a 2s segment in <2s, and how often does it drop one?
+  // A drop mid-close = a silently lost/wrong door event -> that is the ONLY reason door timing lives
+  // on the Pi. Split fetch/decode/track so the bottleneck is attributable (fetch = fixable retention/
+  // prefetch; track = real GPU compute). At ~7% util the cost should be FETCH, not compute.
   if(an.proc_ms==null)return '';
   var bud=an.seg_budget_ms||2000,ratio=an.proc_ms/bud;
   var c=ratio>=1?'bad':ratio>=0.8?'warn':'ok';
-  return kv('proc/seg',Math.round(an.proc_ms)+'ms / '+Math.round(bud)+'ms budget  ('+ratio.toFixed(2)+'x)',c)
-    +kv('  └ track/seg',an.track_ms!=null?Math.round(an.track_ms)+'ms YOLO':'—');
+  var bound=(an.fetch_ms!=null&&an.track_ms!=null)?(an.fetch_ms>an.track_ms?'fetch-bound':'compute-bound'):'';
+  var out=kv('proc/seg',Math.round(an.proc_ms)+'ms / '+Math.round(bud)+'ms  ('+ratio.toFixed(2)+'x '+(ratio>=1?'OVER':'ok')+')',c);
+  if(an.fetch_ms!=null)
+    out+=kv('  └ fetch/decode/track',Math.round(an.fetch_ms)+' / '+Math.round(an.decode_ms||0)+' / '+Math.round(an.track_ms||0)+'ms  '+bound);
+  // drop rate is the gate's verdict: computed here from stored counters (works even for old rows)
+  var tot=(an.segments||0)+(an.dropped||0);
+  var dfrac=an.drop_frac!=null?an.drop_frac:(tot?an.dropped/tot:0);
+  var dc=dfrac>=0.01?'bad':dfrac>0?'warn':'ok';
+  out+=kv('drop rate',(dfrac*100).toFixed(2)+'%'+(an.drop_rate_hr!=null?'  ('+an.drop_rate_hr+'/hr)':'')+'  · '+esc(an.dropped)+' of '+tot,dc);
+  return out;
 }
 function rejcard(an){
   // Distribution of would-be crossings the guards KILLED, by the frac of the gap the foot achieved.

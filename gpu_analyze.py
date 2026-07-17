@@ -238,13 +238,23 @@ def main():
     rej_hist = [0] * 8                            # frac buckets: [0,.05)…[.30,.35) then [.35,∞)
     # per-segment processing time vs the real-time budget (SEG_BUDGET_MS). If total > budget sustained,
     # one L4 cannot keep pace with even one camera -> the drop counter climbs and the 7-cam plan breaks.
-    proc_times = deque(maxlen=40)                 # rolling per-segment total ms (fetch+decode+track+post)
-    track_times = deque(maxlen=40)                # rolling per-segment YOLO track ms (the dominant cost)
+    # ARCHITECTURE GATE (can the GPU own door timing?): fetch/decode/track are split so the bottleneck
+    # is attributable — at ~7% GPU util the cost is FETCH (cross-region pull + retention window), NOT
+    # compute, and fetch is fixable (deeper cloud retention + prefetch) while compute is not. drop_frac
+    # / drop_rate quantify how often a 2s segment is lost (mid-close = a silently wrong door event).
+    proc_times = deque(maxlen=60)                 # rolling per-segment TOTAL ms (fetch+decode+track+post)
+    fetch_times = deque(maxlen=60)                # rolling cross-region pull ms  (the suspected bottleneck)
+    decode_times = deque(maxlen=60)               # rolling HEVC decode ms
+    track_times = deque(maxlen=60)                # rolling YOLO track ms         (the only true GPU-compute cost)
     last_timing_log = 0.0
     log(f"validation mode: {val_state}")
 
+    def _mean(d):
+        return round(sum(d) / len(d), 1) if d else None
+
     def heartbeat():                              # so a DEAD worker is visible on /ops, not silent
         try:
+            _tot = segments + dropped
             http_post_json(f"{CLOUD}/api/gw/{GW}/analyzer_status",
                            {"cam": CAM, "counting_version": counting.COUNTING_VERSION,
                             "uptime_s": time.time() - started, "segments": segments, "dropped": dropped,
@@ -252,9 +262,14 @@ def main():
                             "rej_disp": rej_disp, "rej_dwell": rej_dwell,
                             "rej_in": rej_in, "rej_out": rej_out,
                             "rej_hist": ",".join(str(x) for x in rej_hist),
-                            "proc_ms": round(sum(proc_times) / len(proc_times), 1) if proc_times else None,
-                            "track_ms": round(sum(track_times) / len(track_times), 1) if track_times else None,
-                            "seg_budget_ms": SEG_BUDGET_MS})
+                            "proc_ms": _mean(proc_times), "fetch_ms": _mean(fetch_times),
+                            "decode_ms": _mean(decode_times), "track_ms": _mean(track_times),
+                            "seg_budget_ms": SEG_BUDGET_MS,
+                            # the two gate numbers (since process start): fraction of segments lost, and
+                            # a per-hour drop rate. dropped mid-close = a lost/wrong door event.
+                            "drop_frac": round(dropped / _tot, 4) if _tot else 0.0,
+                            "drop_rate_hr": round(dropped / ((time.time() - started) / 3600.0), 2)
+                                            if time.time() - started > 60 else None})
         except Exception as e:
             log(f"heartbeat POST failed: {e}")
 
@@ -367,13 +382,18 @@ def main():
                 log(f"{name}: +{len(ctr.transits)-before} transits (cum boarded={b} alighted={a}, posted={posted})")
             seg_ms = (time.time() - seg_t0) * 1000
             proc_times.append(seg_ms); track_times.append(track_ms)
+            fetch_times.append(fetch_ms); decode_times.append(decode_ms)
             if time.time() - last_timing_log > 30 and proc_times:
                 pm = sum(proc_times) / len(proc_times); tm = sum(track_times) / len(track_times)
+                fm = sum(fetch_times) / len(fetch_times); dm = sum(decode_times) / len(decode_times)
                 ratio = pm / SEG_BUDGET_MS
+                _tot = segments + dropped
+                dfrac = dropped / _tot if _tot else 0.0
                 verdict = "OVER-BUDGET (cannot keep pace)" if ratio > 1.0 else "within budget"
-                log(f"seg timing: last[fetch={fetch_ms:.0f} decode={decode_ms:.0f} track={track_ms:.0f} n={n_fr}fr] "
-                    f"avg_total={pm:.0f}ms avg_track={tm:.0f}ms vs budget={SEG_BUDGET_MS:.0f}ms "
-                    f"-> {ratio:.2f}x {verdict}; dropped_total={dropped}")
+                bound = "FETCH-bound (fixable: retention+prefetch)" if fm > tm else "COMPUTE-bound (GPU)"
+                log(f"seg timing: avg_total={pm:.0f}ms [fetch={fm:.0f} decode={dm:.0f} track={tm:.0f}] "
+                    f"vs budget={SEG_BUDGET_MS:.0f}ms -> {ratio:.2f}x {verdict}; {bound}; "
+                    f"drop_frac={dfrac:.3%} dropped_total={dropped}")
                 last_timing_log = time.time()
             seen.add(name)
         # close a stale validation episode (door shut) + refresh this cam's mode periodically
