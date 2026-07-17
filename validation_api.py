@@ -75,6 +75,12 @@ def _db():
             db.execute(f"ALTER TABLE validation_item ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass                                   # already added (old rows -> NULL)
+    try:
+        # the counting version the camera went LIVE under. A bump means a live camera is trusting a
+        # counter that no longer runs -> _state() reopens it. Pre-migration live rows -> NULL -> reopen.
+        db.execute("ALTER TABLE camera_validation ADD COLUMN counting_version TEXT")
+    except sqlite3.OperationalError:
+        pass
     return db
 
 
@@ -91,9 +97,28 @@ def _safe(*p):
             raise HTTPException(400, "bad name")
 
 
+def _reopen_if_stale(db, gw, cam):
+    """A COUNTING_VERSION change is a comparability boundary: a camera left 'live' would auto-store counts
+    from an UNVALIDATED counter while showing provenance earned by one that no longer runs — and it can't
+    self-correct (live => GPU stops capturing => 0 episodes => nothing to validate). So when the version it
+    went live under != the current one, flip it back to 'validating' and CLEAR the stale provenance/precision.
+    This is the state half of version-stamping (resetting the verdicts alone left the CAMERA STATE stale).
+    Returns the effective state."""
+    r = db.execute("SELECT state, counting_version FROM camera_validation WHERE gateway_id=? AND cam=?",
+                   (gw, cam)).fetchone()
+    if not r:
+        return "validating"                           # a new camera defaults to validating
+    if r["state"] == "live" and (r["counting_version"] or "") != CURRENT_COUNTING_VERSION:
+        db.execute("UPDATE camera_validation SET state='validating', provenance=NULL, confirmed_at=NULL, "
+                   "n_reviewed=0, n_exact=0, updated_at=? WHERE gateway_id=? AND cam=?",
+                   (time.time(), gw, cam))
+        db.commit()
+        return "validating"
+    return r["state"]
+
+
 def _state(db, gw, cam):
-    r = db.execute("SELECT state FROM camera_validation WHERE gateway_id=? AND cam=?", (gw, cam)).fetchone()
-    return r["state"] if r else "validating"          # a new camera defaults to validating
+    return _reopen_if_stale(db, gw, cam)
 
 
 def _precision(db, gw, cam):
@@ -212,10 +237,11 @@ def golive(gw: str = Form(...), cam: str = Form(...), reviewer: str = Form("oper
         raise HTTPException(400, f"Only {nr} reviewed (need >= {MIN_VALIDATE_N} with load>=1 before "
                                  f"trusting {cam}). A 100%-on-n=1 provenance is meaningless. Keep reviewing.")
     prov = _provenance(cam, nr, ne)
-    db.execute("INSERT INTO camera_validation (gateway_id,cam,state,confirmed_at,provenance,updated_at) "
-               "VALUES (?,?,'live',?,?,?) ON CONFLICT(gateway_id,cam) DO UPDATE SET "
-               "state='live', confirmed_at=excluded.confirmed_at, provenance=excluded.provenance, updated_at=excluded.updated_at",
-               (gw, cam, time.time(), prov, time.time()))
+    db.execute("INSERT INTO camera_validation (gateway_id,cam,state,confirmed_at,provenance,counting_version,updated_at) "
+               "VALUES (?,?,'live',?,?,?,?) ON CONFLICT(gateway_id,cam) DO UPDATE SET "
+               "state='live', confirmed_at=excluded.confirmed_at, provenance=excluded.provenance, "
+               "counting_version=excluded.counting_version, updated_at=excluded.updated_at",
+               (gw, cam, time.time(), prov, CURRENT_COUNTING_VERSION, time.time()))
     # PRIVACY: drop any remaining pending images for this camera on go-live
     for it in db.execute("SELECT id FROM validation_item WHERE gateway_id=? AND cam=? AND status='pending'", (gw, cam)).fetchall():
         shutil.rmtree(IMG_DIR / str(it["id"]), ignore_errors=True)
@@ -228,6 +254,10 @@ def golive(gw: str = Form(...), cam: str = Form(...), reviewer: str = Form("oper
 @validation_router.get("/validate", response_class=HTMLResponse)
 def validate_page():
     db = _db()
+    # reopen any camera left 'live' under a superseded counting version BEFORE rendering, so the operator
+    # sees it flip to validating on load (not only after the next GPU poll hits _state).
+    for c in db.execute("SELECT gateway_id,cam FROM camera_validation").fetchall():
+        _reopen_if_stale(db, c["gateway_id"], c["cam"])
     cams = []
     for c in db.execute("SELECT gateway_id,cam,state,provenance FROM camera_validation ORDER BY gateway_id,cam").fetchall():
         nr, ne = _precision(db, c["gateway_id"], c["cam"])   # derived truth

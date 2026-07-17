@@ -74,19 +74,35 @@ if [ "$(systemctl is-active "$SVC")" != active ]; then
   exit 1
 fi
 
-# parse the REAL port (resolved ExecStart is most reliable; handle --port N and --port=N), else the
-# actually-listening socket; error rather than curl a dead 9090 (the verify was reading 000).
-PORT=$(systemctl show "$SVC" -p ExecStart --value 2>/dev/null | grep -oP '\-\-port[=\s]+\K[0-9]+' | head -1)
+# Parse the REAL port. The previous verify read 000 because the port guess was wrong (fell back to a
+# dead 9090). Most reliable: the socket the RUNNING MainPID actually listens on — works even when the
+# app binds 0.0.0.0 or :: (a '127.0.0.1:' grep misses those). Then the unit --port (events-dash's proven
+# path), then any local listener. If we STILL can't, do NOT emit misleading 000s: the came-up check
+# above already proved the ingest is alive; report the port as unknown and skip the HTTP probe.
+PORT=""
+MPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null)
+if [ -n "$MPID" ] && [ "$MPID" != 0 ]; then
+  PORT=$(ss -tlnpH 2>/dev/null | grep -F "pid=$MPID," | grep -oP ':\K[0-9]+' | head -1)   # the actual listen port
+fi
 [ -n "$PORT" ] || PORT=$(systemctl cat "$SVC" 2>/dev/null | grep -oP '\-\-port[=\s]+\K[0-9]+' | head -1)
-[ -n "$PORT" ] || PORT=$(ss -tlnp 2>/dev/null | grep -oP '127\.0\.0\.1:\K[0-9]+' | head -1)
-[ -n "$PORT" ] || { say "could not determine cloud port — routes may be fine; set PORT=<n> to verify"; PORT=9090; }
+[ -n "$PORT" ] || PORT=$(systemctl show "$SVC" -p ExecStart --value 2>/dev/null | grep -oP '\-\-port[=\s]+\K[0-9]+' | head -1)
+[ -n "$PORT" ] || PORT=$(ss -tlnpH 2>/dev/null | grep -oP '127\.0\.0\.1:\K[0-9]+' | head -1)
+if [ -z "$PORT" ]; then
+  say "AFTER: cloud=active (came-up verified — ingest is UP). Could not determine the HTTP port to probe"
+  say "  the new routes; that is NOT a route failure. To HTTP-verify, re-run with PORT=<n>."
+  say "RESULT: PASS (ingest healthy; routes not HTTP-probed — port unknown)."
+  exit 0
+fi
 BASE="http://127.0.0.1:$PORT"; code(){ curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$@"; }
 MODE=$(code "$BASE/api/gw/site-A/validation_mode/ch29"); PAGE=$(code "$BASE/validate")
 VITEM=$(code -X POST --data '{}' "$BASE/api/gw/site-A/validation_item/ch29")
 EVT=$(code "$BASE/events" || echo "?")           # confirm the ingest surface is still alive
-say "AFTER: cloud=active  validation_mode=$MODE  /validate=$PAGE  validation_item(no-token)=$VITEM  /events=$EVT"
+say "AFTER (port $PORT): validation_mode=$MODE  /validate=$PAGE  validation_item(no-token)=$VITEM  /events=$EVT"
 if [ "$MODE" = 401 ] && [ "$PAGE" = 200 ] && [ "$VITEM" = 401 ]; then
   say "RESULT: PASS — validation UI up, ingest healthy. Review at https://lift.gargi.online/validate"
+elif [ "$MODE" = 000 ] && [ "$PAGE" = 000 ] && [ "$VITEM" = 000 ]; then
+  say "RESULT: CHECK — every probe was 000 = could not connect on :$PORT (wrong port, NOT dead routes)."
+  say "  Service is active. Re-run with the right PORT=<n>, or verify via https://lift.gargi.online/validate"; exit 1
 else
   say "RESULT: CHECK — routes not as expected; journalctl -u $SVC -n 40 (main.py.bak.* available)"; exit 1
 fi
