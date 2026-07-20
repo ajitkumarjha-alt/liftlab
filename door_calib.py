@@ -626,6 +626,73 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
     return _write_result(outdir, "_calib_build.json", result)
 
 
+def foldback(gw=None, cam=None, outdir=None, db_path=None):
+    """Self-improving loop: fold operator-REVIEWED /floorcheck samples back into the calib set. For each
+    floor_sample with a confirmed reviewed_label not yet folded, decode its panel crop -> a new
+    _calib_crop_*.png + a labels.json entry (so --build grows the thin glyphs the reviews flagged: 8/0/
+    6/G). READ-ONLY on gateway.db (never writes the ingest DB); folded sample ids tracked locally in
+    _folded.json. Reviews marked '-' are skipped (excluded). WEB-CALLABLE. Run --build after."""
+    import sqlite3
+
+    import cv2
+    import numpy as np
+    gwid = gw or GW; cam = cam or CAM
+    outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
+    dbp = db_path or os.environ.get("GATEWAY_DB", "/opt/liftlab-b3/cloud/gateway.db")
+    if not os.path.exists(dbp):
+        raise CalibError(f"gateway.db not found at {dbp} — set GATEWAY_DB to the cloud's ingest DB")
+    folded_path = outdir / "_folded.json"
+    folded = set()
+    if folded_path.exists():
+        try:
+            folded = set(json.loads(folded_path.read_text()))
+        except (OSError, ValueError):
+            folded = set()
+    db = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)     # READ-ONLY — foldback never writes ingest
+    db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute("SELECT id, reviewed_label, crop_jpeg FROM floor_sample WHERE gateway_id=? AND cam=? "
+                          "AND reviewed_label IS NOT NULL AND reviewed_label != ''", (gwid, cam)).fetchall()
+    except sqlite3.OperationalError as e:
+        db.close()
+        raise CalibError(f"floor_sample not available ({e}) — deploy door_event_api + review samples at /floorcheck")
+    db.close()
+    labels = {}
+    lj = outdir / "labels.json"
+    if lj.exists():
+        try:
+            labels = json.loads(lj.read_text())
+        except (OSError, ValueError):
+            labels = {}
+    existing = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
+    n = 1 + max([int(Path(g).stem.split("_")[-1]) for g in existing], default=-1)   # continue numbering
+    added = 0
+    for r in rows:
+        if r["id"] in folded:
+            continue
+        lab = str(r["reviewed_label"]).strip()
+        blob = r["crop_jpeg"]
+        if lab == "-" or not blob:                           # reviewed-as-exclude, or no image -> skip
+            folded.add(r["id"]); continue
+        arr = cv2.imdecode(np.frombuffer(bytes(blob), np.uint8), cv2.IMREAD_GRAYSCALE)
+        if arr is None:
+            folded.add(r["id"]); continue
+        fname = f"_calib_crop_{n:03d}.png"
+        cv2.imwrite(str(outdir / fname), arr)                # the reviewed panel crop -> a labeled calib crop
+        labels[fname] = lab
+        folded.add(r["id"]); n += 1; added += 1
+    lj.write_text(json.dumps(labels, indent=2, sort_keys=True))
+    folded_path.write_text(json.dumps(sorted(folded)))
+    result = {"gw": gwid, "cam": cam, "added": added, "reviewed_total": len(rows),
+              "already_folded": len(folded) - added, "labels": len(labels),
+              "note": "run --build to rebuild templates with the appended reviewed examples"}
+    _write_result(outdir, "_calib_foldback.json", result)
+    print(f"[foldback] +{added} reviewed samples appended ({len(rows)} reviewed total, "
+          f"{len(folded) - added} already folded) -> {len(labels)} labeled crops")
+    print(f"[foldback] now: door_calib.py --build   (grows the glyphs the reviews flagged)")
+    return result
+
+
 def main():
     if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0:
         os.umask(0o002)                          # root (sudo): new files/dirs group-writable (664/775)
@@ -639,6 +706,7 @@ def main():
     ap.add_argument("--cells", action="store_true", help="DETERMINISTIC cells from --anchors (no auto-detect)")
     ap.add_argument("--anchors", default="", help="tens_left,units_left,digit_top,digit_bottom,arrow_left (within-panel px)")
     ap.add_argument("--anchor-crop", type=int, default=None, dest="anchor_crop", help="crop index to draw the derived cells on")
+    ap.add_argument("--foldback", action="store_true", help="fold REVIEWED /floorcheck samples into the calib set (then --build)")
     ap.add_argument("--build", action="store_true", help="build templates.npz from collected crops + --labels")
     ap.add_argument("--labels", default="", help="row-major floor labels, e.g. '7^,8^,12^,...,P3v,6v'")
     ap.add_argument("--fresh", action="store_true", help="clear accumulated crops before collecting (default = append)")
@@ -651,6 +719,9 @@ def main():
             return
         if a.panelcheck:
             panelcheck(ref=a.ref)
+            return
+        if a.foldback:
+            foldback()
             return
         if a.anchor is not None:
             r = render_anchor(a.anchor)

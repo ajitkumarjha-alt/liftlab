@@ -33,6 +33,9 @@ ANALYSIS_TOKENS = {g.split(":", 1)[0]: g.split(":", 1)[1]
 _SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 FLOORCHECK_KEEP = int(os.environ.get("FLOORCHECK_KEEP", "300"))   # ephemeral spot-check images per cam
 DOOR_STATES = {"closed", "opening", "open", "closing"}
+# same grammar as the /calib-label wizard: floor + optional ^/v, or '-'. A reviewed sample with a
+# confirmed label folds back into the calib crops (door_calib --foldback) -> a self-improving loop.
+LABEL_RE = re.compile(r"^(-|[A-Za-z0-9]+[\^vV]?)$")
 
 door_event_router = APIRouter()
 
@@ -54,6 +57,10 @@ def _db():
       id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT, ts REAL,
       floor TEXT, direction TEXT, read_conf REAL, panels_agreed INTEGER, reason TEXT,
       door_version TEXT, crop_jpeg BLOB, received_at REAL)""")
+    try:
+        db.execute("ALTER TABLE floor_sample ADD COLUMN reviewed_label TEXT")   # operator-confirmed truth -> foldback
+    except sqlite3.OperationalError:
+        pass
     return db
 
 
@@ -138,7 +145,28 @@ async def floorcheck_ingest(gw: str, request: Request, authorization: str = Head
     return {"ok": True}
 
 
-# ---------------- operator spot-check (Caddy basicauth) ----------------
+# ---------------- operator spot-check + review (Caddy basicauth) ----------------
+@door_event_router.post("/floorcheck/{gw}/{cam}/review")
+async def floorcheck_review(gw: str, cam: str, request: Request):
+    """Confirm the TRUE floor for a sample (human action, basicauth). Sets reviewed_label; door_calib
+    --foldback later appends reviewed samples' crops to the calib set + labels.json and rebuilds."""
+    _safe(gw, cam)
+    d = await request.json()
+    sid = int(d.get("id", -1))
+    label = str(d.get("label", "")).strip()
+    if not LABEL_RE.match(label):
+        raise HTTPException(400, "invalid label — floor + optional ^/v (e.g. 48, 6^, MEP^) or '-'")
+    db = _db()
+    cur = db.execute("UPDATE floor_sample SET reviewed_label=? WHERE id=? AND gateway_id=? AND cam=?",
+                     (label, sid, gw, cam))
+    db.commit()
+    n = cur.rowcount
+    db.close()
+    if not n:
+        raise HTTPException(404, "no such sample")
+    return {"ok": True, "id": sid, "reviewed_label": label}
+
+
 @door_event_router.get("/floorcheck/{gw}/{cam}/img/{sid}.jpg")
 def floorcheck_img(gw: str, cam: str, sid: int):
     _safe(gw, cam)
@@ -156,7 +184,7 @@ def floorcheck_img(gw: str, cam: str, sid: int):
 def floorcheck_data(gw: str, cam: str, limit: int = 60):
     _safe(gw, cam)
     db = _db()
-    rows = db.execute("SELECT id,ts,floor,direction,read_conf,panels_agreed,reason,door_version,"
+    rows = db.execute("SELECT id,ts,floor,direction,read_conf,panels_agreed,reason,door_version,reviewed_label,"
                       "(crop_jpeg IS NOT NULL) AS has_img FROM floor_sample "
                       "WHERE gateway_id=? AND cam=? ORDER BY id DESC LIMIT ?",
                       (gw, cam, max(1, min(limit, 300)))).fetchall()
@@ -194,14 +222,19 @@ h1{font:600 15px var(--mono);margin:0}
 .b-ok{border-left:3px solid var(--ok)} .b-single{border-left:3px solid var(--warn)}
 .b-noread{border-left:3px solid var(--mut)} .b-disagree{border-left:3px solid var(--bad)}
 .note{padding:0 16px;color:var(--mut);font:12px var(--mono)}
+.rev{width:90%;margin:2px auto 5px;display:block;font:600 13px var(--mono);text-align:center;text-transform:uppercase;
+  border:1px solid var(--line);border-radius:5px;background:var(--bg);color:var(--fg);padding:2px}
+.rev.saved{border-color:var(--ok);color:var(--ok)}
 </style></head><body>
 <header>
   <h1>floorcheck · __CAM__ @ __GW__</h1>
   <span class=pill id=stream>—</span>
+  <span class=pill id=reviewed>—</span>
   <span class=pill id=stamp>—</span>
 </header>
 <div class=note>Spot-check the OCR before Tier-2 trusts it: read (big) vs the panel crop. Colour = quality:
-  <b style="color:var(--ok)">ok</b> (2 panels agree) · <b style="color:var(--warn)">single</b> · <b style="color:var(--mut)">no_read</b> · <b style="color:var(--bad)">disagree</b>. A read that mismatches its crop is a bad glyph/cell — relabel &amp; rebuild.</div>
+  <b style="color:var(--ok)">ok</b> (2 panels agree) · <b style="color:var(--warn)">single</b> · <b style="color:var(--mut)">no_read</b> · <b style="color:var(--bad)">disagree</b>.
+  Type the TRUE floor in a box + <kbd>Enter</kbd> to confirm it (e.g. 48, 6^, '-' to exclude); reviewed samples fold back into the templates via <code>door_calib --foldback</code> then rebuild — a self-improving loop.</div>
 <div class=grid id=grid></div>
 <script>
 var GW="__GW__", CAM="__CAM__";
@@ -210,16 +243,30 @@ function cls(reason,agreed){if(reason==="no_read")return"b-noread";if(reason==="
 function draw(d){
   var s=d.stream_24h||{};
   document.getElementById("stream").textContent="24h: "+esc(s.reads||0)+"/"+esc(s.n||0)+" read, "+esc(s.agreed||0)+" agreed, "+esc(s.noread||0)+" no_read, "+esc(s.disagree||0)+" disagree";
+  var nrev=(d.samples||[]).filter(function(r){return r.reviewed_label}).length;
+  document.getElementById("reviewed").textContent=nrev+" reviewed";
   document.getElementById("stamp").textContent="updated "+new Date().toLocaleTimeString();
   var g=(d.samples||[]).map(function(r){
     var img=r.has_img?('<img src="/floorcheck/'+GW+'/'+CAM+'/img/'+r.id+'.jpg" alt="crop">'):'<div style="min-height:60px;background:#000"></div>';
     var f=(r.floor==null?'∅':esc(r.floor))+(r.direction==="up"?' ↑':r.direction==="down"?' ↓':'');
     var t=new Date(r.ts*1000).toLocaleTimeString();
+    var rev='<input class="rev'+(r.reviewed_label?' saved':'')+'" data-id="'+r.id+'" value="'+esc(r.reviewed_label||"")+'" placeholder="'+(r.floor==null?'true floor':'='+esc(r.floor))+'" autocomplete=off>';
     return '<div class="cell '+cls(r.reason,r.panels_agreed)+'">'+img+'<div class=rd>'+f+'</div>'
-      +'<div class=mut>'+t+' · '+esc(r.reason)+(r.read_conf!=null?' · '+r.read_conf:'')+'</div></div>';
+      +'<div class=mut>'+t+' · '+esc(r.reason)+(r.read_conf!=null?' · '+r.read_conf:'')+'</div>'+rev+'</div>';
   }).join('');
   document.getElementById("grid").innerHTML=g||'<div class=note>no samples yet — the GPU posts N/hour when GPU_DOOR is on</div>';
 }
+// delegated: Enter in a review box confirms the true floor (autosave). Attached once.
+document.getElementById("grid").addEventListener("keydown",function(e){
+  var el=e.target; if(!el.classList||!el.classList.contains("rev")||e.key!=="Enter")return;
+  e.preventDefault();
+  var v=el.value.trim().replace(/\s+/g,"");
+  if(!/^(-|[A-Za-z0-9]+[\^vV]?)$/.test(v)){el.style.borderColor="#d4483b";return;}
+  fetch("/floorcheck/"+GW+"/"+CAM+"/review",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id:+el.dataset.id,label:v})}).then(function(r){
+      if(r.ok){el.classList.add("saved");el.blur();}else{el.style.borderColor="#d4483b";}
+    }).catch(function(){el.style.borderColor="#d4483b";});
+});
 function tick(){fetch("/floorcheck/"+GW+"/"+CAM+"/data").then(function(r){return r.json()}).then(draw).catch(function(){});}
 tick(); setInterval(tick, 20000);
 </script></body></html>"""
