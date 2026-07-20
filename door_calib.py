@@ -153,6 +153,7 @@ def main():
     ap.add_argument("--frames", type=int, default=0, help="collect N frames -> door + panel montages")
     ap.add_argument("--build", action="store_true", help="build templates.npz from collected crops + --labels")
     ap.add_argument("--labels", default="", help="row-major floor labels, e.g. '7^,8^,12^,...,P3v,6v'")
+    ap.add_argument("--fresh", action="store_true", help="clear accumulated crops before collecting (default = append)")
     a = ap.parse_args()
     nframes = max(a.collect, a.frames)
     outdir = CALIB_DIR / GW / CAM           # DURABLE (survives restart); served at /calib/{gw}/{cam}/
@@ -205,33 +206,41 @@ def main():
         print(f"[calib]        {CLOUD}/calib/{GW}/{CAM}/_calib_p{i}.jpg   (panel{i}, ruler in absolute frame px)")
 
     if nframes:
-        # Time-ordered montages over N distinct segments. Panels -> read the floors. DOOR -> the leaf
-        # edge sweeps across columns between shut and open frames; a montage spanning a cycle shows the
-        # travel band (or, if the box is on a fixed jamb/wall, the edge NEVER moves — which is the test).
-        panels = {i: [] for i in range(len(prois))}
+        # Collect one panel0 crop per NEW segment. Dedup by MTIME, not path: the relay reuses segment
+        # filenames (ring / rolling file overwritten in place), so the path repeats while the content
+        # changes — a path-keyed dedup (the old bug) then saved exactly ONE crop and skipped the rest.
+        # APPEND across runs (the durable-dir promise): crops accumulate so multiple sessions build glyph
+        # coverage; --fresh starts over. The panel0 montage is rebuilt over ALL crops so it always matches
+        # what --build reads, 1:1.
+        existing = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
+        if a.fresh:
+            for gp in existing:
+                os.remove(gp)
+            existing = []
+        n = 1 + max([int(Path(g).stem.split("_")[-1]) for g in existing], default=-1)   # continue numbering
         doors = []
-        seen = set(); n = 0
-        for gp in glob.glob(str(outdir / "_calib_crop_*.png")):
-            os.remove(gp)          # fresh run -> fresh crops (crop index must match the montage order)
+        last_mtime = None
+        added = 0
         for _ in range(nframes):
             seg = _newest_seg()
-            if seg and seg not in seen:
-                seen.add(seg)
-                f2 = _decode_last_frame(seg)
-                if f2 is not None:
-                    for i, pr in enumerate(prois):
-                        panels[i].append(gd.crop(f2, pr))
-                    doors.append(gd.crop(f2, droi))
-                    # save panel0 RAW grayscale crop in montage order -> --build pairs it with a label
-                    cv2.imwrite(str(outdir / f"_calib_crop_{n:03d}.png"),
-                                cv2.cvtColor(gd.crop(f2, prois[0]), cv2.COLOR_BGR2GRAY))
-                    n += 1
-            time.sleep(2)          # ~one per 2s segment -> N*2s of coverage (catches a door cycle)
-        for i, ts in panels.items():
-            m = _montage(ts, cols=5, factor=8)
-            if m is not None:
-                cv2.imwrite(str(outdir / f"_calib_glyphs{i}.jpg"), m)
-                print(f"[calib] panel{i}: {len(ts)} crops -> {CLOUD}/calib/{GW}/{CAM}/_calib_glyphs{i}.jpg  (floors row-major)")
+            if seg:
+                mt = os.path.getmtime(seg)
+                if mt != last_mtime:          # new CONTENT (path may repeat), decode + save
+                    last_mtime = mt
+                    f2 = _decode_last_frame(seg)
+                    if f2 is not None:
+                        doors.append(gd.crop(f2, droi))
+                        cv2.imwrite(str(outdir / f"_calib_crop_{n:03d}.png"),
+                                    cv2.cvtColor(gd.crop(f2, prois[0]), cv2.COLOR_BGR2GRAY))
+                        n += 1; added += 1
+            time.sleep(2)                     # ~one per 2s segment
+        # panel0 montage over ALL crops (cumulative) so it matches --build exactly; door montage this run
+        allc = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
+        pmont = _montage([cv2.cvtColor(cv2.imread(c, cv2.IMREAD_GRAYSCALE), cv2.COLOR_GRAY2BGR) for c in allc], cols=5, factor=8)
+        if pmont is not None:
+            cv2.imwrite(str(outdir / "_calib_glyphs0.jpg"), pmont)
+        print(f"[calib] +{added} new crops this run -> {len(allc)} total. Label ALL of them row-major:")
+        print(f"[calib]   {CLOUD}/calib/{GW}/{CAM}/_calib_glyphs0.jpg")
         md = _montage(doors, cols=6, factor=2)
         if md is not None:
             cv2.imwrite(str(outdir / "_calib_doormap.jpg"), md)
