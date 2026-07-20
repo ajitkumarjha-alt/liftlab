@@ -436,3 +436,77 @@ def overlay_rois(frame_bgr, rois, labels=None):
         cv2.putText(out, (labels[i] if labels else str(i)), (x, max(10, y - 3)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
     return out
+
+
+# ============================================================ unified per-frame engine + versioning
+def templates_hash(templates):
+    """CONTENT hash of a template set (sorted keys + raw float32 bytes) — the version/cache key. Stable
+    across rebuilds with identical data (unlike the npz zip bytes, which carry timestamps). gpu_door
+    stamps every event with this + refetches when it changes, so a rebuild propagates without a redeploy."""
+    import hashlib
+    h = hashlib.sha256()
+    for k in sorted(templates):
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(templates[k], dtype=np.float32).tobytes())
+    return h.hexdigest()
+
+
+def door_event_changed(prev_key, cur):
+    """Emit-on-change gate: a gw_door_event row is worth writing when the (floor, direction, door_state)
+    tuple changes from the last emitted one, OR a door CYCLE just completed (carries close_travel). This
+    dedups the per-frame trace down to state transitions — compact but lossless for the stops/speed
+    (FloorTracker) and door-timing analysis downstream. Returns (should_emit, new_key)."""
+    key = (cur.get("floor"), cur.get("direction"), cur.get("door_state"))
+    return (bool(cur.get("cycle")) or key != prev_key), key
+
+
+class DoorFloorEngine:
+    """ONE pass per frame: door edge -> DoorTracker (state + close_travel cycle), FloorReader on 1-2
+    panels (AGREE-OR-DISCARD), FloorTracker (Tier-2 stops). process(frame_bgr, t) -> a read dict; emits
+    nothing (the caller emits on-change). Geometry is FRAME px: door_roi=(x,y,w,h); panels=[(panel_roi,
+    digit_cells, arrow_cell), ...] — 1 or 2. TWO panels give the free confidence check (agree-or-discard);
+    ONE panel still reads, flagged panels_agreed=False. Templates are SHARED across panels (the LED glyphs
+    are identical; only the cell GEOMETRY differs — panel1 needs its OWN cells, its own anchor read)."""
+
+    def __init__(self, templates, door_roi, panels, min_score=0.55, blank_range=40,
+                 door_tracker=None, floor_tracker=None):
+        if not panels:
+            raise ValueError("DoorFloorEngine needs at least one panel (panel_roi, digit_cells, arrow_cell)")
+        self.door_roi = tuple(door_roi)
+        self.readers = [(tuple(proi), FloorReader(templates, dcells, acell,
+                                                  min_score=min_score, blank_range=blank_range))
+                        for (proi, dcells, acell) in panels]
+        self.door = door_tracker if door_tracker is not None else DoorTracker()
+        self.floor = floor_tracker if floor_tracker is not None else FloorTracker()
+        self.hash = templates_hash(templates)
+
+    def process(self, frame_bgr, t):
+        import cv2
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if frame_bgr.ndim == 3 else frame_bgr
+        col, strength = door_edge_column(crop(gray, self.door_roi))
+        cycle = self.door.update(t, col, strength)          # completed door cycle (close_travel) or None
+        openness = self.door.openness(col) if col is not None else None
+        reads = [rdr.read_panel(crop(gray, proi)) for proi, rdr in self.readers]
+        got = [r for r in reads if r]
+        floor = direction = conf = None
+        agreed = False
+        reason = "no_read"                                  # nothing matched — incl. MEP (M/E thin-known)
+        if len(self.readers) >= 2:
+            rec = self.readers[0][1].reconcile(reads)       # agree-or-discard
+            if rec:
+                floor, direction, conf, agreed, reason = rec["floor"], rec["direction"], rec["confidence"], True, "ok"
+            elif len(got) == 2:
+                reason = "disagree"                         # both read but conflict -> discard, don't guess
+        else:                                               # single-panel mode (panel1 cells not calibrated yet)
+            r0 = reads[0]
+            if r0:
+                floor, direction, conf, agreed, reason = r0["floor"], r0["direction"], r0["score"], False, "single_panel"
+        stop = self.floor.update(t, floor, direction) if floor else None
+        out = {"t": t, "floor": floor, "direction": direction, "door_state": self.door.state,
+               "openness": (round(float(openness), 3) if openness is not None else None),
+               "read_conf": (round(float(conf), 3) if conf is not None else None),
+               "panels_agreed": agreed, "reason": reason, "n_panels": len(self.readers),
+               "edge_strength": round(float(strength), 3), "cycle": cycle, "stop": stop}
+        if cycle:
+            out["close_travel_s"] = cycle.get("close_travel_s")
+        return out

@@ -55,6 +55,26 @@ ZONE_LANDING = [[514, 394], [834, 322], [722, 529], [732, 684], [761, 776], [618
 HDRS = {"Authorization": "Bearer " + TOKEN}
 BASE = f"{CLOUD}/api/gw/{GW}/live/{CAM}"
 
+# ---- GPU_DOOR: opt-in door/floor pass (gpu_door engine) emitting the SEPARATE gw_door_event stream.
+# ADDITIVE — never touches counting/transit. Geometry is FRAME px from calibration (env for now; the
+# zones store later). Panel1 needs its OWN cells (different in-panel x) for the agree-or-discard check;
+# without them it runs single-panel (flagged). Every event is version-stamped (templates hash + geometry).
+GPU_DOOR = os.environ.get("GPU_DOOR", "0") == "1"
+DOOR_ROI_FRAME = os.environ.get("DOOR_ROI_FRAME", "")            # "x,y,w,h" leaf ROI
+PANEL_ROIS = os.environ.get("PANEL_ROIS", "")                   # "x,y,w,h;x,y,w,h" panel0[;panel1]
+DIGIT_CELLS = os.environ.get("DIGIT_CELLS", "")                 # within-panel px, panel0 (from door_calib --cells)
+ARROW_CELL = os.environ.get("ARROW_CELL", "")
+PANEL1_DIGIT_CELLS = os.environ.get("PANEL1_DIGIT_CELLS", "")   # panel1's OWN cells (needs a panel1 anchor read)
+PANEL1_ARROW_CELL = os.environ.get("PANEL1_ARROW_CELL", "")
+DOOR_MIN_SCORE = float(os.environ.get("DOOR_MIN_SCORE", "0.55"))
+DOOR_BLANK_RANGE = int(os.environ.get("DOOR_BLANK_RANGE", "40"))
+DOOR_STRIDE = max(1, int(os.environ.get("DOOR_STRIDE", "2")))   # run the door pass every Nth decoded frame
+DOOR_HB_S = float(os.environ.get("DOOR_HB_S", "60"))           # emit a row at least this often (liveness)
+FLOORCHECK_PER_HR = int(os.environ.get("FLOORCHECK_PER_HR", "30"))   # sampled reads+crop -> /floorcheck
+FLOOR_ORDER = [s.strip() for s in os.environ.get("FLOOR_ORDER", "").split(",") if s.strip()]  # FloorTracker._idx
+TEMPLATES_REFETCH_S = float(os.environ.get("TEMPLATES_REFETCH_S", "600"))  # re-pull npz; reload if hash changed
+TEMPLATES_URL = f"{CLOUD}/api/gw/{GW}/templates/{CAM}"
+
 
 def log(m):
     print(f"[gpu-analyze] {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {m}", flush=True)
@@ -273,6 +293,86 @@ def decode_segment(data):
     return frames, _rel_times(pts, len(frames), SEG_DUR_S)
 
 
+def _parse_xywh_list(s):
+    out = []
+    for part in (s or "").split(";"):
+        part = part.strip()
+        if part:
+            out.append(tuple(int(v) for v in part.split(",")))
+    return out
+
+
+def _hash8(s):
+    import hashlib
+    return hashlib.sha256(s.encode()).hexdigest()[:8]
+
+
+def build_door_engine(prefetched_tpl=None):
+    """Fetch templates (unless handed a set) + build the DoorFloorEngine from the calibrated geometry.
+    Returns (engine, door_version) on success, else (None, reason). NEVER raises into the worker."""
+    import gpu_door as gd
+    if not (DOOR_ROI_FRAME and PANEL_ROIS and DIGIT_CELLS and ARROW_CELL):
+        return None, "geometry missing (need DOOR_ROI_FRAME, PANEL_ROIS, DIGIT_CELLS, ARROW_CELL)"
+    tpl = prefetched_tpl
+    if tpl is None:
+        try:
+            tpl = gd.fetch_templates(TEMPLATES_URL, headers=HDRS)
+        except Exception as e:
+            return None, f"template fetch failed: {type(e).__name__}: {str(e)[:80]}"
+    try:
+        droi = tuple(int(v) for v in DOOR_ROI_FRAME.split(","))
+        prois = _parse_xywh_list(PANEL_ROIS)
+        panels = [(prois[0], _parse_xywh_list(DIGIT_CELLS), _parse_xywh_list(ARROW_CELL)[0])]
+        if len(prois) >= 2 and PANEL1_DIGIT_CELLS and PANEL1_ARROW_CELL:
+            panels.append((prois[1], _parse_xywh_list(PANEL1_DIGIT_CELLS), _parse_xywh_list(PANEL1_ARROW_CELL)[0]))
+            mode = "2-panel agree-or-discard"
+        else:
+            mode = ("SINGLE-PANEL (no agree-or-discard) — set PANEL1_DIGIT_CELLS/PANEL1_ARROW_CELL "
+                    "from a panel1 anchor read to enable the free confidence check")
+        ft = gd.FloorTracker(floor_order=FLOOR_ORDER or None)
+        eng = gd.DoorFloorEngine(tpl, droi, panels, min_score=DOOR_MIN_SCORE,
+                                 blank_range=DOOR_BLANK_RANGE, floor_tracker=ft)
+    except Exception as e:
+        return None, f"geometry/engine error: {type(e).__name__}: {str(e)[:80]}"
+    geom_sig = _hash8("|".join([DOOR_ROI_FRAME, PANEL_ROIS, DIGIT_CELLS, ARROW_CELL,
+                                PANEL1_DIGIT_CELLS, PANEL1_ARROW_CELL]))
+    version = f"{eng.hash[:8]}+{geom_sig}"          # templates hash + geometry hash = comparability boundary
+    log(f"GPU_DOOR: {len(panels)} panel(s) [{mode}]; templates_hash={eng.hash[:12]}; door_version={version}")
+    return eng, version
+
+
+def post_door_event(rec, version, thash):
+    payload = {"cam": CAM, "ts": rec["t"], "floor": rec["floor"], "direction": rec["direction"],
+               "door_state": rec["door_state"], "openness": rec["openness"], "read_conf": rec["read_conf"],
+               "panels_agreed": rec["panels_agreed"], "reason": rec["reason"],
+               "close_travel_s": rec.get("close_travel_s"), "door_version": version, "templates_hash": thash}
+    try:
+        http_post_json(f"{CLOUD}/api/gw/{GW}/door_event", payload)
+    except Exception as e:
+        log(f"door_event POST failed: {e}")
+
+
+def post_floorcheck(rec, frame_bgr, panel0_roi, version):
+    """Sampled read WITH the panel0 crop -> /floorcheck, so accuracy is eyeballable before Tier-2 trusts it."""
+    import cv2
+
+    import gpu_door as gd
+    b64 = None
+    try:
+        ok, buf = cv2.imencode(".jpg", gd.crop(frame_bgr, panel0_roi))
+        if ok:
+            b64 = base64.b64encode(buf.tobytes()).decode()
+    except Exception:
+        pass
+    payload = {"cam": CAM, "ts": rec["t"], "floor": rec["floor"], "direction": rec["direction"],
+               "read_conf": rec["read_conf"], "panels_agreed": rec["panels_agreed"], "reason": rec["reason"],
+               "door_version": version, "crop_jpeg_b64": b64}
+    try:
+        http_post_json(f"{CLOUD}/api/gw/{GW}/floorcheck", payload)
+    except Exception as e:
+        log(f"floorcheck POST failed: {e}")
+
+
 def main():
     os.makedirs(STATE_DIR, exist_ok=True)
     cursor_path = os.path.join(STATE_DIR, f"cursor_{CAM}")
@@ -332,6 +432,27 @@ def main():
             f"COUNTING_VERSION must reflect this (comparability boundary); current={counting.COUNTING_VERSION}")
     log(f"validation mode: {val_state}")
 
+    # GPU_DOOR state (all no-ops unless enabled). Separate stream; independent of counting.
+    door_gd = None
+    door_eng = None
+    door_version = ""
+    door_thash = ""
+    door_prev_key = None
+    door_last_emit = 0.0
+    last_fc_ts = 0.0
+    last_tpl_refetch = time.time()
+    panel0_roi = None
+    if GPU_DOOR:
+        import gpu_door as door_gd
+        door_eng, dv = build_door_engine()
+        if door_eng is None:
+            log(f"GPU_DOOR DISABLED: {dv}")
+        else:
+            door_version, door_thash = dv, door_eng.hash
+            panel0_roi = _parse_xywh_list(PANEL_ROIS)[0]
+            log(f"GPU_DOOR live: stride={DOOR_STRIDE} (~{25 // DOOR_STRIDE}fps), heartbeat<= {DOOR_HB_S}s, "
+                f"floorcheck={FLOORCHECK_PER_HR}/hr, templates refetch {TEMPLATES_REFETCH_S:.0f}s")
+
     def _mean(d):
         return round(sum(d) / len(d), 1) if d else None
 
@@ -362,6 +483,20 @@ def main():
         new = [s for s in segs if s not in seen]
         if time.time() - last_hb > HEARTBEAT_S:   # heartbeat even when idle (no traffic != dead)
             heartbeat(); last_hb = time.time()
+        # GPU_DOOR: re-pull the templates periodically; reload the engine ONLY if the content hash
+        # changed, so a door_calib --build propagates to the GPU without a redeploy (content-hash cache).
+        if door_eng is not None and time.time() - last_tpl_refetch > TEMPLATES_REFETCH_S:
+            last_tpl_refetch = time.time()
+            try:
+                new_tpl = door_gd.fetch_templates(TEMPLATES_URL, headers=HDRS)
+                if door_gd.templates_hash(new_tpl) != door_thash:
+                    neweng, ndv = build_door_engine(prefetched_tpl=new_tpl)
+                    if neweng is not None:
+                        door_eng, door_version, door_thash = neweng, ndv, neweng.hash
+                        door_prev_key = None      # force a fresh emit under the new version (boundary)
+                        log(f"GPU_DOOR templates changed -> reloaded (version {ndv})")
+            except Exception as e:
+                log(f"templates refetch failed: {e}")
         if not new:
             if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
                 post_episode(episode, "gap"); episode = None
@@ -417,6 +552,24 @@ def main():
             if ANALYZE_FPS > 0 and n_fr > 0:
                 stride = max(1, round((n_fr / SEG_DUR_S) / ANALYZE_FPS))
             for i, fr in enumerate(frames):
+                # GPU_DOOR pass — its OWN cadence (DOOR_STRIDE), independent of the YOLO stride, so it
+                # runs even when counting subsamples. Cheap (Sobel + small-cell NCC) vs YOLO. Emits the
+                # gw_door_event stream on state-change (+ liveness heartbeat); samples N/hr to /floorcheck.
+                if door_eng is not None and i % DOOR_STRIDE == 0:
+                    d_off = seg_wall - ((rel[-1] - rel[i]) if rel else 0.0)
+                    try:
+                        drec = door_eng.process(fr, d_off)
+                    except Exception as e:
+                        drec = None
+                        log(f"door process error: {type(e).__name__}: {str(e)[:80]}")
+                    if drec is not None:
+                        should, door_prev_key = door_gd.door_event_changed(door_prev_key, drec)
+                        if should or (d_off - door_last_emit) >= DOOR_HB_S:
+                            post_door_event(drec, door_version, door_thash)
+                            door_last_emit = d_off
+                        if FLOORCHECK_PER_HR > 0 and (d_off - last_fc_ts) >= (3600.0 / FLOORCHECK_PER_HR):
+                            post_floorcheck(drec, fr, panel0_roi, door_version)
+                            last_fc_ts = d_off
                 if i % stride != 0:
                     continue                      # subsampled out (analyze_fps); keeps decode, skips track
                 if val_state == "validating":
