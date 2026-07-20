@@ -177,8 +177,15 @@ class FloorReader:
         self.blank_range = blank_range        # a cell with max-min brightness below this is BLANK (unlit
         self.blank_label = blank_label        #   padding cell of a single-digit floor). NCC can't match a
         self.arrow_labels = tuple(a for a in arrow_labels if a in self.templates)   # flat/dark cell (0 variance).
-        self.glyph_labels = tuple(k for k in self.templates
-                                  if k not in self.arrow_labels and k != self.blank_label)   # lit glyphs only
+        bpref = self.blank_label + "_"
+        # PER-CELL blank templates ("blank_<i>"): carry the cell's STATIC content (e.g. a door edge in the
+        # hundreds cell) so blank is detected by NCC where the contrast test can't fire. See build_templates.
+        self.blank_cells = {int(k[len(bpref):]): np.asarray(v, np.float32)
+                            for k, v in self.templates.items()
+                            if k.startswith(bpref) and k[len(bpref):].isdigit()}
+        self.glyph_labels = tuple(k for k in self.templates            # lit glyphs only (not arrow/blank/per-cell-blank)
+                                  if k not in self.arrow_labels and k != self.blank_label
+                                  and not (k.startswith(bpref) and k[len(bpref):].isdigit()))
         self._tsz = next(iter(self.templates.values())).shape if self.templates else (16, 10)
 
     def _match(self, cell_img, labels):
@@ -196,14 +203,23 @@ class FloorReader:
         return best, bs
 
     def read_panel(self, panel_gray):
+        import cv2
         chars, scores = [], []
-        for cell in self.digit_cells:                # blind fixed-cell crop, no gap-finding
+        for i, cell in enumerate(self.digit_cells):  # blind fixed-cell crop, no gap-finding
             ci = crop(panel_gray, cell)
             if ci.size == 0:
                 return None
             if (int(ci.max()) - int(ci.min())) < self.blank_range:
-                continue                             # BLANK padding cell (single-digit floor) -> skip
-            lab, s = self._match(ci, self.glyph_labels)
+                continue                             # flat/dark cell -> BLANK (NCC undefined on 0 variance)
+            c = cv2.resize(ci, (self._tsz[1], self._tsz[0]))
+            lab, s = None, -2.0
+            for g in self.glyph_labels:              # best lit-glyph match for this cell
+                sc = ncc(c, self.templates[g])
+                if sc > s:
+                    lab, s = g, sc
+            bt = self.blank_cells.get(i)             # PER-CELL blank: fires where contrast can't — a static
+            if bt is not None and ncc(c, bt) >= max(s, self.min_score):   # edge in the cell (e.g. hundreds)
+                continue                             # blank explains this cell at least as well -> BLANK
             if lab is None or s < self.min_score:
                 return None                          # a lit cell we can't confidently name -> discard panel
             scores.append(s)
@@ -367,11 +383,15 @@ def build_templates(labeled_panels, digit_cells, arrow_cell, tsz=(16, 10),
             skipped += 1
             continue
         used += 1
-        for cell, g in zip(digit_cells, _cell_labels(floor_chars)):
-            if g == blank_label:
-                continue                             # blank padding cell -> nothing to learn (reader detects by brightness)
+        for i, (cell, g) in enumerate(zip(digit_cells, _cell_labels(floor_chars))):
+            # A blank padding cell now learns a PER-CELL blank template ("blank_<i>") instead of being
+            # skipped. It captures whatever STATIC structure sits in that cell — e.g. the hundreds cell
+            # overlaps a fixed door-edge diagonal — so the reader can NCC-match blank there, where the
+            # contrast test never fires (a bright static edge always exceeds blank_range). The static
+            # edge is common-mode in both this blank and the cell's glyph templates, so it cancels.
+            key = f"{blank_label}_{i}" if g == blank_label else g
             c = cv2.resize(crop(panel, cell), (tsz[1], tsz[0])).astype(np.float32)
-            acc.setdefault(g, []).append(c)
+            acc.setdefault(key, []).append(c)
         if arrow:
             c = cv2.resize(crop(panel, arrow_cell), (tsz[1], tsz[0])).astype(np.float32)
             acc.setdefault(arrow, []).append(c)
