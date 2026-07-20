@@ -137,45 +137,88 @@ def _panel_rois():
     return out
 
 
+# The /dev/shm live ring rotates in SECONDS. ANY glob-then-stat/read races: a .ts globbed a moment ago
+# can be gone before getmtime/open. Every LIVE_DIR reader below tolerates a mid-scan vanish (skip it,
+# don't crash). Crucially the mtime SORT is done via _stat_mtime, never a bare key=os.path.getmtime
+# (which raises FileNotFoundError from inside sorted() on a rotated-out file — the reported crash).
+def _stat_mtime(p):
+    try:
+        return os.path.getmtime(p)
+    except OSError:                                  # FileNotFoundError incl. — rotated out mid-scan
+        return None
+
+
+def _live_segs(gw=None, cam=None, retry=True):
+    """Newest-first list of live .ts, robust to the ring rotating during the scan: glob, stat each
+    (dropping any that vanished), sort by surviving mtime. Retries the glob ONCE if the whole snapshot
+    raced away, then returns [] (callers decide: skip / CalibError)."""
+    gw = gw or GW; cam = cam or CAM
+    d = LIVE_DIR / gw / cam
+    for _ in (0, 1):
+        pairs = [(mt, p) for p in glob.glob(str(d / "*.ts")) for mt in (_stat_mtime(p),) if mt is not None]
+        if pairs:
+            pairs.sort(reverse=True)                 # newest first
+            return [p for _, p in pairs]
+        if not retry:
+            break
+    return []
+
+
 def _newest_seg():
-    segs = sorted(glob.glob(str(LIVE_DIR / GW / CAM / "*.ts")), key=os.path.getmtime)
-    return segs[-1] if segs else None
+    segs = _live_segs()
+    return segs[0] if segs else None                 # newest first
 
 
 def _decode_last_frame(seg_path):
+    """Last decoded frame of a segment, or None if it raced away / is a truncated partial write. Never
+    raises — the ring can delete or half-overwrite seg_path between selection and this read."""
     import av
-    with open(seg_path, "rb") as fh:
-        data = fh.read()
-    c = av.open(io.BytesIO(data))
-    fr = None
-    for f in c.decode(video=0):
-        fr = f.to_ndarray(format="bgr24")
-    c.close()
-    return fr
+    try:
+        with open(seg_path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None                                  # rotated out between selection and open
+    try:
+        c = av.open(io.BytesIO(data))
+        fr = None
+        for f in c.decode(video=0):
+            fr = f.to_ndarray(format="bgr24")
+        c.close()
+        return fr
+    except Exception:
+        return None                                  # truncated / non-decodable partial segment
 
 
 def _newest_frame_http():                        # fallback if run somewhere without the local segments
     import requests
-    tok = os.environ.get("ANALYSIS_TOKEN", "").split(":")[-1]
-    base = f"{CLOUD}/api/gw/{GW}/live/{CAM}"
-    h = {"Authorization": "Bearer " + tok}
-    pl = requests.get(f"{base}/index.m3u8", headers=h, timeout=15).text
-    segs = [ln.strip() for ln in pl.splitlines() if ln.strip().endswith(".ts")]
-    if not segs:
-        return None
+    try:
+        tok = os.environ.get("ANALYSIS_TOKEN", "").split(":")[-1]
+        base = f"{CLOUD}/api/gw/{GW}/live/{CAM}"
+        h = {"Authorization": "Bearer " + tok}
+        pl = requests.get(f"{base}/index.m3u8", headers=h, timeout=15).text
+        segs = [ln.strip() for ln in pl.splitlines() if ln.strip().endswith(".ts")]
+        if not segs:
+            return None
+        data = requests.get(f"{base}/{segs[-1]}", headers=h, timeout=15).content
+    except Exception:
+        return None                                  # network / 404 (segment rotated out server-side)
     import av
-    data = requests.get(f"{base}/{segs[-1]}", headers=h, timeout=15).content
-    c = av.open(io.BytesIO(data)); fr = None
-    for f in c.decode(video=0):
-        fr = f.to_ndarray(format="bgr24")
-    c.close()
-    return fr
+    try:
+        c = av.open(io.BytesIO(data)); fr = None
+        for f in c.decode(video=0):
+            fr = f.to_ndarray(format="bgr24")
+        c.close()
+        return fr
+    except Exception:
+        return None
 
 
 def newest_frame():
     seg = _newest_seg()
     if seg:
-        return _decode_last_frame(seg)
+        fr = _decode_last_frame(seg)                 # None if it raced away -> fall back to HTTP
+        if fr is not None:
+            return fr
     return _newest_frame_http()
 
 
@@ -280,18 +323,14 @@ def panelcheck(gw=None, cam=None, n=8, ref=55, outdir=None):
     prois = _panel_rois()
     if not prois:
         raise CalibError("no PANEL_ROIS set")
-    segs = sorted(glob.glob(str(LIVE_DIR / gwid / cam / "*.ts")), key=os.path.getmtime)
+    segs = _live_segs(gwid, cam)                     # newest-first, race-hardened (ring rotates in seconds)
     if not segs:
-        raise CalibError(f"no segments in {LIVE_DIR / gwid / cam}")
-    tiles, seen = [], set()
-    for sp in reversed(segs):                        # newest first, one per distinct content (mtime)
+        raise CalibError(f"no live segments in {LIVE_DIR / gwid / cam} (ring empty / relay down)")
+    tiles = []
+    for sp in segs:                                  # each glob path is distinct content; decode until n
         if len(tiles) >= n:
             break
-        mt = os.path.getmtime(sp)
-        if mt in seen:
-            continue
-        seen.add(mt)
-        fr = _decode_last_frame(sp)
+        fr = _decode_last_frame(sp)                  # None if it raced away / truncated -> skip
         if fr is not None:
             tiles.append(cv2.cvtColor(gd.crop(fr, prois[0]), cv2.COLOR_BGR2GRAY))
     dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
@@ -511,8 +550,8 @@ def collect_crops(gw=None, cam=None, nframes=40, fresh=False, door_roi_frame=Non
     for _ in range(nframes):
         seg = _newest_seg()
         if seg:
-            mt = os.path.getmtime(seg)
-            if mt != last_mtime:              # new CONTENT (path may repeat), decode + save
+            mt = _stat_mtime(seg)             # None if it rotated out between select and stat -> skip
+            if mt is not None and mt != last_mtime:   # new CONTENT (path may repeat), decode + save
                 last_mtime = mt
                 f2 = _decode_last_frame(seg)
                 if f2 is not None:
