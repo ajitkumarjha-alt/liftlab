@@ -294,6 +294,35 @@ class FloorReader:
                 direction, _ = arrow, scores.append(arr_s)
         return _out("".join(chars), direction, round(min(scores), 3), "ok")   # STRING: "25","P3","G"
 
+    def debug_cells(self, panel_gray):
+        """Diagnostic dump for one panel at the chosen shift: per digit-cell top-3 glyph scores + the
+        per-cell blank score + contrast, and the arrow top-2. This is what pinpoints a bad read —
+        shift != [0,0] with a wrong winner = misalignment; a wrong glyph winning by > margin at [0,0] =
+        template confusion; a high blank score that lost = blank logic. Pure diagnostics, changes nothing."""
+        import cv2
+        dx, dy = self._best_shift(panel_gray)
+        out = {"shift": [dx, dy], "cells": [], "arrow": None}
+        for i, cell in enumerate(self.digit_cells):
+            ci = crop(panel_gray, (cell[0] + dx, cell[1] + dy, cell[2], cell[3]))
+            rec = {"i": i}
+            if ci.size == 0:
+                rec["verdict"] = "offpanel"; out["cells"].append(rec); continue
+            rec["contrast"] = int(ci.max()) - int(ci.min())
+            if rec["contrast"] < self.blank_range:
+                rec["verdict"] = "blank(contrast)"; out["cells"].append(rec); continue
+            c = cv2.resize(ci, (self._tsz[1], self._tsz[0]))
+            scored = sorted(((round(ncc(c, self.templates[g]), 3), g) for g in self.glyph_labels), reverse=True)
+            rec["top"] = [[g, s] for s, g in scored[:3]]
+            bt = self.blank_cells.get(i)
+            rec["blank"] = round(ncc(c, bt), 3) if bt is not None else None
+            out["cells"].append(rec)
+        acell = (self.arrow_cell[0] + dx, self.arrow_cell[1] + dy, self.arrow_cell[2], self.arrow_cell[3])
+        ac = crop(panel_gray, acell)
+        if ac.size and self.arrow_labels:
+            cc = cv2.resize(ac, (self._tsz[1], self._tsz[0]))
+            out["arrow"] = [[a, round(ncc(cc, self.templates[a]), 3)] for a in self.arrow_labels]
+        return out
+
     @staticmethod
     def column_profile(reg_gray):
         """Per-column mean brightness — the diagnostic that settles whether a gap survives HEVC. A clean

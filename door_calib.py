@@ -693,6 +693,70 @@ def foldback(gw=None, cam=None, outdir=None, db_path=None):
     return result
 
 
+def readtest(gw=None, cam=None, db_path=None):
+    """REPRODUCE: run the CURRENT reader on the REVIEWED /floorcheck crops (fixtures with known labels)
+    and dump per-sample diagnostics — expected vs read, the chosen shift, per digit-cell top-3 glyph
+    scores + blank score, arrow scores. Isolates the failure mechanism (shift misalignment vs template
+    confusion vs blank logic) on the REAL crops. Read-only on gateway.db. Honours DOOR_SHIFT / DOOR_MARGIN
+    / DOOR_MIN_SCORE so you can A/B (e.g. DOOR_SHIFT=0 to test the shift search). WEB-CALLABLE."""
+    import sqlite3
+
+    import cv2
+    import numpy as np
+    gwid = gw or GW; cam = cam or CAM
+    tp = os.path.join(TEMPLATES_DIR, gwid, f"{cam}.npz")
+    if not os.path.exists(tp):
+        raise CalibError(f"no templates at {tp} — run --build first")
+    tpl = gd.load_templates(tp)
+    dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
+    acell = _parse_cells(os.environ.get("ARROW_CELL", ""))
+    if not dcells or not acell:
+        raise CalibError("set DIGIT_CELLS + ARROW_CELL (the same geometry the GPU runs)")
+    shift = int(os.environ.get("DOOR_SHIFT", "2"))
+    margin = float(os.environ.get("DOOR_MARGIN", "0.05"))
+    minsc = float(os.environ.get("DOOR_MIN_SCORE", "0.55"))
+    rdr = gd.FloorReader(tpl, dcells, acell[0], min_score=minsc, shift_search=shift, margin_min=margin)
+    dbp = db_path or os.environ.get("GATEWAY_DB", "/opt/liftlab-b3/cloud/gateway.db")
+    if not os.path.exists(dbp):
+        raise CalibError(f"gateway.db not found at {dbp} — set GATEWAY_DB")
+    db = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True); db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute("SELECT id,reviewed_label,floor,crop_jpeg FROM floor_sample WHERE gateway_id=? AND cam=? "
+                          "AND reviewed_label IS NOT NULL AND reviewed_label!='' ORDER BY id DESC LIMIT ?",
+                          (gwid, cam, int(os.environ.get("READTEST_N", "40")))).fetchall()
+    except sqlite3.OperationalError as e:
+        db.close(); raise CalibError(f"floor_sample not available ({e}) — review samples at /floorcheck first")
+    db.close()
+    print(f"[readtest] reader: shift_search={shift} margin_min={margin} min_score={minsc}; {len(rows)} reviewed fixtures")
+    correct = total = 0
+    for r in rows:
+        if not r["crop_jpeg"]:
+            continue
+        arr = cv2.imdecode(np.frombuffer(bytes(r["crop_jpeg"]), np.uint8), cv2.IMREAD_GRAYSCALE)
+        if arr is None:
+            continue
+        total += 1
+        lab = str(r["reviewed_label"]).strip()
+        exp = lab.rstrip("^vV") if lab and lab[-1] in "^vV" else lab   # expected floor string (drop arrow)
+        res = rdr.read_panel(arr)
+        dbg = rdr.debug_cells(arr)
+        got = res["floor"]
+        ok = (got == exp)
+        correct += ok
+        print(f"[readtest] #{r['id']:>5} expect {lab!r:7} -> read {str(got)!r:7}/{res.get('direction')} "
+              f"status={res['status']} shift={dbg['shift']} {'OK' if ok else 'XX'}")
+        for c in dbg["cells"]:
+            if "top" in c:
+                print(f"           cell{c['i']} top3={c['top']} blank={c['blank']} contrast={c['contrast']}")
+            else:
+                print(f"           cell{c['i']} {c.get('verdict')}")
+        if dbg.get("arrow"):
+            print(f"           arrow {dbg['arrow']}")
+    print(f"[readtest] {correct}/{total} correct on reviewed fixtures "
+          f"(try DOOR_SHIFT=0 to isolate the shift search; DOOR_MARGIN to tune the ambiguous gate)")
+    return {"correct": correct, "total": total, "shift_search": shift, "margin_min": margin}
+
+
 def main():
     if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0:
         os.umask(0o002)                          # root (sudo): new files/dirs group-writable (664/775)
@@ -707,6 +771,7 @@ def main():
     ap.add_argument("--anchors", default="", help="tens_left,units_left,digit_top,digit_bottom,arrow_left (within-panel px)")
     ap.add_argument("--anchor-crop", type=int, default=None, dest="anchor_crop", help="crop index to draw the derived cells on")
     ap.add_argument("--foldback", action="store_true", help="fold REVIEWED /floorcheck samples into the calib set (then --build)")
+    ap.add_argument("--readtest", action="store_true", help="run the current reader on reviewed /floorcheck fixtures + dump per-cell scores")
     ap.add_argument("--build", action="store_true", help="build templates.npz from collected crops + --labels")
     ap.add_argument("--labels", default="", help="row-major floor labels, e.g. '7^,8^,12^,...,P3v,6v'")
     ap.add_argument("--fresh", action="store_true", help="clear accumulated crops before collecting (default = append)")
@@ -722,6 +787,9 @@ def main():
             return
         if a.foldback:
             foldback()
+            return
+        if a.readtest:
+            readtest()
             return
         if a.anchor is not None:
             r = render_anchor(a.anchor)
