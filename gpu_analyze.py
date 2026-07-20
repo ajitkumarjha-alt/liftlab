@@ -69,6 +69,7 @@ PANEL1_ARROW_CELL = os.environ.get("PANEL1_ARROW_CELL", "")
 DOOR_MIN_SCORE = float(os.environ.get("DOOR_MIN_SCORE", "0.55"))
 DOOR_BLANK_RANGE = int(os.environ.get("DOOR_BLANK_RANGE", "40"))
 DOOR_SHIFT = int(os.environ.get("DOOR_SHIFT", "2"))            # rigid ±Npx cell-alignment search (jitter absorb)
+DOOR_MARGIN = float(os.environ.get("DOOR_MARGIN", "0.05"))    # top-2 glyph gap < this -> ambiguous no_read
 DOOR_STRIDE = max(1, int(os.environ.get("DOOR_STRIDE", "2")))   # run the door pass every Nth decoded frame
 DOOR_HB_S = float(os.environ.get("DOOR_HB_S", "60"))           # emit a row at least this often (liveness)
 FLOORCHECK_PER_HR = int(os.environ.get("FLOORCHECK_PER_HR", "30"))   # sampled reads+crop -> /floorcheck
@@ -331,8 +332,8 @@ def build_door_engine(prefetched_tpl=None):
             mode = ("SINGLE-PANEL (no agree-or-discard) — set PANEL1_DIGIT_CELLS/PANEL1_ARROW_CELL "
                     "from a panel1 anchor read to enable the free confidence check")
         ft = gd.FloorTracker(floor_order=FLOOR_ORDER or None)
-        eng = gd.DoorFloorEngine(tpl, droi, panels, min_score=DOOR_MIN_SCORE,
-                                 blank_range=DOOR_BLANK_RANGE, floor_tracker=ft, shift_search=DOOR_SHIFT)
+        eng = gd.DoorFloorEngine(tpl, droi, panels, min_score=DOOR_MIN_SCORE, blank_range=DOOR_BLANK_RANGE,
+                                 floor_tracker=ft, shift_search=DOOR_SHIFT, margin_min=DOOR_MARGIN)
     except Exception as e:
         return None, f"geometry/engine error: {type(e).__name__}: {str(e)[:80]}"
     geom_sig = _hash8("|".join([DOOR_ROI_FRAME, PANEL_ROIS, DIGIT_CELLS, ARROW_CELL,
@@ -345,7 +346,7 @@ def build_door_engine(prefetched_tpl=None):
 def post_door_event(rec, version, thash):
     payload = {"cam": CAM, "ts": rec["t"], "floor": rec["floor"], "direction": rec["direction"],
                "door_state": rec["door_state"], "openness": rec["openness"], "read_conf": rec["read_conf"],
-               "panels_agreed": rec["panels_agreed"], "reason": rec["reason"],
+               "panels_agreed": rec["panels_agreed"], "reason": rec["reason"], "candidates": rec.get("candidates"),
                "close_travel_s": rec.get("close_travel_s"), "door_version": version, "templates_hash": thash}
     try:
         http_post_json(f"{CLOUD}/api/gw/{GW}/door_event", payload)

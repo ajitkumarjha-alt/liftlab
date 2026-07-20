@@ -16,6 +16,7 @@ recent reads-vs-crops so accuracy can be eyeballed before Tier-2 charts trust th
   GET  /floorcheck/{gw}/{cam}/img/{id}.jpg   the stored panel crop
 """
 import base64
+import json
 import os
 import re
 import sqlite3
@@ -45,6 +46,10 @@ def _db():
       panels_agreed INTEGER, reason TEXT, close_travel_s REAL,
       door_version TEXT, templates_hash TEXT, received_at REAL)""")
     db.execute("CREATE INDEX IF NOT EXISTS ix_door_event ON gw_door_event (gateway_id,cam,ts)")
+    try:
+        db.execute("ALTER TABLE gw_door_event ADD COLUMN candidates TEXT")   # reason='ambiguous' top-2 [[lab,score],..]
+    except sqlite3.OperationalError:
+        pass                                                    # already present
     db.execute("""CREATE TABLE IF NOT EXISTS floor_sample (
       id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT, ts REAL,
       floor TEXT, direction TEXT, read_conf REAL, panels_agreed INTEGER, reason TEXT,
@@ -87,14 +92,16 @@ async def door_event_ingest(gw: str, request: Request, authorization: str = Head
     floor = str(floor) if floor is not None else None
     direction = d.get("direction")
     direction = str(direction) if direction in ("up", "down") else None
+    cand = d.get("candidates")
+    cand = json.dumps(cand) if cand else None                # [[lab,score],[lab,score]] when reason='ambiguous'
     db = _db()
     db.execute("INSERT INTO gw_door_event (gateway_id,cam,ts,floor,direction,door_state,openness,read_conf,"
-               "panels_agreed,reason,close_travel_s,door_version,templates_hash,received_at) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               "panels_agreed,reason,close_travel_s,door_version,templates_hash,candidates,received_at) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (gw, cam, float(d.get("ts", time.time())), floor, direction, ds, _f(d.get("openness")),
                 _f(d.get("read_conf")), 1 if d.get("panels_agreed") else 0, str(d.get("reason", "")),
                 _f(d.get("close_travel_s")), str(d.get("door_version", "")), str(d.get("templates_hash", "")),
-                time.time()))
+                cand, time.time()))
     db.commit()
     db.close()
     return {"ok": True}

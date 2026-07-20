@@ -169,7 +169,7 @@ class FloorReader:
     P/G/etc). Reads BOTH panels, AGREE-OR-DISCARD. arrow (always present, rightmost) -> direction."""
 
     def __init__(self, templates, digit_cells, arrow_cell, min_score=0.55, blank_range=40,
-                 arrow_labels=ARROWS, blank_label=BLANK, shift_search=2):
+                 arrow_labels=ARROWS, blank_label=BLANK, shift_search=2, margin_min=0.05):
         self.templates = {k: np.asarray(v, dtype=np.float32) for k, v in templates.items()}
         self.digit_cells = list(digit_cells)
         self.arrow_cell = arrow_cell
@@ -179,6 +179,10 @@ class FloorReader:
         # robust — still read. Before reading, search (dx,dy) in [-R..R]^2 for the shift that best aligns
         # ALL cells rigidly, then read there. Reader-side, no rebuild. 0 = old fixed-position behavior.
         self.shift_search = int(shift_search)
+        # MARGIN CHECK: if a cell's top-2 glyph NCC scores are within margin_min, the glyph is AMBIGUOUS
+        # (HEVC eats the 1-2px middle-bar that separates 8/0, 6/G) — emit no_read, not a confident wrong
+        # digit that poisons floor attribution. 0 disables. The tied candidates go into the event.
+        self.margin_min = float(margin_min)
         self.blank_range = blank_range        # a cell with max-min brightness below this is BLANK (unlit
         self.blank_label = blank_label        #   padding cell of a single-digit floor). NCC can't match a
         self.arrow_labels = tuple(a for a in arrow_labels if a in self.templates)   # flat/dark cell (0 variance).
@@ -247,36 +251,48 @@ class FloorReader:
     def read_panel(self, panel_gray):
         import cv2
         dx, dy = self._best_shift(panel_gray)        # absorb rigid panel jitter before reading
+
+        def _out(floor, direction, score, status, candidates=None):
+            return {"floor": floor, "direction": direction, "score": score, "status": status,
+                    "candidates": candidates, "n_cells": len(self.digit_cells), "shift": [dx, dy]}
+
         chars, scores = [], []
         for i, cell in enumerate(self.digit_cells):  # blind fixed-cell crop (+ rigid shift), no gap-finding
             ci = crop(panel_gray, (cell[0] + dx, cell[1] + dy, cell[2], cell[3]))
             if ci.size == 0:
-                return None
+                return _out(None, None, None, "no_read")
             if (int(ci.max()) - int(ci.min())) < self.blank_range:
                 continue                             # flat/dark cell -> BLANK (NCC undefined on 0 variance)
             c = cv2.resize(ci, (self._tsz[1], self._tsz[0]))
-            lab, s = None, -2.0
-            for g in self.glyph_labels:              # best lit-glyph match for this cell
+            top1 = top2 = -2.0
+            lab1 = lab2 = None                       # top-2 glyph matches -> the margin check
+            for g in self.glyph_labels:
                 sc = ncc(c, self.templates[g])
-                if sc > s:
-                    lab, s = g, sc
+                if sc > top1:
+                    top2, lab2, top1, lab1 = top1, lab1, sc, g
+                elif sc > top2:
+                    top2, lab2 = sc, g
             bt = self.blank_cells.get(i)             # PER-CELL blank: fires where contrast can't — a static
-            if bt is not None and ncc(c, bt) >= max(s, self.min_score):   # edge in the cell (e.g. hundreds)
+            if bt is not None and ncc(c, bt) >= max(top1, self.min_score):   # edge in the cell (e.g. hundreds)
                 continue                             # blank explains this cell at least as well -> BLANK
-            if lab is None or s < self.min_score:
-                return None                          # a lit cell we can't confidently name -> discard panel
-            scores.append(s)
-            chars.append(lab)                        # non-blank cells, left-to-right = the floor string
+            if lab1 is None or top1 < self.min_score:
+                return _out(None, None, None, "no_read")   # a lit cell we can't confidently name
+            # MARGIN CHECK: top-2 too close -> AMBIGUOUS (HEVC ate the 8-vs-0 / 6-vs-G middle bar). A gap
+            # is honest; a confident 40-that-was-48 poisons attribution. Emit no_read + both candidates.
+            if self.margin_min > 0 and lab2 is not None and (top1 - top2) < self.margin_min:
+                return _out(None, None, round(top1, 3), "ambiguous",
+                            candidates=[[lab1, round(top1, 3)], [lab2, round(top2, 3)]])
+            scores.append(top1)
+            chars.append(lab1)                       # non-blank cells, left-to-right = the floor string
         if not chars:
-            return None
+            return _out(None, None, None, "no_read")
         direction = None
         if self.arrow_labels:                        # arrow shifts with the display too (rigid)
             acell = (self.arrow_cell[0] + dx, self.arrow_cell[1] + dy, self.arrow_cell[2], self.arrow_cell[3])
             arrow, arr_s = self._match(crop(panel_gray, acell), self.arrow_labels)
             if arrow is not None and arr_s >= self.min_score:
                 direction, _ = arrow, scores.append(arr_s)
-        return {"floor": "".join(chars), "direction": direction,   # STRING: "25","P3","G"
-                "score": round(min(scores), 3), "n_cells": len(self.digit_cells), "shift": [dx, dy]}
+        return _out("".join(chars), direction, round(min(scores), 3), "ok")   # STRING: "25","P3","G"
 
     @staticmethod
     def column_profile(reg_gray):
@@ -285,19 +301,16 @@ class FloorReader:
         return reg_gray.astype(np.float32).mean(axis=0)
 
     def reconcile(self, panel_reads):
-        """AGREE-OR-DISCARD across the two panels. Both read + agree on floor -> confident (mean score,
-        +agreement). Disagree or any panel unread -> None (discard; never publish a floor we can't
-        corroborate)."""
-        reads = [r for r in panel_reads if r]
-        if len(reads) < 2:
+        """AGREE-OR-DISCARD across the two panels: both status=='ok' + same floor -> confident. Anything
+        else (a panel unread/ambiguous, or a floor disagreement) -> None. reads are read_panel dicts
+        (which now always return a dict with 'status'; a None is tolerated for back-compat)."""
+        ok = [r for r in panel_reads if r and r.get("status") == "ok" and r.get("floor")]
+        if len(ok) < 2 or any(r["floor"] != ok[0]["floor"] for r in ok):
             return None
-        if any(r["floor"] != reads[0]["floor"] for r in reads):
-            return None
-        # direction: agree if both present + equal; else the one that's present; else None
-        dirs = [r["direction"] for r in reads if r["direction"]]
+        dirs = [r["direction"] for r in ok if r["direction"]]
         direction = dirs[0] if dirs and all(d == dirs[0] for d in dirs) else None
-        return {"floor": reads[0]["floor"], "direction": direction,
-                "confidence": round(min(r["score"] for r in reads), 3), "panels": len(reads), "agree": True}
+        return {"floor": ok[0]["floor"], "direction": direction,
+                "confidence": round(min(r["score"] for r in ok), 3), "panels": len(ok), "agree": True}
 
 
 # ============================================================ floor TRACE -> Tier 2 (stops + speed)
@@ -513,12 +526,13 @@ class DoorFloorEngine:
     are identical; only the cell GEOMETRY differs — panel1 needs its OWN cells, its own anchor read)."""
 
     def __init__(self, templates, door_roi, panels, min_score=0.55, blank_range=40,
-                 door_tracker=None, floor_tracker=None, shift_search=2):
+                 door_tracker=None, floor_tracker=None, shift_search=2, margin_min=0.05):
         if not panels:
             raise ValueError("DoorFloorEngine needs at least one panel (panel_roi, digit_cells, arrow_cell)")
         self.door_roi = tuple(door_roi)
         self.readers = [(tuple(proi), FloorReader(templates, dcells, acell, min_score=min_score,
-                                                  blank_range=blank_range, shift_search=shift_search))
+                                                  blank_range=blank_range, shift_search=shift_search,
+                                                  margin_min=margin_min))
                         for (proi, dcells, acell) in panels]
         self.door = door_tracker if door_tracker is not None else DoorTracker()
         self.floor = floor_tracker if floor_tracker is not None else FloorTracker()
@@ -531,26 +545,33 @@ class DoorFloorEngine:
         cycle = self.door.update(t, col, strength)          # completed door cycle (close_travel) or None
         openness = self.door.openness(col) if col is not None else None
         reads = [rdr.read_panel(crop(gray, proi)) for proi, rdr in self.readers]
-        got = [r for r in reads if r]
+        oks = [r for r in reads if r["status"] == "ok"]
+        ambigs = [r for r in reads if r["status"] == "ambiguous"]
         floor = direction = conf = None
         agreed = False
         reason = "no_read"                                  # nothing matched — incl. MEP (M/E thin-known)
+        candidates = None
         if len(self.readers) >= 2:
-            rec = self.readers[0][1].reconcile(reads)       # agree-or-discard
+            rec = self.readers[0][1].reconcile(reads)       # agree-or-discard (status=='ok' both)
             if rec:
                 floor, direction, conf, agreed, reason = rec["floor"], rec["direction"], rec["confidence"], True, "ok"
-            elif len(got) == 2:
+            elif len(oks) == 2:
                 reason = "disagree"                         # both read but conflict -> discard, don't guess
+            elif ambigs:
+                reason, candidates = "ambiguous", ambigs[0]["candidates"]   # a cell's top-2 too close
         else:                                               # single-panel mode (panel1 cells not calibrated yet)
             r0 = reads[0]
-            if r0:
+            if r0["status"] == "ok":
                 floor, direction, conf, agreed, reason = r0["floor"], r0["direction"], r0["score"], False, "single_panel"
+            elif r0["status"] == "ambiguous":
+                reason, candidates = "ambiguous", r0["candidates"]
         stop = self.floor.update(t, floor, direction) if floor else None
         out = {"t": t, "floor": floor, "direction": direction, "door_state": self.door.state,
                "openness": (round(float(openness), 3) if openness is not None else None),
                "read_conf": (round(float(conf), 3) if conf is not None else None),
                "panels_agreed": agreed, "reason": reason, "n_panels": len(self.readers),
-               "edge_strength": round(float(strength), 3), "cycle": cycle, "stop": stop}
+               "edge_strength": round(float(strength), 3), "cycle": cycle, "stop": stop,
+               "candidates": candidates, "shift": reads[0].get("shift")}
         if cycle:
             out["close_travel_s"] = cycle.get("close_travel_s")
         return out
