@@ -43,13 +43,60 @@ def _url(gw, cam, fname):
     return f"{CLOUD}/calib/{gw}/{cam}/{fname}"
 
 
+def _service_owner():
+    """(uid, gid) that should own calib files so the web app — which runs as the SERVICE user (liftlab)
+    — can overwrite labels.json and re-collect doesn't strand root-owned crops. Prefer CALIB_OWNER env
+    ('user' or 'user:group'); else INHERIT the existing calib dir's owner (so a manual chown sticks);
+    else 'liftlab'. Returns None if the user can't be resolved (leave ownership alone)."""
+    import grp
+    import pwd
+    spec = os.environ.get("CALIB_OWNER", "").strip()
+    if not spec and CALIB_DIR.exists():
+        try:
+            st = CALIB_DIR.stat()
+            return st.st_uid, st.st_gid          # inherit whatever the tree already is
+        except OSError:
+            pass
+    user, _, group = spec.partition(":")
+    try:
+        pw = pwd.getpwnam(user or "liftlab")
+        gid = grp.getgrnam(group).gr_gid if group else pw.pw_gid
+        return pw.pw_uid, gid
+    except (KeyError, OSError):
+        return None
+
+
+def _chown_tree(path):
+    """When running as ROOT (sudo --collect etc.), hand the calib tree to the service user + make it
+    group-writable, so the web app can write labels.json and a later re-collect doesn't strand
+    root-owned files. No-op unless we're root on POSIX; best-effort — never fails the calibration run."""
+    if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return
+    owner = _service_owner()
+    if not owner:
+        return
+    import stat as _stat
+    uid, gid = owner
+    for p in [path, *path.rglob("*")]:
+        try:
+            os.chown(p, uid, gid)
+            m = p.stat().st_mode | _stat.S_IWGRP
+            if p.is_dir():
+                m |= _stat.S_IXGRP
+            os.chmod(p, m)
+        except OSError:
+            pass
+
+
 def _write_result(outdir, name, result):
     """Persist a step's structured result as JSON next to its images so a web poll can read the
-    outcome (+ artifact URLs) without re-running the step."""
+    outcome (+ artifact URLs) without re-running the step. The single chokepoint every command routes
+    through, so it's also where we hand the tree back to the service user (see _chown_tree)."""
     try:
         (outdir / name).write_text(json.dumps(result, indent=2))
     except OSError:
         pass
+    _chown_tree(outdir)
     return result
 
 GW = os.environ.get("GW", "site-A")
@@ -481,6 +528,8 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
 
 
 def main():
+    if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        os.umask(0o002)                          # root (sudo): new files/dirs group-writable (664/775)
     ap = argparse.ArgumentParser()
     ap.add_argument("--collect", type=int, default=0)
     ap.add_argument("--frames", type=int, default=0, help="collect N frames -> door + panel montages")

@@ -21,6 +21,16 @@ for f in calib_label_api.py apply_calib_label_patch.py; do [ -f "/tmp/$f" ] || {
 [ -f "$APP/main.py" ] || { echo "main.py not at $APP"; exit 2; }
 id "$OWNER" >/dev/null 2>&1 || OWNER=root
 
+# The calib tree must be writable by the web app (it writes labels.json). door_calib runs as root
+# (sudo --collect) and would otherwise leave root-owned crops the web user can't overwrite ->
+# PermissionError on labels.json.tmp. Hand the whole tree to the service user + group-write. door_calib
+# now also re-chowns after each run (see _chown_tree), so this survives the next --collect.
+CALIB=/var/lib/liftlab/calib
+mkdir -p "$CALIB"
+chown -R "$OWNER:$OWNER" "$CALIB" 2>/dev/null || true
+chmod -R g+w "$CALIB" 2>/dev/null || true
+say "calib tree owned by $OWNER (labels.json writable by the web app)"
+
 $PY -m py_compile /tmp/calib_label_api.py || { say "compile failed — aborting"; exit 1; }
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/calib_label_api.py "$APP/calib_label_api.py"
 # SMOKE-IMPORT (route+openapi) BEFORE touching main.py — a broken import/route fails HERE, ingest safe.
