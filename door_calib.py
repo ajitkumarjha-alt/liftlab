@@ -180,230 +180,145 @@ def _montage(crops, cols, factor):
     return np.vstack(rows)
 
 
-def _runs(flags):
-    """contiguous True runs in a 1-D bool array -> [(start, end_inclusive), ...]."""
-    runs, s = [], None
-    for i, v in enumerate(flags):
-        if v and s is None:
-            s = i
-        elif not v and s is not None:
-            runs.append((s, i - 1)); s = None
-    if s is not None:
-        runs.append((s, len(flags) - 1))
-    return runs
-
-
-def propose_cells(gw=None, cam=None, outdir=None, min_lit=None, row_frac=None, col_frac=None, queue_k=None):
-    """MEASURE cell geometry from the collected panel0 crops instead of reading rulers by hand.
-
-    v1 profiled BRIGHTNESS and FAILED on real ch29 crops: the panel ROI includes bright door/jamb edges
-    at its borders, which dominate a brightness profile (pitch 4 vs glyph 11, main row = full panel,
-    dark crops not excluded). FIX = profile TEMPORAL VARIANCE across crops: the edges are CONSTANT (fixed
-    structure) while LED cells TOGGLE between glyphs/blank as the floor changes, so per-pixel std over the
-    stack lights up the LEDs and suppresses the edges automatically — no color needed (crops are gray).
-    Then find the main-row band + queue from row-variance, the digit/arrow columns from column-variance,
-    derive fixed pitch from single- vs double-digit widths, and lay 3 right-aligned digit cells + 1 arrow
-    cell. Writes _calib_cells.jpg (overlay), _calib_cells_debug.jpg (mean image + chosen LED cols/bands
-    so the edges' rejection is VISIBLE), and _calib_cells.json. WEB-CALLABLE (returns dict; CalibError)."""
+def render_index(gw=None, cam=None, outdir=None, cols=6):
+    """Montage of every collected crop with its INDEX drawn on it, so the operator can pick a good
+    ANCHOR crop (a two-digit + arrow + queue tile) by number for --anchor. WEB-CALLABLE."""
     import cv2
-    import numpy as np
-    gwid = gw or GW; cam = cam or CAM       # gwid = gateway id; the local 'gw' below is the glyph WIDTH
+    gwid = gw or GW; cam = cam or CAM
     outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
-    MIN_LIT = int(min_lit if min_lit is not None else os.environ.get("CELLS_MIN_LIT", "6"))
-    ROW_F = float(row_frac if row_frac is not None else os.environ.get("CELLS_ROW_FRAC", "0.35"))
-    COL_F = float(col_frac if col_frac is not None else os.environ.get("CELLS_COL_FRAC", "0.30"))
-    QUEUE_K = float(queue_k if queue_k is not None else os.environ.get("CELLS_QUEUE_MAD", "5"))
     paths = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
     if not paths:
         raise CalibError("no _calib_crop_*.png — run collect first")
-    raw = [(Path(p).name, cv2.imread(p, cv2.IMREAD_GRAYSCALE)) for p in paths]
-    raw = [(nm, im) for nm, im in raw if im is not None]
-    Hp = min(im.shape[0] for _, im in raw); Wp = min(im.shape[1] for _, im in raw)
-    names = [nm for nm, _ in raw]
-    A = np.stack([im[:Hp, :Wp].astype(np.float32) for _, im in raw])  # (N, Hp, Wp) raw intensity
-    N = len(A)
-    if N < 5:
-        raise CalibError(f"only {N} crops — need more (varied floors) to isolate LEDs by temporal variance")
+    F = 8
+    tiles = []
+    for p in paths:
+        idx = int(Path(p).stem.split("_")[-1])
+        im = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+        big = cv2.resize(cv2.cvtColor(im, cv2.COLOR_GRAY2BGR),
+                         (im.shape[1] * F, im.shape[0] * F), interpolation=cv2.INTER_NEAREST)
+        cv2.rectangle(big, (0, 0), (big.shape[1] - 1, big.shape[0] - 1), (0, 120, 0), 1)
+        cv2.putText(big, str(idx), (2, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        tiles.append(big)
+    cv2.imwrite(str(outdir / "_calib_index.jpg"), _montage(tiles, cols=cols, factor=1))
+    result = {"gw": gwid, "cam": cam, "n": len(paths), "index_url": _url(gwid, cam, "_calib_index.jpg")}
+    return _write_result(outdir, "_calib_index.json", result)
 
-    # ---- LED isolation by TEMPORAL VARIANCE: per-pixel std OVER crops. Constant edges/background -> ~0;
-    # LED cells that change with the floor -> high. This is what makes the door/jamb edges disappear. ----
-    tstd = A.std(axis=0)                                              # (Hp, Wp)
-    row_act = tstd.sum(axis=1)                                        # LED activity per row
-    row_runs = _runs(row_act > ROW_F * row_act.max())
-    if not row_runs:
-        raise CalibError("no LED row activity — crops all-identical or ROI off the panel")
-    y0, y1 = max(row_runs, key=lambda r: r[1] - r[0])                # main row = WIDEST high-activity band
-    # queue: a dimmer/sparser SECOND band just below the main row (the destination-floor line). It rarely
-    # clears ROW_F, so detect it NOISE-RELATIVE — rows below the main row whose activity beats the
-    # background floor by QUEUE_K MADs. The cell bottom is held above whatever this finds.
-    inmain = np.zeros_like(row_act, bool); inmain[y0:y1 + 1] = True
-    bg = row_act[~inmain]
-    nmed = float(np.median(bg)); nmad = float(np.median(np.abs(bg - nmed))) + 1e-6
-    qthr = nmed + max(QUEUE_K * nmad, 0.06 * (float(row_act.max()) - nmed))
-    qbelow = row_act > qthr; qbelow[:y1 + 2] = False                # strictly below the main row
-    qruns = [r for r in _runs(qbelow) if r[1] - r[0] >= 1]          # >= 2 rows tall (a line, not a noise spike)
-    queue = qruns[0] if qruns else None
 
-    band_act = tstd[y0:y1 + 1, :].sum(axis=0)                        # column activity within the main row
-    col_runs = _runs(band_act > COL_F * band_act.max())
-    if not col_runs:
-        raise CalibError("no LED column activity in the main band")
-    arrow_run = None; digit_runs = col_runs
-    if len(col_runs) >= 2 and (col_runs[-1][0] - col_runs[-2][1] - 1) >= 1:
-        arrow_run, digit_runs = col_runs[-1], col_runs[:-1]          # rightmost gap-separated run = arrow
-    gap_start = arrow_run[0] if arrow_run else Wp
-    led_lo = digit_runs[0][0]                                        # leftmost digit column
-    x_dr = digit_runs[-1][1]                                         # aggregate right edge of the digit block
-    x_hi = (arrow_run[1] if arrow_run else col_runs[-1][1]) + 1
-    cell_y, cell_h = int(y0), int(y1 - y0 + 1)
-    dig_hi = min(gap_start, x_dr + 2)                               # cap per-crop measurement (arrow-jitter guard)
+def render_anchor(crop, gw=None, cam=None, outdir=None):
+    """Enlarge one crop with a FINE within-panel-px ruler so the operator can READ the anchor coords off
+    it: tens-digit left, units-digit left, digit top, digit bottom, arrow left. Pick a two-digit + arrow
+    (+ queue) crop by number from --index. WEB-CALLABLE."""
+    import cv2
+    gwid = gw or GW; cam = cam or CAM
+    outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
+    p = outdir / f"_calib_crop_{int(crop):03d}.png"
+    if not p.exists():
+        raise CalibError(f"no {p.name} — pick an index shown by --index")
+    im = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+    ruled = _ruler(cv2.cvtColor(im, cv2.COLOR_GRAY2BGR), factor=14, step=2)   # labels in WITHIN-PANEL px
+    cv2.imwrite(str(outdir / "_calib_anchor.jpg"), ruled)
+    result = {"gw": gwid, "cam": cam, "crop": int(crop),
+              "anchor_url": _url(gwid, cam, "_calib_anchor.jpg"),
+              "read": "tens_left, units_left, digit_top, digit_bottom, arrow_left  (within-panel px off the ruler)"}
+    return _write_result(outdir, "_calib_anchor.json", result)
 
-    # ---- binarise the LED region + DROP truly-dark/off crops (v1's abs_floor let a near-dark crop with a
-    # bright edge pixel pass Otsu). Threshold = Otsu over POOLED LED-region pixels (dark cell vs lit
-    # stroke), floored at mean+std. A crop with < MIN_LIT lit pixels in the LED region is off/blank. ----
-    reg = A[:, y0:y1 + 1, led_lo:x_hi]
-    T, _ = cv2.threshold(reg.reshape(-1).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    T = max(float(T), float(reg.mean() + reg.std()))
-    masks = []; n_dark = 0
-    for i in range(N):
-        litreg = A[i, y0:y1 + 1, led_lo:x_hi] > T
-        if int(litreg.sum()) < MIN_LIT:
-            n_dark += 1; continue                                   # off/blank panel -> exclude from geometry
-        m = np.zeros((Hp, Wp), bool)
-        m[y0:y1 + 1, led_lo:x_hi] = litreg                          # LED-only mask (edges already excluded)
-        masks.append((names[i], A[i].astype(np.uint8), m))
-    n_kept = len(masks)
-    if n_kept < 3:
-        raise CalibError(f"only {n_kept}/{N} crops have LEDs lit ({n_dark} dropped as dark) — MIN_LIT/ROI/COL_F?")
 
-    # ---- per-crop digit block: right edge (right-aligned anchor) + width (single vs multi digit) ----
-    r_edges, widths = [], []
-    for _, _, m in masks:
-        cols = np.where(m[y0:y1 + 1, :dig_hi].any(axis=0))[0]
-        if cols.size:
-            r_edges.append(int(cols.max())); widths.append(int(cols.max() - cols.min() + 1))
-    if len(r_edges) < 3:
-        raise CalibError("too few crops with digits to measure pitch")
-    r_edges = np.array(r_edges); widths = np.array(widths)
-    C = int(round(np.median(r_edges)))                               # units-digit right edge (px, in-panel)
-    jitter = float(r_edges.max() - r_edges.min())                    # horizontal wobble of that edge
+def propose_cells(gw=None, cam=None, outdir=None, anchors=None, anchor_crop=None, arrow_w=None):
+    """DETERMINISTIC cells from human-read anchors — NO auto-detection. The ch29 panel ROI also sees the
+    moving door/lobby, so every auto approach (brightness v1, temporal-variance v2) FAILED: the door
+    sweep, people and changing light give the WHOLE ROI variance, so nothing isolates the LEDs. Instead
+    the operator reads 5 coords ONCE off the --anchor ruler (from a two-digit + arrow crop); fixed-pitch
+    geometry does the rest, exactly and repeatably. Auto-detection can return later as a wizard, VALIDATED
+    against these human anchors as fixtures.
 
-    uniq = np.sort(np.unique(widths))
-    split = None
-    if uniq.size >= 2:
-        gaps = np.diff(uniq); gi = int(np.argmax(gaps))
-        if gaps[gi] >= 2:                                            # a real jump in block width = digit-count change
-            split = (uniq[gi] + uniq[gi + 1]) / 2.0
-    narrow = widths[widths < split] if split is not None else widths
-    wideg = widths[widths >= split] if split is not None else np.array([], int)
-    gw = float(np.median(narrow)) if narrow.size else float(np.median(widths))   # single-digit width ~ cell glyph width
-    if wideg.size >= 3:
-        pitch = float(np.median(wideg)) - gw                        # 2-digit block = pitch + glyph_width => pitch = Wd - gw
-        pitch_src = f"width-diff (single~{gw:.0f}px×{narrow.size}, double~{np.median(wideg):.0f}px×{wideg.size})"
+    anchors = tens_left, units_left, digit_top, digit_bottom, arrow_left  (within-panel px; str or seq)
+      pitch  = units_left - tens_left                         (an LED matrix is fixed-pitch)
+      cell_w = pitch, but never past the arrow: min(pitch, arrow_left - units_left)
+      3 digit cells RIGHT-ALIGNED on the units cell (d0 = one pitch left of tens: the 3rd char / P-prefix)
+      arrow cell one cell wide at arrow_left; height = digit_bottom - digit_top (bottom set above the queue
+      by the operator's eye). Writes _calib_cells.jpg (cells on the anchor crop) + _calib_cells.json. WEB-CALLABLE."""
+    import cv2
+    gwid = gw or GW; cam = cam or CAM
+    outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
+    if anchors is None:
+        anchors = os.environ.get("CELLS_ANCHORS", "")
+    if isinstance(anchors, str):
+        vals = [int(v) for v in anchors.replace(";", ",").split(",") if v.strip() != ""]
     else:
-        pitch = gw + 1.0
-        pitch_src = f"FALLBACK gw+1 (only {wideg.size} multi-digit crops — pitch UNVERIFIED, approve visually)"
-    pitch = max(1.0, pitch)
+        vals = [int(v) for v in anchors]
+    if len(vals) != 5:
+        raise CalibError("need 5 anchors: tens_left,units_left,digit_top,digit_bottom,arrow_left (within-panel "
+                         "px). Run `--index` to pick a two-digit+arrow crop, then `--anchor N` to read them off the ruler.")
+    tens_left, units_left, top, bottom, arrow_left = vals
+    pitch = units_left - tens_left
+    if pitch <= 0:
+        raise CalibError(f"units_left ({units_left}) must be > tens_left ({tens_left}); got pitch={pitch}")
+    if bottom <= top:
+        raise CalibError(f"digit_bottom ({bottom}) must be > digit_top ({top})")
+    if arrow_left < units_left:
+        raise CalibError(f"arrow_left ({arrow_left}) should be to the RIGHT of units_left ({units_left})")
+    height = bottom - top
 
-    # tolerance: an angled panel wobbles the digit x; if the right edge moves >1px, pad cells (capped so
-    # neighbours don't overlap: at most half the free space between cells, i.e. (pitch - gw)/2).
-    tol = int(np.ceil(jitter / 2.0)) if jitter > 1 else 0
-    tol = int(min(tol, max(0, (pitch - gw) / 2.0)))
-    w = int(round(gw)) + 2 * tol
-    cells = []                                                       # 3 digit cells, LEFT-TO-RIGHT (i=0 leftmost)
-    for i in range(3):
-        Ri = C - (2 - i) * pitch
-        x = int(round(Ri - gw + 1)) - tol
-        cells.append((max(0, x), cell_y, w, cell_h))
-    if arrow_run:
-        ax = max(0, arrow_run[0] - tol)
-        arrow_cell = (ax, cell_y, int(arrow_run[1] - arrow_run[0] + 1) + 2 * tol, cell_h)
-        arrow_src = f"measured run x[{arrow_run[0]}..{arrow_run[1]}]"
+    paths = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
+    if not paths:
+        raise CalibError("no _calib_crop_*.png — run collect first")
+    if anchor_crop is not None:
+        cp = outdir / f"_calib_crop_{int(anchor_crop):03d}.png"
+        if not cp.exists():
+            raise CalibError(f"no {cp.name} — that anchor-crop index wasn't collected")
     else:
-        ax = int(round(C + max(2.0, pitch - gw)))                   # estimate: one gap right of the units digit
-        arrow_cell = (ax, cell_y, int(round(gw)) + 2 * tol, cell_h)
-        arrow_src = "ESTIMATED (no gap-separated run right of digits — verify)"
+        cp = Path(paths[len(paths) // 2])                    # any crop for the confirm overlay if none named
+    base = cv2.imread(str(cp), cv2.IMREAD_GRAYSCALE)
+    Hp, Wp = base.shape[:2]
 
-    # ---- overlay on a TWO-DIGIT crop (prefer one with the arrow lit) so all four boxes have content ----
-    best, best_score = None, -1.0
-    for p, im, m in masks:
-        cols = np.where(m[y0:y1 + 1, :dig_hi].any(axis=0))[0]
-        if cols.size == 0:
-            continue
-        bw = int(cols.max() - cols.min() + 1)
-        if split is not None and bw < split:                        # want a multi-digit tile
-            continue
-        arrow_lit = int(m[y0:y1 + 1, gap_start:].sum()) if arrow_run else 0
-        score = bw + (5 if arrow_lit > 2 else 0)
-        if score > best_score:
-            best, best_score = (p, im, m), score
-    if best is None:
-        best = masks[len(masks) // 2]
-    F = 10
-    big = cv2.resize(cv2.cvtColor(best[1], cv2.COLOR_GRAY2BGR), (Wp * F, Hp * F), interpolation=cv2.INTER_NEAREST)
-    palette = [(0, 180, 255), (0, 220, 120), (255, 160, 0)]         # BGR: cell0,1,2
+    w = pitch if (arrow_left - units_left) >= pitch else max(1, arrow_left - units_left)   # never overlap arrow
+    warn = []
+
+    def _fit(x, cw, tag):
+        if x < 0:
+            warn.append(f"{tag} left {x}<0 -> clamped to 0"); cw += x; x = 0
+        if x + cw > Wp:
+            warn.append(f"{tag} right {x + cw}>{Wp} -> clamped"); cw = Wp - x
+        return int(x), int(max(1, cw))
+
+    lefts = [tens_left - pitch, tens_left, units_left]       # d0 (3rd char / P-prefix), d1 (tens), d2 (units)
+    cells = []
+    for i, l in enumerate(lefts):
+        cx, cw = _fit(int(l), int(w), f"d{i}")
+        cells.append((cx, int(top), cw, int(height)))
+    aw = int(arrow_w if arrow_w is not None else os.environ.get("CELLS_ARROW_W", int(w)))
+    ax, aw = _fit(int(arrow_left), aw, "arrow")
+    arrow_cell = (ax, int(top), aw, int(height))
+
+    # confirm overlay — draw the derived cells on the anchor crop so they visibly land on the real glyphs
+    F = 12
+    big = cv2.resize(cv2.cvtColor(base, cv2.COLOR_GRAY2BGR), (Wp * F, Hp * F), interpolation=cv2.INTER_NEAREST)
+    palette = [(0, 180, 255), (0, 220, 120), (255, 160, 0)]  # BGR: d0, d1, d2
     for i, (cx, cy, cw, ch) in enumerate(cells):
         cv2.rectangle(big, (cx * F, cy * F), ((cx + cw) * F, (cy + ch) * F), palette[i], 2)
-        cv2.putText(big, f"d{i}", (cx * F + 2, cy * F + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, palette[i], 1)
-    axx, ayy, aww, ahh = arrow_cell
-    cv2.rectangle(big, (axx * F, ayy * F), ((axx + aww) * F, (ayy + ahh) * F), (200, 0, 200), 2)
-    cv2.putText(big, "arrow", (axx * F + 2, ayy * F + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 0, 200), 1)
-    if queue:
-        qy = queue[0] * F
-        cv2.line(big, (0, qy), (Wp * F, qy), (0, 0, 255), 1)
-        cv2.putText(big, f"queue y={queue[0]}", (2, qy - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 0, 255), 1)
+        cv2.putText(big, f"d{i}", (cx * F + 2, cy * F + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.4, palette[i], 1)
+    cv2.rectangle(big, (ax * F, top * F), ((ax + aw) * F, (top + height) * F), (200, 0, 200), 2)
+    cv2.putText(big, "arrow", (ax * F + 2, top * F + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 0, 200), 1)
     cv2.imwrite(str(outdir / "_calib_cells.jpg"), big)
-
-    # DEBUG: the MEAN image (door/jamb edges are BRIGHT here) with the LED cols/bands actually chosen +
-    # a column-variance strip beneath. The whole point is visible: the bright border edges are NOT boxed
-    # (bright in mean, flat in variance -> rejected), the green boxes sit on the digits. Verify on real data.
-    F2 = 8
-    meanimg = cv2.normalize(A.mean(axis=0), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    dbg = cv2.resize(cv2.cvtColor(meanimg, cv2.COLOR_GRAY2BGR), (Wp * F2, Hp * F2), interpolation=cv2.INTER_NEAREST)
-    for (a, b) in digit_runs:
-        cv2.rectangle(dbg, (a * F2, y0 * F2), ((b + 1) * F2, (y1 + 1) * F2), (0, 200, 0), 1)
-    if arrow_run:
-        cv2.rectangle(dbg, (arrow_run[0] * F2, y0 * F2), ((arrow_run[1] + 1) * F2, (y1 + 1) * F2), (200, 0, 200), 1)
-    if queue:
-        cv2.line(dbg, (0, queue[0] * F2), (Wp * F2, queue[0] * F2), (0, 0, 255), 1)
-    SH = 44
-    strip = np.zeros((SH, Wp * F2, 3), np.uint8)
-    ca = band_act / (band_act.max() or 1.0)
-    for x in range(Wp):
-        hh = int(ca[x] * (SH - 4))
-        cv2.rectangle(strip, (x * F2, SH - 1 - hh), ((x + 1) * F2 - 1, SH - 1), (0, 170, 0), -1)
-    cv2.putText(strip, "col variance (edges~0)", (2, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (180, 180, 180), 1)
-    cv2.imwrite(str(outdir / "_calib_cells_debug.jpg"), np.vstack([dbg, strip]))
 
     dc = ";".join(f"{x},{y},{cw},{ch}" for (x, y, cw, ch) in cells)
     ac = ",".join(str(v) for v in arrow_cell)
-    result = {"gw": gwid, "cam": cam, "digit_cells": dc, "arrow_cell": ac,
-              "pitch": round(float(pitch), 2), "glyph_w": round(float(gw), 2), "C": int(C),
-              "jitter": float(jitter), "tol": int(tol), "cell_y": int(cell_y), "cell_h": int(cell_h),
-              "queue_y": (int(queue[0]) if queue else None), "n_kept": int(n_kept), "n_dark": int(n_dark),
-              "n_crops": int(N), "led_threshold": round(float(T), 1), "led_cols": [int(led_lo), int(x_hi - 1)],
-              "panel_wh": [int(Wp), int(Hp)], "pitch_src": pitch_src, "arrow_src": arrow_src,
+    result = {"gw": gwid, "cam": cam, "digit_cells": dc, "arrow_cell": ac, "pitch": int(pitch),
+              "cell_w": int(w), "cell_y": int(top), "cell_h": int(height),
+              "anchors": {"tens_left": tens_left, "units_left": units_left, "digit_top": top,
+                          "digit_bottom": bottom, "arrow_left": arrow_left},
+              "anchor_crop": (int(anchor_crop) if anchor_crop is not None else None),
+              "panel_wh": [int(Wp), int(Hp)], "warnings": warn,
               "overlay_url": _url(gwid, cam, "_calib_cells.jpg"),
-              "debug_url": _url(gwid, cam, "_calib_cells_debug.jpg"),
-              "note": "measured on panel0 only; panel1 in-panel digit x differs a few px — spot-check p1"}
+              "note": "deterministic from human anchors; panel1 in-panel digit x differs a few px — spot-check p1"}
     _write_result(outdir, "_calib_cells.json", result)
-    print(f"[cells] {n_kept}/{N} crops used ({n_dark} dropped as dark); panel {Wp}x{Hp}; LED T={T:.0f}; "
-          f"LED cols x[{led_lo}..{x_hi - 1}] (door/jamb edges rejected by variance)")
-    print(f"[cells] main row y[{cell_y}..{cell_y + cell_h - 1}] h={cell_h}"
-          + (f"; QUEUE line detected at y={queue[0]} — cell bottom kept above it" if queue
-             else "; NO queue band detected in aggregate — verify bottom against the 52-over-queue crop"))
-    print(f"[cells] units right edge C={C}px; pitch={pitch:.1f}px [{pitch_src}]; glyph width~{gw:.0f}px")
-    if jitter > 1:
-        print(f"[cells] JITTER: units right edge varies {jitter:.0f}px across crops (panel is angled) "
-              f"-> cells padded ±{tol}px (width {int(round(gw))}->{w})")
-    else:
-        print(f"[cells] jitter {jitter:.0f}px (<=1) — cells sized tight, no tolerance pad")
-    print(f"[cells] arrow: {arrow_src}")
-    print(f"[cells] PROPOSED (within-panel px, left-to-right):")
-    print(f"    DIGIT_CELLS='{dc}'")
-    print(f"    ARROW_CELL='{ac}'")
-    print(f"[cells] APPROVE VISUALLY: {result['overlay_url']}  (boxes on a two-digit crop)")
-    print(f"[cells] VERIFY ISOLATION: {result['debug_url']}  (mean image + green LED cols; edges must be UNboxed)")
+    print(f"[cells] anchors tens_left={tens_left} units_left={units_left} top={top} bottom={bottom} arrow_left={arrow_left}")
+    print(f"[cells] pitch={pitch}px cell_w={w}px height={height}px  (fixed-pitch, right-aligned)")
+    for wln in warn:
+        print(f"[cells] WARN {wln}")
+    print(f"[cells] DIGIT_CELLS='{dc}'")
+    print(f"[cells] ARROW_CELL='{ac}'")
+    print(f"[cells] CONFIRM: {result['overlay_url']}  (cells drawn on {cp.name})")
     print(f"[cells] NOTE: {result['note']}")
     return result
 
@@ -547,14 +462,29 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--collect", type=int, default=0)
     ap.add_argument("--frames", type=int, default=0, help="collect N frames -> door + panel montages")
-    ap.add_argument("--cells", action="store_true", help="MEASURE DIGIT_CELLS + ARROW_CELL from collected crops (no rulers)")
+    ap.add_argument("--index", action="store_true", help="montage of crops WITH indices, to pick an anchor crop")
+    ap.add_argument("--anchor", type=int, default=None, metavar="N", help="enlarge crop N with a fine ruler to read anchor px")
+    ap.add_argument("--cells", action="store_true", help="DETERMINISTIC cells from --anchors (no auto-detect)")
+    ap.add_argument("--anchors", default="", help="tens_left,units_left,digit_top,digit_bottom,arrow_left (within-panel px)")
+    ap.add_argument("--anchor-crop", type=int, default=None, dest="anchor_crop", help="crop index to draw the derived cells on")
     ap.add_argument("--build", action="store_true", help="build templates.npz from collected crops + --labels")
     ap.add_argument("--labels", default="", help="row-major floor labels, e.g. '7^,8^,12^,...,P3v,6v'")
     ap.add_argument("--fresh", action="store_true", help="clear accumulated crops before collecting (default = append)")
     a = ap.parse_args()
     try:
+        if a.index:
+            r = render_index()
+            print(f"[index] {r['n']} crops -> {r['index_url']}")
+            print(f"[index] pick a two-digit + arrow (+ queue) tile; note its number for `--anchor N`")
+            return
+        if a.anchor is not None:
+            r = render_anchor(a.anchor)
+            print(f"[anchor] crop {r['crop']} -> {r['anchor_url']}")
+            print(f"[anchor] read off the ruler: {r['read']}")
+            print(f"[anchor] then: door_calib.py --cells --anchors 'tens_left,units_left,digit_top,digit_bottom,arrow_left' --anchor-crop {r['crop']}")
+            return
         if a.cells:
-            propose_cells()                                # prints + writes _calib_cells.json
+            propose_cells(anchors=a.anchors, anchor_crop=a.anchor_crop)   # prints + writes _calib_cells.json
             return
         if a.build:
             r = build_from_crops(labels=a.labels)
