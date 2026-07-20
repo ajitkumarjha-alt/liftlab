@@ -12,11 +12,45 @@ View:  https://lift.gargi.online/calib/site-A/ch29/_calib_frame.jpg  (and _calib
 import argparse
 import glob
 import io
+import json
 import os
 import time
 from pathlib import Path
 
 import gpu_door as gd
+
+
+class CalibError(Exception):
+    """A recoverable calibration failure (bad input, nothing collected yet, geometry not measurable).
+    EVERY library function below raises THIS, never SystemExit — a web endpoint maps it to a 4xx, the
+    CLI prints it and exits 2. SystemExit would kill a uvicorn worker, so it's confined to __main__."""
+
+
+# --- WEB-CALLABLE contract -------------------------------------------------------------------------
+# door_calib is a LIBRARY first, a CLI second: render_rois / collect_crops / propose_cells /
+# build_from_crops each take explicit params (env only as a default), return a JSON-able dict, write
+# their artifacts to the served calib dir, and raise CalibError (not SystemExit) on bad input. main()
+# is a thin argparse shell over them so the same code path backs a future /calibrate web action.
+
+
+def _calib_dir(gw, cam):
+    d = CALIB_DIR / gw / cam                 # DURABLE (survives restart); served at /calib/{gw}/{cam}/
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _url(gw, cam, fname):
+    return f"{CLOUD}/calib/{gw}/{cam}/{fname}"
+
+
+def _write_result(outdir, name, result):
+    """Persist a step's structured result as JSON next to its images so a web poll can read the
+    outcome (+ artifact URLs) without re-running the step."""
+    try:
+        (outdir / name).write_text(json.dumps(result, indent=2))
+    except OSError:
+        pass
+    return result
 
 GW = os.environ.get("GW", "site-A")
 CAM = os.environ.get("CAM", "ch29")
@@ -171,19 +205,22 @@ def _runs(flags):
     return runs
 
 
-def propose_cells(outdir):
+def propose_cells(gw=None, cam=None, abs_floor=None, outdir=None):
     """MEASURE cell geometry from the collected panel0 crops instead of reading rulers by hand.
     Thresholds lit LED pixels across ALL crops, finds the main-row vertical band (bottom set ABOVE the
     destination-queue line), locates the arrow (rightmost gap-separated column run) and the digit block,
     derives the fixed pitch from single- vs double-digit block widths, and lays 3 right-aligned digit
     cells + 1 arrow cell (within-panel px). Reports horizontal jitter (angled panel) and sizes cells
-    with tolerance if it exceeds 1px. Writes _calib_cells.jpg overlaying the boxes on a two-digit crop."""
+    with tolerance if it exceeds 1px. Writes _calib_cells.jpg (overlay) + _calib_cells.json (result).
+    WEB-CALLABLE: returns a JSON-able dict; raises CalibError (not SystemExit) if crops are missing."""
     import cv2
     import numpy as np
-    abs_floor = int(os.environ.get("CELLS_ABS_FLOOR", "80"))
+    gwid = gw or GW; cam = cam or CAM       # gwid = gateway id; the local 'gw' below is the glyph WIDTH
+    outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
+    abs_floor = int(abs_floor if abs_floor is not None else os.environ.get("CELLS_ABS_FLOOR", "80"))
     paths = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
     if not paths:
-        raise SystemExit("no _calib_crop_*.png — run --collect first")
+        raise CalibError("no _calib_crop_*.png — run collect first")
     raw = [(p, cv2.imread(p, cv2.IMREAD_GRAYSCALE)) for p in paths]
     raw = [(p, im) for p, im in raw if im is not None]
     Hp = min(im.shape[0] for _, im in raw); Wp = min(im.shape[1] for _, im in raw)
@@ -191,14 +228,14 @@ def propose_cells(outdir):
     masks = [(p, im, m) for p, im in imgs for m in [_lit_mask(im, abs_floor)] if m is not None and m.any()]
     n_lit = len(masks)
     if n_lit < 3:
-        raise SystemExit(f"only {n_lit}/{len(imgs)} crops have a lit panel (max<{abs_floor}) — check PANEL_ROIS / CELLS_ABS_FLOOR")
+        raise CalibError(f"only {n_lit}/{len(imgs)} crops have a lit panel (max<{abs_floor}) — check PANEL_ROIS / abs_floor")
     stack = np.stack([m for _, _, m in masks]).astype(np.int32)       # (n, Hp, Wp)
 
     # ---- vertical: main row band, bottom kept ABOVE the destination-queue line ----
     row_occ = stack.sum(axis=(0, 2)).astype(float)                   # lit-pixel count per row, all crops
     row_runs = _runs(row_occ > 0.30 * row_occ.max())
     if not row_runs:
-        raise SystemExit("no lit rows — threshold/ROI problem")
+        raise CalibError("no lit rows — threshold/ROI problem")
     y0, y1 = row_runs[0]                                              # topmost band = the main floor row
     queue = next(((a, b) for (a, b) in row_runs[1:] if a > y1 + 1), None)
     if queue:
@@ -210,7 +247,7 @@ def propose_cells(outdir):
     col_occ = band.sum(axis=(0, 1)).astype(float)
     col_runs = _runs(col_occ > 0.20 * col_occ.max())
     if not col_runs:
-        raise SystemExit("no lit columns in the main band")
+        raise CalibError("no lit columns in the main band")
     arrow_run = None; digit_runs = col_runs
     if len(col_runs) >= 2 and (col_runs[-1][0] - col_runs[-2][1] - 1) >= 1:
         arrow_run, digit_runs = col_runs[-1], col_runs[:-1]
@@ -227,7 +264,7 @@ def propose_cells(outdir):
         if cols.size:
             r_edges.append(int(cols.max())); widths.append(int(cols.max() - cols.min() + 1))
     if len(r_edges) < 3:
-        raise SystemExit("too few crops with digits to measure pitch")
+        raise CalibError("too few crops with digits to measure pitch")
     r_edges = np.array(r_edges); widths = np.array(widths)
     C = int(round(np.median(r_edges)))                               # units-digit right edge (px, in-panel)
     jitter = float(r_edges.max() - r_edges.min())                    # horizontal wobble of that edge
@@ -300,6 +337,14 @@ def propose_cells(outdir):
 
     dc = ";".join(f"{x},{y},{cw},{ch}" for (x, y, cw, ch) in cells)
     ac = ",".join(str(v) for v in arrow_cell)
+    result = {"gw": gwid, "cam": cam, "digit_cells": dc, "arrow_cell": ac,
+              "pitch": round(float(pitch), 2), "glyph_w": round(float(gw), 2), "C": int(C),
+              "jitter": float(jitter), "tol": int(tol), "cell_y": int(cell_y), "cell_h": int(cell_h),
+              "queue_y": (int(queue[0]) if queue else None), "n_lit": int(n_lit), "n_crops": len(imgs),
+              "panel_wh": [int(Wp), int(Hp)], "pitch_src": pitch_src, "arrow_src": arrow_src,
+              "overlay_url": _url(gwid, cam, "_calib_cells.jpg"),
+              "note": "measured on panel0 only; panel1 in-panel digit x differs a few px — spot-check p1"}
+    _write_result(outdir, "_calib_cells.json", result)
     print(f"[cells] {n_lit}/{len(imgs)} lit crops; panel {Wp}x{Hp}")
     print(f"[cells] main row y[{cell_y}..{cell_y + cell_h - 1}] h={cell_h}"
           + (f"; QUEUE line detected at y={queue[0]} — cell bottom kept above it" if queue
@@ -314,15 +359,147 @@ def propose_cells(outdir):
     print(f"[cells] PROPOSED (within-panel px, left-to-right):")
     print(f"    DIGIT_CELLS='{dc}'")
     print(f"    ARROW_CELL='{ac}'")
-    print(f"[cells] APPROVE VISUALLY: {CLOUD}/calib/{GW}/{CAM}/_calib_cells.jpg  (boxes on a two-digit crop)")
-    print(f"[cells] NOTE: measured on panel0 crops; panel1's in-panel digit x can differ a few px "
-          f"(its within-panel offset isn't the same) — spot-check p1 before trusting one cell set for both.")
-    return {"digit_cells": dc, "arrow_cell": ac, "pitch": pitch, "C": C, "jitter": jitter,
-            "cell_y": cell_y, "cell_h": cell_h, "queue_y": (queue[0] if queue else None)}
+    print(f"[cells] APPROVE VISUALLY: {result['overlay_url']}  (boxes on a two-digit crop)")
+    print(f"[cells] NOTE: {result['note']}")
+    return result
+
+
+def _resolve_geometry(fr, door_roi_frame=None, panel_rois=None):
+    """(door_roi, dsrc, panel_rois) for a decoded frame. door_roi_frame='x,y,w,h' (str or seq) is frame
+    px used DIRECTLY (nudged onto the leaf); else the calib-space DOOR_ROI is scaled (lands on the wall)."""
+    H, W = fr.shape[:2]
+    drf = door_roi_frame if door_roi_frame is not None else DOOR_ROI_FRAME
+    if drf:
+        seq = drf.split(",") if isinstance(drf, str) else drf
+        droi = tuple(int(v) for v in seq)
+        dsrc = f"DOOR_ROI_FRAME={droi}"
+    else:
+        droi = gd.scale_roi(DOOR_ROI, CALIB_WH, (W, H))
+        dsrc = f"scaled from calib {DOOR_ROI} -> {droi}  (WRONG surface: set door_roi_frame to the leaf)"
+    if panel_rois is None:
+        prois = _panel_rois()
+    elif isinstance(panel_rois, str):
+        prois = [tuple(int(v) for v in part.split(",")) for part in panel_rois.split(";") if part.strip()]
+    else:
+        prois = [tuple(p) for p in panel_rois]
+    return droi, dsrc, prois
+
+
+def _as_cells(v, envkey):
+    """Normalise cells from a web param OR env into [(x,y,w,h), ...]. Accepts a 'x,y,w,h;...' string,
+    a list of cells, or a single (x,y,w,h)."""
+    if v is None:
+        v = os.environ.get(envkey, "")
+    if isinstance(v, str):
+        return _parse_cells(v)
+    if v and isinstance(v[0], (list, tuple)):
+        return [tuple(c) for c in v]
+    return [tuple(v)] if v else []
+
+
+def render_rois(gw=None, cam=None, door_roi_frame=None, panel_rois=None):
+    """Decode the newest frame + write the ROI-overlay and ruler renders (frame/door/panels). Returns
+    geometry + artifact URLs. WEB-CALLABLE (returns JSON-able dict; raises CalibError if no frame)."""
+    import cv2
+    gw = gw or GW; cam = cam or CAM
+    outdir = _calib_dir(gw, cam)
+    fr = newest_frame()
+    if fr is None:
+        raise CalibError(f"no frame: no segments in {LIVE_DIR/gw/cam} and HTTP fallback empty")
+    H, W = fr.shape[:2]
+    droi, dsrc, prois = _resolve_geometry(fr, door_roi_frame, panel_rois)
+    ann = _frame_grid(gd.overlay_rois(fr, [tuple(droi)] + list(prois),
+                                      ["door"] + [f"p{i}" for i in range(len(prois))]))
+    cv2.imwrite(str(outdir / "_calib_frame.jpg"), ann)
+    cv2.imwrite(str(outdir / "_calib_door.jpg"),
+                _ruler(gd.crop(fr, droi), factor=3, step=20, x0=droi[0], y0=droi[1]))
+    for i, pr in enumerate(prois):
+        cv2.imwrite(str(outdir / f"_calib_p{i}.jpg"), _ruler(gd.crop(fr, pr), x0=pr[0], y0=pr[1]))
+    artifacts = [_url(gw, cam, "_calib_frame.jpg"), _url(gw, cam, "_calib_door.jpg")] + \
+                [_url(gw, cam, f"_calib_p{i}.jpg") for i in range(len(prois))]
+    result = {"gw": gw, "cam": cam, "frame_wh": [W, H], "door_roi": list(droi), "door_src": dsrc,
+              "panels": [list(p) for p in prois], "artifacts": artifacts}
+    return _write_result(outdir, "_calib_rois.json", result)
+
+
+def collect_crops(gw=None, cam=None, nframes=40, fresh=False, door_roi_frame=None, panel_rois=None):
+    """Collect one panel0 crop per NEW segment (dedup by MTIME — the relay reuses seg filenames, so the
+    PATH repeats while content changes; a path-keyed dedup was the old 1-crop bug). APPEND across runs
+    (durable-dir promise); fresh=True starts over. Rebuilds the cumulative panel0 montage (matches what
+    build reads, 1:1) + this-run door montage. Returns counts + URLs. WEB-CALLABLE — but BLOCKS ~2s ×
+    nframes, so a web caller must run it as a background job, not inline in the request."""
+    import cv2
+    gw = gw or GW; cam = cam or CAM
+    outdir = _calib_dir(gw, cam)
+    fr0 = newest_frame()
+    if fr0 is None:
+        raise CalibError(f"no frame: no segments in {LIVE_DIR/gw/cam} and HTTP fallback empty")
+    droi, _dsrc, prois = _resolve_geometry(fr0, door_roi_frame, panel_rois)
+    existing = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
+    if fresh:
+        for gp in existing:
+            os.remove(gp)
+        existing = []
+    n = 1 + max([int(Path(g).stem.split("_")[-1]) for g in existing], default=-1)   # continue numbering
+    doors = []; last_mtime = None; added = 0
+    for _ in range(nframes):
+        seg = _newest_seg()
+        if seg:
+            mt = os.path.getmtime(seg)
+            if mt != last_mtime:              # new CONTENT (path may repeat), decode + save
+                last_mtime = mt
+                f2 = _decode_last_frame(seg)
+                if f2 is not None:
+                    doors.append(gd.crop(f2, droi))
+                    cv2.imwrite(str(outdir / f"_calib_crop_{n:03d}.png"),
+                                cv2.cvtColor(gd.crop(f2, prois[0]), cv2.COLOR_BGR2GRAY))
+                    n += 1; added += 1
+        time.sleep(2)                         # ~one per 2s segment
+    allc = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
+    pmont = _montage([cv2.cvtColor(cv2.imread(c, cv2.IMREAD_GRAYSCALE), cv2.COLOR_GRAY2BGR) for c in allc], cols=5, factor=8)
+    if pmont is not None:
+        cv2.imwrite(str(outdir / "_calib_glyphs0.jpg"), pmont)
+    md = _montage(doors, cols=6, factor=2)
+    if md is not None:
+        cv2.imwrite(str(outdir / "_calib_doormap.jpg"), md)
+    result = {"gw": gw, "cam": cam, "added": added, "total": len(allc),
+              "glyphs_url": _url(gw, cam, "_calib_glyphs0.jpg"),
+              "doormap_url": (_url(gw, cam, "_calib_doormap.jpg") if md is not None else None)}
+    return _write_result(outdir, "_calib_collect.json", result)
+
+
+def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cell=None, align=None, out_path=None):
+    """Build templates.npz from collected crops + row-major labels + fixed cells (from cells step / env /
+    param). labels: comma-string or list; cells: 'x,y,w,h;...' string or list. Returns stats + the fetch
+    URL the GPU pulls. WEB-CALLABLE (raises CalibError on missing crops/labels/cells)."""
+    import cv2
+    gw = gw or GW; cam = cam or CAM
+    outdir = _calib_dir(gw, cam)
+    if labels is None:
+        labels = os.environ.get("LABELS", "")
+    if isinstance(labels, str):
+        labels = [x.strip() for x in labels.split(",") if x.strip()]
+    crops = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
+    if not crops or not labels:
+        raise CalibError("need _calib_crop_*.png (collect first) and labels '7^,8^,...'")
+    if len(crops) != len(labels):
+        raise CalibError(f"{len(crops)} crops but {len(labels)} labels — must be 1:1 row-major (relabel the montage)")
+    dcells = _as_cells(digit_cells, "DIGIT_CELLS")
+    acell = _as_cells(arrow_cell, "ARROW_CELL")
+    if not dcells or not acell:
+        raise CalibError("fixed cells required (no segmentation): digit_cells 'x,y,w,h;x,y,w,h;x,y,w,h' + "
+                         "arrow_cell 'x,y,w,h' (within-panel px — run the cells step to measure them)")
+    labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in zip(crops, labels)]
+    tpl, stats = gd.build_templates(labeled, dcells, acell[0], align=(align or os.environ.get("ALIGN", "right")))
+    outp = out_path or os.environ.get("TEMPLATES_OUT", os.path.join(TEMPLATES_DIR, gw, f"{cam}.npz"))
+    os.makedirs(os.path.dirname(outp), exist_ok=True)
+    gd.save_templates(tpl, outp)
+    result = {"gw": gw, "cam": cam, "stats": stats, "n_templates": len(tpl), "out_path": outp,
+              "fetch_url": f"{CLOUD}/api/gw/{gw}/templates/{cam}"}
+    return _write_result(outdir, "_calib_build.json", result)
 
 
 def main():
-    import cv2
     ap = argparse.ArgumentParser()
     ap.add_argument("--collect", type=int, default=0)
     ap.add_argument("--frames", type=int, default=0, help="collect N frames -> door + panel montages")
@@ -331,101 +508,31 @@ def main():
     ap.add_argument("--labels", default="", help="row-major floor labels, e.g. '7^,8^,12^,...,P3v,6v'")
     ap.add_argument("--fresh", action="store_true", help="clear accumulated crops before collecting (default = append)")
     a = ap.parse_args()
-    nframes = max(a.collect, a.frames)
-    outdir = CALIB_DIR / GW / CAM           # DURABLE (survives restart); served at /calib/{gw}/{cam}/
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    if a.cells:
-        propose_cells(outdir)
-        return
-
-    if a.build:
-        labels = [x.strip() for x in (a.labels or os.environ.get("LABELS", "")).split(",") if x.strip()]
-        crops = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
-        if not crops or not labels:
-            raise SystemExit("need _calib_crop_*.png (run --collect first) and --labels '7^,8^,...' (or LABELS env)")
-        if len(crops) != len(labels):
-            raise SystemExit(f"{len(crops)} crops but {len(labels)} labels — must be 1:1 row-major (relabel the montage)")
-        dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
-        acell = _parse_cells(os.environ.get("ARROW_CELL", ""))
-        if not dcells or not acell:
-            raise SystemExit("FIXED CELLS required (no segmentation): DIGIT_CELLS='x,y,w,h;x,y,w,h' ARROW_CELL='x,y,w,h' "
-                             "— WITHIN-PANEL px (read off _calib_p0 ruler, subtract the panel's left x). Left-to-right.")
-        labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in zip(crops, labels)]
-        tpl, stats = gd.build_templates(labeled, dcells, acell[0], align=os.environ.get("ALIGN", "right"))
-        outp = os.environ.get("TEMPLATES_OUT", os.path.join(TEMPLATES_DIR, GW, f"{CAM}.npz"))
-        os.makedirs(os.path.dirname(outp), exist_ok=True)
-        gd.save_templates(tpl, outp)
-        print(f"[build] {stats}")
-        print(f"[build] wrote {len(tpl)} templates -> {outp}")
-        print(f"[build] the GPU fetches it (no scp needed): GET {CLOUD}/api/gw/{GW}/templates/{CAM}  (Bearer analysis token)")
-        return
-
-    fr = newest_frame()
-    if fr is None:
-        raise SystemExit(f"no frame: no segments in {LIVE_DIR/GW/CAM} and HTTP fallback empty")
-    H, W = fr.shape[:2]
-    if DOOR_ROI_FRAME:
-        droi = tuple(int(v) for v in DOOR_ROI_FRAME.split(","))    # frame px, used DIRECTLY (nudgeable)
-        dsrc = f"DOOR_ROI_FRAME={droi}"
-    else:
-        droi = gd.scale_roi(DOOR_ROI, CALIB_WH, (W, H))            # scaled (lands on the wall — override it)
-        dsrc = f"scaled from calib {DOOR_ROI} -> {droi}  (WRONG surface: set DOOR_ROI_FRAME to the leaf)"
-    prois = _panel_rois()
-    ann = _frame_grid(gd.overlay_rois(fr, [tuple(droi)] + list(prois),
-                                      ["door"] + [f"p{i}" for i in range(len(prois))]))
-    cv2.imwrite(str(outdir / "_calib_frame.jpg"), ann)
-    cv2.imwrite(str(outdir / "_calib_door.jpg"),
-                _ruler(gd.crop(fr, droi), factor=3, step=20, x0=droi[0], y0=droi[1]))
-    for i, pr in enumerate(prois):
-        cv2.imwrite(str(outdir / f"_calib_p{i}.jpg"), _ruler(gd.crop(fr, pr), x0=pr[0], y0=pr[1]))
-    print(f"[calib] frame {W}x{H}; door_roi={droi}  [{dsrc}]; panels(frame px)={prois}")
-    print(f"[calib] view:  {CLOUD}/calib/{GW}/{CAM}/_calib_frame.jpg   (40px grid -> find the leaf seam, read the door box)")
-    print(f"[calib]        {CLOUD}/calib/{GW}/{CAM}/_calib_door.jpg    (door_roi crop, ruler in absolute frame px)")
-    for i in range(len(prois)):
-        print(f"[calib]        {CLOUD}/calib/{GW}/{CAM}/_calib_p{i}.jpg   (panel{i}, ruler in absolute frame px)")
-
-    if nframes:
-        # Collect one panel0 crop per NEW segment. Dedup by MTIME, not path: the relay reuses segment
-        # filenames (ring / rolling file overwritten in place), so the path repeats while the content
-        # changes — a path-keyed dedup (the old bug) then saved exactly ONE crop and skipped the rest.
-        # APPEND across runs (the durable-dir promise): crops accumulate so multiple sessions build glyph
-        # coverage; --fresh starts over. The panel0 montage is rebuilt over ALL crops so it always matches
-        # what --build reads, 1:1.
-        existing = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
-        if a.fresh:
-            for gp in existing:
-                os.remove(gp)
-            existing = []
-        n = 1 + max([int(Path(g).stem.split("_")[-1]) for g in existing], default=-1)   # continue numbering
-        doors = []
-        last_mtime = None
-        added = 0
-        for _ in range(nframes):
-            seg = _newest_seg()
-            if seg:
-                mt = os.path.getmtime(seg)
-                if mt != last_mtime:          # new CONTENT (path may repeat), decode + save
-                    last_mtime = mt
-                    f2 = _decode_last_frame(seg)
-                    if f2 is not None:
-                        doors.append(gd.crop(f2, droi))
-                        cv2.imwrite(str(outdir / f"_calib_crop_{n:03d}.png"),
-                                    cv2.cvtColor(gd.crop(f2, prois[0]), cv2.COLOR_BGR2GRAY))
-                        n += 1; added += 1
-            time.sleep(2)                     # ~one per 2s segment
-        # panel0 montage over ALL crops (cumulative) so it matches --build exactly; door montage this run
-        allc = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
-        pmont = _montage([cv2.cvtColor(cv2.imread(c, cv2.IMREAD_GRAYSCALE), cv2.COLOR_GRAY2BGR) for c in allc], cols=5, factor=8)
-        if pmont is not None:
-            cv2.imwrite(str(outdir / "_calib_glyphs0.jpg"), pmont)
-        print(f"[calib] +{added} new crops this run -> {len(allc)} total. Label ALL of them row-major:")
-        print(f"[calib]   {CLOUD}/calib/{GW}/{CAM}/_calib_glyphs0.jpg")
-        md = _montage(doors, cols=6, factor=2)
-        if md is not None:
-            cv2.imwrite(str(outdir / "_calib_doormap.jpg"), md)
-            print(f"[calib] door: {len(doors)} crops -> {CLOUD}/calib/{GW}/{CAM}/_calib_doormap.jpg  "
-                  f"(edge should SWEEP columns shut<->open; if it never moves, the box is on a fixed jamb/wall)")
+    try:
+        if a.cells:
+            propose_cells()                                # prints + writes _calib_cells.json
+            return
+        if a.build:
+            r = build_from_crops(labels=a.labels)
+            print(f"[build] {r['stats']}")
+            print(f"[build] wrote {r['n_templates']} templates -> {r['out_path']}")
+            print(f"[build] the GPU fetches it (no scp needed): GET {r['fetch_url']}  (Bearer analysis token)")
+            return
+        r = render_rois()
+        print(f"[calib] frame {r['frame_wh'][0]}x{r['frame_wh'][1]}; door_roi={tuple(r['door_roi'])}  "
+              f"[{r['door_src']}]; panels(frame px)={[tuple(p) for p in r['panels']]}")
+        for u in r["artifacts"]:
+            print(f"[calib]   {u}")
+        nframes = max(a.collect, a.frames)
+        if nframes:
+            c = collect_crops(nframes=nframes, fresh=a.fresh)
+            print(f"[calib] +{c['added']} new crops this run -> {c['total']} total. Label ALL row-major:")
+            print(f"[calib]   {c['glyphs_url']}")
+            if c["doormap_url"]:
+                print(f"[calib] door montage -> {c['doormap_url']}  "
+                      f"(edge should SWEEP shut<->open; if it never moves, the box is on a fixed jamb/wall)")
+    except CalibError as e:
+        raise SystemExit(f"[calib] {e}")                   # CLI-only: catchable error -> stderr + nonzero exit
 
 
 if __name__ == "__main__":
