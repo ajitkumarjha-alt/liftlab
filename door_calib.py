@@ -760,6 +760,126 @@ def labelcheck(gw=None, cam=None, outdir=None):
     return result
 
 
+def fitcells(gw=None, cam=None, outdir=None, radius=3, iters=3):
+    """AUTO-FIT per-cell geometry from the labeled crops — ends anchor guessing. The display is SLANTED
+    (per-cell x/y offsets a uniform grid can't fit), so grid-search EACH cell's (x,y) INDEPENDENTLY
+    (±radius) to maximise NCC of its labeled content against that glyph's consensus template. Human
+    labels = ground truth; geometry = fitted parameters. A digit appears in BOTH tens and units, so the
+    well-aligned units cell anchors the shared template and pulls the misaligned tens cell into line;
+    iterate to converge. Prints fitted DIGIT_CELLS/ARROW_CELL + writes _calib_fitcells.jpg (overlay on a
+    two-digit crop) for a one-time sanity check. Residual UNIFORM jitter is left to the runtime shift
+    search — this fixes the fixed per-cell SLANT. WEB-CALLABLE."""
+    from collections import defaultdict
+
+    import cv2
+    import numpy as np
+    gwid = gw or GW; cam = cam or CAM
+    outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
+    dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
+    acell0 = _parse_cells(os.environ.get("ARROW_CELL", ""))
+    if not dcells or not acell0:
+        raise CalibError("set DIGIT_CELLS + ARROW_CELL (the STARTING geometry to refine)")
+    lj = outdir / "labels.json"
+    if not lj.exists():
+        raise CalibError("no labels.json — label at /calib-label first")
+    labels = json.loads(lj.read_text())
+    tsz = (16, 10); n = len(dcells); BLANK = "blank"; R = int(radius)
+    samples = []                                              # (panel, [glyph-or-blank per cell], arrow)
+    for fname, lab in labels.items():
+        lab = str(lab).strip()
+        if not lab or lab == "-":
+            continue
+        p = outdir / fname
+        panel = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE) if p.exists() else None
+        if panel is None:
+            continue
+        glyphs = gd._label_to_glyphs(lab)
+        arrow = glyphs[-1] if glyphs and glyphs[-1] in ("up", "down") else None
+        fc = glyphs[:-1] if arrow else glyphs
+        if not fc or len(fc) > n:
+            continue
+        samples.append((panel, [BLANK] * (n - len(fc)) + fc, arrow))
+    if len(samples) < 20:
+        raise CalibError(f"only {len(samples)} usable labeled crops — need more coverage to fit geometry")
+
+    def rs(panel, cell):
+        return cv2.resize(gd.crop(panel, cell), (tsz[1], tsz[0])).astype(np.float32)
+
+    def key(g, i):
+        return f"{BLANK}_{i}" if g == BLANK else g
+
+    def means(cells, acell):
+        # UNITS-ANCHORED reference: the rightmost digit cell is the right-alignment anchor and reads
+        # correctly (its units_left was calibrated), so build each DIGIT template from the UNITS cell —
+        # a clean, aligned reference the misaligned tens cell is fitted TO. A pure self-consistent mean
+        # would instead pull the CORRECT units cell toward a wrong tens (they'd meet in the middle).
+        # blank_<i> is per-cell; a glyph never seen in units (e.g. P) falls back to its global mean.
+        ui = n - 1
+        glob, unit = defaultdict(list), defaultdict(list)
+        for panel, cl, arrow in samples:
+            for i, (cell, g) in enumerate(zip(cells, cl)):
+                k = key(g, i)
+                glob[k].append(rs(panel, cell))
+                if g != BLANK and i == ui:
+                    unit[g].append(rs(panel, cell))
+            if arrow:
+                glob[arrow].append(rs(panel, acell))
+        return {k: (np.mean(unit[k], axis=0) if k in unit else np.mean(v, axis=0)) for k, v in glob.items()}
+
+    def fit_one(base, targets):
+        x, y, w, h = base
+        best, bs = (0, 0), -1e18
+        for dy in range(-R, R + 1):
+            for dx in range(-R, R + 1):
+                s = sum(ncc for p, tt in targets for ncc in (gd.ncc(rs(p, (x + dx, y + dy, w, h)), tt),))
+                if s > bs:
+                    bs, best = s, (dx, dy)
+        return (x + best[0], y + best[1], w, h), best, (bs / len(targets) if targets else 0.0)
+
+    orig = list(dcells) + [acell0[0]]
+    cells, acell, scores = list(dcells), acell0[0], {}
+    for _ in range(int(iters)):
+        M = means(cells, acell)
+        newc = []
+        for i, base in enumerate(cells):
+            tg = [(p, M[key(cl[i], i)]) for p, cl, arrow in samples if key(cl[i], i) in M]
+            fc, _mv, sc = fit_one(base, tg)
+            newc.append(fc); scores[f"d{i}"] = round(sc, 3)
+        atg = [(p, M[arrow]) for p, cl, arrow in samples if arrow and arrow in M]
+        acell, _amv, asc = fit_one(acell, atg)
+        scores["arrow"] = round(asc, 3)
+        cells = newc
+    fin = list(cells) + [acell]
+    moves = {(f"d{i}" if i < len(cells) else "arrow"): [fin[i][0] - orig[i][0], fin[i][1] - orig[i][1]]
+             for i in range(len(fin))}                        # CUMULATIVE offset from the starting geometry
+
+    dc = ";".join(f"{x},{y},{w},{h}" for x, y, w, h in cells)
+    ac = ",".join(str(v) for v in acell)
+    # overlay the FITTED cells on a two-digit crop for the one-time visual check
+    two = next((s for s in samples if sum(1 for g in s[1] if g != BLANK) == 2 and s[2]), samples[0])
+    F = 12
+    big = cv2.resize(cv2.cvtColor(two[0], cv2.COLOR_GRAY2BGR), (two[0].shape[1] * F, two[0].shape[0] * F),
+                     interpolation=cv2.INTER_NEAREST)
+    for i, (x, y, w, h) in enumerate(cells):
+        cv2.rectangle(big, (x * F, y * F), ((x + w) * F, (y + h) * F), (0, 220, 0), 2)
+        cv2.putText(big, f"d{i}", (x * F + 2, y * F + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 0), 1)
+    cv2.rectangle(big, (acell[0] * F, acell[1] * F), ((acell[0] + acell[2]) * F, (acell[1] + acell[3]) * F), (200, 0, 200), 2)
+    cv2.imwrite(str(outdir / "_calib_fitcells.jpg"), big)
+
+    result = {"gw": gwid, "cam": cam, "digit_cells": dc, "arrow_cell": ac, "moves": moves,
+              "cell_ncc": scores, "n_samples": len(samples), "radius": R, "iters": int(iters),
+              "overlay_url": _url(gwid, cam, "_calib_fitcells.jpg"),
+              "note": "fitted per-cell geometry (slant absorbed). Sanity-check the overlay, then set these "
+                      "DIGIT_CELLS/ARROW_CELL (and rebuild if the shift changes what --build crops)."}
+    _write_result(outdir, "_calib_fitcells.json", result)
+    print(f"[fitcells] {len(samples)} labeled crops; per-cell offsets (px): {moves}")
+    print(f"[fitcells] per-cell mean NCC after fit: {scores}")
+    print(f"[fitcells] DIGIT_CELLS='{dc}'")
+    print(f"[fitcells] ARROW_CELL='{ac}'")
+    print(f"[fitcells] SANITY-CHECK overlay: {result['overlay_url']}")
+    return result
+
+
 def readtest(gw=None, cam=None, db_path=None):
     """REPRODUCE: run the CURRENT reader on the REVIEWED /floorcheck crops (fixtures with known labels)
     and dump per-sample diagnostics — expected vs read, the chosen shift, per digit-cell top-3 glyph
@@ -840,6 +960,7 @@ def main():
     ap.add_argument("--foldback", action="store_true", help="fold REVIEWED /floorcheck samples into the calib set (then --build)")
     ap.add_argument("--readtest", action="store_true", help="run the current reader on reviewed /floorcheck fixtures + dump per-cell scores")
     ap.add_argument("--labelcheck", action="store_true", help="flag probable MISLABELS (crop vs its glyph template) for re-review")
+    ap.add_argument("--fitcells", action="store_true", help="AUTO-FIT per-cell geometry from labeled crops (ends anchor guessing)")
     ap.add_argument("--build", action="store_true", help="build templates.npz from collected crops + --labels")
     ap.add_argument("--labels", default="", help="row-major floor labels, e.g. '7^,8^,12^,...,P3v,6v'")
     ap.add_argument("--fresh", action="store_true", help="clear accumulated crops before collecting (default = append)")
@@ -861,6 +982,9 @@ def main():
             return
         if a.labelcheck:
             labelcheck()
+            return
+        if a.fitcells:
+            fitcells()
             return
         if a.anchor is not None:
             r = render_anchor(a.anchor)

@@ -211,36 +211,50 @@ class FloorReader:
                     best, bs = lab, s
         return best, bs
 
-    def _cell_align(self, panel_gray, cell, i):
-        """Glyph-match quality of a cell for the shift objective — but ONLY for GLYPH-BEARING cells.
-        Returns None for a BLANK cell (low contrast, OR its per-cell blank template beats every glyph):
-        the static hundreds-cell door edge has blank NCC ~1.0 at [0,0] and would otherwise DOMINATE the
-        rigid sum, pinning a false [0,0] peak so the shift can never correct a tens misalignment. By
-        scoring only lit digit cells, the shift aligns to the DIGITS, which is the whole point."""
+    def _blank_at_zero(self, panel_gray, base_cell, i):
+        """Per-cell blank NCC judged at ZERO shift (base cell). The per-cell blank is STATIC FRAME content
+        — the door edge in the hundreds cell does NOT jitter with the LED display — so it must be scored
+        at the fixed frame position, never at the digits' searched shift (which would misalign it and
+        wrongly flip blank<->glyph). Returns None if this cell has no blank template."""
         import cv2
-        ci = crop(panel_gray, cell)
+        bt = self.blank_cells.get(i)
+        if bt is None:
+            return None
+        b0 = crop(panel_gray, base_cell)
+        if b0.size == 0 or b0.shape[0] < 2 or b0.shape[1] < 2:
+            return -2.0
+        return ncc(cv2.resize(b0, (self._tsz[1], self._tsz[0])), bt)
+
+    def _cell_align(self, panel_gray, base_cell, dx, dy, i):
+        """Glyph-match quality of a cell for the shift objective — GLYPH-BEARING cells only. Glyphs are
+        scored at (base + shift) (they follow the display jitter); BLANK is judged at ZERO shift (static
+        frame content, see _blank_at_zero). Returns None for a blank cell (low contrast OR blank beats
+        every glyph) so the static edge can't dominate the rigid sum and pin a false [0,0] peak."""
+        import cv2
+        x, y, w, h = base_cell
+        ci = crop(panel_gray, (x + dx, y + dy, w, h))
         if ci.size == 0 or ci.shape[0] < 2 or ci.shape[1] < 2:
             return None
         if (int(ci.max()) - int(ci.min())) < self.blank_range:
             return None                              # blank by contrast -> not glyph-bearing
         c = cv2.resize(ci, (self._tsz[1], self._tsz[0]))
         gbest = max((ncc(c, self.templates[g]) for g in self.glyph_labels), default=-2.0)
-        bt = self.blank_cells.get(i)
-        if bt is not None and ncc(c, bt) >= gbest:
+        b = self._blank_at_zero(panel_gray, base_cell, i)   # blank judged at ZERO shift
+        if b is not None and b >= gbest:
             return None                              # per-cell blank wins -> not glyph-bearing
         return gbest
 
     def _best_shift(self, panel_gray):
-        """Rigid (dx,dy) in [-R..R]^2 that best aligns the GLYPH-BEARING cells (the display translates as
-        one). Blank cells are excluded from the objective (see _cell_align) so the static edge can't pin
-        it. Ties keep (0,0); a shift with no glyph-bearing cell is rejected."""
+        """Rigid (dx,dy) in [-R..R]^2 that best aligns the GLYPH-BEARING cells (the LED display translates
+        as one). Blank cells are excluded (see _cell_align) so the static edge can't pin it. Ties keep
+        (0,0); a shift with no glyph-bearing cell is rejected."""
         R = self.shift_search
         if R <= 0:
             return 0, 0
 
         def score(dx, dy):
             vals = [v for i, c in enumerate(self.digit_cells)
-                    if (v := self._cell_align(panel_gray, (c[0] + dx, c[1] + dy, c[2], c[3]), i)) is not None]
+                    if (v := self._cell_align(panel_gray, c, dx, dy, i)) is not None]
             return sum(vals) if vals else -1e9
         best_s, best = (0, 0), score(0, 0)
         for dy in range(-R, R + 1):
@@ -261,7 +275,7 @@ class FloorReader:
                     "candidates": candidates, "n_cells": len(self.digit_cells), "shift": [dx, dy]}
 
         chars, scores = [], []
-        for i, cell in enumerate(self.digit_cells):  # blind fixed-cell crop (+ rigid shift), no gap-finding
+        for i, cell in enumerate(self.digit_cells):  # glyphs at the searched shift; blank at ZERO shift
             ci = crop(panel_gray, (cell[0] + dx, cell[1] + dy, cell[2], cell[3]))
             if ci.size == 0:
                 return _out(None, None, None, "no_read")
@@ -276,8 +290,10 @@ class FloorReader:
                     top2, lab2, top1, lab1 = top1, lab1, sc, g
                 elif sc > top2:
                     top2, lab2 = sc, g
-            bt = self.blank_cells.get(i)             # PER-CELL blank: fires where contrast can't — a static
-            if bt is not None and ncc(c, bt) >= max(top1, self.min_score):   # edge in the cell (e.g. hundreds)
+            # PER-CELL blank at ZERO shift (STATIC frame content — the door edge doesn't jitter with the
+            # display). Judging it at the digits' shift misaligned it and killed every nonzero-shift read.
+            b = self._blank_at_zero(panel_gray, cell, i)
+            if b is not None and b >= max(top1, self.min_score):
                 continue                             # blank explains this cell at least as well -> BLANK
             if lab1 is None or top1 < self.min_score:
                 return _out(None, None, None, "no_read")   # a lit cell we can't confidently name
@@ -317,8 +333,8 @@ class FloorReader:
             c = cv2.resize(ci, (self._tsz[1], self._tsz[0]))
             scored = sorted(((round(ncc(c, self.templates[g]), 3), g) for g in self.glyph_labels), reverse=True)
             rec["top"] = [[g, s] for s, g in scored[:3]]
-            bt = self.blank_cells.get(i)
-            rec["blank"] = round(ncc(c, bt), 3) if bt is not None else None
+            b = self._blank_at_zero(panel_gray, cell, i)   # blank judged at ZERO shift (static edge)
+            rec["blank"] = round(b, 3) if b is not None else None
             out["cells"].append(rec)
         acell = (self.arrow_cell[0] + dx, self.arrow_cell[1] + dy, self.arrow_cell[2], self.arrow_cell[3])
         ac = crop(panel_gray, acell)
