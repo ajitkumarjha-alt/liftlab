@@ -169,11 +169,16 @@ class FloorReader:
     P/G/etc). Reads BOTH panels, AGREE-OR-DISCARD. arrow (always present, rightmost) -> direction."""
 
     def __init__(self, templates, digit_cells, arrow_cell, min_score=0.55, blank_range=40,
-                 arrow_labels=ARROWS, blank_label=BLANK):
+                 arrow_labels=ARROWS, blank_label=BLANK, shift_search=2):
         self.templates = {k: np.asarray(v, dtype=np.float32) for k, v in templates.items()}
         self.digit_cells = list(digit_cells)
         self.arrow_cell = arrow_cell
         self.min_score = min_score
+        # RIGID SHIFT SEARCH radius (px). The LED display translates as one; per-frame jitter (~2-4px
+        # measured) at tight cells breaks the most sensitive cell (tens) while units/arrow — anchored /
+        # robust — still read. Before reading, search (dx,dy) in [-R..R]^2 for the shift that best aligns
+        # ALL cells rigidly, then read there. Reader-side, no rebuild. 0 = old fixed-position behavior.
+        self.shift_search = int(shift_search)
         self.blank_range = blank_range        # a cell with max-min brightness below this is BLANK (unlit
         self.blank_label = blank_label        #   padding cell of a single-digit floor). NCC can't match a
         self.arrow_labels = tuple(a for a in arrow_labels if a in self.templates)   # flat/dark cell (0 variance).
@@ -202,11 +207,49 @@ class FloorReader:
                     best, bs = lab, s
         return best, bs
 
+    def _cell_align(self, panel_gray, cell, i):
+        """Best NCC for one cell over glyphs AND its per-cell blank — the alignment quality of that cell.
+        -1e9 if the (shifted) cell fell off the panel. Used only to SCORE a candidate rigid shift."""
+        import cv2
+        ci = crop(panel_gray, cell)
+        if ci.size == 0 or ci.shape[0] < 2 or ci.shape[1] < 2:
+            return -1e9
+        c = cv2.resize(ci, (self._tsz[1], self._tsz[0]))
+        best = -2.0
+        for g in self.glyph_labels:
+            sc = ncc(c, self.templates[g])
+            if sc > best:
+                best = sc
+        bt = self.blank_cells.get(i)
+        if bt is not None:
+            b = ncc(c, bt)
+            if b > best:
+                best = b
+        return best
+
+    def _best_shift(self, panel_gray):
+        """Rigid (dx,dy) in [-R..R]^2 that maximises total cell alignment — the display's true position
+        this frame. Same shift for every cell (the LED matrix is one rigid display). Ties keep (0,0)."""
+        R = self.shift_search
+        if R <= 0:
+            return 0, 0
+        best_s, best = (0, 0), sum(self._cell_align(panel_gray, c, i) for i, c in enumerate(self.digit_cells))
+        for dy in range(-R, R + 1):
+            for dx in range(-R, R + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                s = sum(self._cell_align(panel_gray, (c[0] + dx, c[1] + dy, c[2], c[3]), i)
+                        for i, c in enumerate(self.digit_cells))
+                if s > best:
+                    best, best_s = s, (dx, dy)
+        return best_s
+
     def read_panel(self, panel_gray):
         import cv2
+        dx, dy = self._best_shift(panel_gray)        # absorb rigid panel jitter before reading
         chars, scores = [], []
-        for i, cell in enumerate(self.digit_cells):  # blind fixed-cell crop, no gap-finding
-            ci = crop(panel_gray, cell)
+        for i, cell in enumerate(self.digit_cells):  # blind fixed-cell crop (+ rigid shift), no gap-finding
+            ci = crop(panel_gray, (cell[0] + dx, cell[1] + dy, cell[2], cell[3]))
             if ci.size == 0:
                 return None
             if (int(ci.max()) - int(ci.min())) < self.blank_range:
@@ -227,12 +270,13 @@ class FloorReader:
         if not chars:
             return None
         direction = None
-        if self.arrow_labels:
-            arrow, arr_s = self._match(crop(panel_gray, self.arrow_cell), self.arrow_labels)
+        if self.arrow_labels:                        # arrow shifts with the display too (rigid)
+            acell = (self.arrow_cell[0] + dx, self.arrow_cell[1] + dy, self.arrow_cell[2], self.arrow_cell[3])
+            arrow, arr_s = self._match(crop(panel_gray, acell), self.arrow_labels)
             if arrow is not None and arr_s >= self.min_score:
                 direction, _ = arrow, scores.append(arr_s)
         return {"floor": "".join(chars), "direction": direction,   # STRING: "25","P3","G"
-                "score": round(min(scores), 3), "n_cells": len(self.digit_cells)}
+                "score": round(min(scores), 3), "n_cells": len(self.digit_cells), "shift": [dx, dy]}
 
     @staticmethod
     def column_profile(reg_gray):
@@ -469,12 +513,12 @@ class DoorFloorEngine:
     are identical; only the cell GEOMETRY differs — panel1 needs its OWN cells, its own anchor read)."""
 
     def __init__(self, templates, door_roi, panels, min_score=0.55, blank_range=40,
-                 door_tracker=None, floor_tracker=None):
+                 door_tracker=None, floor_tracker=None, shift_search=2):
         if not panels:
             raise ValueError("DoorFloorEngine needs at least one panel (panel_roi, digit_cells, arrow_cell)")
         self.door_roi = tuple(door_roi)
-        self.readers = [(tuple(proi), FloorReader(templates, dcells, acell,
-                                                  min_score=min_score, blank_range=blank_range))
+        self.readers = [(tuple(proi), FloorReader(templates, dcells, acell, min_score=min_score,
+                                                  blank_range=blank_range, shift_search=shift_search))
                         for (proi, dcells, acell) in panels]
         self.door = door_tracker if door_tracker is not None else DoorTracker()
         self.floor = floor_tracker if floor_tracker is not None else FloorTracker()

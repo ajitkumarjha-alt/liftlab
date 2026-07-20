@@ -270,6 +270,66 @@ def render_anchor(crop, gw=None, cam=None, outdir=None):
     return _write_result(outdir, "_calib_anchor.json", result)
 
 
+def panelcheck(gw=None, cam=None, n=8, ref=55, outdir=None):
+    """Dump N recent LIVE panel0 extractions next to a reference calib crop, cells drawn on each — so a
+    GEOMETRY OFFSET is visible (digits inside the boxes on the calib crop, shifted out of them on live =
+    the panel moved). Reads the newest segments directly (no collect loop). WEB-CALLABLE."""
+    import cv2
+    gwid = gw or GW; cam = cam or CAM
+    outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
+    prois = _panel_rois()
+    if not prois:
+        raise CalibError("no PANEL_ROIS set")
+    segs = sorted(glob.glob(str(LIVE_DIR / gwid / cam / "*.ts")), key=os.path.getmtime)
+    if not segs:
+        raise CalibError(f"no segments in {LIVE_DIR / gwid / cam}")
+    tiles, seen = [], set()
+    for sp in reversed(segs):                        # newest first, one per distinct content (mtime)
+        if len(tiles) >= n:
+            break
+        mt = os.path.getmtime(sp)
+        if mt in seen:
+            continue
+        seen.add(mt)
+        fr = _decode_last_frame(sp)
+        if fr is not None:
+            tiles.append(cv2.cvtColor(gd.crop(fr, prois[0]), cv2.COLOR_BGR2GRAY))
+    dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
+    acell = _parse_cells(os.environ.get("ARROW_CELL", ""))
+    F = 10
+
+    def _tile(gray, label, color):
+        big = cv2.resize(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR),
+                         (gray.shape[1] * F, gray.shape[0] * F), interpolation=cv2.INTER_NEAREST)
+        for (x, y, w, h) in dcells:                  # where the reader crops — digits should sit INSIDE
+            cv2.rectangle(big, (x * F, y * F), ((x + w) * F, (y + h) * F), (0, 220, 0), 1)
+        if acell:
+            x, y, w, h = acell[0]
+            cv2.rectangle(big, (x * F, y * F), ((x + w) * F, (y + h) * F), (200, 0, 200), 1)
+        cv2.putText(big, label, (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+        return big
+
+    rendered = []
+    refp = outdir / f"_calib_crop_{int(ref):03d}.png"
+    if refp.exists():
+        rendered.append(_tile(cv2.imread(str(refp), cv2.IMREAD_GRAYSCALE), f"calib#{int(ref)}", (0, 180, 255)))
+    else:
+        print(f"[panelcheck] ref crop {refp.name} not found — showing live only")
+    for i, t in enumerate(tiles):
+        rendered.append(_tile(t, f"live{i}", (255, 255, 255)))
+    if not rendered:
+        raise CalibError("no tiles (no ref crop, no decodable segments)")
+    cv2.imwrite(str(outdir / "_calib_panelcheck.jpg"), _montage(rendered, cols=4, factor=1))
+    result = {"gw": gwid, "cam": cam, "n_live": len(tiles), "ref": int(ref),
+              "url": _url(gwid, cam, "_calib_panelcheck.jpg"),
+              "note": "green=digit cells, magenta=arrow. Digits inside the boxes on calib but shifted out on "
+                      "live = the panel moved (the ±2px shift search absorbs it at read time)."}
+    _write_result(outdir, "_calib_panelcheck.json", result)
+    print(f"[panelcheck] {len(tiles)} live panel0 crops vs calib#{int(ref)} -> {result['url']}")
+    print(f"[panelcheck] {result['note']}")
+    return result
+
+
 def propose_cells(gw=None, cam=None, outdir=None, anchors=None, anchor_crop=None, arrow_w=None):
     """DETERMINISTIC cells from human-read anchors — NO auto-detection. The ch29 panel ROI also sees the
     moving door/lobby, so every auto approach (brightness v1, temporal-variance v2) FAILED: the door
@@ -535,6 +595,8 @@ def main():
     ap.add_argument("--frames", type=int, default=0, help="collect N frames -> door + panel montages")
     ap.add_argument("--index", action="store_true", help="montage of crops WITH indices, to pick an anchor crop")
     ap.add_argument("--anchor", type=int, default=None, metavar="N", help="enlarge crop N with a fine ruler to read anchor px")
+    ap.add_argument("--panelcheck", action="store_true", help="live panel extractions vs a calib crop (cells drawn) to spot a geometry offset")
+    ap.add_argument("--ref", type=int, default=55, help="reference calib crop index for --panelcheck (default 55)")
     ap.add_argument("--cells", action="store_true", help="DETERMINISTIC cells from --anchors (no auto-detect)")
     ap.add_argument("--anchors", default="", help="tens_left,units_left,digit_top,digit_bottom,arrow_left (within-panel px)")
     ap.add_argument("--anchor-crop", type=int, default=None, dest="anchor_crop", help="crop index to draw the derived cells on")
@@ -547,6 +609,9 @@ def main():
             r = render_index()
             print(f"[index] {r['n']} crops -> {r['index_url']}")
             print(f"[index] pick a two-digit + arrow (+ queue) tile; note its number for `--anchor N`")
+            return
+        if a.panelcheck:
+            panelcheck(ref=a.ref)
             return
         if a.anchor is not None:
             r = render_anchor(a.anchor)
