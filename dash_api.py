@@ -46,6 +46,22 @@ DOOR_SPECS = {
 CLOSE_TRAVEL_MAX_BOUNDARY = "2026-07-16T11:48:11+00:00"   # CLOSE_TRAVEL_MAX 10->30 (admits longer real closes)
 _BOUNDARY_EPOCH = datetime.fromisoformat(CLOSE_TRAVEL_MAX_BOUNDARY).timestamp()
 
+# DATA GAPS — windows where NO data was collected (relay/collect blind). Demand/counting/door numbers
+# in these windows are MISSING, not zero; charts must mark them so a dip isn't read as low demand.
+# Times are UTC; the human note gives the IST window operators reported it in.
+DATA_GAPS = [
+    # Relay stall: ffmpeg wedged alive-but-no-output; the DIED detector couldn't see it (fixed in
+    # relay_soak.sh: alive-but-not-delivering => restart). Counting + door collect blind. Includes
+    # Monday AM peak. Reported Jul 19 15:20 – Jul 20 09:47 IST => UTC below.
+    {"start": "2026-07-19T09:50:00+00:00", "end": "2026-07-20T04:17:00+00:00",
+     "cause": "relay-stall", "cams": ["ch29"],
+     "note": "relay stall — collect blind ~Jul 19 15:20 to Jul 20 09:47 IST (incl. Monday AM peak); "
+             "demand/counting/door here is MISSING, not low"},
+]
+for _g in DATA_GAPS:
+    _g["start_epoch"] = datetime.fromisoformat(_g["start"]).timestamp()
+    _g["end_epoch"] = datetime.fromisoformat(_g["end"]).timestamp()
+
 # Fixed peak windows (local hours). The PEAK TRAP: sheet coefficients describe a PEAK design
 # condition, not an all-day average — report both separately; the ratio is itself a finding.
 PEAK_WINDOWS = {"am_peak": (8, 10), "pm_peak": (18, 20)}
@@ -406,7 +422,8 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1):
     return JSONResponse({"gw": gw, "cam": cam or "fleet", "n_days": ndays, "profile": profile,
                          "windows": windows,
                          "boundaries": {"close_travel_max": {"iso": CLOSE_TRAVEL_MAX_BOUNDARY, "epoch": _BOUNDARY_EPOCH,
-                                        "note": "CLOSE_TRAVEL_MAX 10->30s; close-travel here uses the post-boundary regime only"}}})
+                                        "note": "CLOSE_TRAVEL_MAX 10->30s; close-travel here uses the post-boundary regime only"}},
+                         "data_gaps": [g for g in DATA_GAPS if (cam is None or cam in g.get("cams", []) or not g.get("cams"))]})
 
 
 @dash_router.get("/dash", response_class=HTMLResponse)
@@ -642,8 +659,11 @@ function renderTrends(){
   if(!TR){document.getElementById('trendview').innerHTML=trCams()+'<div class=mut>loading…</div>';return;}
   var prof=TR.profile, hours=prof.map(function(p){return p.hour}), W=TR.windows;
   var bd=TR.boundaries.close_travel_max.iso.slice(0,10);
+  var gaps=(TR.data_gaps||[]);
+  var gapbanner=gaps.length?('<div class=mut style="font-size:12px;margin:2px 0 6px;padding:4px 8px;border-left:3px solid #b00;background:rgba(176,0,0,.06)"><b>DATA GAP</b> — '+gaps.map(function(g){return esc(g.note)}).join(' · ')+'. Hour buckets overlapping this window are undercounted (samples MISSING, not low demand).</div>'):'';
   var h=trCams()
     +'<div class=mut style="font-size:12px;margin:2px 0 6px">'+esc(TR.cam)+' · '+TR.n_days+' day(s) · close-travel uses the post-'+bd+' regime only (CLOSE_TRAVEL_MAX comparability boundary)</div>'
+    +gapbanner
     +'<div class=strip>'+winCard('all-day',W.all_day)+winCard('AM peak',W.am_peak)+winCard('PM peak',W.pm_peak)+'</div>'
     +'<div class=mut style="font-size:11px;margin:2px 0 8px">* transfer PROVISIONAL (transit precision, re-validating). <b>THE PEAK TRAP</b>: the sheet coefficients describe a PEAK design condition, not an all-day average — peak &amp; all-day are shown SEPARATELY; the ratio is itself a finding.</div>'
     +'<div class=card>'+svgBars('cycles / hour-of-day — the demand curve',hours,prof.map(function(p){return p.cycles}),'#127a3d',null,'')+'</div>'

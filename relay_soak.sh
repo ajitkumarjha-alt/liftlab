@@ -24,7 +24,18 @@ DOOR_STRIKES_MAX="${RELAY_DOOR_STRIKES:-3}"    # for this many consecutive sampl
 # segments landing". A stall/death drops delivery to ~zero; a quiet cabin still trickles bytes.
 # The raw per-stream kbps is in the CSV for the full picture.
 ARRIVING_KBPS="${RELAY_ARRIVING_KBPS:-10}"     # below this over an interval = no segments = stalled/dead
+STALL_STRIKES_MAX="${RELAY_STALL_STRIKES:-2}"  # alive-but-not-delivering for this many intervals => restart.
+# THE 18h-OUTAGE FIX. ffmpeg can wedge ALIVE with no output (RTSP read hangs, or the PUT socket jams):
+# kill -0 still passes, so the DIED path (below) never fires and the stream stays dark for hours. But
+# `delivering` (segments landing at the VM, bytes up this interval) already SEES it — it drops to ~0
+# while the process is nominally alive. So: track per-stream stall strikes and kill+relaunch a stream
+# that is alive yet not delivering. At INTERVAL=30 the default 2 strikes = restart ~60s into a stall.
 HLS_TIME="${RELAY_HLS_TIME:-2}"                # segment seconds
+# Belt-and-suspenders for the RTSP-read stall specifically: abort a socket read that hangs longer than
+# this (microseconds) so ffmpeg EXITS and the DIED path restarts it. Independent of the delivery check
+# above (which also catches a wedged PUT). Set 0 to disable if an ffmpeg build rejects the option.
+RW_TIMEOUT_US="${RELAY_RW_TIMEOUT_US:-30000000}"
+RWTO_ARG=""; [ "${RW_TIMEOUT_US}" != 0 ] && RWTO_ARG="-rw_timeout ${RW_TIMEOUT_US}"
 MREQ_ARG=""; [ "${RELAY_MULTIPLE_REQUESTS:-}" = 1 ] && MREQ_ARG="-multiple_requests 1"
 WATCH_CH="${WATCH_CHANNEL:-29}"
 AGENT_PY=/home/askjitk/liftlab-b3/pi-agent/.venv/bin/python
@@ -74,7 +85,7 @@ launch(){ # $1=slot -> (re)start the direct-PUT ffmpeg for that cam, echo pid
   local url="rtsp://${USER_ENC}:${PASS_ENC}@${NVR_HOST}:554/${ch}/${STREAM}?transmode=unicast&profile=vam"
   local base="$CLOUD/api/gw/$GW/live/$cam"
   ffmpeg -nostdin -hide_banner -loglevel error \
-    -rtsp_transport tcp -i "$url" -an -c:v copy \
+    -rtsp_transport tcp $RWTO_ARG -i "$url" -an -c:v copy \
     -f hls -hls_time "$HLS_TIME" -hls_list_size 5 -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts \
     -method PUT -http_persistent 1 $MREQ_ARG \
     -headers "Authorization: Bearer ${GATEWAY_TOKEN}"$'\r\n' \
@@ -101,7 +112,8 @@ say "launched $NCH direct-PUT sub relays: ${PIDS[*]}"
 sleep 6
 prev_tx=$(tx_bytes); prev_sj=$(live_stats_json); prev_t=$(date +%s.%N)
 declare -A PREVB; for ((i=0;i<NCH;i++)); do PREVB[$i]=$(stat_bytes "$prev_sj" "${CAMS[$i]}"); PREVJ[${PIDS[$i]}]=$(pid_jiffies "${PIDS[$i]}"); done
-strikes=0; hz=$(getconf CLK_TCK); GUARD_TRIPS=0
+strikes=0; hz=$(getconf CLK_TCK); GUARD_TRIPS=0; STALL_RESTARTS=0
+declare -A STALL; for ((i=0;i<NCH;i++)); do STALL[$i]=0; done   # per-stream alive-but-not-delivering strikes
 
 # ---------- soak loop ----------
 while :; do
@@ -124,16 +136,31 @@ while :; do
       alive=$((alive+1)); j1=$(pid_jiffies "$local_pid"); pj=${PREVJ[$local_pid]:-$j1}
       cpu=$(awk -v s="$cpu" -v a="$pj" -v b="$j1" -v hz="$hz" -v dt="$dt" 'BEGIN{printf "%.1f",s+(b-a)/hz/dt*100}')
       PREVJ[$local_pid]=$j1
+      # STALL DETECT: alive but no segments landing at the VM => ffmpeg wedged (RTSP read hang or jammed
+      # PUT). kill -0 passed, so the DIED path won't fire — this is the 18h-outage class. dk<ARRIVING_KBPS
+      # for STALL_STRIKES_MAX intervals => kill+relaunch. (A quiet cabin still trickles > ARRIVING_KBPS.)
+      if awk "BEGIN{exit !($dk < $ARRIVING_KBPS)}"; then
+        STALL[$i]=$(( ${STALL[$i]:-0} + 1 ))
+        say "stream ${cam} STALLED — alive but delivered ${dk}kbps < ${ARRIVING_KBPS} (strike ${STALL[$i]}/${STALL_STRIKES_MAX})"
+        if [ "${STALL[$i]}" -ge "$STALL_STRIKES_MAX" ]; then
+          say "stream ${cam} stall sustained — killing+restarting ffmpeg (pid $local_pid). tail: $(tail -1 /tmp/relay_soak_${cam}.log 2>/dev/null)"
+          kill "$local_pid" 2>/dev/null; sleep 0.5; kill -9 "$local_pid" 2>/dev/null
+          np=$(launch "$i"); PIDS[$i]=$np; PREVJ[$np]=$(pid_jiffies "$np"); STALL[$i]=0
+          STALL_RESTARTS=$((STALL_RESTARTS+1))
+        fi
+      else
+        STALL[$i]=0
+      fi
     else
       say "stream ${CAMS[$i]} DIED — restarting (wifi/NVR dropout). tail: $(tail -1 /tmp/relay_soak_${CAMS[$i]}.log 2>/dev/null)"
-      np=$(launch "$i"); PIDS[$i]=$np; PREVJ[$np]=$(pid_jiffies "$np")
+      np=$(launch "$i"); PIDS[$i]=$np; PREVJ[$np]=$(pid_jiffies "$np"); STALL[$i]=0
     fi
   done
   smbps=$(awk -v k="$sumk" 'BEGIN{printf "%.2f",k/1000}')
   tp=$(temp_c); thr=$(throttle_live); ma=$(mem_avail); df=$(door_fps); ps_json="${ps_json%,}}"
   echo "$(date -u +%FT%TZ),${upl},${smbps}${percols},${cpu},${tp},${thr},${ma},${df:-NA},${alive},${delivering}" >> "$CSV"
   # POST relay metrics to the cloud so /ops shows relay health without SSH (separate from the watch)
-  payload="{\"sum_delivered_mbps\":${smbps},\"streams_alive\":${alive},\"streams_delivering\":${delivering},\"ff_cpu\":${cpu:-0},\"soc_temp\":${tp:-0},\"throttle_live\":\"${thr}\",\"mem_avail_mb\":${ma:-0},\"door_fps\":${df:-0},\"guard_trips\":${GUARD_TRIPS:-0},\"per_stream\":${ps_json}}"
+  payload="{\"sum_delivered_mbps\":${smbps},\"streams_alive\":${alive},\"streams_delivering\":${delivering},\"ff_cpu\":${cpu:-0},\"soc_temp\":${tp:-0},\"throttle_live\":\"${thr}\",\"mem_avail_mb\":${ma:-0},\"door_fps\":${df:-0},\"guard_trips\":${GUARD_TRIPS:-0},\"stall_restarts\":${STALL_RESTARTS:-0},\"per_stream\":${ps_json}}"
   curl -s -o /dev/null --max-time 5 -X POST -H "Authorization: Bearer $GATEWAY_TOKEN" \
     -H "Content-Type: application/json" -d "$payload" "$CLOUD/api/gw/$GW/relay_status" 2>/dev/null || true
   prev_tx=$cur_tx; prev_sj=$cur_sj; prev_t=$now

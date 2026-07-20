@@ -27,6 +27,11 @@ from fastapi.responses import HTMLResponse, Response
 
 DB_PATH = os.environ.get("GATEWAY_DB", "./gateway.db")
 SNAP_DIR = Path(os.environ.get("SNAP_DIR", "/run/liftlab-snap"))
+# Where the relay's HLS PUTs land (tmpfs). GROUND TRUTH for staleness: newest .ts mtime per cam is
+# what the relay's self-reported relay_status can't lie about — during the 18h stall the relay kept
+# POSTing (alive=7) while these files sat frozen. /ops reads them directly, red when age > 60s.
+LIVE_DIR = Path(os.environ.get("LIVE_DIR", "/dev/shm/liftlab-live"))
+SEG_STALE_S = float(os.environ.get("OPS_SEG_STALE_S", "60"))
 GATEWAY_TOKENS = {
     g.split(":", 1)[0]: g.split(":", 1)[1]
     for g in os.environ.get("GATEWAY_TOKENS", "site-A:devtoken").split(",") if ":" in g
@@ -44,6 +49,10 @@ def _db() -> sqlite3.Connection:
       sum_delivered_mbps REAL, streams_alive INTEGER, streams_delivering INTEGER,
       ff_cpu REAL, soc_temp REAL, throttle_live TEXT, mem_avail_mb INTEGER,
       door_fps REAL, guard_trips INTEGER, per_stream TEXT)""")
+    try:
+        db.execute("ALTER TABLE relay_status ADD COLUMN stall_restarts INTEGER")
+    except sqlite3.OperationalError:
+        pass                                       # column already present
     return db
 
 
@@ -67,11 +76,12 @@ async def relay_status_ingest(gw: str, request: Request, authorization: str = He
     db = _db()
     db.execute(
         "INSERT INTO relay_status (gateway_id,ts,sum_delivered_mbps,streams_alive,streams_delivering,"
-        "ff_cpu,soc_temp,throttle_live,mem_avail_mb,door_fps,guard_trips,per_stream) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "ff_cpu,soc_temp,throttle_live,mem_avail_mb,door_fps,guard_trips,stall_restarts,per_stream) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (gw, time.time(), d.get("sum_delivered_mbps"), d.get("streams_alive"), d.get("streams_delivering"),
          d.get("ff_cpu"), d.get("soc_temp"), d.get("throttle_live"), d.get("mem_avail_mb"),
-         d.get("door_fps"), d.get("guard_trips", 0), json.dumps(d.get("per_stream", {}))))
+         d.get("door_fps"), d.get("guard_trips", 0), d.get("stall_restarts", 0),
+         json.dumps(d.get("per_stream", {}))))
     db.execute("DELETE FROM relay_status WHERE gateway_id=? AND id NOT IN "
                "(SELECT id FROM relay_status WHERE gateway_id=? ORDER BY id DESC LIMIT 720)", (gw, gw))
     db.commit()
@@ -143,6 +153,31 @@ def _series(db, table, cols, gw, n=120):
         return []
 
 
+def _live_seg_age(gw: str):
+    """Ground-truth relay staleness: newest .ts mtime per cam dir under LIVE_DIR/{gw}. Returns
+    {cam: age_seconds}. Independent of the relay's self-reported status — a stalled relay keeps
+    POSTing streams_alive while these files freeze, so this is what would have caught the 18h gap."""
+    out = {}
+    base = LIVE_DIR / gw
+    try:
+        cams = [d for d in base.iterdir() if d.is_dir()]
+    except (OSError, FileNotFoundError):
+        return out
+    now = time.time()
+    for d in cams:
+        newest = None
+        try:
+            for ts in d.glob("*.ts"):
+                m = ts.stat().st_mtime
+                if newest is None or m > newest:
+                    newest = m
+        except OSError:
+            continue
+        if newest is not None:
+            out[d.name] = round(now - newest, 1)
+    return out
+
+
 @ops_router.get("/ops/{gw}/data")
 def ops_data(gw: str):
     _safe(gw)
@@ -182,6 +217,8 @@ def ops_data(gw: str):
         "t": time.time(),
         "watch": watch,
         "relay": relay,
+        "live_seg_age": _live_seg_age(gw),         # ground-truth per-cam newest-segment age (seconds)
+        "seg_stale_s": SEG_STALE_S,
         "transit": transit,
         "validation": validation,
         "analyzer": analyzer,
@@ -338,8 +375,18 @@ function drawData(d){
     +kv('mem_avail',esc(w.mem_avail_mb)+' MB')+kv('rss',esc(w.rss_mb)+' MB')+'</div>';
   var rage=r.ts?Math.round(d.t-r.ts):null;
   var ps=r.per_stream||{},psh=Object.keys(ps).sort().map(function(c){return '<span>'+c+' '+ps[c]+'k</span>'}).join('');
+  // GROUND TRUTH: newest-segment age per cam read off the VM's tmpfs — independent of the relay's
+  // self-report (a stalled relay keeps POSTing alive while these freeze). Red at >= seg_stale_s.
+  var sa=d.live_seg_age||{},stale=+d.seg_stale_s||60;
+  var sac=Object.keys(sa).sort();
+  var nstale=sac.filter(function(c){return sa[c]>=stale}).length;
+  var sah=sac.length?sac.map(function(c){return kv(c,sa[c]+'s',cls(sa[c],stale/2,stale))}).join('')
+    :'<div class=kv><span>no segments on VM</span></div>';
   document.getElementById('relay').innerHTML=
-    '<div class=card><h3>delivery</h3>'
+    '<div class=card><h3>segment age (VM, truth)</h3>'
+    +'<div class="big '+(nstale>0?'bad':'ok')+'">'+(sac.length?(sac.length-nstale)+'/'+sac.length+' fresh':'—')+'</div>'
+    +sah+'</div>'
+    +'<div class=card><h3>delivery</h3>'
     +'<div class=big>'+(r.streams_delivering==null?'—':r.streams_delivering)+'/'+esc(r.streams_alive)+'</div>'
     +kv('sum delivered',r.sum_delivered_mbps!=null?(+r.sum_delivered_mbps).toFixed(2)+' Mbps':'—')
     +kv('relay_status age',rage==null?'— (no relay data)':rage+'s',cls(rage,45,120))+'</div>'
@@ -348,6 +395,7 @@ function drawData(d){
     +kv('ff_cpu',r.ff_cpu!=null?(+r.ff_cpu).toFixed(0)+'%':'—')
     +kv('door_fps',r.door_fps!=null?(+r.door_fps).toFixed(2):'—',cls(r.door_fps,8,6,true))
     +kv('soc_temp',r.soc_temp!=null?(+r.soc_temp).toFixed(1)+'°C':'—',cls(r.soc_temp,70,80))
+    +kv('stall restarts',esc(r.stall_restarts==null?0:r.stall_restarts),r.stall_restarts>0?'warn':'')
     +kv('guard_trips',esc(r.guard_trips),r.guard_trips>0?'bad':'')+'</div>';
 }
 function tickData(){fetch('/ops/'+GW+'/data').then(function(r){return r.json()}).then(drawData).catch(function(){});}
