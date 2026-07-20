@@ -212,38 +212,42 @@ class FloorReader:
         return best, bs
 
     def _cell_align(self, panel_gray, cell, i):
-        """Best NCC for one cell over glyphs AND its per-cell blank — the alignment quality of that cell.
-        -1e9 if the (shifted) cell fell off the panel. Used only to SCORE a candidate rigid shift."""
+        """Glyph-match quality of a cell for the shift objective — but ONLY for GLYPH-BEARING cells.
+        Returns None for a BLANK cell (low contrast, OR its per-cell blank template beats every glyph):
+        the static hundreds-cell door edge has blank NCC ~1.0 at [0,0] and would otherwise DOMINATE the
+        rigid sum, pinning a false [0,0] peak so the shift can never correct a tens misalignment. By
+        scoring only lit digit cells, the shift aligns to the DIGITS, which is the whole point."""
         import cv2
         ci = crop(panel_gray, cell)
         if ci.size == 0 or ci.shape[0] < 2 or ci.shape[1] < 2:
-            return -1e9
+            return None
+        if (int(ci.max()) - int(ci.min())) < self.blank_range:
+            return None                              # blank by contrast -> not glyph-bearing
         c = cv2.resize(ci, (self._tsz[1], self._tsz[0]))
-        best = -2.0
-        for g in self.glyph_labels:
-            sc = ncc(c, self.templates[g])
-            if sc > best:
-                best = sc
+        gbest = max((ncc(c, self.templates[g]) for g in self.glyph_labels), default=-2.0)
         bt = self.blank_cells.get(i)
-        if bt is not None:
-            b = ncc(c, bt)
-            if b > best:
-                best = b
-        return best
+        if bt is not None and ncc(c, bt) >= gbest:
+            return None                              # per-cell blank wins -> not glyph-bearing
+        return gbest
 
     def _best_shift(self, panel_gray):
-        """Rigid (dx,dy) in [-R..R]^2 that maximises total cell alignment — the display's true position
-        this frame. Same shift for every cell (the LED matrix is one rigid display). Ties keep (0,0)."""
+        """Rigid (dx,dy) in [-R..R]^2 that best aligns the GLYPH-BEARING cells (the display translates as
+        one). Blank cells are excluded from the objective (see _cell_align) so the static edge can't pin
+        it. Ties keep (0,0); a shift with no glyph-bearing cell is rejected."""
         R = self.shift_search
         if R <= 0:
             return 0, 0
-        best_s, best = (0, 0), sum(self._cell_align(panel_gray, c, i) for i, c in enumerate(self.digit_cells))
+
+        def score(dx, dy):
+            vals = [v for i, c in enumerate(self.digit_cells)
+                    if (v := self._cell_align(panel_gray, (c[0] + dx, c[1] + dy, c[2], c[3]), i)) is not None]
+            return sum(vals) if vals else -1e9
+        best_s, best = (0, 0), score(0, 0)
         for dy in range(-R, R + 1):
             for dx in range(-R, R + 1):
                 if dx == 0 and dy == 0:
                     continue
-                s = sum(self._cell_align(panel_gray, (c[0] + dx, c[1] + dy, c[2], c[3]), i)
-                        for i, c in enumerate(self.digit_cells))
+                s = score(dx, dy)
                 if s > best:
                     best, best_s = s, (dx, dy)
         return best_s
@@ -442,7 +446,7 @@ def _label_to_glyphs(label):
 
 
 def build_templates(labeled_panels, digit_cells, arrow_cell, tsz=(16, 10),
-                    align="right", blank_label=BLANK):
+                    align="right", blank_label=BLANK, min_examples=3):
     """FIXED-CELL builder (no segmentation). labeled_panels: (gray panel, label_str). For each: parse
     the label -> floor chars + arrow, ALIGN the chars into the fixed digit_cells (right-aligned pads the
     LEFT cells with 'blank'), crop each cell BLINDLY and accumulate under its char (or 'blank'), crop
@@ -481,8 +485,18 @@ def build_templates(labeled_panels, digit_cells, arrow_cell, tsz=(16, 10),
         if arrow:
             c = cv2.resize(crop(panel, arrow_cell), (tsz[1], tsz[0])).astype(np.float32)
             acc.setdefault(arrow, []).append(c)
-    templates = {g: np.mean(v, axis=0) for g, v in acc.items()}
-    return templates, {"used": used, "skipped": skipped, "glyphs": {g: len(v) for g, v in acc.items()}}
+    # DROP DEGENERATE glyphs: a lit glyph learned from < min_examples crops is unreliable — e.g. M from
+    # ONE edge-dominated MEP crop becomes a blank-clone that scores ~0.96 on every hundreds cell and
+    # misreads every floor as M0. Blank_<i> and arrows are exempt (structural / plentiful). A dropped
+    # glyph just reads no_read until foldback grows it — honest, vs a confident wrong.
+    templates, dropped = {}, {}
+    for g, v in acc.items():
+        exempt = g.startswith(blank_label + "_") or g in ARROWS
+        if not exempt and len(v) < min_examples:
+            dropped[g] = len(v); continue
+        templates[g] = np.mean(v, axis=0)
+    return templates, {"used": used, "skipped": skipped, "dropped": dropped,
+                       "min_examples": min_examples, "glyphs": {g: len(v) for g, v in acc.items()}}
 
 
 def save_templates(templates, path):

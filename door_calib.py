@@ -616,7 +616,8 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
         raise CalibError("fixed cells required (no segmentation): digit_cells 'x,y,w,h;x,y,w,h;x,y,w,h' + "
                          "arrow_cell 'x,y,w,h' (within-panel px — run the cells step to measure them)")
     labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in kept]
-    tpl, stats = gd.build_templates(labeled, dcells, acell[0], align=(align or os.environ.get("ALIGN", "right")))
+    tpl, stats = gd.build_templates(labeled, dcells, acell[0], align=(align or os.environ.get("ALIGN", "right")),
+                                    min_examples=int(os.environ.get("MIN_GLYPH_EXAMPLES", "3")))
     outp = out_path or os.environ.get("TEMPLATES_OUT", os.path.join(TEMPLATES_DIR, gw, f"{cam}.npz"))
     os.makedirs(os.path.dirname(outp), exist_ok=True)
     gd.save_templates(tpl, outp)
@@ -690,6 +691,72 @@ def foldback(gw=None, cam=None, outdir=None, db_path=None):
     print(f"[foldback] +{added} reviewed samples appended ({len(rows)} reviewed total, "
           f"{len(folded) - added} already folded) -> {len(labels)} labeled crops")
     print(f"[foldback] now: door_calib.py --build   (grows the glyphs the reviews flagged)")
+    return result
+
+
+def labelcheck(gw=None, cam=None, outdir=None):
+    """LABEL-SANITY pass: for each glyph, NCC every contributing crop-cell against that glyph's mean
+    template; a crop far below its glyph's own distribution is a probable MISLABEL (e.g. a parked-6 tile
+    labeled G, or vice-versa — the bidirectional G/6 contamination). Flags them for re-review at
+    /calib-label. Uses labels.json + DIGIT_CELLS/ARROW_CELL. WEB-CALLABLE."""
+    from collections import defaultdict
+
+    import cv2
+    import numpy as np
+    gwid = gw or GW; cam = cam or CAM
+    outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
+    dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
+    acell = _parse_cells(os.environ.get("ARROW_CELL", ""))
+    if not dcells or not acell:
+        raise CalibError("set DIGIT_CELLS + ARROW_CELL")
+    lj = outdir / "labels.json"
+    if not lj.exists():
+        raise CalibError("no labels.json — label at /calib-label first")
+    labels = json.loads(lj.read_text())
+    tsz = (16, 10); n = len(dcells); blank = "blank"
+    acc = defaultdict(list)                                   # glyph -> [(crop_fname, resized_cell)]
+    for fname, lab in labels.items():
+        lab = str(lab).strip()
+        if not lab or lab == "-":
+            continue
+        p = outdir / fname
+        panel = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE) if p.exists() else None
+        if panel is None:
+            continue
+        glyphs = gd._label_to_glyphs(lab)
+        arrow = glyphs[-1] if glyphs and glyphs[-1] in ("up", "down") else None
+        floor_chars = glyphs[:-1] if arrow else glyphs
+        if not floor_chars or len(floor_chars) > n:
+            continue
+        cell_labs = [blank] * (n - len(floor_chars)) + floor_chars   # right-aligned (build's default)
+        for cell, g in zip(dcells, cell_labs):
+            if g == blank:
+                continue
+            acc[g].append((fname, cv2.resize(gd.crop(panel, cell), (tsz[1], tsz[0])).astype(np.float32)))
+        if arrow:
+            acc[arrow].append((fname, cv2.resize(gd.crop(panel, acell[0]), (tsz[1], tsz[0])).astype(np.float32)))
+    flags = []
+    print(f"[labelcheck] {len(acc)} glyphs from {len(labels)} labels")
+    for g, items in sorted(acc.items()):
+        mean = np.mean([c for _, c in items], axis=0)
+        nccs = [(gd.ncc(c, mean), f) for f, c in items]
+        arr = np.array([s for s, _ in nccs])
+        med = float(np.median(arr))
+        note = ""
+        if len(items) >= 3:                                  # need a distribution to call an outlier
+            mad = float(np.median(np.abs(arr - med))) + 1e-6
+            thr = min(0.6, med - 4 * mad)
+            out = sorted((s, f) for s, f in nccs if s < thr)
+            for s, f in out:
+                flags.append({"crop": f, "labeled": g, "ncc": round(s, 3), "glyph_median": round(med, 2)})
+            if out:
+                note = "  MISLABEL? " + ", ".join(f"{f}={s:.2f}" for s, f in out)
+        print(f"    {g!r:6} n={len(items):3} median_ncc={med:.2f}{note}")
+    result = {"gw": gwid, "cam": cam, "flags": flags,
+              "note": "low-NCC crops are probable MISLABELS — re-review them at /calib-label, then --build"}
+    _write_result(outdir, "_calib_labelcheck.json", result)
+    print(f"[labelcheck] {len(flags)} probable mislabel(s) flagged" +
+          (f" -> re-review at {CLOUD}/calib-label/{gwid}/{cam}" if flags else " (labels look consistent)"))
     return result
 
 
@@ -772,6 +839,7 @@ def main():
     ap.add_argument("--anchor-crop", type=int, default=None, dest="anchor_crop", help="crop index to draw the derived cells on")
     ap.add_argument("--foldback", action="store_true", help="fold REVIEWED /floorcheck samples into the calib set (then --build)")
     ap.add_argument("--readtest", action="store_true", help="run the current reader on reviewed /floorcheck fixtures + dump per-cell scores")
+    ap.add_argument("--labelcheck", action="store_true", help="flag probable MISLABELS (crop vs its glyph template) for re-review")
     ap.add_argument("--build", action="store_true", help="build templates.npz from collected crops + --labels")
     ap.add_argument("--labels", default="", help="row-major floor labels, e.g. '7^,8^,12^,...,P3v,6v'")
     ap.add_argument("--fresh", action="store_true", help="clear accumulated crops before collecting (default = append)")
@@ -791,6 +859,9 @@ def main():
         if a.readtest:
             readtest()
             return
+        if a.labelcheck:
+            labelcheck()
+            return
         if a.anchor is not None:
             r = render_anchor(a.anchor)
             print(f"[anchor] crop {r['crop']} -> {r['anchor_url']}")
@@ -803,6 +874,9 @@ def main():
         if a.build:
             r = build_from_crops(labels=a.labels)
             print(f"[build] {r['n_labeled']}/{r.get('n_crops','?')} crops labeled ({r['n_excluded']} excluded: no label or '-')")
+            dr = r['stats'].get('dropped') or {}
+            if dr:
+                print(f"[build] DROPPED degenerate glyphs (< {r['stats'].get('min_examples')} examples): {dr} — read no_read until foldback grows them")
             print(f"[build] {r['stats']}")
             print(f"[build] wrote {r['n_templates']} templates -> {r['out_path']}")
             print(f"[build] the GPU fetches it (no scp needed): GET {r['fetch_url']}  (Bearer analysis token)")
