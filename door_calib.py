@@ -428,9 +428,11 @@ def collect_crops(gw=None, cam=None, nframes=40, fresh=False, door_roi_frame=Non
 
 
 def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cell=None, align=None, out_path=None):
-    """Build templates.npz from collected crops + row-major labels + fixed cells (from cells step / env /
-    param). labels: comma-string or list; cells: 'x,y,w,h;...' string or list. Returns stats + the fetch
-    URL the GPU pulls. WEB-CALLABLE (raises CalibError on missing crops/labels/cells)."""
+    """Build templates.npz from collected crops + labels + fixed cells (from cells step / env / param).
+    LABEL SOURCE: an explicit `labels` (comma-string/list, legacy 1:1 row-major) OR — when none is given —
+    labels.json written by the /calib-label wizard, keyed by crop FILENAME (indices shift as crops append,
+    filenames don't). Crops with no label or marked '-' are EXCLUDED, with the count reported. Returns
+    stats + the GPU fetch URL. WEB-CALLABLE (raises CalibError on missing crops/labels/cells)."""
     import cv2
     gw = gw or GW; cam = cam or CAM
     outdir = _calib_dir(gw, cam)
@@ -439,21 +441,41 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
     if isinstance(labels, str):
         labels = [x.strip() for x in labels.split(",") if x.strip()]
     crops = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
-    if not crops or not labels:
-        raise CalibError("need _calib_crop_*.png (collect first) and labels '7^,8^,...'")
-    if len(crops) != len(labels):
-        raise CalibError(f"{len(crops)} crops but {len(labels)} labels — must be 1:1 row-major (relabel the montage)")
+    if not crops:
+        raise CalibError("no _calib_crop_*.png — run collect first")
+
+    if labels:                                                # explicit labels -> legacy 1:1 row-major
+        if len(crops) != len(labels):
+            raise CalibError(f"{len(crops)} crops but {len(labels)} labels — must be 1:1 row-major (or label at /calib-label)")
+        pairs = list(zip(crops, labels))
+    else:                                                     # default: labels.json (filename-keyed) from the wizard
+        lj = outdir / "labels.json"
+        if not lj.exists():
+            raise CalibError(f"no labels: pass --labels, or label the crops at /calib-label/{gw}/{cam} "
+                             f"(writes {lj.name})")
+        try:
+            lab_map = json.loads(lj.read_text())
+        except (OSError, ValueError) as e:
+            raise CalibError(f"labels.json unreadable: {e}")
+        pairs = [(c, lab_map.get(Path(c).name)) for c in crops]
+
+    kept = [(c, lab.strip()) for c, lab in pairs if lab and str(lab).strip() and str(lab).strip() != "-"]
+    excluded = len(crops) - len(kept)                        # missing a label or marked '-'
+    if not kept:
+        raise CalibError(f"no usable labels (all {len(crops)} crops missing or '-') — label at /calib-label/{gw}/{cam}")
+
     dcells = _as_cells(digit_cells, "DIGIT_CELLS")
     acell = _as_cells(arrow_cell, "ARROW_CELL")
     if not dcells or not acell:
         raise CalibError("fixed cells required (no segmentation): digit_cells 'x,y,w,h;x,y,w,h;x,y,w,h' + "
                          "arrow_cell 'x,y,w,h' (within-panel px — run the cells step to measure them)")
-    labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in zip(crops, labels)]
+    labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in kept]
     tpl, stats = gd.build_templates(labeled, dcells, acell[0], align=(align or os.environ.get("ALIGN", "right")))
     outp = out_path or os.environ.get("TEMPLATES_OUT", os.path.join(TEMPLATES_DIR, gw, f"{cam}.npz"))
     os.makedirs(os.path.dirname(outp), exist_ok=True)
     gd.save_templates(tpl, outp)
     result = {"gw": gw, "cam": cam, "stats": stats, "n_templates": len(tpl), "out_path": outp,
+              "n_labeled": len(kept), "n_excluded": int(excluded), "n_crops": len(crops),
               "fetch_url": f"{CLOUD}/api/gw/{gw}/templates/{cam}"}
     return _write_result(outdir, "_calib_build.json", result)
 
@@ -488,6 +510,7 @@ def main():
             return
         if a.build:
             r = build_from_crops(labels=a.labels)
+            print(f"[build] {r['n_labeled']}/{r.get('n_crops','?')} crops labeled ({r['n_excluded']} excluded: no label or '-')")
             print(f"[build] {r['stats']}")
             print(f"[build] wrote {r['n_templates']} templates -> {r['out_path']}")
             print(f"[build] the GPU fetches it (no scp needed): GET {r['fetch_url']}  (Bearer analysis token)")
