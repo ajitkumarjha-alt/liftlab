@@ -19,13 +19,16 @@ install -m 644 /tmp/liftlab-relay.service "$UNIT"
 mkdir -p /home/askjitk/liftlab-watch && chown askjitk:askjitk /home/askjitk/liftlab-watch
 systemctl daemon-reload
 systemctl enable liftlab-relay >/dev/null 2>&1 || true
-say "installed direct-PUT relay_soak.sh + unit (NOT started). Delivery health = segments ARRIVING"
-say "  (alive AND >=10kbps/interval) — NOT a bitrate threshold; nvr_solo.json is diagnostic-only."
+say "installed direct-PUT relay_soak.sh + unit (NOT started). Stall signal = newest-segment AGE on the"
+say "  VM (server clock, bitrate-independent); unknown age => NO restart, so a telemetry blip can't"
+say "  restart all 7. Supervisor has its own watchdog: no loop tick in RELAY_LOOP_STALL_S => SIGKILL."
 say "  door guard floor = 8.0 fps (RELAY_DOOR_FLOOR in the unit; above the 6fps quality alarm)."
 say "door watch active? -> $(systemctl is-active liftlab-watch 2>/dev/null)"
 say ""
 say "PLAN:"
 say "  1. Pi: sudo systemctl start liftlab-relay"
+say "  1b. VERIFY THE WATCHDOG ARMED — without this line the 22h-stall class is unprotected:"
+say "      journalctl -u liftlab-relay -n 30 | grep 'supervisor watchdog armed'"
 say "  2. Pi: tail -f /home/askjitk/liftlab-watch/relay_soak.csv   (want 7/7 delivering, sum ~3.6)"
 say "  3. Then the stitch fix (restart, no lull — persistence reuses the baseline)"
 say "  4. Run the 24h"

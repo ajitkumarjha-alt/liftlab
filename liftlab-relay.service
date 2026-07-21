@@ -14,6 +14,13 @@ EnvironmentFile=/etc/liftlab-agent.env
 Environment=RELAY_CSV=/home/askjitk/liftlab-watch/relay_soak.csv
 Environment=RELAY_INTERVAL=30
 Environment=RELAY_DOOR_FLOOR=8.0
+# Stall detection (the 22h-outage fix). A stream whose newest segment on the VM is older than
+# RELAY_SEG_STALL_S is dead regardless of what its process status or bitrate says; two strikes at
+# INTERVAL=30 restarts it ~60-90s in. RELAY_LOOP_STALL_S guards the SUPERVISOR itself — it froze
+# for 22h while systemd reported active, so the loop now has to prove it is turning.
+Environment=RELAY_SEG_STALL_S=60
+Environment=RELAY_LOOP_STALL_S=120
+Environment=RELAY_CALL_TIMEOUT=10
 ExecStart=/bin/bash /home/askjitk/liftlab-b3/pi-agent/relay_soak.sh
 # on-failure only: a DOOR GUARD trip exits 0 (stay stopped, don't fight the watch); a crash
 # exits non-zero and restarts. Internal per-stream restarts handle wifi/NVR dropouts.
