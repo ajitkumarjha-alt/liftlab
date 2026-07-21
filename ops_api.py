@@ -53,6 +53,11 @@ def _db() -> sqlite3.Connection:
         db.execute("ALTER TABLE relay_status ADD COLUMN stall_restarts INTEGER")
     except sqlite3.OperationalError:
         pass                                       # column already present
+    for col in ("guard_state TEXT", "guard_floor REAL"):
+        try:
+            db.execute(f"ALTER TABLE relay_status ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass                                   # column already present
     return db
 
 
@@ -76,12 +81,15 @@ async def relay_status_ingest(gw: str, request: Request, authorization: str = He
     db = _db()
     db.execute(
         "INSERT INTO relay_status (gateway_id,ts,sum_delivered_mbps,streams_alive,streams_delivering,"
-        "ff_cpu,soc_temp,throttle_live,mem_avail_mb,door_fps,guard_trips,stall_restarts,per_stream) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "ff_cpu,soc_temp,throttle_live,mem_avail_mb,door_fps,guard_trips,stall_restarts,per_stream,"
+        "guard_state,guard_floor) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (gw, time.time(), d.get("sum_delivered_mbps"), d.get("streams_alive"), d.get("streams_delivering"),
          d.get("ff_cpu"), d.get("soc_temp"), d.get("throttle_live"), d.get("mem_avail_mb"),
          d.get("door_fps"), d.get("guard_trips", 0), d.get("stall_restarts", 0),
-         json.dumps(d.get("per_stream", {}))))
+         json.dumps(d.get("per_stream", {})),
+         # guard_state: ok | cooldown (stopped, will retry) | down (gave up, needs a human).
+         d.get("guard_state", "ok"), d.get("guard_floor")))
     db.execute("DELETE FROM relay_status WHERE gateway_id=? AND id NOT IN "
                "(SELECT id FROM relay_status WHERE gateway_id=? ORDER BY id DESC LIMIT 720)", (gw, gw))
     db.commit()
@@ -250,12 +258,20 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)
 .kv{display:flex;justify-content:space-between;gap:10px;padding:2px 0;font:12px var(--mono)} .kv b{font-weight:600}
 .big{font:600 22px var(--mono)} .pill{font:11px var(--mono);padding:1px 7px;border-radius:10px;background:#eef2f4;color:var(--mut)}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+/* Door-guard banner. A guard trip stops the relay, which stops counting AND floor OCR — the Jul 20
+   trip cost 22h precisely because nothing said so. Loud, top of page, impossible to scroll past. */
+#guardbanner:empty{display:none}
+.gb{border-radius:8px;padding:12px 14px;margin:0 0 14px;font:600 14px/1.45 var(--mono)}
+.gb.down{background:#4a1015;border:2px solid var(--bad);color:#ffd9dd}
+.gb.cool{background:#4a3210;border:2px solid var(--warn);color:#ffe9c2}
+.gb small{display:block;font-weight:400;opacity:.85;margin-top:4px}
 .ps{font:11px var(--mono);display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:2px 10px}
 #stamp{font:11px var(--mono);color:var(--mut)}
 @media(prefers-color-scheme:dark){:root{--bg:#0e1418;--card:#161d22;--line:#243038;--fg:#d6dee3;--mut:#7f9099}.pill{background:#1c262c}}
 </style>
 <header><h1>liftlab ops · __GW__</h1><span class=sub id=stamp>loading…</span></header>
 <div class=wrap>
+  <div id=guardbanner></div>
   <h2>Live cameras <span class=pill id=camcount></span></h2>
   <div class=grid id=grid></div>
   <h2>GPU analyzer</h2><div class=cards id=analyzer></div>
@@ -334,6 +350,20 @@ function rejcard(an){
 function drawData(d){
   document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString();
   var w=d.watch||{},r=d.relay||{},tr=d.transit,val=d.validation||{},an=d.analyzer;
+  // DOOR GUARD BANNER — the relay feeds counting + floor OCR, so a guard stop is a data outage.
+  var gs=r.guard_state||'ok',gb=document.getElementById('guardbanner');
+  if(gs==='down'){
+    gb.innerHTML='<div class="gb down">RELAY DOWN — door guard gave up after '+esc(r.guard_trips)
+      +' consecutive trips. Counting and floor OCR are receiving nothing.'
+      +'<small>Last door_fps '+(r.door_fps!=null?(+r.door_fps).toFixed(2):'—')+' vs floor '
+      +(r.guard_floor!=null?(+r.guard_floor).toFixed(2):'—')+'. It will NOT retry on its own — '
+      +'investigate the watch/Pi contention, then: sudo systemctl restart liftlab-relay</small></div>';
+  }else if(gs==='cooldown'){
+    gb.innerHTML='<div class="gb cool">RELAY STOPPED by the door guard (trip '+esc(r.guard_trips)
+      +') — retrying automatically after cooldown.'
+      +'<small>door_fps '+(r.door_fps!=null?(+r.door_fps).toFixed(2):'—')+' held below floor '
+      +(r.guard_floor!=null?(+r.guard_floor).toFixed(2):'—')+'. No counting or floor OCR until it resumes.</small></div>';
+  }else{gb.innerHTML='';}
   var anhtml;
   if(!an){anhtml='<div class=card><h3>GPU analyzer</h3><div class="big bad">no heartbeat</div>'
     +'<div class=kv><span>never reported — worker down or not deployed</span></div></div>';}

@@ -14,6 +14,17 @@ say(){ echo "[apply-relay] $*"; }
 [ -d "$PIAG" ] || { echo "pi-agent dir $PIAG not found"; exit 2; }
 
 bash -n /tmp/relay_soak.sh || { say "relay_soak.sh syntax error — aborting"; exit 1; }
+# STALE GUARD OVERRIDES. The Jul 21 trip fired ~40s after start, which is impossible under the
+# 3-strikes/90s rule the old source documented — so the RUNNING config differed from the source, almost
+# certainly via one of these keys in the agent env. They override the new measured-baseline logic
+# silently, so surface them instead of letting the same ambiguity cost another day.
+for k in RELAY_DOOR_FLOOR RELAY_DOOR_STRIKES; do
+  if grep -q "^${k}=" /etc/liftlab-agent.env 2>/dev/null; then
+    say "WARNING: /etc/liftlab-agent.env sets $k=$(grep "^${k}=" /etc/liftlab-agent.env | cut -d= -f2-)"
+    say "  RELAY_DOOR_FLOOR pins an absolute floor and DEFEATS the measured baseline; RELAY_DOOR_STRIKES"
+    say "  is no longer read (the sag is timed, not counted). Remove both unless you mean to override."
+  fi
+done
 install -o askjitk -g askjitk -m 755 /tmp/relay_soak.sh "$PIAG/relay_soak.sh"
 install -m 644 /tmp/liftlab-relay.service "$UNIT"
 mkdir -p /home/askjitk/liftlab-watch && chown askjitk:askjitk /home/askjitk/liftlab-watch

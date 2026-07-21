@@ -13,7 +13,16 @@ User=askjitk
 EnvironmentFile=/etc/liftlab-agent.env
 Environment=RELAY_CSV=/home/askjitk/liftlab-watch/relay_soak.csv
 Environment=RELAY_INTERVAL=30
-Environment=RELAY_DOOR_FLOOR=8.0
+# DOOR GUARD. NO RELAY_DOOR_FLOOR here on purpose: setting it pins an absolute floor and overrides
+# the measured-baseline logic, which is what tripped the relay at 9.35/9.44 — inside normal jitter of
+# the ~9.4 baseline. The floor is now derived per-start as baseline*(1-margin), never below the 6.0
+# quality alarm, from a baseline measured BEFORE any ffmpeg is spawned.
+Environment=RELAY_DOOR_MARGIN=0.15
+Environment=RELAY_DOOR_ABS_FLOOR=6.0
+Environment=RELAY_DOOR_LOW_S=60
+Environment=RELAY_DOOR_GRACE_S=120
+Environment=RELAY_DOOR_COOLDOWN_S=600
+Environment=RELAY_DOOR_TRIPS_MAX=3
 # Stall detection (the 22h-outage fix). A stream whose newest segment on the VM is older than
 # RELAY_SEG_STALL_S is dead regardless of what its process status or bitrate says; two strikes at
 # INTERVAL=30 restarts it ~60-90s in. RELAY_LOOP_STALL_S guards the SUPERVISOR itself — it froze
