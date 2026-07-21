@@ -256,7 +256,7 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
 .card h3{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut)}
 .kv{display:flex;justify-content:space-between;gap:10px;padding:2px 0;font:12px var(--mono)} .kv b{font-weight:600}
-.big{font:600 22px var(--mono)} .pill{font:11px var(--mono);padding:1px 7px;border-radius:10px;background:#eef2f4;color:var(--mut)}
+.big{font:600 22px var(--mono)} .big.mut{color:var(--mut);font-weight:400} .pill{font:11px var(--mono);padding:1px 7px;border-radius:10px;background:#eef2f4;color:var(--mut)}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
 /* Door-guard banner. A guard trip stops the relay, which stops counting AND floor OCR — the Jul 20
    trip cost 22h precisely because nothing said so. Loud, top of page, impossible to scroll past. */
@@ -281,6 +281,9 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)
 </div>
 <script>
 var GW="__GW__";
+// watch_status older than this = liftlab-watch is retired, not merely late (it is stopped AND
+// disabled on the Pi). Generous on purpose: a brief gap should still read as "late", not "gone".
+var WATCH_RETIRED_S=3600;
 function esc(s){return (s==null?'':(''+s))}
 function cls(v,warn,bad,inv){if(v==null)return'';v=+v;if(inv)return v<=bad?'bad':v<=warn?'warn':'ok';return v>=bad?'bad':v>=warn?'warn':'ok'}
 var cams=[];
@@ -389,7 +392,21 @@ function drawData(d){
     +'<div class=card><h3>last transit</h3>'+kv('ago',tr.last_ts?Math.round(d.t-tr.last_ts)+'s':'—')
     +kv('source','GPU L4')+'</div>')
     : '<div class=card><h3>transit</h3><div class=kv><span>GPU analyzer not reporting yet</span></div></div>') + vcards;
+  // DOOR WATCH — RETIRED. Once liftlab-watch is stopped, watch_status stops advancing and every tile
+  // here goes permanently red. A panel that is always red is a panel people learn to ignore, and it
+  // would sit next to the seg-age badges that ARE the truth of the pipe. So past a threshold we stop
+  // pretending it's a live component and render the retirement instead. Rows stay in the DB; the
+  // history is intact and still queryable, it is just no longer presented as a running service.
   var age=w.ts?Math.round(d.t-w.ts):null;
+  if(age==null||age>WATCH_RETIRED_S){
+    document.getElementById('watch').innerHTML=
+      '<div class=card><h3>door watch</h3><div class="big mut">RETIRED</div>'
+      +kv('last report',age==null?'never':Math.round(age/3600)+'h ago')
+      +kv('deliverable','2.81s close, n=1053 (banked)')
+      +kv('door cycles now','GPU DoorFloorEngine → gw_door_event')
+      +'<div class=kv><span>Pi-watch and GPU-engine door data are separate eras — never pool them.</span></div>'
+      +'</div>';
+  }else{
   document.getElementById('watch').innerHTML=
     '<div class=card><h3>state</h3><div class=big>'+esc(w.state||'—')+'</div>'
     +kv('baseline',esc(w.baseline_source)+(w.baseline_confirmed?' ✓':''))
@@ -403,6 +420,7 @@ function drawData(d){
     +kv('throttle live',esc(w.throttle_live)||'none',(w.throttle_live&&w.throttle_live!=='none'&&w.throttle_live!=='[]')?'bad':'ok')
     +kv('throttle sticky',esc(w.throttle_sticky)||'none')
     +kv('mem_avail',esc(w.mem_avail_mb)+' MB')+kv('rss',esc(w.rss_mb)+' MB')+'</div>';
+  }
   var rage=r.ts?Math.round(d.t-r.ts):null;
   var ps=r.per_stream||{},psh=Object.keys(ps).sort().map(function(c){return '<span>'+c+' '+ps[c]+'k</span>'}).join('');
   // GROUND TRUTH: newest-segment age per cam read off the VM's tmpfs — independent of the relay's
