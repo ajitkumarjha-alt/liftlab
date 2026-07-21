@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
-# DIRECT-PUT relay supervisor (liftlab-relay service) — the FIELD-PROVEN path (9.5h overnight).
-# Each cabin SUB stream: ffmpeg HLS with -method PUT straight to the VM. Logs a CSV row every 30s
-# to a DURABLE path, restarts dropped streams, and KILLS ITSELF if the door loop (liftlab-watch
-# signal_fps) sags — the watch is sacred, the relay is expendable. No decoupled uploader: that was
-# built for a 7-concurrent-PUT "starvation" that turned out to be a threshold artifact (mixed
-# camera bitrates + a fixed floor). It stays in git if correct-threshold delivery ever falls short.
+# DIRECT-PUT relay supervisor (liftlab-relay service). The Pi is a DUMB STREAMER: keep 7 ffmpegs up,
+# PUT their HLS segments to the VM, log a CSV row every 30s, restart anything that dies or stops
+# delivering. That is the whole job. All analysis — counting, floor OCR, and now door cycles — happens
+# on the GPU box against the same feed.
+#
+# THE DOOR GUARD IS GONE (Jul 21). It watched liftlab-watch's signal_fps and killed the relay to
+# protect the door loop. It cost 22h + 25min of pipeline data in two days, both times BY DESIGN, and
+# the thing it was protecting is now retired: the door-watch deliverable is banked (2.81s close, n=1053)
+# and the GPU's DoorFloorEngine measures door cycles on the same stream. Two components measuring the
+# same thing, one authorised to kill the other, is a conflict — deleted rather than tuned. Nothing in
+# this file may reference watch_local, door_fps, or liftlab-watch again.
+#
+# NOTE FOR ANALYSIS: Pi-watch door data and GPU-engine door data are SEPARATE ERAS. Never pool them.
+# The boundary is recorded in WATCH_ERA.md and stamped into the CSV at the retirement deploy.
+#
+# No decoupled uploader: that was built for a 7-concurrent-PUT "starvation" that turned out to be a
+# threshold artifact (mixed camera bitrates + a fixed floor). It stays in git if correct-threshold
+# delivery ever falls short.
 #
 # Creds come from the systemd EnvironmentFile (/etc/liftlab-agent.env) injected into the env.
 set -uo pipefail
@@ -12,32 +24,6 @@ set -uo pipefail
 STREAM=2
 INTERVAL="${RELAY_INTERVAL:-30}"
 CSV="${RELAY_CSV:-/home/askjitk/liftlab-watch/relay_soak.csv}"
-# ---------------- DOOR GUARD (redesigned after 2 deliberate outages) ----------------
-# The guard cost 22h + 25min of data across Jul 20-21, both times by DESIGN: it tripped and the policy
-# was stay-stopped-forever. Pi vitals at diagnosis were clean (50.6C, load 0.08, throttled=0xe0000 =
-# sticky historical bits, no live throttle), so neither trip was a thermal or capacity crisis.
-#
-# What was actually wrong with the old rule, from the CSV:
-#   - Jul 16 trips at door_fps 9.35 and 9.44 — AT the ~9.4 healthy baseline. A fixed threshold set
-#     inside the normal jitter band fires on noise, not harm.
-#   - Jul 21 14:12:52 trip at 6.24, FORTY SECONDS after relay start: 7 ffmpegs spawning at once
-#     depress the watch transiently. Startup transient != steady-state harm.
-#   - Jul 20 16:00:39 trip at 7.99 is the only one that might reflect real contention — and even that
-#     recovered nothing, because the policy never retried.
-# So: measure the baseline instead of assuming it, judge against a MARGIN below it, require the sag
-# to be SUSTAINED, ignore the startup transient, and — since the relay now feeds counting and floor
-# OCR rather than a soak test — RETRY instead of dying, staying down only when it's genuinely durable.
-DOOR_BASELINE="${RELAY_DOOR_BASELINE:-9.4}"      # fallback if the pre-launch measurement fails
-DOOR_MARGIN="${RELAY_DOOR_MARGIN:-0.15}"         # trip below baseline*(1-margin): 9.4 -> 7.99
-DOOR_ABS_FLOOR="${RELAY_DOOR_ABS_FLOOR:-6.0}"    # the watch QUALITY alarm; never permit below this
-DOOR_LOW_S="${RELAY_DOOR_LOW_S:-60}"             # sag must persist this long (TIME, not sample count)
-DOOR_GRACE_S="${RELAY_DOOR_GRACE_S:-120}"        # no guard evaluation for this long after (re)launch
-DOOR_COOLDOWN_S="${RELAY_DOOR_COOLDOWN_S:-600}"  # stop, wait this long, then retry
-DOOR_TRIPS_MAX="${RELAY_DOOR_TRIPS_MAX:-3}"      # consecutive trips before giving up and staying down
-DOOR_RESET_S="${RELAY_DOOR_RESET_S:-1800}"       # healthy this long => the trip streak is over
-# Kept only so an operator can still pin an absolute floor; unset by default (the measured baseline
-# and margin decide). If set, it OVERRIDES the computed floor.
-DOOR_FLOOR="${RELAY_DOOR_FLOOR:-}"
 # Delivery health = is the stream ALIVE and are SEGMENTS STILL ARRIVING at the VM (bytes up this
 # interval). HEVC sub bitrate is scene-dependent, so its VALUE — fixed, peak, OR rolling — cannot
 # tell a quiet cabin from a fault: both are just fewer bytes (a rolling EMA still false-flags a
@@ -53,8 +39,8 @@ STALL_STRIKES_MAX="${RELAY_STALL_STRIKES:-2}"  # alive-but-not-delivering for th
 # that is alive yet not delivering. At INTERVAL=30 the default 2 strikes = restart ~60s into a stall.
 # --- STALL-DETECTION HARDENING (NOT the cause of the Jul 20-21 gaps) ---
 # CORRECTION: an earlier revision of this file blamed those outages on a frozen supervisor loop. That
-# was wrong. GUARD_TRIP rows in relay_soak.csv show both were door-guard trips under the old
-# stay-stopped-forever policy (see DOOR GUARD above) — the relay was deliberately stopped, not stuck.
+# was wrong. GUARD_TRIP rows in relay_soak.csv show both were trips of the door guard that used to
+# live here — the relay was deliberately stopped, not stuck. That guard is now deleted entirely.
 # The two changes below are hardening for failures we have NOT yet had; they are kept because both
 # holes are real, but neither explains a byte of the lost data.
 #
@@ -64,9 +50,9 @@ STALL_STRIKES_MAX="${RELAY_STALL_STRIKES:-2}"  # alive-but-not-delivering for th
 #     stats call fails, the delta reads 0 bytes for EVERY cam and restarts all seven at once (a cloud
 #     blip becomes a relay-wide restart storm). An unknown age restarts nothing.
 SEG_STALL_S="${RELAY_SEG_STALL_S:-60}"         # newest segment older than this = that stream is dead
-# (2) The supervisor loop had unbounded calls in it. door_fps() shells into watch_local.py with NO
-#     timeout, and watch_local reads the /dev/shm segment ring — the same ring that has a known race.
-#     One hang there parks the whole loop forever: no stall checks, no CSV rows, no relay_status
+# (2) The supervisor loop had unbounded calls in it. The worst offender (a watch_local shell-out) left
+#     with the door guard, but the class remains: anything shelling out of this loop can hang.
+#     One hang parks the whole loop forever: no stall checks, no CSV rows, no relay_status
 #     POSTs, ffmpeg children unwatched. systemd sees "active" the entire time. Every external call in
 #     the loop is now bounded, AND the loop is watched by its own watchdog (see supervisor_watchdog).
 CALL_TIMEOUT="${RELAY_CALL_TIMEOUT:-10}"       # cap on any helper shelling out of the loop
@@ -79,9 +65,6 @@ HLS_TIME="${RELAY_HLS_TIME:-2}"                # segment seconds
 RW_TIMEOUT_US="${RELAY_RW_TIMEOUT_US:-30000000}"
 RWTO_ARG=""; [ "${RW_TIMEOUT_US}" != 0 ] && RWTO_ARG="-rw_timeout ${RW_TIMEOUT_US}"
 MREQ_ARG=""; [ "${RELAY_MULTIPLE_REQUESTS:-}" = 1 ] && MREQ_ARG="-multiple_requests 1"
-WATCH_CH="${WATCH_CHANNEL:-29}"
-AGENT_PY=/home/askjitk/liftlab-b3/pi-agent/.venv/bin/python
-WATCH_LOCAL=/home/askjitk/liftlab-b3/pi-agent/watch_local.py
 say(){ echo "[relay-soak] $(date -u +%FT%TZ) $*"; }
 
 # creds: prefer the injected env; only source the file if we actually can (manual root run)
@@ -111,16 +94,11 @@ say "delivery health = segments still arriving (>= ${ARRIVING_KBPS}kbps/interval
 # ---------- helpers ----------
 tx_bytes(){ cat "/sys/class/net/$IFACE/statistics/tx_bytes" 2>/dev/null||echo 0; }
 # EVERY helper that shells out is wrapped in `timeout`. An unbounded one of these froze the loop for
-# 22h — vcgencmd can block on a busy VideoCore mailbox, and door_fps reads the /dev/shm ring.
+# an unbounded shell-out — vcgencmd can block on a busy VideoCore mailbox.
 temp_c(){ timeout "$CALL_TIMEOUT" vcgencmd measure_temp 2>/dev/null | sed -E "s/temp=([0-9.]+).*/\1/"; }
 throttle_live(){ local v; v=$(timeout "$CALL_TIMEOUT" vcgencmd get_throttled 2>/dev/null|sed 's/.*=//'); v=$((v)); local o="";
   (( v & 1 ))&&o+="undervolt "; (( v & 2 ))&&o+="freqcap "; (( v & 4 ))&&o+="throttled "; (( v & 8 ))&&o+="templimit "; echo "${o:-none}"|tr ' ' '+'|sed 's/+$//'; }
 mem_avail(){ awk '/MemAvailable/{printf "%d",$2/1024}' /proc/meminfo; }
-# THE FREEZE POINT. This shells into watch_local.py, which reads the /dev/shm segment ring — the ring
-# with the known reader race. Unbounded, it parks the supervisor loop indefinitely; the door guard then
-# never evaluates either, so the relay neither watches its streams nor protects the watch. Bounded now:
-# a timeout yields empty output, which the guard already treats as "no reading" (no strike, no trip).
-door_fps(){ timeout "$CALL_TIMEOUT" "$AGENT_PY" "$WATCH_LOCAL" status "$WATCH_CH" 2>/dev/null | grep -oE "'signal_fps': [0-9.]+" | head -1 | grep -oE "[0-9.]+$"; }
 pid_jiffies(){ awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null||echo 0; }
 live_stats_json(){ curl -s --max-time 6 -H "Authorization: Bearer $GATEWAY_TOKEN" "$CLOUD/api/gw/$GW/live_stats" 2>/dev/null; }
 stat_bytes(){ printf '%s' "$1" | python3 -c "import sys,json
@@ -153,71 +131,23 @@ launch(){ # $1=slot -> (re)start the direct-PUT ffmpeg for that cam, echo pid
   echo $!
 }
 
-# ---------- guard state -> /ops ----------
-# A guard trip now zeroes the relay for at least a cooldown, so it MUST be visible without SSH. Posts
-# the streams-are-zero row plus guard_trips (consecutive count) and guard_state (cooldown|down). The
-# cloud's ingest ignores keys it doesn't know, so this is safe to deploy before the /ops change.
-post_guard(){
-  local df="$1" state="$2"
-  curl -s -o /dev/null --max-time 5 -X POST -H "Authorization: Bearer $GATEWAY_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{\"sum_delivered_mbps\":0,\"streams_alive\":0,\"streams_delivering\":0,\"door_fps\":${df:-0},\
-\"guard_trips\":${GUARD_TRIPS},\"guard_state\":\"${state}\",\"guard_floor\":${GUARD_FLOOR},\
-\"stall_restarts\":${STALL_RESTARTS:-0},\"per_stream\":{}}" \
-    "$CLOUD/api/gw/$GW/relay_status" 2>/dev/null || true
-}
-
 # ---------- CSV header (write once; append if resuming) ----------
 mkdir -p "$(dirname "$CSV")"
 if [ ! -s "$CSV" ]; then
   hdr="ts,uplink_mbps,sum_delivered_mbps"; for cam in "${CAMS[@]}"; do hdr+=",d_${cam}_kbps"; done
+  # door_fps column is RETAINED but always NA from the watch-retirement onward: dropping it would
+  # break append-compatibility with existing relay_soak.csv files, and its emptiness is itself the
+  # era marker. Door timing now comes from the GPU engine's gw_door_event stream, not from here.
   hdr+=",ff_cpu_total,soc_temp,throttle_live,mem_avail_mb,door_fps,streams_alive,streams_delivering"
   echo "$hdr" > "$CSV"
 fi
-
-# ---------- BASELINE: measure the watch BEFORE we load it ----------
-# The old guard compared against a hardcoded number and tripped at 9.35/9.44 — inside normal jitter of
-# the ~9.4 baseline. The only honest reference is what THIS Pi's watch is doing right now with no relay
-# running, which is exactly the state we're in at this point in the script (no ffmpeg spawned yet).
-measure_baseline(){
-  local s v n=0 sum=0
-  for s in 1 2 3; do
-    v=$(door_fps)
-    if [ -n "$v" ]; then sum=$(awk -v a="$sum" -v b="$v" 'BEGIN{print a+b}'); n=$((n+1)); fi
-    [ "$s" -lt 3 ] && sleep 2
-  done
-  [ "$n" -gt 0 ] && awk -v s="$sum" -v n="$n" 'BEGIN{printf "%.2f", s/n}' || echo ""
-}
-MEASURED=$(measure_baseline)
-if [ -n "$MEASURED" ] && awk "BEGIN{exit !($MEASURED >= $DOOR_ABS_FLOOR)}"; then
-  DOOR_BASELINE="$MEASURED"; BASE_SRC="measured(unloaded)"
-elif [ -n "$MEASURED" ]; then
-  # The watch is ALREADY below the quality alarm before we've added any load. Using that as the
-  # baseline would set the floor even lower and make the guard useless exactly when it matters.
-  BASE_SRC="fallback(measured ${MEASURED} < abs_floor ${DOOR_ABS_FLOOR} — watch already degraded)"
-  say "WARN watch is at ${MEASURED}fps with NO relay load — below the ${DOOR_ABS_FLOOR} quality alarm."
-else
-  BASE_SRC="fallback(watch unreadable)"
-fi
-# floor = a margin below baseline, but never below the quality alarm. An explicit RELAY_DOOR_FLOOR wins.
-GUARD_FLOOR=$(awk -v b="$DOOR_BASELINE" -v m="$DOOR_MARGIN" -v a="$DOOR_ABS_FLOOR" \
-              'BEGIN{f=b*(1-m); printf "%.2f", (f>a?f:a)}')
-[ -n "$DOOR_FLOOR" ] && { GUARD_FLOOR="$DOOR_FLOOR"; BASE_SRC="$BASE_SRC + operator override"; }
-# ONE line stating the guard's EFFECTIVE config. The old code's trip at 40s was impossible under its
-# documented 3-strikes/90s rule, which means the deployed strike count differed from the source — an
-# ambiguity that cost a day. It is no longer possible to wonder what the thresholds actually are.
-say "DOOR GUARD: baseline=${DOOR_BASELINE} [$BASE_SRC] margin=$(awk -v m="$DOOR_MARGIN" 'BEGIN{printf "%.0f%%",m*100}')"
-say "  -> floor=${GUARD_FLOOR}fps, must be sustained ${DOOR_LOW_S}s; grace ${DOOR_GRACE_S}s after each"
-say "  (re)launch; trip => stop + retry after ${DOOR_COOLDOWN_S}s (x2 backoff), give up after ${DOOR_TRIPS_MAX} consecutive."
 
 # ---------- launch producers, set up teardown ----------
 declare -a PIDS; declare -A PREVJ
 start_streams(){
   local i
   for ((i=0;i<NCH;i++)); do PIDS[$i]=$(launch "$i"); PREVJ[${PIDS[$i]}]=$(pid_jiffies "${PIDS[$i]}"); done
-  GRACE_UNTIL=$(( $(date +%s) + DOOR_GRACE_S ))     # startup transient is NOT steady-state harm
-  LOW_SINCE=0
-  say "launched $NCH direct-PUT sub relays: ${PIDS[*]} (guard grace ${DOOR_GRACE_S}s)"
+  say "launched $NCH direct-PUT sub relays: ${PIDS[*]}"
 }
 stop_streams(){
   local p
@@ -235,9 +165,9 @@ trap 'cleanup' EXIT
 # ---------- supervisor self-watchdog (the bash analogue of gpu_watchdog's os._exit) ----------
 # The relay's OWN liveness. Everything above watches the ffmpeg streams; nothing watched the watcher.
 # NOTE: this did NOT cause the Jul 20-21 outages — those were door-guard trips (GUARD_TRIP rows in the
-# CSV confirm it), not a freeze. It stays because the hole is real: door_fps() shells into watch_local,
-# which reads the /dev/shm ring with the known reader race, and an unbounded hang there would park the
-# loop exactly as feared. Hardening for a failure we have not had yet. The loop touches HB_FILE every
+# CSV confirm it), not a freeze. It stays because the hole is real: a dumb streamer still needs dumb
+# babysitting, and any shell-out from this loop can hang it. Hardening for a failure we have not had
+# yet. The loop touches HB_FILE every
 # turn; if that mtime stops advancing the supervisor is wedged and CANNOT recover itself — so
 # this kills it and lets systemd restart. Same reasoning as os._exit over sys.exit in gpu_watchdog:
 # a watchdog that cannot force the exit is theatre.
@@ -268,10 +198,7 @@ say "supervisor watchdog armed: loop must tick every ${LOOP_STALL_S}s (hb=$HB_FI
 sleep 6
 prev_tx=$(tx_bytes); prev_sj=$(live_stats_json); prev_t=$(date +%s.%N)
 declare -A PREVB; for ((i=0;i<NCH;i++)); do PREVB[$i]=$(stat_bytes "$prev_sj" "${CAMS[$i]}"); PREVJ[${PIDS[$i]}]=$(pid_jiffies "${PIDS[$i]}"); done
-hz=$(getconf CLK_TCK); GUARD_TRIPS=0; STALL_RESTARTS=0; SEQ=0
-COOLDOWN="$DOOR_COOLDOWN_S"    # doubles per consecutive trip, resets after DOOR_RESET_S healthy
-HEALTHY_SINCE=0                # when the current healthy run began (clears the trip streak)
-# LOW_SINCE / GRACE_UNTIL are (re)set by start_streams on every launch and relaunch.
+hz=$(getconf CLK_TCK); STALL_RESTARTS=0; SEQ=0
 declare -A STALL; for ((i=0;i<NCH;i++)); do STALL[$i]=0; done   # per-stream alive-but-not-delivering strikes
 
 # ---------- soak loop ----------
@@ -326,61 +253,12 @@ while :; do
     fi
   done
   smbps=$(awk -v k="$sumk" 'BEGIN{printf "%.2f",k/1000}')
-  tp=$(temp_c); thr=$(throttle_live); ma=$(mem_avail); df=$(door_fps); ps_json="${ps_json%,}}"
-  echo "$(date -u +%FT%TZ),${upl},${smbps}${percols},${cpu},${tp},${thr},${ma},${df:-NA},${alive},${delivering}" >> "$CSV"
+  tp=$(temp_c); thr=$(throttle_live); ma=$(mem_avail); ps_json="${ps_json%,}}"
+  # door_fps column is literal NA from the watch-retirement onward — the Pi no longer measures doors.
+  echo "$(date -u +%FT%TZ),${upl},${smbps}${percols},${cpu},${tp},${thr},${ma},NA,${alive},${delivering}" >> "$CSV"
   # POST relay metrics to the cloud so /ops shows relay health without SSH (separate from the watch)
-  payload="{\"sum_delivered_mbps\":${smbps},\"streams_alive\":${alive},\"streams_delivering\":${delivering},\"ff_cpu\":${cpu:-0},\"soc_temp\":${tp:-0},\"throttle_live\":\"${thr}\",\"mem_avail_mb\":${ma:-0},\"door_fps\":${df:-0},\"guard_trips\":${GUARD_TRIPS:-0},\"stall_restarts\":${STALL_RESTARTS:-0},\"per_stream\":${ps_json}}"
+  payload="{\"sum_delivered_mbps\":${smbps},\"streams_alive\":${alive},\"streams_delivering\":${delivering},\"ff_cpu\":${cpu:-0},\"soc_temp\":${tp:-0},\"throttle_live\":\"${thr}\",\"mem_avail_mb\":${ma:-0},\"stall_restarts\":${STALL_RESTARTS:-0},\"per_stream\":${ps_json}}"
   curl -s -o /dev/null --max-time 5 -X POST -H "Authorization: Bearer $GATEWAY_TOKEN" \
     -H "Content-Type: application/json" -d "$payload" "$CLOUD/api/gw/$GW/relay_status" 2>/dev/null || true
   prev_tx=$cur_tx; prev_sj=$cur_sj; prev_t=$now
-  # ---------- DOOR GUARD: the watch is sacred, but the relay is no longer expendable ----------
-  # It feeds counting and floor OCR now, so "protect the watch" can no longer mean "lose everything
-  # else until a human notices". Stop, cool down, RETRY; stay down only when the harm is durable.
-  gnow=$(date +%s)
-  if [ "$gnow" -lt "$GRACE_UNTIL" ]; then
-    : # startup transient — 7 ffmpegs spawning at once briefly depress the watch. This is the Jul 21
-      # 14:12:52 trip (6.24fps, 40s after start): real dip, zero steady-state meaning.
-  elif [ -z "$df" ]; then
-    # No reading. Don't accumulate (can't judge) and don't reset (don't erase a sag in progress).
-    [ "$((SEQ % 10))" = 0 ] && say "door_fps unreadable — guard holding, neither tripping nor clearing"
-  elif awk "BEGIN{exit !($df < $GUARD_FLOOR)}"; then
-    [ "$LOW_SINCE" = 0 ] && { LOW_SINCE=$gnow; say "WARN door_fps=$df < floor ${GUARD_FLOOR} — sag started, must hold ${DOOR_LOW_S}s to trip"; }
-    lowfor=$(( gnow - LOW_SINCE ))
-    if [ "$lowfor" -ge "$DOOR_LOW_S" ]; then
-      GUARD_TRIPS=$((GUARD_TRIPS+1))
-      say "DOOR GUARD TRIPPED (${GUARD_TRIPS}/${DOOR_TRIPS_MAX} consecutive): door_fps=$df < ${GUARD_FLOOR} sustained ${lowfor}s — stopping streams."
-      echo "$(date -u +%FT%TZ),GUARD_TRIP,door_fps=$df,floor=${GUARD_FLOOR},sustained=${lowfor}s,trip=${GUARD_TRIPS}/${DOOR_TRIPS_MAX}" >> "$CSV"
-      stop_streams
-      post_guard "$df" "$([ "$GUARD_TRIPS" -ge "$DOOR_TRIPS_MAX" ] && echo down || echo cooldown)"
-      if [ "$GUARD_TRIPS" -ge "$DOOR_TRIPS_MAX" ]; then
-        say "GIVING UP: ${GUARD_TRIPS} consecutive trips — the contention is durable, not transient."
-        say "  Relay stays DOWN. /ops carries the alert; counting + floor OCR are dark until this is fixed."
-        echo "$(date -u +%FT%TZ),GUARD_GIVE_UP,door_fps=$df,relay_down_until_operator_acts" >> "$CSV"
-        cleanup; trap - EXIT; exit 0     # exit 0 => systemd will NOT restart. Deliberate, and now VISIBLE.
-      fi
-      say "cooldown ${COOLDOWN}s, then retrying (next backoff $((COOLDOWN*2))s)"
-      waited=0
-      while [ "$waited" -lt "$COOLDOWN" ]; do
-        sleep 10; : > "$HB_FILE"          # keep ticking or the supervisor watchdog kills us mid-cooldown
-        waited=$((waited+10))
-      done
-      COOLDOWN=$((COOLDOWN*2))
-      start_streams                        # resets GRACE_UNTIL + LOW_SINCE
-      for ((i=0;i<NCH;i++)); do STALL[$i]=0; PREVB[$i]=0; done
-      prev_sj=$(live_stats_json)
-      for ((i=0;i<NCH;i++)); do PREVB[$i]=$(stat_bytes "$prev_sj" "${CAMS[$i]}"); done
-      HEALTHY_SINCE=0
-    fi
-  else
-    # Healthy sample. Clear any sag in progress, and once we've been healthy long enough, declare the
-    # trip streak over — otherwise three trips spread across a week would look "consecutive" and
-    # permanently ground a relay that is actually fine.
-    [ "$LOW_SINCE" != 0 ] && say "door_fps=$df recovered above ${GUARD_FLOOR} — sag cleared"
-    LOW_SINCE=0
-    [ "$HEALTHY_SINCE" = 0 ] && HEALTHY_SINCE=$gnow
-    if [ "$GUARD_TRIPS" -gt 0 ] && [ $(( gnow - HEALTHY_SINCE )) -ge "$DOOR_RESET_S" ]; then
-      say "healthy ${DOOR_RESET_S}s since the last trip — clearing the streak (was ${GUARD_TRIPS}) and backoff"
-      GUARD_TRIPS=0; COOLDOWN="$DOOR_COOLDOWN_S"
-    fi
-  fi
 done
