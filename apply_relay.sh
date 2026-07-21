@@ -14,7 +14,7 @@ UNIT=/etc/systemd/system/liftlab-relay.service
 ERA=/home/askjitk/liftlab-watch/WATCH_ERA.md
 CSV=/home/askjitk/liftlab-watch/relay_soak.csv
 say(){ echo "[apply-relay] $*"; }
-say "REV=dumb-streamer-1  (retires liftlab-watch; relay has NO door guard; Restart=always)"
+say "REV=dumb-streamer-2  (probes the rtsp timeout option; MERGES unit Environment= keys)"
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
 [ -f /tmp/relay_soak.sh ] || { echo "missing /tmp/relay_soak.sh"; exit 2; }
 [ -f /tmp/liftlab-relay.service ] || { echo "missing /tmp/liftlab-relay.service"; exit 2; }
@@ -78,7 +78,33 @@ fi
 
 # ---------- 3. install the guard-free relay ----------
 install -o askjitk -g askjitk -m 755 /tmp/relay_soak.sh "$PIAG/relay_soak.sh"
-install -m 644 /tmp/liftlab-relay.service "$UNIT"
+
+# ---------- install the unit, MERGING operator-set Environment= keys ----------
+# This clobbered a hand-added Environment= line on Jul 21 15:01 and took all 7 streams down: the key
+# it destroyed had been suppressing an ffmpeg option this build rejects. The Pi's running config has
+# now diverged from git twice (RELAY_DOOR_STRIKES was the first), so treat the DEPLOYED unit as
+# carrying operator intent — same merge discipline apply_gpu.sh already uses for its env file.
+# New-unit definitions win; keys only the old unit had are carried forward and reported.
+KEPT=""
+if [ -f "$UNIT" ]; then
+  while IFS= read -r line; do
+    k=${line#Environment=}; k=${k%%=*}
+    grep -qE "^Environment=${k}=" /tmp/liftlab-relay.service || KEPT="${KEPT}${line}"$'\n'
+  done < <(grep -E '^Environment=' "$UNIT" 2>/dev/null)
+fi
+if [ -n "$KEPT" ]; then
+  # Must land INSIDE [Service] — appending at the end would put them in [Install], where systemd
+  # ignores them silently and we would have "preserved" nothing.
+  awk -v keep="$KEPT" '/^\[Install\]/ && !done {printf "%s", keep; done=1} {print}' \
+      /tmp/liftlab-relay.service > "$UNIT.tmp"
+  mv "$UNIT.tmp" "$UNIT"; chmod 644 "$UNIT"
+  say "PRESERVED operator Environment= keys the new unit does not define:"
+  printf '%s' "$KEPT" | sed 's/^/    /'
+  say "  (these are why the relay worked before — review them, do not assume they are cruft)"
+else
+  install -m 644 /tmp/liftlab-relay.service "$UNIT"
+  [ -f "$UNIT" ] && say "unit installed (no extra operator Environment= keys found to preserve)"
+fi
 mkdir -p /home/askjitk/liftlab-watch && chown askjitk:askjitk /home/askjitk/liftlab-watch
 # Dead guard knobs in the agent env. Harmless now (nothing reads them) but they document a policy
 # that no longer exists, and RELAY_DOOR_FLOOR in particular misleads anyone debugging later.
@@ -102,6 +128,17 @@ else
   say "RESULT: CHECK — relay is up but the supervisor watchdog did NOT arm."
   say "  journalctl -u liftlab-relay -n 40"; exit 1
 fi
+# STREAMS ACTUALLY UP? The Jul 21 15:01 break left the service "active" with zero ffmpeg alive for an
+# hour. is-active is not evidence; a live ffmpeg per channel is.
+# NB: no $GW here (this script never defines it, and set -u would abort), and `pgrep -c` PRINTS 0
+# while EXITING 1 on no match, so `pgrep -c ... || echo 0` emits two zeroes and breaks -lt.
+# Count lines instead.
+FF=$(pgrep -f 'api/gw/.*/live/' 2>/dev/null | wc -l)
+if [ "$FF" -lt 1 ]; then
+  say "RESULT: FAIL — service is active but NO ffmpeg is running. The relay is not streaming."
+  say "  journalctl -u liftlab-relay -n 30   (look for FATAL / 'Option not found')"; exit 1
+fi
+say "ffmpeg processes alive: $FF"
 # Restart=always is the point of this rev: nothing the relay does should leave it dead.
 say "restart policy: $(systemctl show -p Restart --value liftlab-relay) | start limit interval: $(systemctl show -p StartLimitIntervalUSec --value liftlab-relay)"
 say ""

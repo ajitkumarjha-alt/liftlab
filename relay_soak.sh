@@ -61,9 +61,18 @@ HB_FILE="${RELAY_HB_FILE:-/tmp/relay_soak.hb}" # touched every loop turn; the wa
 HLS_TIME="${RELAY_HLS_TIME:-2}"                # segment seconds
 # Belt-and-suspenders for the RTSP-read stall specifically: abort a socket read that hangs longer than
 # this (microseconds) so ffmpeg EXITS and the DIED path restarts it. Independent of the delivery check
-# above (which also catches a wedged PUT). Set 0 to disable if an ffmpeg build rejects the option.
+# above (which also catches a wedged PUT). Set RELAY_RW_TIMEOUT_US=0 to disable entirely.
+#
+# WHICH option that is depends on the ffmpeg build, and getting it wrong kills every stream instantly:
+# `-rw_timeout` is an AVIO/protocol option that the RTSP DEMUXER does not accept, so ffmpeg exits with
+# "Error opening input files: Option not found" before a byte moves. That is exactly what took all 7
+# streams down on Jul 21 15:01, when a redeploy overwrote a unit whose hand-added Environment= line had
+# been quietly disabling it. Hardcoding any single spelling just moves the landmine, so PROBE the real
+# binary and use whatever it actually accepts:
+#   -stimeout    socket I/O timeout, µs — unambiguous, present through ffmpeg 5.x
+#   -timeout     its successor for the rtsp demuxer (stimeout removed in 6.x), also µs
+#   -rw_timeout  protocol-level; last resort, and the one that fails on rtsp
 RW_TIMEOUT_US="${RELAY_RW_TIMEOUT_US:-30000000}"
-RWTO_ARG=""; [ "${RW_TIMEOUT_US}" != 0 ] && RWTO_ARG="-rw_timeout ${RW_TIMEOUT_US}"
 MREQ_ARG=""; [ "${RELAY_MULTIPLE_REQUESTS:-}" = 1 ] && MREQ_ARG="-multiple_requests 1"
 say(){ echo "[relay-soak] $(date -u +%FT%TZ) $*"; }
 
@@ -74,6 +83,37 @@ if [ -z "${NVR_HOST:-}" ] && [ -r /etc/liftlab-agent.env ]; then set -a; . /etc/
 : "${CLOUD_URL:?CLOUD_URL not in env}"
 CLOUD="${CLOUD_URL%/}"; GW="${GW:-${GATEWAY_ID:-site-A}}"
 command -v ffmpeg >/dev/null || { say "ffmpeg missing"; exit 1; }
+
+# ---------- probe: does THIS ffmpeg accept the read-timeout option we want to pass? ----------
+# Runs the real binary against a dead local port with the candidate option. A rejected option prints
+# "Option not found" and exits before any connection is attempted; an accepted one gets as far as
+# failing to connect. So the probe distinguishes a PARSE error from a NETWORK error, which is precisely
+# the distinction that was missed when this broke (all 7 dying instantly on a CLI error, not a link).
+ffmpeg_accepts(){   # $1 = candidate option words, e.g. "-stimeout 30000000"
+  local out
+  out=$(timeout 10 ffmpeg -nostdin -hide_banner -loglevel error \
+        -rtsp_transport tcp $1 -i "rtsp://127.0.0.1:9/probe" -t 0 -f null - 2>&1)
+  case "$out" in
+    *"Option not found"*|*"Unrecognized option"*|*"Invalid argument"*) return 1 ;;
+  esac
+  return 0
+}
+RWTO_ARG=""
+if [ "${RW_TIMEOUT_US}" != 0 ]; then
+  for _cand in "-stimeout ${RW_TIMEOUT_US}" "-timeout ${RW_TIMEOUT_US}" "-rw_timeout ${RW_TIMEOUT_US}"; do
+    if ffmpeg_accepts "$_cand"; then RWTO_ARG="$_cand"; break; fi
+  done
+  if [ -n "$RWTO_ARG" ]; then
+    say "rtsp read timeout: '${RWTO_ARG%% *}' accepted by this ffmpeg (probed, ${RW_TIMEOUT_US}us)"
+  else
+    # Streaming without a read timeout is FAR better than not streaming at all. The segment-age stall
+    # detector already restarts a wedged stream ~60-90s in; the ffmpeg-level timeout is only a faster path.
+    say "WARN no rtsp read-timeout option accepted by this ffmpeg — streaming WITHOUT one."
+    say "  A wedged RTSP read will now be caught by the segment-age stall detector instead (~60-90s)."
+  fi
+else
+  say "rtsp read timeout: DISABLED by RELAY_RW_TIMEOUT_US=0"
+fi
 USER_ENC=$(python3 -c "import os,urllib.parse as u;print(u.quote(os.environ.get('NVR_USER','admin'),safe=''))")
 PASS_ENC=$(python3 -c "import os,urllib.parse as u;print(u.quote(os.environ.get('NVR_PASS',os.environ.get('NVR_PASSWORD','')),safe=''))")
 IFACE=$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}'); [ -n "$IFACE" ] || IFACE=eth0
@@ -145,9 +185,27 @@ fi
 # ---------- launch producers, set up teardown ----------
 declare -a PIDS; declare -A PREVJ
 start_streams(){
-  local i
+  local i alive_now=0
   for ((i=0;i<NCH;i++)); do PIDS[$i]=$(launch "$i"); PREVJ[${PIDS[$i]}]=$(pid_jiffies "${PIDS[$i]}"); done
   say "launched $NCH direct-PUT sub relays: ${PIDS[*]}"
+  # INSTANT-DEATH CHECK. A bad ffmpeg option kills every stream in milliseconds, and the loop below
+  # would then relaunch them every INTERVAL forever, logging one truncated tail line per stream — which
+  # is how a CLI parse error masqueraded as a running relay for an hour. Look, once, immediately, and
+  # print the ACTUAL error instead of hiding it in a per-stream tail.
+  sleep 3
+  for ((i=0;i<NCH;i++)); do kill -0 "${PIDS[$i]}" 2>/dev/null && alive_now=$((alive_now+1)); done
+  if [ "$alive_now" = 0 ]; then
+    say "FATAL: all $NCH ffmpeg died within 3s of launch — this is a COMMAND error, not the network."
+    say "  command was: ffmpeg -nostdin -hide_banner -loglevel error -rtsp_transport tcp $RWTO_ARG -i <rtsp-url> -an -c:v copy"
+    say "               -f hls -hls_time $HLS_TIME -hls_list_size 5 -hls_flags delete_segments+omit_endlist"
+    say "               -hls_segment_type mpegts -method PUT -http_persistent 1 $MREQ_ARG -headers <auth>"
+    say "               -hls_segment_filename $CLOUD/api/gw/$GW/live/${CAMS[0]}/seg%03d.ts .../index.m3u8"
+    say "  ffmpeg said:"
+    sed 's/^/    /' "/tmp/relay_soak_${CAMS[0]}.log" 2>/dev/null | head -10
+    return 1
+  fi
+  [ "$alive_now" -lt "$NCH" ] && say "WARN only $alive_now/$NCH streams survived the first 3s — see /tmp/relay_soak_*.log"
+  return 0
 }
 stop_streams(){
   local p
@@ -156,7 +214,14 @@ stop_streams(){
   for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null; done
   PIDS=()
 }
-start_streams
+if ! start_streams; then
+  # Exit non-zero so systemd restarts us (Restart=always) AND the journal carries the real reason.
+  # Restarting will not fix a bad option, but a loud repeating FATAL is findable; seven streams
+  # silently respawning into the same parse error is not.
+  say "relay cannot stream with this command — exiting so the failure is visible, not looping quietly."
+  for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null; done
+  exit 1
+fi
 cleanup(){ say "stopping — killing $NCH ffmpeg"; for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
            [ -n "${WD_PID:-}" ] && kill "$WD_PID" 2>/dev/null; rm -f "$HB_FILE"; }
 trap 'cleanup; exit 0' TERM INT
@@ -181,7 +246,7 @@ supervisor_watchdog(){
     if [ "$hbm" -gt 0 ] && [ "$age" -gt "$LOOP_STALL_S" ]; then
       say "SUPERVISOR STALL: loop has not ticked in ${age}s (limit ${LOOP_STALL_S}s) — the supervisor is wedged."
       say "  last CSV row: $(tail -1 "$CSV" 2>/dev/null)"
-      say "  ffmpeg children still up: $(pgrep -c -f "$CLOUD/api/gw/$GW/live/" 2>/dev/null || echo 0)/$NCH"
+      say "  ffmpeg children still up: $(pgrep -f "$CLOUD/api/gw/$GW/live/" 2>/dev/null | wc -l)/$NCH"
       say "  blocked in: $(cat /proc/$main/wchan 2>/dev/null || echo unknown); children of the loop:"
       ps --ppid "$main" -o pid,etime,stat,wchan:20,cmd --no-headers 2>/dev/null | sed 's/^/    /' || true
       say "  killing relay (SIGKILL) so systemd Restart=on-failure brings it back with fresh streams."
