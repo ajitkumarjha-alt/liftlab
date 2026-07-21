@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+from concurrent.futures import TimeoutError as _FuturesTimeout
 
 import numpy as np
 
@@ -82,11 +83,33 @@ DOOR_HB_S = float(os.environ.get("DOOR_HB_S", "60"))           # emit a row at l
 FLOORCHECK_PER_HR = int(os.environ.get("FLOORCHECK_PER_HR", "30"))   # sampled reads+crop -> /floorcheck
 FLOOR_ORDER = [s.strip() for s in os.environ.get("FLOOR_ORDER", "").split(",") if s.strip()]  # FloorTracker._idx
 TEMPLATES_REFETCH_S = float(os.environ.get("TEMPLATES_REFETCH_S", "600"))  # re-pull npz; reload if hash changed
+# --- liveness: progress-based, because "active (running)" told us nothing during the 5h44m hang ---
+WD_STALL_S = float(os.environ.get("WD_STALL_S", "120"))    # no segment processed this long -> dump + exit
+WD_GRACE_S = float(os.environ.get("WD_GRACE_S", "180"))    # cold start: model load + CUDA init
+SOCK_TIMEOUT_S = float(os.environ.get("SOCK_TIMEOUT_S", "30"))   # default for sockets we don't own
+FETCH_WAIT_S = float(os.environ.get("FETCH_WAIT_S", "60"))  # cap on waiting for a prefetch future
 TEMPLATES_URL = f"{CLOUD}/api/gw/{GW}/templates/{CAM}"
 
 
 def log(m):
     print(f"[gpu-analyze] {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {m}", flush=True)
+
+
+# LIVENESS (see gpu_watchdog.py). harden_sockets MUST run before the Session below is built —
+# setdefaulttimeout only affects sockets created after it. This is a floor under the libraries we
+# don't call directly; our own HTTP calls all carry explicit timeouts already.
+try:
+    import gpu_watchdog as _wd
+    _wd.harden_sockets(SOCK_TIMEOUT_S)
+except Exception as _e:                       # never let liveness plumbing stop the analyzer
+    _wd = None
+    print(f"[gpu-analyze] watchdog unavailable: {_e}", flush=True)
+
+
+def wd_phase(name):
+    """Breadcrumb for the stall report — no-op if the watchdog module is missing."""
+    if _wd is not None:
+        _wd.phase(name)
 
 
 # Pooled keep-alive session: urllib does a fresh TCP+TLS handshake PER segment (~3-4 RTTs of setup
@@ -146,12 +169,26 @@ def http_get_timed(url, timeout=15):
     return body, 0.0, (time.time() - t0) * 1000
 
 
-def http_post_json(url, obj, timeout=10):
+SLOW_POST_MS = float(os.environ.get("SLOW_POST_MS", "2000"))   # log any POST slower than this
+
+
+def http_post_json(url, obj, timeout=10, what=""):
+    """POST with an explicit timeout AND a breadcrumb. `what` names the call in the watchdog's stall
+    report, so a hang inside a POST identifies itself even before the traceback is read. A POST that
+    merely runs SLOW (but returns) is logged too — that's the early warning the 07:50 hang never gave."""
     import json
     data = json.dumps(obj).encode()
     req = urllib.request.Request(url, data=data, headers={**HDRS, "Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.status
+    wd_phase(f"POST {what or url}")
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status
+    finally:
+        ms = (time.time() - t0) * 1000
+        if ms > SLOW_POST_MS:
+            log(f"SLOW POST {what or url}: {ms:.0f}ms (timeout={timeout}s)")
+        wd_phase("loop")
 
 
 def get_val_state():
@@ -219,7 +256,8 @@ def post_episode(ep, reason=""):
                              "det_max": det_max, "det_mean": round(det_mean, 1), "distinct_ids": n_ids,
                              "det_frames": len(dc), "conf_min": round(c_min, 2),
                              "conf_mean": round(c_mean, 2), "conf_max": round(c_max, 2),
-                             "counting_version": counting.COUNTING_VERSION})   # verdict is valid only for this logic
+                             "counting_version": counting.COUNTING_VERSION},  # verdict is valid only for this logic
+                            what="validation_item")
         log(f"episode POST -> HTTP {st}")
     except Exception as e:
         log(f"episode POST FAILED: {type(e).__name__}: {getattr(e, 'code', '')} {str(e)[:120]}")
@@ -360,7 +398,7 @@ def post_door_event(rec, version, thash):
                "panels_agreed": rec["panels_agreed"], "reason": rec["reason"], "candidates": rec.get("candidates"),
                "close_travel_s": rec.get("close_travel_s"), "door_version": version, "templates_hash": thash}
     try:
-        http_post_json(f"{CLOUD}/api/gw/{GW}/door_event", payload)
+        http_post_json(f"{CLOUD}/api/gw/{GW}/door_event", payload, what="door_event")
     except Exception as e:
         log(f"door_event POST failed: {e}")
 
@@ -381,7 +419,7 @@ def post_floorcheck(rec, frame_bgr, panel0_roi, version):
                "read_conf": rec["read_conf"], "panels_agreed": rec["panels_agreed"], "reason": rec["reason"],
                "door_version": version, "crop_jpeg_b64": b64}
     try:
-        http_post_json(f"{CLOUD}/api/gw/{GW}/floorcheck", payload)
+        http_post_json(f"{CLOUD}/api/gw/{GW}/floorcheck", payload, what="floorcheck")
     except Exception as e:
         log(f"floorcheck POST failed: {e}")
 
@@ -411,6 +449,7 @@ def main():
     last_transit_ts = 0.0
     started = time.time()
     last_drop_log = time.time()
+    last_idle_log = 0.0
     last_hb = 0.0
     # rejected-crossing telemetry: would-be crossings the guards killed, so disp_frac/min_frames can be
     # tuned from the real distribution. rej_hist buckets the achieved frac in 0.05 steps [0..0.35, then .35+].
@@ -487,11 +526,20 @@ def main():
                             # a per-hour drop rate. dropped mid-close = a lost/wrong door event.
                             "drop_frac": round(dropped / _tot, 4) if _tot else 0.0,
                             "drop_rate_hr": round(dropped / ((time.time() - started) / 3600.0), 2)
-                                            if time.time() - started > 60 else None})
+                                            if time.time() - started > 60 else None},
+                           what="analyzer_status")
         except Exception as e:
             log(f"heartbeat POST failed: {e}")
 
+    # ARM LAST: everything above (model load, CUDA init, template fetch, engine build) is startup,
+    # and the grace window covers it. From here on, a segment must complete every WD_STALL_S or the
+    # watchdog dumps every thread's stack and exits for systemd. Progress is measured as SEGMENTS
+    # PROCESSED — not loop turns, not "process alive", both of which stayed true through the hang.
+    if _wd is not None:
+        _wd.arm(stall_secs=WD_STALL_S, grace=WD_GRACE_S)
+
     while True:
+        wd_phase("playlist")
         segs = playlist_segments()
         new = [s for s in segs if s not in seen]
         if time.time() - last_hb > HEARTBEAT_S:   # heartbeat even when idle (no traffic != dead)
@@ -513,6 +561,16 @@ def main():
         if not new:
             if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
                 post_episode(episode, "gap"); episode = None
+            # STARVATION IS NOT A HANG. The playlist fetch above returned, so the loop is turning and
+            # the network works — there is simply nothing upstream to process. Refresh the watchdog:
+            # restarting cannot conjure segments, and a restart-loop through a relay outage would bury
+            # the real signal (upstream) under a fake one (worker). Log it so idleness stays VISIBLE
+            # rather than silent — silence is what cost us 5h44m.
+            if _wd is not None:
+                _wd.progress("idle(no new segs)")
+            if segs and time.time() - last_idle_log > 60:
+                log(f"idle: playlist has {len(segs)} segs, none new (upstream not advancing?)")
+                last_idle_log = time.time()
             time.sleep(POLL_S)
             continue
         # STAY NEAR LIVE: if we've fallen behind, skip the old queued segments (they're about to be
@@ -535,7 +593,17 @@ def main():
             seg_t0 = time.time()                  # measured AFTER prefetch: captures NON-OVERLAPPED work
             _prefetch(name)                        # (no-op if already prefetched)
             try:
-                data, connect_ms, transfer_ms = prefetched.pop(name).result()
+                # BOUNDED wait. Future.result() with no timeout was the one genuinely unbounded
+                # block left in the loop: http_get_timed carries its own 15s, but if a prefetch
+                # thread died in a way that never resolved the future, the main loop waited
+                # forever — silent, GPU idle, unit "active". Exactly the 07:50 signature.
+                wd_phase(f"fetch-wait {name}")
+                data, connect_ms, transfer_ms = prefetched.pop(name).result(timeout=FETCH_WAIT_S)
+            except _FuturesTimeout:
+                log(f"segment {name} prefetch WAIT EXCEEDED {FETCH_WAIT_S:.0f}s — abandoning (watchdog will "
+                    f"dump+exit if this repeats); the fetch thread is wedged")
+                seen.add(name); dropped += 1
+                continue
             except urllib.error.HTTPError as e:
                 if e.code == 404:                 # pruned off the rolling window before we fetched it
                     seen.add(name); dropped += 1
@@ -545,6 +613,7 @@ def main():
                 log(f"segment {name} fetch failed: {type(e).__name__}: {e}"); continue
             fetch_ms = connect_ms + transfer_ms   # fetch DURATION (ran overlapped w/ the prior track)
             dec_t0 = time.time()
+            wd_phase(f"decode {name}")
             frames, rel = decode_segment(data)
             decode_ms = (time.time() - dec_t0) * 1000       # HEVC decode cost
             if not frames:
@@ -570,6 +639,7 @@ def main():
                 # gw_door_event stream on state-change (+ liveness heartbeat); samples N/hr to /floorcheck.
                 if door_eng is not None and i % DOOR_STRIDE == 0:
                     d_off = seg_wall - ((rel[-1] - rel[i]) if rel else 0.0)
+                    wd_phase(f"door-pass {name} fr{i}")
                     try:
                         drec = door_eng.process(fr, d_off)
                     except Exception as e:
@@ -588,6 +658,7 @@ def main():
                 if val_state == "validating":
                     recent.append(fr)             # buffer frames so a transit can grab a sequence
                 tr_t0 = time.time()
+                wd_phase(f"track {name} fr{i}")
                 dets = det.track(fr)
                 track_ms += (time.time() - tr_t0) * 1000     # YOLO inference — the cost that must fit the budget
                 frame_off = seg_wall - ((rel[-1] - rel[i]) if rel else 0.0)   # REAL per-frame time (not 25fps assumed)
@@ -618,7 +689,8 @@ def main():
                 for t in ctr.transits[pre:]:      # transits detected ON this frame
                     try:                          # POST the count (both modes; idempotent, cloud dedups)
                         http_post_json(f"{CLOUD}/api/gw/{GW}/transit",
-                                       {"cam": CAM, "ts": t.offset_s, "direction": t.direction, "track_id": t.track_id})
+                                       {"cam": CAM, "ts": t.offset_s, "direction": t.direction, "track_id": t.track_id},
+                                       what="transit")
                         posted += 1
                         last_transit_ts = t.offset_s
                     except Exception as e:
@@ -666,6 +738,13 @@ def main():
                     f"fetch={fm:.0f}ms[connect={cm:.0f} transfer={xm:.0f}]; drop_frac={dfrac:.3%} dropped_total={dropped}")
                 last_timing_log = time.time()
             seen.add(name)
+            # THE liveness signal: one fully-processed segment (fetched, decoded, tracked, door-passed,
+            # posted). Placed here and nowhere else on purpose — an idle poll, a 404 skip, or a loop
+            # spinning without doing work must NOT look like health, or the watchdog re-learns the same
+            # lie systemd told us.
+            if _wd is not None:
+                _wd.progress(name)
+            wd_phase("loop")
         # close a stale validation episode (door shut) + refresh this cam's mode periodically
         if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
             post_episode(episode, "gap-between-segments"); episode = None

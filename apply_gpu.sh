@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Install the GPU transit analyzer on liftlab-gpu (preemption-safe systemd). Auto-detects the ~/lab
 # venv + user so it survives Spot preemption (Restart=always + enabled -> starts on boot).
-# FILES NEEDED IN /tmp: apply_gpu.sh gpu_analyze.py counting.py gpu_door.py liftlab-gpu.service
+# FILES NEEDED IN /tmp: apply_gpu.sh gpu_analyze.py counting.py gpu_door.py gpu_watchdog.py liftlab-gpu.service
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_gpu.sh gpu_analyze.py counting.py gpu_door.py liftlab-gpu.service; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_gpu.sh gpu_analyze.py counting.py gpu_door.py gpu_watchdog.py liftlab-gpu.service; do curl -fsSL -o /tmp/$f $B/$f; done
 # RUN AS ROOT ON liftlab-gpu, passing the read-only analysis token:
 #   sudo ANALYSIS_TOKEN=site-A:<read-only-token> bash /tmp/apply_gpu.sh
 set -uo pipefail
 say(){ echo "[apply-gpu] $*"; }
 # --- staleness tell: the OLD script cannot print this. If you do NOT see this REV line and a
 #     'MainPID X -> Y' line at the end, you ran a cached /tmp copy — re-curl apply_gpu.sh. ---
-say "REV=restart-verify-4-envmerge+gpudoor  (restarts + asserts PID changed; MERGES env; installs gpu_door.py)"
+say "REV=restart-verify-5-watchdog  (restarts + asserts PID changed; MERGES env; installs gpu_door.py + gpu_watchdog.py)"
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo ANALYSIS_TOKEN=... bash $0"; exit 2; }
-for f in gpu_analyze.py counting.py gpu_door.py liftlab-gpu.service; do [ -f "/tmp/$f" ] || { echo "missing /tmp/$f"; exit 2; }; done
+for f in gpu_analyze.py counting.py gpu_door.py gpu_watchdog.py liftlab-gpu.service; do [ -f "/tmp/$f" ] || { echo "missing /tmp/$f"; exit 2; }; done
 : "${ANALYSIS_TOKEN:?pass ANALYSIS_TOKEN=site-A:<read-only-token> (minted on the cloud by apply_analysis.sh)}"
 LABUSER="${LABUSER:-$(ls -d /home/*/lab 2>/dev/null | head -1 | cut -d/ -f3)}"
 [ -n "$LABUSER" ] || { echo "could not find ~/lab; set LABUSER=<user>"; exit 2; }
@@ -26,13 +26,16 @@ MODEL="${MODEL:-$(ls "/home/$LABUSER/yolo11m.pt" 2>/dev/null || ls "$LABDIR"/yol
 APPDIR=/opt/liftlab-gpu
 say "user=$LABUSER venv=$VENVPY model=$MODEL"
 
-"$VENVPY" -m py_compile /tmp/gpu_analyze.py /tmp/counting.py /tmp/gpu_door.py || { say "python compile failed"; exit 1; }
+"$VENVPY" -m py_compile /tmp/gpu_analyze.py /tmp/counting.py /tmp/gpu_door.py /tmp/gpu_watchdog.py || { say "python compile failed"; exit 1; }
 "$VENVPY" -c "import torch,ultralytics,av,cv2; print('  torch',torch.__version__,'cuda',torch.cuda.is_available(),'| ultralytics',ultralytics.__version__)" \
   || { say "deps missing in ~/lab venv (need torch/ultralytics/av/cv2)"; exit 1; }
 install -d -o "$LABUSER" -g "$LABUSER" "$APPDIR"
 install -o "$LABUSER" -g "$LABUSER" -m 755 /tmp/gpu_analyze.py "$APPDIR/gpu_analyze.py"
 install -o "$LABUSER" -g "$LABUSER" -m 644 /tmp/counting.py "$APPDIR/counting.py"
 install -o "$LABUSER" -g "$LABUSER" -m 644 /tmp/gpu_door.py "$APPDIR/gpu_door.py"   # GPU_DOOR pass — else ModuleNotFoundError crash-loop
+# progress-based liveness. gpu_analyze degrades gracefully without it (logs "watchdog unavailable"),
+# so a missing file is not a crash-loop — but then the 5h44m-hang class is UNPROTECTED again.
+install -o "$LABUSER" -g "$LABUSER" -m 644 /tmp/gpu_watchdog.py "$APPDIR/gpu_watchdog.py"
 # token env (root-only) — MERGE, don't clobber: refresh ANALYSIS_TOKEN but PRESERVE every other key the
 # operator set (GPU_DOOR, DOOR_ROI_FRAME, PANEL_ROIS, DIGIT_CELLS, ARROW_CELL, ...). Atomic temp+mv.
 ENVF=/etc/liftlab-gpu.env
@@ -62,6 +65,15 @@ fi
 if [ -z "$NEWPID" ] || [ "$NEWPID" = 0 ] || [ "$NEWPID" = "$OLDPID" ]; then
   say "RESULT: FAIL — restart did NOT take (PID unchanged: $OLDPID -> $NEWPID). The OLD code is still running."
   say "  journalctl -u liftlab-gpu -n 40"; exit 1
+fi
+# The watchdog is the whole point of this rev — an install where it silently didn't arm leaves the
+# hang class unprotected while LOOKING deployed. Assert it announced itself in the journal.
+if journalctl -u liftlab-gpu --since -60s --no-pager 2>/dev/null | grep -q "gpu-watchdog.*armed:"; then
+  say "watchdog: ARMED (stall dump+exit active; kill -USR1 $NEWPID dumps stacks on demand)"
+else
+  say "RESULT: CHECK — process is live but the WATCHDOG DID NOT ARM (no '[gpu-watchdog] ... armed:' line)."
+  say "  The 5h44m-hang class is unprotected. Look for 'watchdog unavailable' in: journalctl -u liftlab-gpu -n 40"
+  exit 1
 fi
 say "RESULT: PASS — new process $NEWPID is live (old $OLDPID replaced)."
 say "  Follow: journalctl -u liftlab-gpu -f   (expect 'start:', 'frame WxH -> zones scaled', 'seg timing:', transit/REJECT lines)"
