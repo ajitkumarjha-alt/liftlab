@@ -902,7 +902,9 @@ def readtest(gw=None, cam=None, db_path=None):
     shift = int(os.environ.get("DOOR_SHIFT", "2"))
     margin = float(os.environ.get("DOOR_MARGIN", "0.05"))
     minsc = float(os.environ.get("DOOR_MIN_SCORE", "0.55"))
-    rdr = gd.FloorReader(tpl, dcells, acell[0], min_score=minsc, shift_search=shift, margin_min=margin)
+    rdr = gd.FloorReader(tpl, dcells, acell[0], min_score=minsc, shift_search=shift, margin_min=margin,
+                         blank_min=float(os.environ.get("DOOR_BLANK_MIN", "0.45")),
+                         shift_floor=float(os.environ.get("DOOR_SHIFT_FLOOR", "0.40")))
     dbp = db_path or os.environ.get("GATEWAY_DB", "/opt/liftlab-b3/cloud/gateway.db")
     if not os.path.exists(dbp):
         raise CalibError(f"gateway.db not found at {dbp} — set GATEWAY_DB")
