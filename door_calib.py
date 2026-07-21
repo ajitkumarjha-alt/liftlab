@@ -617,7 +617,8 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
                          "arrow_cell 'x,y,w,h' (within-panel px — run the cells step to measure them)")
     labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in kept]
     tpl, stats = gd.build_templates(labeled, dcells, acell[0], align=(align or os.environ.get("ALIGN", "right")),
-                                    min_examples=int(os.environ.get("MIN_GLYPH_EXAMPLES", "3")))
+                                    min_examples=int(os.environ.get("MIN_GLYPH_EXAMPLES", "3")),
+                                    exemplars=int(os.environ.get("GLYPH_EXEMPLARS", "3")))
     outp = out_path or os.environ.get("TEMPLATES_OUT", os.path.join(TEMPLATES_DIR, gw, f"{cam}.npz"))
     os.makedirs(os.path.dirname(outp), exist_ok=True)
     gd.save_templates(tpl, outp)

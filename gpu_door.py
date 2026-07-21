@@ -209,7 +209,16 @@ class FloorReader:
         self.glyph_labels = tuple(k for k in self.templates            # lit glyphs only (not arrow/blank/per-cell-blank)
                                   if k not in self.arrow_labels and k != self.blank_label
                                   and not (k.startswith(bpref) and k[len(bpref):].isdigit()))
-        self._tsz = next(iter(self.templates.values())).shape if self.templates else (16, 10)
+        t0 = next(iter(self.templates.values()), None)
+        self._tsz = tuple(int(x) for x in t0.shape[-2:]) if t0 is not None else (16, 10)   # last 2 dims (multi-exemplar)
+
+    @staticmethod
+    def _ncc(c, tmpl):
+        """NCC of a cell against a template that may be a (k,H,W) stack of EXPOSURE exemplars — take the
+        MAX (a real crop matches its own exposure's sharp exemplar, not a blurred all-exposure mean)."""
+        if getattr(tmpl, "ndim", 2) == 3:
+            return max(ncc(c, tmpl[j]) for j in range(tmpl.shape[0]))
+        return ncc(c, tmpl)
 
     def _match(self, cell_img, labels):
         import cv2
@@ -220,7 +229,7 @@ class FloorReader:
         for lab in labels:
             t = self.templates.get(lab)
             if t is not None:
-                s = ncc(c, t)
+                s = self._ncc(c, t)
                 if s > bs:
                     best, bs = lab, s
         return best, bs
@@ -237,7 +246,7 @@ class FloorReader:
         b0 = crop(panel_gray, base_cell)
         if b0.size == 0 or b0.shape[0] < 2 or b0.shape[1] < 2:
             return -2.0
-        return ncc(cv2.resize(b0, (self._tsz[1], self._tsz[0])), bt)
+        return self._ncc(cv2.resize(b0, (self._tsz[1], self._tsz[0])), bt)
 
     def _cell_align(self, panel_gray, base_cell, dx, dy, i):
         """Glyph-match quality of a cell for the shift objective — GLYPH-BEARING cells only. Glyphs are
@@ -252,7 +261,7 @@ class FloorReader:
         if (int(ci.max()) - int(ci.min())) < self.blank_range:
             return None                              # blank by contrast -> not glyph-bearing
         c = cv2.resize(ci, (self._tsz[1], self._tsz[0]))
-        gbest = max((ncc(c, self.templates[g]) for g in self.glyph_labels), default=-2.0)
+        gbest = max((self._ncc(c, self.templates[g]) for g in self.glyph_labels), default=-2.0)
         b = self._blank_at_zero(panel_gray, base_cell, i)   # blank judged at ZERO shift
         if b is not None and b >= gbest:
             return None                              # per-cell blank wins -> not glyph-bearing
@@ -303,7 +312,7 @@ class FloorReader:
             top1 = top2 = -2.0
             lab1 = lab2 = None                       # top-2 glyph matches -> the margin check
             for g in self.glyph_labels:
-                sc = ncc(c, self.templates[g])
+                sc = self._ncc(c, self.templates[g])
                 if sc > top1:
                     top2, lab2, top1, lab1 = top1, lab1, sc, g
                 elif sc > top2:
@@ -354,7 +363,7 @@ class FloorReader:
             if rec["contrast"] < self.blank_range:
                 rec["verdict"] = "blank(contrast)"; out["cells"].append(rec); continue
             c = cv2.resize(ci, (self._tsz[1], self._tsz[0]))
-            scored = sorted(((round(ncc(c, self.templates[g]), 3), g) for g in self.glyph_labels), reverse=True)
+            scored = sorted(((round(self._ncc(c, self.templates[g]), 3), g) for g in self.glyph_labels), reverse=True)
             rec["top"] = [[g, s] for s, g in scored[:3]]
             b = self._blank_at_zero(panel_gray, cell, i)   # blank judged at ZERO shift (static edge)
             rec["blank"] = round(b, 3) if b is not None else None
@@ -363,7 +372,7 @@ class FloorReader:
         ac = crop(panel_gray, acell)
         if ac.size and self.arrow_labels:
             cc = cv2.resize(ac, (self._tsz[1], self._tsz[0]))
-            out["arrow"] = [[a, round(ncc(cc, self.templates[a]), 3)] for a in self.arrow_labels]
+            out["arrow"] = [[a, round(self._ncc(cc, self.templates[a]), 3)] for a in self.arrow_labels]
         return out
 
     @staticmethod
@@ -484,8 +493,30 @@ def _label_to_glyphs(label):
     return glyphs
 
 
+def _cluster(crops, K):
+    """Up to K EXPOSURE exemplars for a glyph — k-means on the flattened crops (deterministic init). A
+    single blurry MEAN averages across exposure conditions until a real crop matches it poorly (a true G
+    scored 0.25 on the G-mean while matching the 6-mean at 0.72); per-exposure exemplars stay sharp and
+    the reader takes MAX over them. Returns a (k, H, W) stack (k <= K; k = n when few crops)."""
+    arrs = [np.asarray(c, np.float32) for c in crops]
+    shp = arrs[0].shape
+    X = np.stack([a.ravel() for a in arrs])
+    n = len(X)
+    if n <= K:
+        return X.reshape(n, *shp)
+    d0 = np.linalg.norm(X - X.mean(0), axis=1)                # spread the K seeds along the exposure axis
+    cen = X[np.argsort(d0)[np.linspace(0, n - 1, K).astype(int)]].copy()
+    for _ in range(8):
+        a = ((X[:, None, :] - cen[None, :, :]) ** 2).sum(-1).argmin(1)
+        newc = np.stack([X[a == k].mean(0) if np.any(a == k) else cen[k] for k in range(K)])
+        if np.allclose(newc, cen):
+            break
+        cen = newc
+    return cen.reshape(K, *shp)
+
+
 def build_templates(labeled_panels, digit_cells, arrow_cell, tsz=(16, 10),
-                    align="right", blank_label=BLANK, min_examples=3):
+                    align="right", blank_label=BLANK, min_examples=3, exemplars=3):
     """FIXED-CELL builder (no segmentation). labeled_panels: (gray panel, label_str). For each: parse
     the label -> floor chars + arrow, ALIGN the chars into the fixed digit_cells (right-aligned pads the
     LEFT cells with 'blank'), crop each cell BLINDLY and accumulate under its char (or 'blank'), crop
@@ -533,9 +564,10 @@ def build_templates(labeled_panels, digit_cells, arrow_cell, tsz=(16, 10),
         exempt = g.startswith(blank_label + "_") or g in ARROWS
         if not exempt and len(v) < min_examples:
             dropped[g] = len(v); continue
-        templates[g] = np.mean(v, axis=0)
-    return templates, {"used": used, "skipped": skipped, "dropped": dropped,
-                       "min_examples": min_examples, "glyphs": {g: len(v) for g, v in acc.items()}}
+        templates[g] = _cluster(v, exemplars)                # (k,H,W) exposure exemplars; reader maxes over them
+    return templates, {"used": used, "skipped": skipped, "dropped": dropped, "min_examples": min_examples,
+                       "exemplars": {g: int(t.shape[0]) for g, t in templates.items()},
+                       "glyphs": {g: len(v) for g, v in acc.items()}}
 
 
 def save_templates(templates, path):
