@@ -170,7 +170,7 @@ class FloorReader:
 
     def __init__(self, templates, digit_cells, arrow_cell, min_score=0.55, blank_range=40,
                  arrow_labels=ARROWS, blank_label=BLANK, shift_search=2, margin_min=0.05,
-                 blank_min=0.45, shift_floor=0.40):
+                 blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90):
         self.templates = {k: np.asarray(v, dtype=np.float32) for k, v in templates.items()}
         self.digit_cells = list(digit_cells)
         self.arrow_cell = arrow_cell
@@ -184,11 +184,15 @@ class FloorReader:
         # (HEVC eats the 1-2px middle-bar that separates 8/0, 6/G) — emit no_read, not a confident wrong
         # digit that poisons floor attribution. 0 disables. The tied candidates go into the event.
         self.margin_min = float(margin_min)
-        # BLANK confidence floor — DECOUPLED from the glyph min_score. A padding cell is BLANK when its
-        # per-cell blank beats every glyph AND clears this modest floor; requiring it to also clear the
-        # (higher) glyph min_score wrongly failed single-digit floors' tens cell (blank_1 ~0.58-0.80 beat
-        # junk glyphs but fell under min_score -> the whole panel died no_read).
+        # BLANK confidence floor for a DIM/DARK cell — decoupled from the glyph min_score so a single-
+        # digit floor's dim tens cell (blank ~0.58-0.80 beats junk glyphs 0.3-0.45) reads blank.
         self.blank_min = float(blank_min)
+        # ...BUT blank may only WIN in a cell that isn't clearly LIT (contrast < lit_range) OR whose blank
+        # is EXCEPTIONAL (>= blank_strong, i.e. the static door edge ~1.0). A LIT cell (a real digit is
+        # present, contrast >= lit_range) with a weak glyph + moderate blank must NOT be blanked — that
+        # DELETES the digit (a confident misread, worse than an honest no_read).
+        self.lit_range = float(lit_range)
+        self.blank_strong = float(blank_strong)
         # SHIFT quality floor — on a low-contrast frame the shift search can lock onto a junk match at a
         # nonzero shift and misalign every cell. If the best shift's glyph-bearing cells don't average at
         # least this NCC, don't trust it: fall back to (0,0) (the read then honestly blanks / no_reads).
@@ -305,11 +309,15 @@ class FloorReader:
                 elif sc > top2:
                     top2, lab2 = sc, g
             # PER-CELL blank at ZERO shift (STATIC frame content — the door edge doesn't jitter with the
-            # display). Judging it at the digits' shift misaligned it and killed every nonzero-shift read.
-            # Blank wins if it beats every glyph AND clears blank_min (NOT the glyph min_score — decoupled).
+            # display; judging it at the digits' shift killed every nonzero-shift read). Blank may WIN only
+            # if it beats every glyph AND either the cell isn't clearly LIT (dim/dark padding: contrast <
+            # lit_range, blank >= blank_min) OR its blank is EXCEPTIONAL (>= blank_strong, the door edge).
+            # A LIT cell (contrast >= lit_range) with a weak glyph + moderate blank -> no_read, NOT blank
+            # (blanking a lit cell deletes the digit -> a confident misread, worse than an honest gap).
+            lit = (int(ci.max()) - int(ci.min())) >= self.lit_range
             b = self._blank_at_zero(panel_gray, cell, i)
-            if b is not None and b >= max(top1, self.blank_min):
-                continue                             # blank explains this cell at least as well -> BLANK
+            if b is not None and b >= top1 and (b >= self.blank_strong or (not lit and b >= self.blank_min)):
+                continue                             # blank explains this cell -> BLANK
             if lab1 is None or top1 < self.min_score:
                 return _out(None, None, None, "no_read")   # a lit cell we can't confidently name
             # MARGIN CHECK: top-2 too close -> AMBIGUOUS (HEVC ate the 8-vs-0 / 6-vs-G middle bar). A gap
@@ -601,14 +609,15 @@ class DoorFloorEngine:
 
     def __init__(self, templates, door_roi, panels, min_score=0.55, blank_range=40,
                  door_tracker=None, floor_tracker=None, shift_search=2, margin_min=0.05,
-                 blank_min=0.45, shift_floor=0.40):
+                 blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90):
         if not panels:
             raise ValueError("DoorFloorEngine needs at least one panel (panel_roi, digit_cells, arrow_cell)")
         self.door_roi = tuple(door_roi)
         self.readers = [(tuple(proi), FloorReader(templates, dcells, acell, min_score=min_score,
                                                   blank_range=blank_range, shift_search=shift_search,
                                                   margin_min=margin_min, blank_min=blank_min,
-                                                  shift_floor=shift_floor))
+                                                  shift_floor=shift_floor, lit_range=lit_range,
+                                                  blank_strong=blank_strong))
                         for (proi, dcells, acell) in panels]
         self.door = door_tracker if door_tracker is not None else DoorTracker()
         self.floor = floor_tracker if floor_tracker is not None else FloorTracker()

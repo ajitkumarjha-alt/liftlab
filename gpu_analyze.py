@@ -70,8 +70,10 @@ DOOR_MIN_SCORE = float(os.environ.get("DOOR_MIN_SCORE", "0.55"))
 DOOR_BLANK_RANGE = int(os.environ.get("DOOR_BLANK_RANGE", "40"))
 DOOR_SHIFT = int(os.environ.get("DOOR_SHIFT", "2"))            # rigid ±Npx cell-alignment search (jitter absorb)
 DOOR_MARGIN = float(os.environ.get("DOOR_MARGIN", "0.05"))    # top-2 glyph gap < this -> ambiguous no_read
-DOOR_BLANK_MIN = float(os.environ.get("DOOR_BLANK_MIN", "0.45"))   # blank confidence floor (decoupled from min_score)
+DOOR_BLANK_MIN = float(os.environ.get("DOOR_BLANK_MIN", "0.45"))   # blank floor for a DIM cell (not lit)
 DOOR_SHIFT_FLOOR = float(os.environ.get("DOOR_SHIFT_FLOOR", "0.40"))  # reject a shift whose cells avg below this
+DOOR_LIT_RANGE = float(os.environ.get("DOOR_LIT_RANGE", "120"))   # contrast >= this = LIT digit; blank must not delete it
+DOOR_BLANK_STRONG = float(os.environ.get("DOOR_BLANK_STRONG", "0.90"))  # blank this high wins even in a lit cell (edge)
 DOOR_STRIDE = max(1, int(os.environ.get("DOOR_STRIDE", "2")))   # run the door pass every Nth decoded frame
 DOOR_HB_S = float(os.environ.get("DOOR_HB_S", "60"))           # emit a row at least this often (liveness)
 FLOORCHECK_PER_HR = int(os.environ.get("FLOORCHECK_PER_HR", "30"))   # sampled reads+crop -> /floorcheck
@@ -336,7 +338,8 @@ def build_door_engine(prefetched_tpl=None):
         ft = gd.FloorTracker(floor_order=FLOOR_ORDER or None)
         eng = gd.DoorFloorEngine(tpl, droi, panels, min_score=DOOR_MIN_SCORE, blank_range=DOOR_BLANK_RANGE,
                                  floor_tracker=ft, shift_search=DOOR_SHIFT, margin_min=DOOR_MARGIN,
-                                 blank_min=DOOR_BLANK_MIN, shift_floor=DOOR_SHIFT_FLOOR)
+                                 blank_min=DOOR_BLANK_MIN, shift_floor=DOOR_SHIFT_FLOOR,
+                                 lit_range=DOOR_LIT_RANGE, blank_strong=DOOR_BLANK_STRONG)
     except Exception as e:
         return None, f"geometry/engine error: {type(e).__name__}: {str(e)[:80]}"
     geom_sig = _hash8("|".join([DOOR_ROI_FRAME, PANEL_ROIS, DIGIT_CELLS, ARROW_CELL,
