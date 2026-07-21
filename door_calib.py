@@ -907,7 +907,10 @@ def readtest(gw=None, cam=None, db_path=None):
                          blank_min=float(os.environ.get("DOOR_BLANK_MIN", "0.45")),
                          shift_floor=float(os.environ.get("DOOR_SHIFT_FLOOR", "0.40")),
                          lit_range=float(os.environ.get("DOOR_LIT_RANGE", "120")),
-                         blank_strong=float(os.environ.get("DOOR_BLANK_STRONG", "0.90")))
+                         blank_strong=float(os.environ.get("DOOR_BLANK_STRONG", "0.90")),
+                         blank_lit_margin=float(os.environ.get("DOOR_BLANK_LIT_MARGIN", "0.15")),
+                         confuse_band=float(os.environ.get("DOOR_CONFUSE_BAND", "0")),
+                         disc_min=float(os.environ.get("DOOR_DISC_MIN", "0.10")))
     dbp = db_path or os.environ.get("GATEWAY_DB", "/opt/liftlab-b3/cloud/gateway.db")
     if not os.path.exists(dbp):
         raise CalibError(f"gateway.db not found at {dbp} — set GATEWAY_DB")

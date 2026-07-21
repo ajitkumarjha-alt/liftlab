@@ -170,7 +170,8 @@ class FloorReader:
 
     def __init__(self, templates, digit_cells, arrow_cell, min_score=0.55, blank_range=40,
                  arrow_labels=ARROWS, blank_label=BLANK, shift_search=2, margin_min=0.05,
-                 blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90):
+                 blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90,
+                 blank_lit_margin=0.15, confuse_band=0.0, disc_min=0.10):
         self.templates = {k: np.asarray(v, dtype=np.float32) for k, v in templates.items()}
         self.digit_cells = list(digit_cells)
         self.arrow_cell = arrow_cell
@@ -193,6 +194,15 @@ class FloorReader:
         # DELETES the digit (a confident misread, worse than an honest no_read).
         self.lit_range = float(lit_range)
         self.blank_strong = float(blank_strong)
+        # In a LIT cell an exceptional blank (the cell0 door edge) may still win, but ONLY if it beats
+        # the glyph by this margin — else a blank_1 that barely edges a lit '6' (0.907 vs 0.83) would
+        # delete the digit (63 -> 3). The door edge clears it easily (blank ~1.0 >> a weak glyph).
+        self.blank_lit_margin = float(blank_lit_margin)
+        # CONFUSABLE-PAIR diff-region tiebreak (opt-in; 0 = off). When top-2 glyph scores are within
+        # confuse_band, decide between them on the pixels where the two win-exemplars DIFFER, not whole
+        # cell — for a genuine pair (3/5, 8/6) that exemplars sharpened so the margin no longer flags.
+        self.confuse_band = float(confuse_band)
+        self.disc_min = float(disc_min)
         # SHIFT quality floor — on a low-contrast frame the shift search can lock onto a junk match at a
         # nonzero shift and misalign every cell. If the best shift's glyph-bearing cells don't average at
         # least this NCC, don't trust it: fall back to (0,0) (the read then honestly blanks / no_reads).
@@ -219,6 +229,24 @@ class FloorReader:
         if getattr(tmpl, "ndim", 2) == 3:
             return max(ncc(c, tmpl[j]) for j in range(tmpl.shape[0]))
         return ncc(c, tmpl)
+
+    @staticmethod
+    def _best_exemplar(c, tmpl):
+        if getattr(tmpl, "ndim", 2) == 3:
+            return tmpl[max(range(tmpl.shape[0]), key=lambda k: ncc(c, tmpl[k]))]
+        return tmpl
+
+    def _discriminant(self, c, lab1, lab2):
+        """Sign/strength of the cell along the DIFFERENCE of the two glyphs' best exemplars: correlation
+        of the (mean-subtracted) cell with (e1 - e2). >0 = more like lab1 on the discriminating pixels;
+        <0 = more like lab2. Concentrates the decision on where the pair differs (the 1-2px HEVC eats),
+        instead of the shared bulk that whole-cell NCC is dominated by."""
+        e1 = self._best_exemplar(c, self.templates[lab1]).astype(np.float32).ravel()
+        e2 = self._best_exemplar(c, self.templates[lab2]).astype(np.float32).ravel()
+        d = e1 - e2; d = d - d.mean()
+        cc = c.astype(np.float32).ravel(); cc = cc - cc.mean()
+        nd = float(np.sqrt((d * d).sum())); ncr = float(np.sqrt((cc * cc).sum()))
+        return float((cc * d).sum() / (nd * ncr)) if nd > 1e-6 and ncr > 1e-6 else 0.0
 
     def _match(self, cell_img, labels):
         import cv2
@@ -325,13 +353,29 @@ class FloorReader:
             # (blanking a lit cell deletes the digit -> a confident misread, worse than an honest gap).
             lit = (int(ci.max()) - int(ci.min())) >= self.lit_range
             b = self._blank_at_zero(panel_gray, cell, i)
-            if b is not None and b >= top1 and (b >= self.blank_strong or (not lit and b >= self.blank_min)):
+            # BLANK wins iff it beats every glyph AND: (dim cell) blank >= blank_min; OR (LIT cell) blank
+            # is exceptional (the door edge) AND beats the glyph by blank_lit_margin — never delete a lit
+            # digit on a blank that merely edges it (0.907 vs 0.83 = a deleted '6', worse than no_read).
+            if b is not None and b >= top1 and (
+                    (not lit and b >= self.blank_min)
+                    or (lit and b >= self.blank_strong and b >= top1 + self.blank_lit_margin)):
                 continue                             # blank explains this cell -> BLANK
             if lab1 is None or top1 < self.min_score:
                 return _out(None, None, None, "no_read")   # a lit cell we can't confidently name
-            # MARGIN CHECK: top-2 too close -> AMBIGUOUS (HEVC ate the 8-vs-0 / 6-vs-G middle bar). A gap
-            # is honest; a confident 40-that-was-48 poisons attribution. Emit no_read + both candidates.
-            if self.margin_min > 0 and lab2 is not None and (top1 - top2) < self.margin_min:
+            # CONFUSABLE-PAIR diff-region tiebreak (opt-in, confuse_band>0): whole-cell NCC can pick the
+            # wrong one of a similar pair (3/5, 8/6) that exemplars sharpened; re-decide on the pixels
+            # where the two win-exemplars DIFFER. proj<0 -> the OTHER glyph; inconclusive + a true near-
+            # tie -> ambiguous.
+            if self.confuse_band > 0 and lab2 is not None and (top1 - top2) < self.confuse_band:
+                proj = self._discriminant(c, lab1, lab2)
+                if proj < -self.disc_min:
+                    lab1, top1, lab2, top2 = lab2, top2, lab1, top1   # difference region overrules
+                elif abs(proj) < self.disc_min and (top1 - top2) < self.margin_min:
+                    return _out(None, None, round(top1, 3), "ambiguous",
+                                candidates=[[lab1, round(top1, 3)], [lab2, round(top2, 3)]])
+            # MARGIN CHECK: top-2 too close -> AMBIGUOUS (HEVC ate the discriminating segment). A gap is
+            # honest; a confident 40-that-was-48 poisons attribution. Emit no_read + both candidates.
+            elif self.margin_min > 0 and lab2 is not None and (top1 - top2) < self.margin_min:
                 return _out(None, None, round(top1, 3), "ambiguous",
                             candidates=[[lab1, round(top1, 3)], [lab2, round(top2, 3)]])
             scores.append(top1)
@@ -641,7 +685,8 @@ class DoorFloorEngine:
 
     def __init__(self, templates, door_roi, panels, min_score=0.55, blank_range=40,
                  door_tracker=None, floor_tracker=None, shift_search=2, margin_min=0.05,
-                 blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90):
+                 blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90,
+                 blank_lit_margin=0.15, confuse_band=0.0, disc_min=0.10):
         if not panels:
             raise ValueError("DoorFloorEngine needs at least one panel (panel_roi, digit_cells, arrow_cell)")
         self.door_roi = tuple(door_roi)
@@ -649,7 +694,8 @@ class DoorFloorEngine:
                                                   blank_range=blank_range, shift_search=shift_search,
                                                   margin_min=margin_min, blank_min=blank_min,
                                                   shift_floor=shift_floor, lit_range=lit_range,
-                                                  blank_strong=blank_strong))
+                                                  blank_strong=blank_strong, blank_lit_margin=blank_lit_margin,
+                                                  confuse_band=confuse_band, disc_min=disc_min))
                         for (proi, dcells, acell) in panels]
         self.door = door_tracker if door_tracker is not None else DoorTracker()
         self.floor = floor_tracker if floor_tracker is not None else FloorTracker()
