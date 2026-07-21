@@ -84,6 +84,22 @@ if [ -z "${NVR_HOST:-}" ] && [ -r /etc/liftlab-agent.env ]; then set -a; . /etc/
 CLOUD="${CLOUD_URL%/}"; GW="${GW:-${GATEWAY_ID:-site-A}}"
 command -v ffmpeg >/dev/null || { say "ffmpeg missing"; exit 1; }
 
+# ---------- THE ffmpeg command, in exactly one place ----------
+# Both launch() and --selftest build the command from here, so the deploy gate cannot test a command
+# that differs from the one that actually runs. That drift is what let a CLI parse error ship: the
+# dry-run stub accepted any flags, so it verified control flow and proved nothing about the arguments.
+# $RWTO_ARG / $MREQ_ARG are intentionally UNQUOTED — each must word-split into separate argv entries
+# ("-timeout" "30000000"), and an empty one must vanish rather than become an empty argument.
+ffmpeg_args(){   # $1=input url  $2=output base url  -> sets FFARGS[]
+  FFARGS=(-nostdin -hide_banner -loglevel error
+          -rtsp_transport tcp $RWTO_ARG -i "$1" -an -c:v copy
+          -f hls -hls_time "$HLS_TIME" -hls_list_size 5
+          -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts
+          -method PUT -http_persistent 1 $MREQ_ARG
+          -headers "Authorization: Bearer ${GATEWAY_TOKEN}"$'\r\n'
+          -hls_segment_filename "$2/seg%03d.ts" "$2/index.m3u8")
+}
+
 # ---------- probe: does THIS ffmpeg accept the read-timeout option we want to pass? ----------
 # Runs the real binary against a dead local port with the candidate option. A rejected option prints
 # "Option not found" and exits before any connection is attempted; an accepted one gets as far as
@@ -100,6 +116,12 @@ ffmpeg_accepts(){   # $1 = candidate option words, e.g. "-stimeout 30000000"
 }
 RWTO_ARG=""
 if [ "${RW_TIMEOUT_US}" != 0 ]; then
+  # ORDER MATTERS, and it is not arbitrary. ffmpeg renamed the rtsp demuxer's socket-I/O timeout
+  # `stimeout` -> `timeout` in 6.0 (the old `timeout`, which meant "wait for an incoming connection"
+  # in listen mode, became `listen_timeout`). So `-stimeout` identifies a <=5.x build unambiguously,
+  # `-timeout` is the >=6.x spelling, and `-rw_timeout` — the one that broke everything on
+  # 7.1.5-0+deb13u1+rpt1 — is a protocol/AVIO option the rtsp demuxer never had. It is LAST, and only
+  # reachable on some hypothetical build that accepts it. Probing beats remembering.
   for _cand in "-stimeout ${RW_TIMEOUT_US}" "-timeout ${RW_TIMEOUT_US}" "-rw_timeout ${RW_TIMEOUT_US}"; do
     if ffmpeg_accepts "$_cand"; then RWTO_ARG="$_cand"; break; fi
   done
@@ -112,7 +134,33 @@ if [ "${RW_TIMEOUT_US}" != 0 ]; then
     say "  A wedged RTSP read will now be caught by the segment-age stall detector instead (~60-90s)."
   fi
 else
-  say "rtsp read timeout: DISABLED by RELAY_RW_TIMEOUT_US=0"
+  # NAME THE KNOB. The previous text said "set 0 to disable" without saying 0 in WHAT, and that cost a
+  # debugging round. Every message about this option now states the variable that controls it.
+  say "rtsp read timeout: DISABLED because RELAY_RW_TIMEOUT_US=0 is set in the environment."
+  say "  The anti-wedge is OFF. Since the option is now PROBED (not hardcoded), the reason this was"
+  say "  set — '-rw_timeout' killing ffmpeg 7.1.5 — no longer applies: unset RELAY_RW_TIMEOUT_US to"
+  say "  restore it and the probe will pick '-timeout'. Wedges remain covered by the segment-age check."
+fi
+
+# ---------- --selftest: parse-check the REAL command, launch nothing ----------
+# The deploy gate (apply_relay.sh) calls this. It builds the exact FFARGS that launch() will use —
+# including the HLS/PUT output options, not just the input side — and runs ffmpeg against dead local
+# ports. Anything that fails to PARSE fails here, at deploy time, instead of taking all 7 streams down.
+if [ "${1:-}" = "--selftest" ]; then
+  ffmpeg_args "rtsp://127.0.0.1:9/selftest" "http://127.0.0.1:9/selftest"
+  say "selftest: ffmpeg $(ffmpeg -hide_banner -version 2>/dev/null | head -1 | cut -d' ' -f1-3)"
+  say "selftest: full command -> ffmpeg ${FFARGS[*]}"
+  out=$(timeout 15 ffmpeg "${FFARGS[@]}" 2>&1)
+  case "$out" in
+    *"Option not found"*|*"Unrecognized option"*|*"Invalid argument"*|*"Error splitting the argument"*)
+      say "SELFTEST FAILED — ffmpeg rejects this command line:"
+      printf '%s\n' "$out" | head -10 | sed 's/^/    /'
+      exit 1 ;;
+  esac
+  # Reaching a connection/protocol error means the CLI parsed — which is all this gate can prove
+  # without a live NVR, and exactly the failure class that shipped.
+  say "SELFTEST PASSED — command parses; ffmpeg got as far as the (deliberately dead) endpoints."
+  exit 0
 fi
 USER_ENC=$(python3 -c "import os,urllib.parse as u;print(u.quote(os.environ.get('NVR_USER','admin'),safe=''))")
 PASS_ENC=$(python3 -c "import os,urllib.parse as u;print(u.quote(os.environ.get('NVR_PASS',os.environ.get('NVR_PASSWORD','')),safe=''))")
@@ -161,13 +209,8 @@ launch(){ # $1=slot -> (re)start the direct-PUT ffmpeg for that cam, echo pid
   local i=$1 ch=${CHANS[$i]} cam=${CAMS[$i]}
   local url="rtsp://${USER_ENC}:${PASS_ENC}@${NVR_HOST}:554/${ch}/${STREAM}?transmode=unicast&profile=vam"
   local base="$CLOUD/api/gw/$GW/live/$cam"
-  ffmpeg -nostdin -hide_banner -loglevel error \
-    -rtsp_transport tcp $RWTO_ARG -i "$url" -an -c:v copy \
-    -f hls -hls_time "$HLS_TIME" -hls_list_size 5 -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts \
-    -method PUT -http_persistent 1 $MREQ_ARG \
-    -headers "Authorization: Bearer ${GATEWAY_TOKEN}"$'\r\n' \
-    -hls_segment_filename "$base/seg%03d.ts" "$base/index.m3u8" \
-    >"/tmp/relay_soak_${cam}.log" 2>&1 &
+  ffmpeg_args "$url" "$base"
+  ffmpeg "${FFARGS[@]}" >"/tmp/relay_soak_${cam}.log" 2>&1 &
   echo $!
 }
 

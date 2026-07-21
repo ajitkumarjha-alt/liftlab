@@ -14,7 +14,7 @@ UNIT=/etc/systemd/system/liftlab-relay.service
 ERA=/home/askjitk/liftlab-watch/WATCH_ERA.md
 CSV=/home/askjitk/liftlab-watch/relay_soak.csv
 say(){ echo "[apply-relay] $*"; }
-say "REV=dumb-streamer-2  (probes the rtsp timeout option; MERGES unit Environment= keys)"
+say "REV=dumb-streamer-3  (real-ffmpeg parse gate; probed rtsp timeout; MERGES unit env)"
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
 [ -f /tmp/relay_soak.sh ] || { echo "missing /tmp/relay_soak.sh"; exit 2; }
 [ -f /tmp/liftlab-relay.service ] || { echo "missing /tmp/liftlab-relay.service"; exit 2; }
@@ -25,6 +25,23 @@ bash -n /tmp/relay_soak.sh || { say "relay_soak.sh syntax error — aborting"; e
 # /tmp copy can never quietly reinstate the thing that cost 22h.
 if grep -nE '^[^#]*(watch_local|door_fps\(|GUARD_TRIP)' /tmp/relay_soak.sh; then
   say "ABORT: /tmp/relay_soak.sh still references the watch/door guard (lines above) — stale copy?"; exit 1
+fi
+
+# ---------- CLI PARSE GATE (runs before ANY mutation) ----------
+# A bad ffmpeg option killed all 7 streams for an hour and `bash -n` cannot see it: the command is
+# only assembled at runtime, and the earlier dry-run stubbed ffmpeg with something that accepted any
+# flags. So ask the REAL binary, using the REAL command the relay builds (--selftest shares
+# ffmpeg_args with launch(), so the gate and the launcher cannot drift apart).
+say "ffmpeg: $(ffmpeg -hide_banner -version 2>/dev/null | head -1 || echo MISSING)"
+say "rtsp demuxer timeout options this build actually has:"
+if ! ffmpeg -hide_banner -h demuxer=rtsp 2>/dev/null \
+     | grep -E '^[[:space:]]+-(stimeout|timeout|listen_timeout|rw_timeout)\b' | sed 's/^/    /'; then
+  say "    (none found — the relay will stream without a read timeout and say so)"
+fi
+if ! bash /tmp/relay_soak.sh --selftest; then
+  say "ABORT: the relay's ffmpeg command does not PARSE on this box — nothing installed, nothing"
+  say "  stopped, relay left exactly as it is. Fix the command before deploying."
+  exit 1
 fi
 
 # ---------- 1. retire the door watch ----------
@@ -112,6 +129,14 @@ for k in RELAY_DOOR_FLOOR RELAY_DOOR_STRIKES RELAY_DOOR_MARGIN RELAY_DOOR_ABS_FL
   grep -q "^${k}=" /etc/liftlab-agent.env 2>/dev/null && \
     say "NOTE: /etc/liftlab-agent.env still sets $k — now UNREAD (door guard deleted); safe to remove."
 done
+# The workaround that got the relay green is now obsolete AND costly: RELAY_RW_TIMEOUT_US=0 disables
+# the PROBE as well as the option, so the anti-wedge stays off for a reason that no longer applies.
+if grep -qE '^RELAY_RW_TIMEOUT_US=0' /etc/liftlab-agent.env 2>/dev/null \
+   || grep -qE '^Environment=RELAY_RW_TIMEOUT_US=0' "$UNIT" 2>/dev/null; then
+  say "NOTE: RELAY_RW_TIMEOUT_US=0 is still set — the emergency workaround for '-rw_timeout' killing"
+  say "  ffmpeg 7.1.5. The option is PROBED now, so removing that key restores the anti-wedge and the"
+  say "  relay will select '-timeout' instead. Left in place — that is your call, not this script's."
+fi
 systemctl daemon-reload
 systemctl enable liftlab-relay >/dev/null 2>&1 || true
 systemctl restart liftlab-relay
