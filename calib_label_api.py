@@ -113,6 +113,7 @@ _PAGE = r"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport c
 header{padding:10px 16px;border-bottom:1px solid var(--line);background:var(--card);display:flex;gap:14px;align-items:baseline;flex-wrap:wrap}
 h1{font:600 15px var(--mono);margin:0}
 .pill{font:11px var(--mono);padding:2px 8px;border-radius:10px;background:var(--line);color:var(--mut)}
+a.pill{text-decoration:none;color:#4c8bf5}
 .wrap{max-width:520px;margin:16px auto;padding:0 14px;text-align:center}
 .imgbox{background:#000;border:1px solid var(--line);border-radius:10px;padding:10px;display:inline-block}
 img{image-rendering:pixelated;height:62vh;max-height:560px;width:auto;display:block}
@@ -133,6 +134,7 @@ kbd{font:11px var(--mono);background:var(--line);border-radius:4px;padding:1px 5
   <span class=pill id=pos>—</span>
   <span class=pill id=prog>—</span>
   <span class=pill id=doneflag></span>
+  <a class=pill href="/calib-roi/__GW__/__CAM__">← draw ROIs</a>
 </header>
 <div class=wrap>
   <div class=imgbox><img id=crop alt="crop"></div>

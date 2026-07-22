@@ -128,13 +128,39 @@ def _parse_cells(s):
     return out
 
 
-def _panel_rois():
+def _roi_json(gw=None, cam=None):
+    """The /calib-roi wizard's drawn boxes: {door_roi_frame:[x,y,w,h], panel_rois:[[x,y,w,h],...]}
+    in FRAME px. Read ONLY when the corresponding env is absent — env still wins, so ch29's
+    established flow is byte-for-byte unchanged. Missing/corrupt file => {} (never raises: a
+    calibration aid must not break a run that was configured by env)."""
+    try:
+        v = json.loads((_calib_dir(gw or GW, cam or CAM) / "roi.json").read_text())
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _panel_rois(gw=None, cam=None):
+    """Panel ROIs with an explicit precedence: env > roi.json > built-in default.
+
+    The built-in default is CH29's geometry. On any other camera it is not a default, it is another
+    lift's panel — and it fails as quietly bad OCR rather than as an error. So the source is returned
+    alongside the boxes and surfaced by render_rois; 'default' on a new camera means STOP.
+    """
+    env = os.environ.get("PANEL_ROIS", "")
+    if env:
+        src = "PANEL_ROIS env"
+    else:
+        drawn = _roi_json(gw, cam).get("panel_rois")
+        if drawn:
+            return [tuple(int(v) for v in p) for p in drawn], "roi.json (/calib-roi wizard)"
+        env, src = PANEL_ROIS_DEFAULT, "BUILT-IN DEFAULT (ch29 geometry — wrong for any other camera)"
     out = []
-    for part in os.environ.get("PANEL_ROIS", PANEL_ROIS_DEFAULT).split(";"):
+    for part in env.split(";"):
         part = part.strip()
         if part:
             out.append(tuple(int(v) for v in part.split(",")))
-    return out
+    return out, src
 
 
 # The /dev/shm live ring rotates in SECONDS. ANY glob-then-stat/read races: a .ts globbed a moment ago
@@ -320,9 +346,9 @@ def panelcheck(gw=None, cam=None, n=8, ref=55, outdir=None):
     import cv2
     gwid = gw or GW; cam = cam or CAM
     outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
-    prois = _panel_rois()
+    prois, _psrc = _panel_rois(gwid, cam)
     if not prois:
-        raise CalibError("no PANEL_ROIS set")
+        raise CalibError("no PANEL_ROIS set, no roi.json — draw the boxes at /calib-roi/{}/{}".format(gwid, cam))
     segs = _live_segs(gwid, cam)                     # newest-first, race-hardened (ring rotates in seconds)
     if not segs:
         raise CalibError(f"no live segments in {LIVE_DIR / gwid / cam} (ring empty / relay down)")
@@ -469,25 +495,37 @@ def propose_cells(gw=None, cam=None, outdir=None, anchors=None, anchor_crop=None
     return result
 
 
-def _resolve_geometry(fr, door_roi_frame=None, panel_rois=None):
-    """(door_roi, dsrc, panel_rois) for a decoded frame. door_roi_frame='x,y,w,h' (str or seq) is frame
-    px used DIRECTLY (nudged onto the leaf); else the calib-space DOOR_ROI is scaled (lands on the wall)."""
+def _resolve_geometry(fr, door_roi_frame=None, panel_rois=None, gw=None, cam=None):
+    """(door_roi, dsrc, panel_rois, psrc) for a decoded frame.
+
+    Door precedence: explicit arg > DOOR_ROI_FRAME env > roi.json (/calib-roi wizard) > the scaled
+    calib-space DOOR_ROI, which is known to land on the WALL rather than the leaf and is therefore
+    reported as wrong rather than used quietly."""
     H, W = fr.shape[:2]
-    drf = door_roi_frame if door_roi_frame is not None else DOOR_ROI_FRAME
+    drf = door_roi_frame if door_roi_frame is not None else (DOOR_ROI_FRAME or None)
+    dsrc = None
+    if drf:
+        dsrc = f"DOOR_ROI_FRAME={{}}"
+    else:
+        drawn = _roi_json(gw, cam).get("door_roi_frame")
+        if drawn:
+            drf, dsrc = drawn, "roi.json (/calib-roi wizard)={}"
     if drf:
         seq = drf.split(",") if isinstance(drf, str) else drf
         droi = tuple(int(v) for v in seq)
-        dsrc = f"DOOR_ROI_FRAME={droi}"
+        dsrc = dsrc.format(droi) if "{}" in dsrc else dsrc
     else:
         droi = gd.scale_roi(DOOR_ROI, CALIB_WH, (W, H))
-        dsrc = f"scaled from calib {DOOR_ROI} -> {droi}  (WRONG surface: set door_roi_frame to the leaf)"
+        dsrc = f"scaled from calib {DOOR_ROI} -> {droi}  (WRONG surface: draw the leaf at /calib-roi)"
     if panel_rois is None:
-        prois = _panel_rois()
+        prois, psrc = _panel_rois(gw, cam)
     elif isinstance(panel_rois, str):
         prois = [tuple(int(v) for v in part.split(",")) for part in panel_rois.split(";") if part.strip()]
+        psrc = "explicit argument"
     else:
         prois = [tuple(p) for p in panel_rois]
-    return droi, dsrc, prois
+        psrc = "explicit argument"
+    return droi, dsrc, prois, psrc
 
 
 def _as_cells(v, envkey):
@@ -512,7 +550,7 @@ def render_rois(gw=None, cam=None, door_roi_frame=None, panel_rois=None):
     if fr is None:
         raise CalibError(f"no frame: no segments in {LIVE_DIR/gw/cam} and HTTP fallback empty")
     H, W = fr.shape[:2]
-    droi, dsrc, prois = _resolve_geometry(fr, door_roi_frame, panel_rois)
+    droi, dsrc, prois, psrc = _resolve_geometry(fr, door_roi_frame, panel_rois, gw, cam)
     ann = _frame_grid(gd.overlay_rois(fr, [tuple(droi)] + list(prois),
                                       ["door"] + [f"p{i}" for i in range(len(prois))]))
     cv2.imwrite(str(outdir / "_calib_frame.jpg"), ann)
@@ -523,7 +561,7 @@ def render_rois(gw=None, cam=None, door_roi_frame=None, panel_rois=None):
     artifacts = [_url(gw, cam, "_calib_frame.jpg"), _url(gw, cam, "_calib_door.jpg")] + \
                 [_url(gw, cam, f"_calib_p{i}.jpg") for i in range(len(prois))]
     result = {"gw": gw, "cam": cam, "frame_wh": [W, H], "door_roi": list(droi), "door_src": dsrc,
-              "panels": [list(p) for p in prois], "artifacts": artifacts}
+              "panels": [list(p) for p in prois], "panel_src": psrc, "artifacts": artifacts}
     return _write_result(outdir, "_calib_rois.json", result)
 
 
@@ -539,7 +577,7 @@ def collect_crops(gw=None, cam=None, nframes=40, fresh=False, door_roi_frame=Non
     fr0 = newest_frame()
     if fr0 is None:
         raise CalibError(f"no frame: no segments in {LIVE_DIR/gw/cam} and HTTP fallback empty")
-    droi, _dsrc, prois = _resolve_geometry(fr0, door_roi_frame, panel_rois)
+    droi, _dsrc, prois, _psrc = _resolve_geometry(fr0, door_roi_frame, panel_rois, gw, cam)
     existing = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
     if fresh:
         for gp in existing:
