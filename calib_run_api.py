@@ -36,6 +36,9 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
 CALIB_DIR = Path(os.environ.get("CALIB_DIR", "/var/lib/liftlab/calib"))
+# The --build output lands here. Resolved the SAME way door_calib resolves it, so the runner and
+# the job cannot disagree about which tree needs to be writable.
+TEMPLATES_DIR = Path(os.environ.get("TEMPLATES_DIR", "/var/lib/liftlab/templates"))
 _SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 JOB_TIMEOUT_S = float(os.environ.get("CALIB_JOB_TIMEOUT_S", "1800"))   # --collect 60 is ~2s/frame
 MAX_LINES = int(os.environ.get("CALIB_JOB_MAX_LINES", "4000"))
@@ -74,6 +77,21 @@ def _safe(*p):
             raise HTTPException(400, "bad name")
 
 
+def _unwritable():
+    """Directories the job will write that this process's user cannot. Checked BEFORE launching, so
+    a permissions problem shows on the button as a reason instead of surfacing as a PermissionError
+    traceback three minutes into a Build. The CLI era ran door_calib under sudo, so these trees are
+    routinely root-owned while the buttons run as the service user."""
+    bad = []
+    for d in (CALIB_DIR, TEMPLATES_DIR):
+        probe = d
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent          # a dir the job will CREATE needs a writable parent
+        if not os.access(probe, os.W_OK | os.X_OK):
+            bad.append(str(d))
+    return bad
+
+
 def _runner():
     """(python, script, reason). Resolved once per call so a fixed unit takes effect on restart
     without a code change."""
@@ -84,6 +102,15 @@ def _runner():
                             "runs door_calib (this app's venv deliberately has no cv2)")
     if not sc:
         return None, None, ("door_calib.py not found — set DOOR_CALIB_SCRIPT to its path")
+    bad = _unwritable()
+    if bad:
+        import getpass
+        try:
+            who = getpass.getuser()
+        except Exception:
+            who = f"uid {os.getuid()}" if hasattr(os, "getuid") else "this user"
+        return py, sc, (f"not writable by {who}: {', '.join(bad)} — the CLI built these under sudo, "
+                        f"so they are root-owned. Fix: chown -R {who} {' '.join(bad)}")
     return py, sc, None
 
 

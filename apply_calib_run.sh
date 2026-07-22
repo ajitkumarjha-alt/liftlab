@@ -17,7 +17,7 @@ PY=$APP/.venv/bin/python
 SVC=liftlab-cloud
 OWNER=liftlab
 say(){ echo "[calib-run] $*"; }
-say "REV=run-buttons-2  (fix: .service.d drop-in path; installs gpu_door.py beside door_calib)"
+say "REV=run-buttons-3  (fix: chown calib+templates for the service user; write-checked)"
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
 for f in calib_run_api.py apply_calib_run_patch.py; do [ -f "/tmp/$f" ] || { echo "missing /tmp/$f"; exit 2; }; done
 [ -f "$APP/main.py" ] || { echo "main.py not at $APP"; exit 2; }
@@ -68,6 +68,49 @@ else
   say "runner: $CALIB_PY $CALIB_SCRIPT"
 fi
 
+# ---------- EVERY directory the runner writes, handed to the service user ----------
+# The buttons run door_calib as the SERVICE user; the CLI era ran it under sudo. Anything root
+# created back then is unwritable now, and it fails as a PermissionError deep inside a job rather
+# than as anything the operator can act on. This is the same root cause as the labels.json 500.
+#
+# door_calib's own _chown_tree only helps when it runs AS ROOT, and only for the calib outdir it
+# just wrote — it has never touched the templates tree. Sweep both here.
+#   CALIB_DIR      crops, montages, *.json, roi.json, labels.json, _job.log
+#   TEMPLATES_DIR  the --build output: <TEMPLATES_DIR>/<gw>/<cam>.npz (needs to CREATE <gw>/ too)
+CALIB="${CALIB_DIR:-/var/lib/liftlab/calib}"
+TEMPLATES="${TEMPLATES_DIR:-}"
+if [ -z "$TEMPLATES" ]; then
+  # honour a TEMPLATES_DIR already set on the unit before falling back to the default
+  TEMPLATES=$(systemctl show -p Environment --value "$SVC" 2>/dev/null | tr ' ' '\n' \
+              | sed -n 's/^TEMPLATES_DIR=//p' | head -1)
+fi
+TEMPLATES="${TEMPLATES:-/var/lib/liftlab/templates}"
+for d in "$CALIB" "$TEMPLATES"; do
+  mkdir -p "$d"
+  chown -R "$OWNER:$OWNER" "$d" 2>/dev/null || true
+  # u+rwX,g+rwX: the X only sets +x on DIRECTORIES, so .npz and .png do not become executable.
+  chmod -R u+rwX,g+rwX "$d" 2>/dev/null || true
+  say "owner: $d -> $OWNER (recursive, group-writable)"
+done
+
+# PROVE the service user can write them. chown reporting success is not the same as the runner
+# being able to write — that gap is exactly what the drop-in bug taught, so check the effect.
+WRITE_FAIL=0
+for d in "$CALIB" "$TEMPLATES"; do
+  if sudo -u "$OWNER" sh -c ": > '$d/.liftlab_write_test' && rm -f '$d/.liftlab_write_test'" 2>/dev/null; then
+    say "write check OK: $OWNER can create files in $d"
+  else
+    say "WRITE CHECK FAILED: $OWNER cannot write $d"
+    ls -ld "$d" | sed 's/^/    /'
+    WRITE_FAIL=1
+  fi
+done
+if [ "$WRITE_FAIL" = 1 ]; then
+  say "ABORT: the Build button would PermissionError. Fix ownership and re-run:"
+  say "  chown -R $OWNER:$OWNER $CALIB $TEMPLATES"
+  exit 1
+fi
+
 $PY -m py_compile /tmp/calib_run_api.py || { say "compile failed — aborting"; exit 1; }
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/calib_run_api.py "$APP/calib_run_api.py"
 for f in calib_roi_api.py calib_cells_api.py calib_label_api.py; do
@@ -88,6 +131,8 @@ if [ -n "$CALIB_PY" ] && [ -n "$CALIB_SCRIPT" ]; then
 [Service]
 Environment=DOOR_CALIB_PY=$CALIB_PY
 Environment=DOOR_CALIB_SCRIPT=$CALIB_SCRIPT
+Environment=CALIB_DIR=$CALIB
+Environment=TEMPLATES_DIR=$TEMPLATES
 EOF
   say "wrote drop-in $DROPIN/calib-run.conf"
   # Remove the never-read directory the previous revision created, so a box that ran it is not left
