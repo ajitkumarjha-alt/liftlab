@@ -26,6 +26,7 @@ import time
 import uuid
 from pathlib import Path
 
+import nav_common as nc
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 
@@ -216,7 +217,7 @@ def survey_page(gw: str):
 
     body = "".join(tiles) or ('<p class="muted">No survey yet. Run a channel survey '
                               'from the fleet page.</p>')
-    return f"""<!doctype html><meta charset=utf-8><title>survey · {gw}</title>
+    return f"""<!doctype html><meta charset=utf-8><title>survey · {gw}</title><style>{nc.NAV_CSS}</style>{nc.header('', gw)}
     <style>:root{{--mono:ui-monospace,Consolas,monospace}}
     body{{background:#0e1417;color:#dbe3e6;font:14px system-ui;max-width:1100px;margin:auto;padding:18px}}
     h1{{font-size:14px;letter-spacing:.15em;text-transform:uppercase;color:#e3a53f}}
@@ -312,7 +313,7 @@ def validation_page(gw: str):
         for r in rows)
     body = tiles or ('<p class="muted">No validation frames yet. Queue a pull/analyze with '
                      '<code>keep_validation_frame=on</code>.</p>')
-    return f"""<!doctype html><meta charset=utf-8><title>validation · {gw}</title>
+    return f"""<!doctype html><meta charset=utf-8><title>validation · {gw}</title><style>{nc.NAV_CSS}</style>{nc.header('', gw)}
     <style>:root{{--mono:ui-monospace,Consolas,monospace}}
     body{{background:#0e1417;color:#dbe3e6;font:14px system-ui;max-width:1100px;margin:auto;padding:18px}}
     h1{{font-size:14px;letter-spacing:.15em;text-transform:uppercase;color:#e3a53f}}
@@ -356,7 +357,14 @@ def loadtest_page(gw: str):
         "SELECT t,temp,throttled,load1,mem_mb,payload FROM loadtest WHERE gateway_id=? ORDER BY t", (gw,))]
     db.close()
     if not rows:
-        return f"<!doctype html><meta charset=utf-8><body style='background:#0e1417;color:#dbe3e6;font:14px system-ui;padding:20px'><h1 style='color:#e3a53f'>load-test · {gw}</h1><p>No telemetry yet. Run load_probe.py.</p><a style='color:#63a37e' href='/'>&larr; fleet</a>"
+        # The empty state is still a page an operator can land on, so it carries the same header —
+        # a dead end is a dead end whether or not it has data on it. (The old '&larr; fleet' link
+        # pointed at "/", which is now the dash redirect.)
+        return (f"<!doctype html><meta charset=utf-8><title>load-test · {gw}</title>"
+                f"<style>{nc.NAV_CSS}</style>{nc.header('', gw)}"
+                f"<body style='background:#0e1417;color:#dbe3e6;font:14px system-ui;padding:20px'>"
+                f"<h1 style='color:#e3a53f'>load-test · {gw}</h1>"
+                f"<p>No telemetry yet. Run load_probe.py.</p>")
     W, H, pad = 900, 240, 36
     tmax = max(r["t"] or 0 for r in rows) or 1
     tempmin, tempmax = 35, 90
@@ -369,7 +377,7 @@ def loadtest_page(gw: str):
     last = json.loads(rows[-1]["payload"] or "{}")
     fps_rows = "".join(f"<tr><td>ch{ch}</td><td>{d.get('fps')}</td><td>{d.get('decoded')}</td><td>{d.get('dropped')}</td><td>{d.get('events')}</td><td>{d.get('backjumps')}</td><td style='color:#d0574d'>{d.get('err') or ''}</td></tr>" for ch, d in last.items())
     peak = max((r["temp"] or 0) for r in rows)
-    return f"""<!doctype html><meta charset=utf-8><title>load-test · {gw}</title>
+    return f"""<!doctype html><meta charset=utf-8><title>load-test · {gw}</title><style>{nc.NAV_CSS}</style>{nc.header('', gw)}
     <style>body{{background:#0e1417;color:#dbe3e6;font:14px system-ui;max-width:960px;margin:auto;padding:18px}}
     h1{{font-size:14px;letter-spacing:.15em;text-transform:uppercase;color:#e3a53f}}
     table{{width:100%;border-collapse:collapse;font-family:ui-monospace,Consolas,monospace;font-size:12px;margin-top:10px}}
@@ -455,7 +463,7 @@ def watch_status_series(gw: str, hours: int = 48):
 def pihealth_graph(gw: str):
     _P = gw
     _html = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>pi health GW_PLACEHOLDER</title>
+<title>pi health GW_PLACEHOLDER</title><style>NAVCSS_PLACEHOLDER</style>NAV_PLACEHOLDER
 <style>
 body{background:#fff;color:#1a1a1a;font:14px system-ui;max-width:1000px;margin:auto;padding:16px}
 h1{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:#333}
@@ -537,7 +545,9 @@ async function draw(){
 }
 draw(); setInterval(draw,10000);
 </script>"""
-    return _html.replace("GW_PLACEHOLDER", _P)
+    return (_html.replace("GW_PLACEHOLDER", _P)
+                 .replace("NAVCSS_PLACEHOLDER", nc.NAV_CSS)
+                 .replace("NAV_PLACEHOLDER", nc.header("", _P)))
 
 
 # Run the migration at import so fleet_status (SELECT *) sees the state column.

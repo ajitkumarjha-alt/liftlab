@@ -5,6 +5,11 @@
 set -uo pipefail
 APP=/opt/liftlab-b3/cloud
 PY=$APP/.venv/bin/python
+# The nav_common guard below installs as the service user. This script hardcoded "liftlab" at
+# every install site and never defined OWNER, so the guard referenced an unset variable and
+# set -u aborted the whole script at line 18 — before anything was installed.
+OWNER=liftlab
+id "$OWNER" >/dev/null 2>&1 || OWNER=root
 say(){ echo "[validation] $*"; }
 code(){ curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$@"; }
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
@@ -23,10 +28,10 @@ elif [ ! -f "$APP/nav_common.py" ]; then
 fi
 
 $PY -m py_compile /tmp/survey_api.py || { say "survey_api.py does NOT compile — aborting"; exit 1; }
-install -o liftlab -g liftlab -m 644 /tmp/survey_api.py "$APP/survey_api.py"
+install -o "$OWNER" -g "$OWNER" -m 644 /tmp/survey_api.py "$APP/survey_api.py"
 say "installed survey_api.py (+validation routes)"
 
-sudo -u liftlab $PY - <<'PY'
+sudo -u "$OWNER" $PY - <<'PY'
 import pathlib, shutil, time
 p = pathlib.Path("/opt/liftlab-b3/cloud/dashboard.html"); s = p.read_text()
 old = '<a class="svlink" href="/survey/${g.id}">'

@@ -8,7 +8,7 @@
 # FILES NEEDED IN /tmp: apply_calib_cells.sh calib_cells_api.py apply_calib_cells_patch.py
 #                       calib_roi_api.py door_calib.py [dash_api.py]
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_calib_cells.sh calib_cells_api.py apply_calib_cells_patch.py calib_roi_api.py door_calib.py dash_api.py nav_common.py; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_calib_cells.sh calib_cells_api.py apply_calib_cells_patch.py calib_roi_api.py door_calib.py dash_api.py nav_common.py gpu_door.py; do curl -fsSL -o /tmp/$f $B/$f; done
 #   sudo bash /tmp/apply_calib_cells.sh
 #
 # CADDY: /calib-cells must sit behind the SAME basicauth as /calib, /calib-label and /calib-roi.
@@ -68,15 +68,30 @@ for f in dash_api.py calib_label_api.py; do
     install -o "$OWNER" -g "$OWNER" -m 644 "/tmp/$f" "$APP/$f"; say "installed $f"
   fi
 done
-if [ -f /tmp/door_calib.py ]; then
-  $PY -m py_compile /tmp/door_calib.py || { say "door_calib.py failed to compile — NOT installing"; exit 1; }
-  if [ -f "$APP/door_calib.py" ]; then
-    install -o "$OWNER" -g "$OWNER" -m 644 /tmp/door_calib.py "$APP/door_calib.py"
-    say "installed door_calib.py (reads cells from roi.json when the envs are unset)"
-  else
-    say "NOTE: no $APP/door_calib.py — calibration runs elsewhere. Copy the new door_calib.py THERE,"
-    say "  or the cells will be drawn and saved and read by nothing at --build time."
-  fi
+# ---------- where does calibration actually run? ----------
+# DOOR_CALIB_SCRIPT is the answer, from the environment or the drop-in apply_calib_run.sh wrote.
+# Assuming $APP was a guess that printed "no /opt/liftlab-b3/cloud/door_calib.py" on a box where
+# calibration lives at /opt/liftlab-analysis — a NOTE for a file that was never going to be there.
+# gpu_door.py must land in the SAME directory: door_calib imports it at module scope.
+CALIB_SCRIPT="${DOOR_CALIB_SCRIPT:-}"
+if [ -z "$CALIB_SCRIPT" ]; then
+  CALIB_SCRIPT=$(systemctl show -p Environment --value "$SVC" 2>/dev/null | tr ' ' '\n' | sed -n 's/^DOOR_CALIB_SCRIPT=//p' | head -1)
+fi
+if [ -z "$CALIB_SCRIPT" ]; then
+  for c in /opt/liftlab-analysis/door_calib.py "$APP/door_calib.py" /opt/liftlab-b3/calib/door_calib.py; do
+    [ -f "$c" ] && { CALIB_SCRIPT="$c"; break; }
+  done
+fi
+if [ -n "$CALIB_SCRIPT" ]; then
+  CALIBDIR=$(dirname "$CALIB_SCRIPT")
+  for f in door_calib.py gpu_door.py; do
+    [ -f "/tmp/$f" ] || continue
+    $PY -m py_compile "/tmp/$f" || { say "$f failed to compile — NOT installing it"; continue; }
+    install -m 644 "/tmp/$f" "$CALIBDIR/$f" && say "refreshed $CALIBDIR/$f"
+  done
+else
+  say "NOTE: door_calib.py not found and DOOR_CALIB_SCRIPT unset — calibration code NOT refreshed."
+  say "  Set DOOR_CALIB_SCRIPT=/path/to/door_calib.py (apply_calib_run.sh writes it into the unit)."
 fi
 
 if ! ( cd "$APP" && sudo -u "$OWNER" env PYTHONPATH="$APP" $PY -c "from fastapi import FastAPI
