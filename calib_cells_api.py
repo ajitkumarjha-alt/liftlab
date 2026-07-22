@@ -46,6 +46,11 @@ _SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 # it warns and never blocks.
 QUEUE_ZONE_FRAC = float(os.environ.get("CELLS_QUEUE_ZONE_FRAC", "0.80"))
 MIN_SIDE = 3                                     # a 2px cell is a misclick
+# How far a drawn digit may sit off perfect pitch and still be kept as a real residual. Small, because
+# the pitch itself is not in doubt — only where each glyph sits within its step.
+X_RESIDUAL = int(os.environ.get("CELLS_X_RESIDUAL", "2"))
+# Past this, an offset from the uniform grid is more likely a bad drag than a slant worth encoding.
+OFFSET_WARN = int(os.environ.get("CELLS_OFFSET_WARN", "4"))
 
 calib_cells_router = APIRouter()
 
@@ -115,15 +120,26 @@ def _rect(v, what):
 def _derive_cells(tens, units, arrow, hundreds, panel_wh):
     """Drawn boxes -> the cell geometry door_calib will crop with.
 
-    Mirrors door_calib.propose_cells deliberately: pitch = units_left - tens_left; cell width is the
-    pitch but never far enough right to touch the arrow; the three digit cells are right-aligned on
-    units with d0 one pitch left of tens; all four share one top and height. Hand-drawn boxes are
-    NOT used literally — an LED matrix is fixed-pitch on one baseline, and honouring four
-    independently-wobbled rectangles is precisely how the typed-anchor loop kept landing off.
-    Everything normalised away is reported so the operator sees it rather than discovers it later.
+    NORMALISE WHAT IS PHYSICALLY FIXED, PRESERVE WHAT IS PHYSICALLY VARIABLE.
+
+    Fixed: the pitch and the cell size. An LED matrix has one character pitch and one glyph box, so
+    the pitch (measured over the tens->units span, the longest baseline available) is a better
+    measure of both than any single hand-drawn edge.
+
+    NOT fixed: the vertical position of each cell. These displays SLANT — fitcells measured a [1,3]
+    offset on ch29's tens cell, and ch16 shows the same tilt. An earlier version of this function
+    forced one baseline across all cells, which erased exactly that slant and left fitcells to
+    rediscover it from labelled crops after the build. So each cell keeps ITS OWN y as drawn, and a
+    small x residual (±{X_RESIDUAL}px) off perfect pitch is kept too. The operator's drags encode the
+    slant directly.
+
+    Output is the same structure fitcells emits: per-cell [x,y,w,h] with independent x/y and shared
+    w/h, plus `offsets` = per-cell [dx,dy] from the uniform grid — the identical meaning and sign
+    convention as fitcells' `moves`, so the two are directly comparable.
     """
     Wp, Hp = panel_wh
     warn = []
+    kept, normalised = [], []
     tens_left, units_left, arrow_left = tens[0], units[0], arrow[0]
 
     if units_left <= tens_left:
@@ -134,35 +150,67 @@ def _derive_cells(tens, units, arrow, hundreds, panel_wh):
                                  f"arrow x={arrow_left})")
     pitch = units_left - tens_left
 
-    # One baseline for all cells. Averaging is the honest reduction of two hand-drawn tops; the
-    # deviation is reported so a genuinely slanted pair gets noticed instead of silently averaged.
-    top = int(round((tens[1] + units[1]) / 2))
+    # The uniform-grid REFERENCE the offsets are measured against — the geometry the old normalising
+    # version would have produced. Keeping it explicit is what makes `offsets` mean the same thing
+    # as fitcells' `moves` (both are "how far from the uniform grid").
+    ref_y = int(round((tens[1] + units[1]) / 2))
     height = int(round((tens[3] + units[3]) / 2))
-    dy = abs(tens[1] - units[1])
-    dh = abs(tens[3] - units[3])
-    if dy > 2:
-        warn.append(f"TENS and UNITS tops differ by {dy}px — normalised to y={top} (they share a baseline)")
-    if dh > 2:
-        warn.append(f"TENS and UNITS heights differ by {dh}px — normalised to h={height}")
+    normalised.append(f"height {height}px (shared — one glyph box)")
+    if abs(tens[3] - units[3]) > 2:
+        warn.append(f"TENS and UNITS heights differ by {abs(tens[3] - units[3])}px — shared height "
+                    f"{height}px used (the glyph box is one size; only position varies)")
 
     cell_w = pitch if (arrow_left - units_left) >= pitch else max(1, arrow_left - units_left)
+    normalised.append(f"cell width {cell_w}px (from pitch {pitch}px)")
     if cell_w < pitch:
         warn.append(f"cell width trimmed {pitch}->{cell_w}px so the units cell cannot reach the arrow")
     drawn_w = int(round((tens[2] + units[2]) / 2))
     if abs(drawn_w - cell_w) > 2:
         warn.append(f"drawn digit width ~{drawn_w}px replaced by the pitch-derived {cell_w}px "
-                    f"(fixed-pitch matrix — the pitch is the reliable measure, not the hand-drawn edge)")
+                    f"(fixed-pitch matrix — the pitch is the reliable measure, not one drawn edge)")
 
+    # ── per-cell x: pitch position, plus the drawn residual within ±X_RESIDUAL ──────────────
+    def _x_for(ideal, drawn, tag):
+        if drawn is None:
+            return ideal, 0
+        res = drawn - ideal
+        if abs(res) > X_RESIDUAL:
+            clamped = max(-X_RESIDUAL, min(X_RESIDUAL, res))
+            warn.append(f"{tag} x is {res:+d}px off perfect pitch — kept {clamped:+d}px "
+                        f"(beyond ±{X_RESIDUAL}px contradicts a fixed-pitch matrix; check the drag)")
+            res = clamped
+        return ideal + res, res
+
+    ideal_x = [units_left - 2 * pitch, units_left - pitch, units_left]
+    xs, x_res = [], []
+    for i, (ide, drawn) in enumerate(zip(ideal_x, (hundreds[0] if hundreds else None, tens_left, units_left))):
+        x, r = _x_for(ide, drawn, f"d{i}")
+        xs.append(x)
+        x_res.append(r)
+
+    # ── per-cell y: AS DRAWN. This is the slant. ────────────────────────────────────────────
+    # d0 is usually not drawn (it holds a 3rd char / P-prefix that rarely lights), so extrapolate the
+    # slant the drawn pair establishes rather than dropping it onto the shared baseline: one more
+    # pitch to the left is one more step of the same tilt.
+    slant = units[1] - tens[1]
     if hundreds is not None:
-        d0_left = hundreds[0]
-        expected = tens_left - pitch
-        if abs(d0_left - expected) > 2:
-            warn.append(f"HUNDREDS drawn at x={d0_left}, one pitch left of TENS would be x={expected} "
-                        f"— using your box; if the panel is fixed-pitch these should agree")
+        ys = [hundreds[1], tens[1], units[1]]
     else:
-        d0_left = tens_left - pitch
+        ys = [tens[1] - slant, tens[1], units[1]]
+        if slant:
+            normalised.append(f"d0 y extrapolated from the {slant:+d}px tens→units tilt")
+    kept.append(f"per-cell y as drawn (tilt {slant:+d}px across one pitch)")
+    # The tilt itself, checked directly. Per-cell offsets alone can miss this: with HUNDREDS drawn,
+    # a steep tilt spreads into several offsets that are each under the threshold while the slope is
+    # plainly implausible. A real display slant is a pixel or three per pitch (fitcells measured 3 on
+    # ch29); anything much steeper is a drag that wandered.
+    if abs(slant) > OFFSET_WARN:
+        warn.append(f"tilt is {slant:+d}px per {pitch}px of pitch — that is a very steep slant for an "
+                    f"LED panel. Real ones run a few px; check TENS and UNITS are on the same row.")
+    if any(r for r in x_res):
+        kept.append("x residual " + ", ".join(f"d{i}{r:+d}" for i, r in enumerate(x_res) if r))
 
-    def _fit(x, cw, tag):
+    def _fit(x, y, cw, ch, tag):
         if x < 0:
             warn.append(f"{tag} left {x}<0 -> clamped to 0 (cell narrowed)")
             cw += x
@@ -170,14 +218,23 @@ def _derive_cells(tens, units, arrow, hundreds, panel_wh):
         if x + cw > Wp:
             warn.append(f"{tag} right {x + cw}>{Wp} -> clamped to the panel edge")
             cw = Wp - x
-        return int(x), int(max(1, cw))
+        return int(x), int(y), int(max(1, cw)), int(ch)
 
-    cells = []
-    for i, l in enumerate((d0_left, tens_left, units_left)):
-        cx, cw = _fit(int(l), int(cell_w), f"d{i}")
-        cells.append([cx, top, cw, height])
-    ax, aw = _fit(int(arrow_left), int(arrow[2]), "arrow")
-    arrow_cell = [ax, top, aw, height]
+    # fitcells-compatible per-cell offsets from the uniform grid (same sign convention as `moves`).
+    # Measured on the INTENDED geometry, before the panel-edge clamp: d0's ideal x is routinely
+    # negative (one pitch left of tens falls off a tight panel), and clamping it to 0 would otherwise
+    # register as a large spurious offset and fire the bad-drag warning on a perfectly good drag.
+    # The clamp is already reported on its own.
+    offsets = {f"d{i}": [xs[i] - ideal_x[i], ys[i] - ref_y] for i in range(3)}
+    offsets["arrow"] = [0, arrow[1] - ref_y]
+    for tag, (dx, dy) in offsets.items():
+        if abs(dx) > OFFSET_WARN or abs(dy) > OFFSET_WARN:
+            warn.append(f"{tag} sits [{dx:+d},{dy:+d}]px off the uniform grid — beyond ±{OFFSET_WARN}px "
+                        f"that is more likely a bad drag than a real slant. Check the overlay.")
+
+    cells = [list(_fit(xs[i], ys[i], cell_w, height, f"d{i}")) for i in range(3)]
+    arrow_cell = list(_fit(arrow_left, arrow[1], arrow[2], height, "arrow"))
+    top = ref_y
 
     # Overlap checks (requirement: warn on overlap). The pitch derivation makes digit-vs-digit
     # overlap impossible, but a hand-placed HUNDREDS or a narrow panel can still produce one.
@@ -200,6 +257,10 @@ def _derive_cells(tens, units, arrow, hundreds, panel_wh):
             "pitch": int(pitch), "cell_w": int(cell_w), "cell_y": int(top), "cell_h": int(height),
             "panel_wh": [int(Wp), int(Hp)], "warnings": warn,
             "hundreds_drawn": hundreds is not None,
+            # Same shape and meaning as fitcells' `moves`: per-cell [dx,dy] from the uniform grid.
+            # A build made from these should leave fitcells with little left to move.
+            "offsets": offsets, "slant_px_per_pitch": int(slant),
+            "kept": kept, "normalised": normalised,
             # The equivalent --anchors line, so the wizard and the CLI remain mutually intelligible.
             "anchors": {"tens_left": int(tens_left), "units_left": int(units_left),
                         "digit_top": int(top), "digit_bottom": int(top + height),
@@ -356,7 +417,9 @@ code{font:11px var(--mono);background:var(--line);padding:1px 4px;border-radius:
       <h3>3 · derived cells</h3>
       <div class=kv><span>pitch</span><b id=vPitch>—</b></div>
       <div class=kv><span>cell w × h</span><b id=vWH>—</b></div>
-      <div class=kv><span>baseline y</span><b id=vY>—</b></div>
+      <div class=kv><span>tilt / pitch</span><b id=vSlant>—</b></div>
+      <div class=kv><span>offsets [dx,dy]</span><b id=vOff>—</b></div>
+      <div class=note id=vKept style="margin:4px 0 0"></div>
       <div class=kv><span>DIGIT_CELLS</span><b><code id=vDC>—</code></b></div>
       <div class=kv><span>ARROW_CELL</span><b><code id=vAC>—</code></b></div>
       <div style="margin-top:8px">
@@ -375,6 +438,7 @@ code{font:11px var(--mono);background:var(--line);padding:1px 4px;border-radius:
 <script>
 var GW="__GW__", CAM="__CAM__";
 var $=function(id){return document.getElementById(id)};
+function esc(s){return s==null?'':(''+s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
 var S=null, zoom=8, mode="tens", crop=null;
 var D={tens:null,units:null,arrow:null,hundreds:null};   // drawn, WITHIN-PANEL px
 var DERIVED=null, drag=null, pending=false;
@@ -423,7 +487,15 @@ function show(){
   var j=DERIVED;
   $("vPitch").textContent=j?(j.pitch+"px"):"—";
   $("vWH").textContent=j?(j.cell_w+" × "+j.cell_h+"px"):"—";
-  $("vY").textContent=j?(j.cell_y+" → "+(j.cell_y+j.cell_h)):"—";
+  $("vSlant").textContent=j?((j.slant_px_per_pitch>0?"+":"")+j.slant_px_per_pitch+"px"):"—";
+  // The per-cell offsets from the uniform grid — the same numbers, sign convention and meaning as
+  // door_calib --fitcells reports as `moves`. Near-zero after a build means the drag already
+  // encoded the slant and fitcells has nothing left to find.
+  $("vOff").textContent=j?["d0","d1","d2","arrow"].map(function(k){
+    var o=(j.offsets||{})[k]; return o?(k+" ["+(o[0]>0?"+":"")+o[0]+","+(o[1]>0?"+":"")+o[1]+"]"):"";
+  }).filter(Boolean).join("  "):"—";
+  $("vKept").innerHTML=j?("<b>kept</b> "+(j.kept||[]).map(esc).join("; ")
+    +"<br><b>normalised</b> "+(j.normalised||[]).map(esc).join("; ")):"";
   $("vDC").textContent=j?j.digit_cells_str:"—";
   $("vAC").textContent=j?j.arrow_cell_str:"—";
   $("save").disabled=!j;
