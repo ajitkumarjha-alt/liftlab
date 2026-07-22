@@ -3,9 +3,9 @@
 # SUBPROCESS; it imports no cv2 and creates no tables, so the ingest process stays CV-free.
 # Also ships the three wizard pages, which grow the button strip.
 # FILES NEEDED IN /tmp: apply_calib_run.sh calib_run_api.py apply_calib_run_patch.py
-#                       calib_roi_api.py calib_cells_api.py calib_label_api.py [door_calib.py]
+#                       calib_roi_api.py calib_cells_api.py calib_label_api.py [door_calib.py gpu_door.py]
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_calib_run.sh calib_run_api.py apply_calib_run_patch.py calib_roi_api.py calib_cells_api.py calib_label_api.py door_calib.py; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_calib_run.sh calib_run_api.py apply_calib_run_patch.py calib_roi_api.py calib_cells_api.py calib_label_api.py door_calib.py gpu_door.py; do curl -fsSL -o /tmp/$f $B/$f; done
 #   sudo bash /tmp/apply_calib_run.sh
 #
 # THE ONE THING TO GET RIGHT: door_calib needs cv2 + numpy and this app's venv does not have them.
@@ -17,7 +17,7 @@ PY=$APP/.venv/bin/python
 SVC=liftlab-cloud
 OWNER=liftlab
 say(){ echo "[calib-run] $*"; }
-say "REV=run-buttons-1  (Collect / Top-up / Build / Fitcells / Refresh frame as buttons)"
+say "REV=run-buttons-2  (fix: .service.d drop-in path; installs gpu_door.py beside door_calib)"
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
 for f in calib_run_api.py apply_calib_run_patch.py; do [ -f "/tmp/$f" ] || { echo "missing /tmp/$f"; exit 2; }; done
 [ -f "$APP/main.py" ] || { echo "main.py not at $APP"; exit 2; }
@@ -37,10 +37,27 @@ if [ -z "$CALIB_SCRIPT" ]; then
     [ -f "$c" ] && { CALIB_SCRIPT="$c"; break; }
   done
 fi
-if [ -f /tmp/door_calib.py ] && [ -n "$CALIB_SCRIPT" ]; then
-  $PY -m py_compile /tmp/door_calib.py \
-    && install -o "$OWNER" -g "$OWNER" -m 644 /tmp/door_calib.py "$CALIB_SCRIPT" \
-    && say "refreshed $CALIB_SCRIPT"
+if [ -n "$CALIB_SCRIPT" ]; then
+  CALIBDIR=$(dirname "$CALIB_SCRIPT")
+  # door_calib does `import gpu_door as gd` at MODULE scope, so gpu_door.py must sit BESIDE it.
+  # Refreshing door_calib alone left the old (or no) gpu_door there, and the first Build click died
+  # with ModuleNotFoundError: gpu_door. Install every sibling door_calib imports, together.
+  for f in door_calib.py gpu_door.py; do
+    [ -f "/tmp/$f" ] || continue
+    $PY -m py_compile "/tmp/$f" || { say "$f failed to compile — NOT installing it"; continue; }
+    install -o "$OWNER" -g "$OWNER" -m 644 "/tmp/$f" "$CALIBDIR/$f" && say "refreshed $CALIBDIR/$f"
+  done
+  # Prove the import graph RESOLVES under the interpreter that will actually run it. A missing
+  # sibling or a venv without cv2 must fail here, at deploy, not on the operator's first click.
+  if [ -n "$CALIB_PY" ]; then
+    if IMPERR=$(cd "$CALIBDIR" && "$CALIB_PY" -c "import door_calib" 2>&1); then
+      say "import check: door_calib imports cleanly under $CALIB_PY"
+    else
+      say "WARNING: door_calib does NOT import under $CALIB_PY — Build/Fitcells WILL fail:"
+      printf '%s\n' "$IMPERR" | tail -3 | sed 's/^/    /'
+      say "  (usually a missing sibling — gpu_door.py — or cv2/numpy absent from that venv)"
+    fi
+  fi
 fi
 if [ -z "$CALIB_PY" ] || [ -z "$CALIB_SCRIPT" ]; then
   say "WARNING: no cv2-capable python and/or door_calib.py found."
@@ -62,13 +79,26 @@ done
 
 # Persist the runner paths into the unit so a restart keeps them (a drop-in, not an edit of the unit).
 if [ -n "$CALIB_PY" ] && [ -n "$CALIB_SCRIPT" ]; then
-  mkdir -p "/etc/systemd/system/$SVC.d"
-  cat > "/etc/systemd/system/$SVC.d/calib-run.conf" <<EOF
+  # The drop-in directory is <UNIT FILENAME>.d — liftlab-cloud.SERVICE.d. Writing to "$SVC.d"
+  # (liftlab-cloud.d) creates a directory systemd never reads: the env never reached the process,
+  # and the buttons stayed disabled reporting "no python with cv2" until it was moved by hand.
+  DROPIN="/etc/systemd/system/${SVC}.service.d"
+  mkdir -p "$DROPIN"
+  cat > "$DROPIN/calib-run.conf" <<EOF
 [Service]
 Environment=DOOR_CALIB_PY=$CALIB_PY
 Environment=DOOR_CALIB_SCRIPT=$CALIB_SCRIPT
 EOF
-  say "wrote drop-in /etc/systemd/system/$SVC.d/calib-run.conf"
+  say "wrote drop-in $DROPIN/calib-run.conf"
+  # Remove the never-read directory the previous revision created, so a box that ran it is not left
+  # with a decoy that looks like configuration.
+  if [ -f "/etc/systemd/system/${SVC}.d/calib-run.conf" ]; then
+    rm -f "/etc/systemd/system/${SVC}.d/calib-run.conf"
+    rmdir "/etc/systemd/system/${SVC}.d" 2>/dev/null || true
+    say "removed the stale (never-read) /etc/systemd/system/${SVC}.d/calib-run.conf"
+  fi
+  # And PROVE it took: after the restart below, the running process must actually have the var.
+  VERIFY_DROPIN=1
 fi
 
 if ! ( cd "$APP" && sudo -u "$OWNER" env PYTHONPATH="$APP" $PY -c "from fastapi import FastAPI
@@ -89,6 +119,15 @@ if [ "$(systemctl is-active "$SVC")" != active ]; then
   cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; systemctl restart "$SVC"
   say "restored. journalctl -u $SVC -n 40"; exit 1
 fi
+# The drop-in is only real if the RUNNING process has it. systemd-show reads the merged unit, which
+# is exactly what the wrong-directory bug got wrong — the file existed, the service never saw it.
+if [ "${VERIFY_DROPIN:-0}" = 1 ]; then
+  if systemctl show -p Environment --value "$SVC" 2>/dev/null | grep -q DOOR_CALIB_PY; then
+    say "drop-in verified: DOOR_CALIB_PY is in the running unit environment"
+  else
+    say "RESULT: FAIL — the drop-in did NOT reach $SVC. The buttons will be disabled."
+    say "  check: systemctl show -p Environment $SVC ; ls /etc/systemd/system/${SVC}.service.d/"; exit 1
+  fi
 PORT=""
 MPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null)
 [ -n "$MPID" ] && [ "$MPID" != 0 ] && PORT=$(ss -tlnpH 2>/dev/null | grep -F "pid=$MPID," | grep -oP ':\K[0-9]+' | head -1)
@@ -104,6 +143,7 @@ ST=$(code "$BASE/calib-run/site-A/$CAM/status"); ROI=$(code "$BASE/calib-roi/sit
 LBL=$(code "$BASE/calib-label/site-A/$CAM"); OPS=$(code "$BASE/ops")
 RUNOK=$(curl -s --max-time 8 "$BASE/calib-run/site-A/$CAM/status" | grep -o '"ok":[a-z]*' | head -1)
 say "AFTER (port $PORT): /calib-run/status=$ST  /calib-roi=$ROI  /calib-label=$LBL  /ops=$OPS  runner $RUNOK"
+fi
 if [ "$ST" = 200 ] && [ "$ROI" = 200 ] && [ "$LBL" = 200 ]; then
   say "RESULT: PASS — buttons live at https://lift.gargi.online/calib-roi/site-A/$CAM"
   [ "$RUNOK" = '"ok":true' ] || say "  NOTE: runner reports NOT ok — buttons will be disabled with the reason shown on the page."

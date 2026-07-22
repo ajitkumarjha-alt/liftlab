@@ -268,7 +268,12 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)
 .ps{font:11px var(--mono);display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:2px 10px}
 #stamp{font:11px var(--mono);color:var(--mut)}
 @media(prefers-color-scheme:dark){:root{--bg:#0e1418;--card:#161d22;--line:#243038;--fg:#d6dee3;--mut:#7f9099}.pill{background:#1c262c}}
+
+.nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 14px;border-bottom:1px solid var(--line);background:var(--card);font:12px var(--mono)}
+.nav a{color:#4c8bf5;text-decoration:none}.nav a:hover{text-decoration:underline}
+.nav .sep{color:var(--mut);opacity:.6}.nav .here{color:var(--mut)}.nav .home{font-weight:600}
 </style>
+<div class=nav><a class=home href="/dash">← dash</a><span class=sep>/</span><span class=here>ops</span><span class=sep>|</span><a href="/validate">validate</a><a href="/events">events</a><a href="/pihealth/__GW__">pihealth</a></div>
 <header><h1>liftlab ops · __GW__</h1><span class=sub id=stamp>loading…</span></header>
 <div class=wrap>
   <div id=guardbanner></div>

@@ -731,6 +731,9 @@ table.t2 td{text-align:right;padding:2px 6px;border-bottom:1px solid #f2f5f7;fon
   <a href="/validate">/validate</a> · <a href="/pihealth/__GW__">/pihealth</a></div>
 <script>
 var GW="__GW__", cur=null, DATA=null;
+// DEEP LINK: /dash?cam=ch16 opens that camera's tab. Every wizard page breadcrumbs back here, and
+// "back to dash" that dumps you on a different camera is not a breadcrumb.
+(function(){var m=/[?&]cam=([A-Za-z0-9._-]+)/.exec(location.search); if(m)cur=m[1];})();
 function esc(s){return s==null?'':(''+s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
 function age(s){return s==null?'—':(s<90?Math.round(s)+'s':Math.round(s/60)+'m')+' ago'}
 function kv(k,v,c){return '<div class=kv><span class=mut>'+k+'</span><b class="'+(c||'')+'">'+v+'</b></div>'}
@@ -804,7 +807,11 @@ function tabs(d){
       +'<span class=dot style="background:'+dot+'"></span>'+esc(c.cam)+(c.label?' '+esc(c.label):'')+'</div>';
   }).join('');
 }
-function pick(cam){cur=cam;render();}
+function pick(cam){
+  cur=cam;
+  try{history.replaceState(null,'', '/dash?cam='+encodeURIComponent(cam));}catch(e){}
+  render();
+}
 
 function bars(door){
   if(!door||!door.n){return '';}
@@ -1186,7 +1193,12 @@ textarea{width:100%;height:180px;background:#0a0a0a;color:#7fdca0;border:1px sol
          font-family:var(--mono);font-size:12px;padding:8px;box-sizing:border-box}
 .hint{color:#888;font-size:12px;margin:6px 0}
 #sizebar{font-family:var(--mono);font-size:12px;margin:4px 0;padding:4px 8px;border-radius:5px;background:#1a1a1a}
+
+.nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 14px;border-bottom:1px solid #e3e8ec;background:#fff;font:12px ui-monospace,Menlo,monospace}
+.nav a{color:#4c8bf5;text-decoration:none}.nav a:hover{text-decoration:underline}
+.nav .sep{color:#6b7a84;opacity:.6}.nav .here{color:#6b7a84}.nav .home{font-weight:600}
 </style>
+<div class=nav><a class=home href="/dash?cam=__CAM__">← dash</a><span class=sep>/</span><a href="/dash?cam=__CAM__">__CAM__</a><span class=sep>/</span><span class=here>calibrate</span><span class=sep>|</span><a href="/calib-roi/__GW__/__CAM__">ROIs (wizard)</a><a href="/calib-cells/__GW__/__CAM__">cells</a><a href="/calib-label/__GW__/__CAM__">labels</a><a href="/floorcheck/__GW__/__CAM__">floorcheck</a></div>
 <h1>liftlab · calibrate <span id=cam style=color:#888></span></h1>
 <div id=sizebar>frame …</div>
 <div id=tools></div>

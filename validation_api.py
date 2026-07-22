@@ -35,6 +35,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.concurrency import run_in_threadpool
 
 DB_PATH = os.environ.get("GATEWAY_DB", "./gateway.db")
+# For the nav bar only: /ops is gateway-scoped and this page is not, so it needs a default.
+DASH_GW = os.environ.get("DASH_GW", "site-A")
 IMG_DIR = Path(os.environ.get("VALIDATION_IMG_DIR", "/var/lib/liftlab/validation_img"))
 GATEWAY_TOKENS = {g.split(":", 1)[0]: g.split(":", 1)[1]
                   for g in os.environ.get("GATEWAY_TOKENS", "site-A:devtoken").split(",") if ":" in g}
@@ -321,6 +323,9 @@ def validate_page():
 
 def _render(cams, pend, npend=0, nsup=0, nmiss=0):
     css = """<style>body{margin:0;background:#f6f8fa;color:#1c2429;font:14px/1.5 system-ui,sans-serif}
+    .nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 14px;border-bottom:1px solid #e3e8ec;background:#fff;font:12px ui-monospace,monospace}
+    .nav a{color:#4c8bf5;text-decoration:none}.nav a:hover{text-decoration:underline}
+    .nav .sep{color:#6b7a84;opacity:.6}.nav .here{color:#6b7a84}.nav .home{font-weight:600}
     header{padding:12px 18px;border-bottom:1px solid #e3e8ec;background:#fff}h1{font-size:16px;margin:0}
     .wrap{max-width:1000px;margin:0 auto;padding:16px}h2{font-size:13px;text-transform:uppercase;color:#6b7a84;letter-spacing:.05em;margin:18px 4px 8px}
     .cam{display:flex;gap:12px;align-items:center;background:#fff;border:1px solid #e3e8ec;border-radius:8px;padding:8px 12px;margin:6px 0;font:12px ui-monospace,monospace}
@@ -375,6 +380,9 @@ def _render(cams, pend, npend=0, nsup=0, nmiss=0):
     sup_note += f" · {nmiss} expired (imagery gone) this load" if nmiss else ""
     return (f"<!doctype html><meta charset=utf-8><title>validate</title>"
             f"<meta name=viewport content='width=device-width,initial-scale=1'>{css}"
+            f'<div class=nav><a class=home href="/dash">← dash</a><span class=sep>/</span>'
+            f'<span class=here>validate</span><span class=sep>|</span>'
+            f'<a href="/ops/{DASH_GW}">ops</a><a href="/events">events</a></div>'
             f"<header><h1>liftlab · validation</h1>"
             f"<div class=sub style='font:12px ui-monospace,monospace;color:#6b7a84'>reviewing under counting "
             f"<b>{CURRENT_COUNTING_VERSION}</b> · {npend} episodes pending{sup_note}</div></header><div class=wrap>"

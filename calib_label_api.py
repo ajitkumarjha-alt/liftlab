@@ -140,7 +140,18 @@ kbd{font:11px var(--mono);background:var(--line);border-radius:4px;padding:1px 5
 .msg{font:12px var(--mono);min-height:16px;margin-top:6px}
 .msg.err{color:var(--bad)}.msg.ok{color:var(--ok)}
 .note{color:var(--mut);font:12px var(--mono)}
+
+/* NAV (site rule): every page carries a way back to /dash and to this camera's tab. A page an
+   operator can only leave with the browser Back button is a page they get stranded on. */
+.nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 14px;border-bottom:1px solid var(--line,#e3e8ec);
+  background:var(--card,#fff);font:12px ui-monospace,Menlo,monospace}
+.nav a{color:#4c8bf5;text-decoration:none}
+.nav a:hover{text-decoration:underline}
+.nav .sep{color:var(--mut,#6b7a84);opacity:.6}
+.nav .here{color:var(--mut,#6b7a84)}
+.nav .home{font-weight:600}
 </style></head><body>
+<div class=nav><a class=home href="/dash?cam=__CAM__">← dash</a><span class=sep>/</span><a href="/dash?cam=__CAM__">__CAM__</a><span class=sep>/</span><span class=here>labels</span><span class=sep>|</span><a href="/calib-roi/__GW__/__CAM__">ROIs</a><a href="/calib-label/__GW__/__CAM__">labels</a><a href="/calib-cells/__GW__/__CAM__">cells</a><a href="/floorcheck/__GW__/__CAM__">floorcheck</a><a href="/validate?cam=__CAM__">validate</a><a href="/ops/__GW__">ops</a></div>
 <header>
   <h1>label · __CAM__ @ __GW__</h1>
   <span class=pill id=pos>—</span>
