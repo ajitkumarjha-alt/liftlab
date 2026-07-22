@@ -22,6 +22,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+import nav_common as nc
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
@@ -269,11 +270,8 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)
 #stamp{font:11px var(--mono);color:var(--mut)}
 @media(prefers-color-scheme:dark){:root{--bg:#0e1418;--card:#161d22;--line:#243038;--fg:#d6dee3;--mut:#7f9099}.pill{background:#1c262c}}
 
-.nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 14px;border-bottom:1px solid var(--line);background:var(--card);font:12px var(--mono)}
-.nav a{color:#4c8bf5;text-decoration:none}.nav a:hover{text-decoration:underline}
-.nav .sep{color:var(--mut);opacity:.6}.nav .here{color:var(--mut)}.nav .home{font-weight:600}
 </style>
-<div class=nav><a class=home href="/dash">← dash</a><span class=sep>/</span><span class=here>ops</span><span class=sep>|</span><a href="/validate">validate</a><a href="/events">events</a><a href="/pihealth/__GW__">pihealth</a></div>
+__NAV__
 <header><h1>liftlab ops · __GW__</h1><span class=sub id=stamp>loading…</span></header>
 <div class=wrap>
   <div id=guardbanner></div>
@@ -456,7 +454,24 @@ tickGrid();tickData();setInterval(tickGrid,2000);setInterval(tickData,15000);
 </script>"""
 
 
+def _default_cam(gw):
+    """A camera to hang the header's per-camera links on. Gateway-scoped pages have no camera of
+    their own, but the operator still needs one click to Floorcheck; the first lift channel is the
+    least surprising choice. None => the header omits that entry rather than inventing one."""
+    try:
+        db = _db()
+        r = db.execute("SELECT channel FROM channel_map WHERE gateway_id=? AND is_lift=1 "
+                       "ORDER BY channel LIMIT 1", (gw,)).fetchone()
+        db.close()
+        return f"ch{r['channel']}" if r else None
+    except Exception:
+        return None
+
+
 @ops_router.get("/ops/{gw}", response_class=HTMLResponse)
 def ops_page(gw: str):
     _safe(gw)
-    return HTMLResponse(_PAGE.replace("__GW__", gw))
+    page = (_PAGE.replace("__GW__", gw)
+                 .replace("__NAV__", nc.header("ops", gw, _default_cam(gw)))
+                 .replace("</style>", nc.NAV_CSS + "</style>", 1))
+    return HTMLResponse(page)

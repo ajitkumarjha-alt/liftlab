@@ -25,6 +25,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import nav_common as nc
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
@@ -798,6 +799,20 @@ def _csv(rows, header, name):
                              "Cache-Control": "no-store"})
 
 
+@dash_router.get("/dash/{gw}/cams")
+def dash_cams(gw: str):
+    """Just the camera list — for the switcher on every per-camera page. Deliberately NOT
+    /dash/{gw}/data: that builds the whole dashboard including Tier-2 for every camera, which is a
+    lot of work to fill a dropdown, on every page load, on every page."""
+    db = _db()
+    cams = _cameras(db, gw)
+    reg = _registry(db, gw)
+    db.close()
+    return JSONResponse({"gw": gw, "cameras": [
+        {"cam": c["cam"], "label": c.get("label") or "",
+         "enabled": bool((reg.get(c["cam"]) or {}).get("enabled"))} for c in cams]})
+
+
 @dash_router.get("/dash/{gw}/export.csv")
 def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
                 period: str = "all", from_d: str = "", to_d: str = ""):
@@ -879,7 +894,10 @@ def root_redirect():
 
 @dash_router.get("/dash", response_class=HTMLResponse)
 def dash_page():
-    return _PAGE.replace("__GW__", os.environ.get("DASH_GW", "site-A")).replace("__FLEET__", FLEET_URL)
+    gw = os.environ.get("DASH_GW", "site-A")
+    return (_PAGE.replace("__GW__", gw).replace("__FLEET__", FLEET_URL)
+                 .replace("__NAV__", nc.header("dash", gw))
+                 .replace("</style>", nc.NAV_CSS + "</style>", 1))
 
 
 _PAGE = r"""<!doctype html><meta charset=utf-8><title>liftlab · dash</title>
@@ -914,6 +932,9 @@ a{color:#0a6;text-decoration:none}a:hover{text-decoration:underline}
 .bars .bar{width:100%;background:#127a3d}
 .bars span{font-size:8px;color:#999;margin-top:1px}
 .blank{color:#999;font-style:italic;font-size:13px;padding:6px 0}
+.camlinks{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.cbtn{font:600 11px var(--mono);padding:4px 9px;border:1px solid var(--b);border-radius:12px;text-decoration:none;color:#2a6db0;background:transparent}
+.cbtn:hover{background:rgba(42,109,176,.08)}
 .dlbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 10px}
 .dlbtn{font:600 11px var(--mono);padding:4px 9px;border:1px solid var(--line);border-radius:12px;text-decoration:none;color:#2a6db0;background:transparent}
 .dlbtn:hover{background:rgba(42,109,176,.08)}
@@ -936,7 +957,8 @@ table.t2 th:first-child,table.t2 td:first-child{text-align:left}
 table.t2 td{text-align:right;padding:2px 6px;border-bottom:1px solid #f2f5f7;font-variant-numeric:tabular-nums}
 .foot{margin-top:14px;font-size:12px}
 </style>
-<h1>liftlab · dash <span class=mut id=stamp></span></h1>
+__NAV__
+<h1 style="padding:0 2px">liftlab · dash <span class=mut id=stamp></span></h1>
 <div class=tabs id=nav></div>
 <div class=strip id=strip></div>
 <div id=headline></div>
@@ -1077,10 +1099,21 @@ function panel(d){
   }
   // Setup wizard entry points, beside validate: this is where an operator looks when a NEW camera
   // needs calibrating, so the flow has to be discoverable from here rather than from a runbook.
-  var link='<div style="margin-top:6px"><a href="/validate?cam='+c.cam+'">validate this camera →</a></div>'
-    +'<div style="margin-top:4px;font-size:12px">setup: <a href="/calib-roi/'+GW+'/'+c.cam+'">draw ROIs</a>'
-    +' → <a href="/calib-label/'+GW+'/'+c.cam+'">label crops</a>'
-    +' → <a href="/calib-cells/'+GW+'/'+c.cam+'">draw cells</a></div>';
+  // Deep views as BUTTONS beside the snapshot, not small print in a footer. This panel is where an
+  // operator stands when they want to look closer at ONE camera, so every next place they might go
+  // has to be visible from here.
+  var link='<div class=camlinks>'
+    +'<a class=cbtn href="/floorcheck/'+GW+'/'+c.cam+'">Floorcheck</a>'
+    +'<a class=cbtn href="/validate?cam='+c.cam+'">Validate</a>'
+    +'<a class=cbtn href="/ops/'+GW+'">Ops</a>'
+    +'<a class=cbtn href="/calibrate?cam='+c.cam+'">Calibrate</a>'
+    +'</div>'
+    +'<div class=camlinks style="margin-top:2px">'
+    +'<span class=mut style="font-size:11px;align-self:center">setup</span>'
+    +'<a class=cbtn href="/calib-roi/'+GW+'/'+c.cam+'">ROIs</a>'
+    +'<a class=cbtn href="/calib-label/'+GW+'/'+c.cam+'">label</a>'
+    +'<a class=cbtn href="/calib-cells/'+GW+'/'+c.cam+'">cells</a>'
+    +'</div>';
 
   document.getElementById('panel').innerHTML=
     '<div class=panelwrap><div>'+snap+link+'</div>'
@@ -1429,8 +1462,13 @@ def calibrate_page(cam: str = "ch29", fw: int = 0, fh: int = 0):
     w, h = FRAME_SIZES.get(cam, FRAME_SIZE_DEFAULT)
     if fw > 0 and fh > 0:
         w, h = fw, fh
-    return (_CALIB_PAGE.replace("__GW__", os.environ.get("DASH_GW", "site-A"))
-            .replace("__CAM__", cam).replace("__FW__", str(w)).replace("__FH__", str(h)))
+    gw = os.environ.get("DASH_GW", "site-A")
+    nav = nc.header("", gw, cam) + nc.cam_bar(gw, cam, "")
+    page = (_CALIB_PAGE.replace("__GW__", gw).replace("__CAM__", cam)
+            .replace("__FW__", str(w)).replace("__FH__", str(h))
+            .replace("__NAV__", nav)
+            .replace("</style>", nc.NAV_CSS + "</style>", 1))
+    return page + nc.switcher_js(gw, cam, "/calibrate?cam=__C__")
 
 
 _CALIB_PAGE = r"""<!doctype html><meta charset=utf-8><title>liftlab · calibrate</title>
@@ -1453,11 +1491,8 @@ textarea{width:100%;height:180px;background:#0a0a0a;color:#7fdca0;border:1px sol
 .hint{color:#888;font-size:12px;margin:6px 0}
 #sizebar{font-family:var(--mono);font-size:12px;margin:4px 0;padding:4px 8px;border-radius:5px;background:#1a1a1a}
 
-.nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 14px;border-bottom:1px solid #e3e8ec;background:#fff;font:12px ui-monospace,Menlo,monospace}
-.nav a{color:#4c8bf5;text-decoration:none}.nav a:hover{text-decoration:underline}
-.nav .sep{color:#6b7a84;opacity:.6}.nav .here{color:#6b7a84}.nav .home{font-weight:600}
 </style>
-<div class=nav><a class=home href="/dash?cam=__CAM__">← dash</a><span class=sep>/</span><a href="/dash?cam=__CAM__">__CAM__</a><span class=sep>/</span><span class=here>calibrate</span><span class=sep>|</span><a href="/calib-roi/__GW__/__CAM__">ROIs (wizard)</a><a href="/calib-cells/__GW__/__CAM__">cells</a><a href="/calib-label/__GW__/__CAM__">labels</a><a href="/floorcheck/__GW__/__CAM__">floorcheck</a></div>
+__NAV__
 <h1>liftlab · calibrate <span id=cam style=color:#888></span></h1>
 <div id=sizebar>frame …</div>
 <div id=tools></div>

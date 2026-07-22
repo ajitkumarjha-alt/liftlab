@@ -10,6 +10,18 @@ code(){ curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$@"; }
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
 [ -f /tmp/survey_api.py ] || { echo "missing /tmp/survey_api.py — curl it first"; exit 2; }
 
+# nav_common.py is a HARD dependency of every page module (the shared header). Installing a page
+# without it is an ImportError that takes the ENTIRE operator UI down, not just this page — so it is
+# installed here unconditionally and the deploy refuses to continue without it.
+if [ -f /tmp/nav_common.py ]; then
+  $PY -m py_compile /tmp/nav_common.py || { say "nav_common.py failed to compile — aborting"; exit 1; }
+  install -o "$OWNER" -g "$OWNER" -m 644 /tmp/nav_common.py "$APP/nav_common.py"
+  say "installed nav_common.py (shared header)"
+elif [ ! -f "$APP/nav_common.py" ]; then
+  say "ABORT: nav_common.py is neither in /tmp nor installed. Every page imports it; continuing"
+  say "  would ImportError the whole UI. Re-curl nav_common.py and run again."; exit 1
+fi
+
 $PY -m py_compile /tmp/survey_api.py || { say "survey_api.py does NOT compile — aborting"; exit 1; }
 install -o liftlab -g liftlab -m 644 /tmp/survey_api.py "$APP/survey_api.py"
 say "installed survey_api.py (+validation routes)"

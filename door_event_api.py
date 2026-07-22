@@ -22,6 +22,7 @@ import re
 import sqlite3
 import time
 
+import nav_common as nc
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
@@ -202,7 +203,12 @@ def floorcheck_data(gw: str, cam: str, limit: int = 60):
 @door_event_router.get("/floorcheck/{gw}/{cam}", response_class=HTMLResponse)
 def floorcheck_page(gw: str, cam: str):
     _safe(gw, cam)
-    return HTMLResponse(_PAGE.replace("__GW__", gw).replace("__CAM__", cam))
+    nav = nc.header('floorcheck', gw, cam) + nc.cam_bar(gw, cam, '')
+    page = (_PAGE.replace("__GW__", gw).replace("__CAM__", cam)
+                 .replace("__NAV__", nav)
+                 .replace("</style>", nc.NAV_CSS + "</style>", 1))
+    page += nc.switcher_js(gw, cam, f"/floorcheck/{gw}/__C__")
+    return HTMLResponse(page)
 
 
 _PAGE = r"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -226,17 +232,8 @@ h1{font:600 15px var(--mono);margin:0}
   border:1px solid var(--line);border-radius:5px;background:var(--bg);color:var(--fg);padding:2px}
 .rev.saved{border-color:var(--ok);color:var(--ok)}
 
-/* NAV (site rule): every page carries a way back to /dash and to this camera's tab. A page an
-   operator can only leave with the browser Back button is a page they get stranded on. */
-.nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 14px;border-bottom:1px solid var(--line,#e3e8ec);
-  background:var(--card,#fff);font:12px ui-monospace,Menlo,monospace}
-.nav a{color:#4c8bf5;text-decoration:none}
-.nav a:hover{text-decoration:underline}
-.nav .sep{color:var(--mut,#6b7a84);opacity:.6}
-.nav .here{color:var(--mut,#6b7a84)}
-.nav .home{font-weight:600}
 </style></head><body>
-<div class=nav><a class=home href="/dash?cam=__CAM__">← dash</a><span class=sep>/</span><a href="/dash?cam=__CAM__">__CAM__</a><span class=sep>/</span><span class=here>floorcheck</span><span class=sep>|</span><a href="/calib-roi/__GW__/__CAM__">ROIs</a><a href="/calib-label/__GW__/__CAM__">labels</a><a href="/calib-cells/__GW__/__CAM__">cells</a><a href="/floorcheck/__GW__/__CAM__">floorcheck</a><a href="/validate?cam=__CAM__">validate</a><a href="/ops/__GW__">ops</a></div>
+__NAV__
 <header>
   <h1>floorcheck · __CAM__ @ __GW__</h1>
   <span class=pill id=stream>—</span>

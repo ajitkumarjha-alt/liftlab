@@ -4,7 +4,7 @@
 # -> restart -> verify-or-restore. Crop images are served by the existing ops_api /calib route.
 # FILES NEEDED IN /tmp: apply_calib_label.sh calib_label_api.py apply_calib_label_patch.py
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_calib_label.sh calib_label_api.py apply_calib_label_patch.py; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_calib_label.sh calib_label_api.py apply_calib_label_patch.py nav_common.py; do curl -fsSL -o /tmp/$f $B/$f; done
 #   sudo bash /tmp/apply_calib_label.sh
 #
 # CADDY: /calib-label must be behind the SAME basicauth as /calib. If your Caddy default already puts
@@ -30,6 +30,18 @@ mkdir -p "$CALIB"
 chown -R "$OWNER:$OWNER" "$CALIB" 2>/dev/null || true
 chmod -R g+w "$CALIB" 2>/dev/null || true
 say "calib tree owned by $OWNER (labels.json writable by the web app)"
+
+# nav_common.py is a HARD dependency of every page module (the shared header). Installing a page
+# without it is an ImportError that takes the ENTIRE operator UI down, not just this page — so it is
+# installed here unconditionally and the deploy refuses to continue without it.
+if [ -f /tmp/nav_common.py ]; then
+  $PY -m py_compile /tmp/nav_common.py || { say "nav_common.py failed to compile — aborting"; exit 1; }
+  install -o "$OWNER" -g "$OWNER" -m 644 /tmp/nav_common.py "$APP/nav_common.py"
+  say "installed nav_common.py (shared header)"
+elif [ ! -f "$APP/nav_common.py" ]; then
+  say "ABORT: nav_common.py is neither in /tmp nor installed. Every page imports it; continuing"
+  say "  would ImportError the whole UI. Re-curl nav_common.py and run again."; exit 1
+fi
 
 $PY -m py_compile /tmp/calib_label_api.py || { say "compile failed — aborting"; exit 1; }
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/calib_label_api.py "$APP/calib_label_api.py"

@@ -4,7 +4,7 @@
 # main.py as root -> restart -> verify-or-restore. /ops /events /validate /pihealth are untouched.
 # FILES NEEDED IN /tmp: apply_dash.sh dash_api.py apply_dash_patch.py
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_dash.sh dash_api.py apply_dash_patch.py; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_dash.sh dash_api.py apply_dash_patch.py nav_common.py; do curl -fsSL -o /tmp/$f $B/$f; done
 #   sudo bash /tmp/apply_dash.sh
 set -uo pipefail
 APP=/opt/liftlab-b3/cloud
@@ -16,6 +16,18 @@ say(){ echo "[dash] $*"; }
 for f in dash_api.py apply_dash_patch.py; do [ -f "/tmp/$f" ] || { echo "missing /tmp/$f"; exit 2; }; done
 [ -f "$APP/main.py" ] || { echo "main.py not at $APP"; exit 2; }
 id "$OWNER" >/dev/null 2>&1 || OWNER=root
+
+# nav_common.py is a HARD dependency of every page module (the shared header). Installing a page
+# without it is an ImportError that takes the ENTIRE operator UI down, not just this page — so it is
+# installed here unconditionally and the deploy refuses to continue without it.
+if [ -f /tmp/nav_common.py ]; then
+  $PY -m py_compile /tmp/nav_common.py || { say "nav_common.py failed to compile — aborting"; exit 1; }
+  install -o "$OWNER" -g "$OWNER" -m 644 /tmp/nav_common.py "$APP/nav_common.py"
+  say "installed nav_common.py (shared header)"
+elif [ ! -f "$APP/nav_common.py" ]; then
+  say "ABORT: nav_common.py is neither in /tmp nor installed. Every page imports it; continuing"
+  say "  would ImportError the whole UI. Re-curl nav_common.py and run again."; exit 1
+fi
 
 $PY -m py_compile /tmp/dash_api.py || { say "compile failed — aborting"; exit 1; }
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/dash_api.py "$APP/dash_api.py"

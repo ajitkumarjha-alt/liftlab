@@ -8,7 +8,7 @@
 # FILES NEEDED IN /tmp: apply_calib_cells.sh calib_cells_api.py apply_calib_cells_patch.py
 #                       calib_roi_api.py door_calib.py [dash_api.py]
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_calib_cells.sh calib_cells_api.py apply_calib_cells_patch.py calib_roi_api.py door_calib.py dash_api.py; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_calib_cells.sh calib_cells_api.py apply_calib_cells_patch.py calib_roi_api.py door_calib.py dash_api.py nav_common.py; do curl -fsSL -o /tmp/$f $B/$f; done
 #   sudo bash /tmp/apply_calib_cells.sh
 #
 # CADDY: /calib-cells must sit behind the SAME basicauth as /calib, /calib-label and /calib-roi.
@@ -28,6 +28,18 @@ id "$OWNER" >/dev/null 2>&1 || OWNER=root
 CALIB=/var/lib/liftlab/calib
 mkdir -p "$CALIB"; chown -R "$OWNER:$OWNER" "$CALIB" 2>/dev/null || true; chmod -R g+w "$CALIB" 2>/dev/null || true
 say "calib tree owned by $OWNER (roi.json writable by the web app)"
+
+# nav_common.py is a HARD dependency of every page module (the shared header). Installing a page
+# without it is an ImportError that takes the ENTIRE operator UI down, not just this page — so it is
+# installed here unconditionally and the deploy refuses to continue without it.
+if [ -f /tmp/nav_common.py ]; then
+  $PY -m py_compile /tmp/nav_common.py || { say "nav_common.py failed to compile — aborting"; exit 1; }
+  install -o "$OWNER" -g "$OWNER" -m 644 /tmp/nav_common.py "$APP/nav_common.py"
+  say "installed nav_common.py (shared header)"
+elif [ ! -f "$APP/nav_common.py" ]; then
+  say "ABORT: nav_common.py is neither in /tmp nor installed. Every page imports it; continuing"
+  say "  would ImportError the whole UI. Re-curl nav_common.py and run again."; exit 1
+fi
 
 $PY -m py_compile /tmp/calib_cells_api.py || { say "compile failed — aborting"; exit 1; }
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/calib_cells_api.py "$APP/calib_cells_api.py"
