@@ -1,0 +1,31 @@
+[Unit]
+Description=liftlab GPU fleet — one gpu_analyze worker per camera ENABLED in the cloud registry
+After=network-online.target
+Wants=network-online.target
+# The fleet supervises its own children, so a crash loop here is visible rather than silent.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=__USER__
+StateDirectory=liftlab-gpu
+Environment=CLOUD_URL=https://lift.gargi.online
+Environment=GW=site-A
+Environment=STATE_DIR=/var/lib/liftlab-gpu
+Environment=MODEL=__MODEL__
+Environment=DEVICE=cuda
+Environment=WORKER_PY=__VENVPY__
+Environment=WORKER_SCRIPT=__APPDIR__/gpu_analyze.py
+# How often the registry is polled. A toggle on /dash takes effect within this.
+Environment=FLEET_POLL_S=30
+EnvironmentFile=/etc/liftlab-gpu.env
+WorkingDirectory=__APPDIR__
+ExecStart=__VENVPY__ __APPDIR__/gpu_fleet.py
+# Restart always: the fleet has no exit that should leave it dead. KillMode=control-group (the
+# default) takes the workers with it, which is what we want — the supervisor is the only thing that
+# should be deciding which workers exist.
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -434,6 +434,15 @@ def _tier2(db, gw, cam, transits):
     }
 
 
+def _registry(db, gw):
+    """The GPU camera registry (wizard piece 5) — what the fleet is asked to run. Read-only here;
+    /dash toggles it through the registry API, which is the single writer."""
+    rows = _q(db, "SELECT cam, enabled, stride, analyze_fps, updated_at FROM camera_registry "
+                  "WHERE gateway_id=? ORDER BY cam", (gw,))
+    return {r["cam"]: {"enabled": bool(r["enabled"]), "stride": r["stride"],
+                       "analyze_fps": r["analyze_fps"], "updated_at": r["updated_at"]} for r in rows}
+
+
 def _transits_for_join(db, gw):
     """(ts, direction) per cam, ascending — the join side for per-floor demand."""
     rows = _q(db, "SELECT cam, ts, direction FROM transit_event WHERE gateway_id=? AND ts IS NOT NULL "
@@ -494,6 +503,7 @@ def dash_data(gw: str):
     trans = _transit_by_cam(db, gw)
     xfer = _transfer_by_cam(db, gw)
     floor_cov = _floor_coverage(db, gw)
+    registry = _registry(db, gw)
     tj = _transits_for_join(db, gw)
     tier2 = {c["cam"]: _tier2(db, gw, c["cam"], tj.get(c["cam"], [])) for c in cams}
     tier2 = {k: v for k, v in tier2.items() if v}
@@ -577,7 +587,7 @@ def dash_data(gw: str):
 
     return JSONResponse({"t": now, "gw": gw, "ist_today": _ist_today_str(),
                          "pi": pi, "relay": relay, "gpu": gpu,
-                         "cameras": out_cams, "headline": headline,
+                         "cameras": out_cams, "headline": headline, "registry": registry,
                          "floor_coverage": floor_cov, "tier2": tier2, "unavailable": unavailable})
 
 
@@ -691,6 +701,8 @@ a{color:#0a6;text-decoration:none}a:hover{text-decoration:underline}
 .bars .bar{width:100%;background:#127a3d}
 .bars span{font-size:8px;color:#999;margin-top:1px}
 .blank{color:#999;font-style:italic;font-size:13px;padding:6px 0}
+.gpubtn{font:600 12px system-ui;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);cursor:pointer}
+.gpubtn:disabled{opacity:.5;cursor:default}
 /* Chart tooltip. pointerdown as well as pointerover, so a phone tap works — these charts are read
    on site as often as at a desk, and hover does not exist there. */
 #tip{position:fixed;z-index:99;display:none;pointer-events:none;background:#11181d;color:#eef3f6;
@@ -851,11 +863,43 @@ function panel(d){
     +'<div class=card><h3>Door</h3>'+door+'</div>'
     +'<div class=card><h3>Transit</h3>'+trans+'</div>'
     +'<div class=card><h3>State</h3>'+state+'</div>'
+    +'<div class=card><h3>GPU analysis</h3>'+gpuToggle(d,c.cam)+'</div>'
     +'<div class=card><h3>Camera</h3>'+kv('channel',esc(c.channel))+kv('label',esc(c.label||'—'))
       +kv('snapshot',c.snap?('<span class="'+staleCls(c.snap.age_s,20)+'">'+age(c.snap.age_s)+'</span>'):'—')+'</div>'
     +'</div></div>'
     + tier2card((d.tier2||{})[c.cam]);
 }
+
+// ── GPU camera registry (wizard piece 5) ─────────────────────────────────────────────────
+// Enabling a camera here is the whole deployment step: the fleet supervisor polls the registry and
+// starts a worker. No env edit, no SSH, no restart. The button says what will happen and roughly
+// when, because "nothing visibly happened" is the failure mode of an async toggle.
+function gpuToggle(d,cam){
+  var r=(d.registry||{})[cam];
+  var on=r&&r.enabled;
+  var body=kv('state',on?'<span class=ok>ENABLED</span>':'<span class=mut>disabled</span>')
+    +(r?kv('stride / analyze_fps',esc(r.stride)+' / '+esc(r.analyze_fps||0)):'')
+    +'<div style="margin-top:6px"><button class=gpubtn data-cam="'+esc(cam)+'" data-on="'+(on?'0':'1')+'">'
+    +(on?'Disable analysis':'Enable analysis')+'</button>'
+    +'<span class=mut id=gpumsg-'+esc(cam)+' style="font-size:11px;margin-left:8px"></span></div>';
+  if(!r){body+='<div class=mut style="font-size:11px;margin-top:4px">not in the registry yet — enabling adds it</div>';}
+  return body;
+}
+document.addEventListener('click',function(e){
+  var b=e.target; if(!b.classList||!b.classList.contains('gpubtn'))return;
+  var cam=b.getAttribute('data-cam'), on=b.getAttribute('data-on')==='1';
+  b.disabled=true;
+  var msg=document.getElementById('gpumsg-'+cam);
+  if(msg)msg.textContent='saving…';
+  fetch('/api/gw/'+GW+'/cameras/'+cam,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({enabled:on})}).then(function(r){
+      return r.json().then(function(j){
+        if(!r.ok){if(msg){msg.textContent=j.detail||'failed';}b.disabled=false;return;}
+        if(msg)msg.textContent=j.note||'saved';
+        load();                       // refresh so the panel reflects the registry, not the click
+      });
+    }).catch(function(){if(msg)msg.textContent='failed';b.disabled=false;});
+});
 
 // ── TIER-2 (from the GPU door engine's gw_door_event stream) ──────────────────────────────
 // Every figure states its n. The era filter is printed at the top of the card, not buried in a
