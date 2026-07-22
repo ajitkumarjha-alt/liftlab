@@ -82,14 +82,32 @@ def fetch_registry():
     for c in cams:
         cam = str(c.get("cam", ""))
         if cam:
+            g = c.get("geometry") or {}
             out[cam] = {"enabled": bool(c.get("enabled")), "stride": int(c.get("stride") or 2),
-                        "analyze_fps": float(c.get("analyze_fps") or 0)}
+                        "analyze_fps": float(c.get("analyze_fps") or 0),
+                        # Door geometry travels with the camera, from roi.json via the registry, so a
+                        # fleet-spawned worker can read floors without anyone editing a unit file.
+                        "geometry": {k: str(v) for k, v in sorted(g.items()) if k in
+                                     ("door_roi_frame", "panel_rois", "digit_cells", "arrow_cell")}}
     return {"cams": out, "hash": d.get("hash")}
 
 
 def start(cam, cfg):
     env = dict(os.environ, CAM=cam, GW=GW,
                DOOR_STRIDE=str(cfg["stride"]), PYTHONUNBUFFERED="1")
+    # Geometry from the registry. Env names are gpu_analyze's own, and an ABSENT key is unset rather
+    # than blank: gpu_analyze treats "" as "not configured" and falls back, whereas a stale value
+    # inherited from the fleet's environment would silently configure this camera from another
+    # lift's panel — the exact failure the built-in PANEL_ROIS default already caused once.
+    geom = cfg.get("geometry") or {}
+    for key, envname in (("door_roi_frame", "DOOR_ROI_FRAME"), ("panel_rois", "PANEL_ROIS"),
+                         ("digit_cells", "DIGIT_CELLS"), ("arrow_cell", "ARROW_CELL")):
+        if geom.get(key):
+            env[envname] = geom[key]
+        else:
+            env.pop(envname, None)
+    env["GPU_DOOR"] = "1" if (geom.get("door_roi_frame") and geom.get("panel_rois")
+                              and geom.get("digit_cells") and geom.get("arrow_cell")) else "0"
     # ANALYZE_FPS is only SET when the registry asks for subsampling. Passing "0.0" is behaviourally
     # identical to unset (gpu_analyze treats <=0 as "every frame"), but it surfaces as a literal 0.0
     # on /ops next to workers showing "all(~25)", and two renderings of the same setting read as two
@@ -106,7 +124,8 @@ def start(cam, cfg):
         return
     _procs[cam] = {"proc": p, "started": time.time(), "cfg": dict(cfg),
                    "restarts": _procs.get(cam, {}).get("restarts", 0), "last_exit": None}
-    log(f"{cam}: started pid={p.pid} stride={cfg['stride']} analyze_fps={cfg['analyze_fps']}")
+    log(f"{cam}: started pid={p.pid} stride={cfg['stride']} analyze_fps={cfg['analyze_fps']} "
+        f"door={'ON' if env.get('GPU_DOOR') == '1' else 'off (geometry incomplete — draw it at /calib-roi)'}")
 
 
 def stop(cam, why):

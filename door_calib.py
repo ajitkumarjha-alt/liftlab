@@ -682,8 +682,15 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
     outp = out_path or os.environ.get("TEMPLATES_OUT", os.path.join(TEMPLATES_DIR, gw, f"{cam}.npz"))
     os.makedirs(os.path.dirname(outp), exist_ok=True)
     gd.save_templates(tpl, outp)
+    # RECORD THE ERA THIS BUILD PRODUCED. Without it, "which templates should this camera be running"
+    # is only knowable by re-hashing the npz, which needs numpy — and the web app deliberately has
+    # none. Writing it here, where the hash is already computed, lets the dash compare the era a
+    # worker is REPORTING against the era it SHOULD be on, and flag a worker still running stale
+    # templates instead of silently charting its output as current.
+    thash = gd.templates_hash(tpl)
     result = {"gw": gw, "cam": cam, "stats": stats, "n_templates": len(tpl), "out_path": outp,
               "n_labeled": len(kept), "n_excluded": int(excluded), "n_crops": len(crops),
+              "templates_hash": thash, "era": thash[:8], "built_at": time.time(),
               "fetch_url": f"{CLOUD}/api/gw/{gw}/templates/{cam}"}
     return _write_result(outdir, "_calib_build.json", result)
 

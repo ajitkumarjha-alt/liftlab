@@ -4,7 +4,7 @@
 # main.py as root -> restart -> verify-or-restore. /ops /events /validate /pihealth are untouched.
 # FILES NEEDED IN /tmp: apply_dash.sh dash_api.py apply_dash_patch.py
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_dash.sh dash_api.py apply_dash_patch.py nav_common.py; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_fleet_move_patch.py apply_dash.sh dash_api.py apply_dash_patch.py nav_common.py; do curl -fsSL -o /tmp/$f $B/$f; done
 #   sudo bash /tmp/apply_dash.sh
 set -uo pipefail
 APP=/opt/liftlab-b3/cloud
@@ -46,6 +46,12 @@ OLDPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || echo 0)
 # ROOT ROUTE CONFLICT. dash_api now serves "/" as a 307 to /dash. FastAPI matches the FIRST
 # registered route, so if main.py defines its own "/" it keeps it and the redirect is DEAD CODE —
 # silently, which is the worst outcome. Say so here rather than let it look deployed.
+# MOVE the fleet page off "/" so dash_api's redirect can own it. Runs before the restart; it backs
+# main.py up, AST-checks the result, and refuses rather than guesses if it finds no root route or
+# more than one. Set SKIP_FLEET_MOVE=1 to leave main.py alone.
+if [ "${SKIP_FLEET_MOVE:-0}" != 1 ] && [ -f /tmp/apply_fleet_move_patch.py ]; then
+  $PY /tmp/apply_fleet_move_patch.py || say "fleet move: not applied (see above) — / redirect stays inert"
+fi
 if grep -qE '^\s*@app\.(get|route)\("/"' "$APP/main.py"; then
   say "NOTE: main.py defines its own \"/\" route, which WINS over dash_api's redirect."
   say "  The / -> /dash redirect will NOT take effect until that handler is changed or removed."

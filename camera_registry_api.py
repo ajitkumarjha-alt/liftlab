@@ -25,6 +25,7 @@ import os
 import re
 import sqlite3
 import time
+from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -36,6 +37,50 @@ ANALYSIS_TOKENS = {g.split(":", 1)[0]: g.split(":", 1)[1]
                    for g in os.environ.get("ANALYSIS_TOKENS", "").split(",") if ":" in g}
 _SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 MAX_ENABLED = int(os.environ.get("FLEET_MAX_ENABLED", "7"))   # the L4 fits ~7 at 14%/cam
+CALIB_DIR = Path(os.environ.get("CALIB_DIR", "/var/lib/liftlab/calib"))
+
+
+def _geometry(gw, cam):
+    """This camera's door geometry, from roi.json — the wizard's output and the source of truth.
+
+    THE LAST SELF-CONFIGURE GAP. Workers are spawned by the fleet from the registry, but door
+    geometry was env-based and per-camera, so a fleet-started worker counted transits and could not
+    read floors: nobody had put DOOR_ROI_FRAME/PANEL_ROIS/DIGIT_CELLS in its environment. Geometry
+    is per-camera DATA and already lives per-camera on disk, so it travels with the rest of the
+    camera's configuration instead of being hand-placed in a unit file.
+
+    Returned in the exact string shapes gpu_analyze parses, so the fleet passes them through
+    untouched — a second place that formats geometry is a second place it can be formatted wrong.
+    """
+    try:
+        d = json.loads((CALIB_DIR / gw / cam / "roi.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    out = {}
+
+    def _xywh(v):
+        return ",".join(str(int(round(float(n)))) for n in v) if isinstance(v, (list, tuple)) and len(v) == 4 else None
+
+    door = _xywh(d.get("door_roi_frame"))
+    if door:
+        out["door_roi_frame"] = door
+    panels = [p for p in (_xywh(x) for x in (d.get("panel_rois") or [])) if p]
+    if panels:
+        out["panel_rois"] = ";".join(panels)
+    cells = d.get("cells") or {}
+    digits = [c for c in (_xywh(x) for x in (cells.get("digit_cells") or [])) if c]
+    if digits:
+        out["digit_cells"] = ";".join(digits)
+    arrow = _xywh(cells.get("arrow_cell"))
+    if arrow:
+        out["arrow_cell"] = arrow
+    # Cells measured against a panel that has since moved describe different pixels. The wizard
+    # already flags this; carry the flag so a worker is not configured from geometry known stale.
+    if cells.get("stale"):
+        out["cells_stale"] = str(cells["stale"])[:200]
+    return out
 
 camera_registry_router = APIRouter()
 
@@ -69,13 +114,19 @@ def _rows(db, gw):
         "WHERE gateway_id=? ORDER BY cam", (gw,)).fetchall()]
 
 
-def _payload(rows):
-    """The fleet's view + a content hash. Hash covers ONLY the fields that change what runs, so an
-    edited note or a touched updated_at does not look like a restart-worthy change."""
-    cams = [{"cam": r["cam"], "enabled": bool(r["enabled"]), "stride": int(r["stride"] or 2),
-             "analyze_fps": float(r["analyze_fps"] or 0)} for r in rows]
-    h = hashlib.sha256(json.dumps(sorted((c["cam"], c["enabled"], c["stride"], c["analyze_fps"])
-                                         for c in cams)).encode()).hexdigest()[:12]
+def _payload(rows, gw):
+    """The fleet's view + a content hash. The hash covers only what CHANGES WHAT RUNS — including
+    geometry, so redrawing an ROI restarts that worker — but not notes or updated_at, which would
+    make an edited comment look like a restart-worthy change."""
+    cams = []
+    for r in rows:
+        c = {"cam": r["cam"], "enabled": bool(r["enabled"]), "stride": int(r["stride"] or 2),
+             "analyze_fps": float(r["analyze_fps"] or 0)}
+        c["geometry"] = _geometry(gw, r["cam"])
+        cams.append(c)
+    h = hashlib.sha256(json.dumps(sorted(
+        (c["cam"], c["enabled"], c["stride"], c["analyze_fps"],
+         json.dumps(c["geometry"], sort_keys=True)) for c in cams)).encode()).hexdigest()[:12]
     return cams, h
 
 
@@ -86,7 +137,7 @@ def cameras_get(gw: str, authorization: str = Header("")):
     db = _db()
     rows = _rows(db, gw)
     db.close()
-    cams, h = _payload(rows)
+    cams, h = _payload(rows, gw)
     return JSONResponse({"gateway": gw, "cameras": cams, "hash": h, "t": time.time(),
                          "enabled_count": sum(1 for c in cams if c["enabled"]),
                          "max_enabled": MAX_ENABLED})
@@ -126,7 +177,7 @@ async def cameras_set(gw: str, cam: str, request: Request):
     db.commit()
     rows = _rows(db, gw)
     db.close()
-    cams, h = _payload(rows)
+    cams, h = _payload(rows, gw)
     return {"ok": True, "cam": cam, "enabled": enabled, "stride": stride, "analyze_fps": afps,
             "hash": h, "cameras": cams,
             "note": "the GPU fleet picks this up on its next poll (~30s); nothing restarts"}

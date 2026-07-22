@@ -18,6 +18,7 @@ Every panel carries its own timestamp.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -31,6 +32,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 DB_PATH = os.environ.get("GATEWAY_DB", "./gateway.db")
 SNAP_DIR = Path(os.environ.get("SNAP_DIR", "/run/liftlab-snap"))
+CALIB_DIR = Path(os.environ.get("CALIB_DIR", "/var/lib/liftlab/calib"))
 SNAP_STALE_S = float(os.environ.get("SNAP_STALE_S", "20"))
 # The Pi fleet overview lives in main.py, not here, so its path is configuration rather than a
 # guess. Set DASH_FLEET_URL to wherever that page ends up when it moves off "/".
@@ -323,6 +325,22 @@ def _ist_hour(ts):
         return None
 
 
+def _expected_era(gw, cam):
+    """The era the last BUILD produced, from _calib_build.json — plain JSON, no numpy needed here.
+
+    Observed (what a worker reports) is the right thing to FILTER by: it is what actually produced
+    the rows. Expected is the right thing to CHECK against: if a worker is still running templates
+    from before the last build, its reads are real but stale, and charting them as current is how a
+    known-bad geometry keeps looking fine.
+    """
+    try:
+        d = json.loads((CALIB_DIR / gw / cam / "_calib_build.json").read_text())
+    except (OSError, ValueError):
+        return None, None
+    era = d.get("era") or (str(d.get("templates_hash") or "")[:8] or None)
+    return (era or None), d.get("built_at")
+
+
 def _era_for(db, gw, cam):
     """The templates-hash prefix to filter this camera's door rows by, and where it came from.
 
@@ -491,11 +509,19 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
     era_t1 = rows[-1]["ts"]
     joinable = sum(1 for t, _ in transits if era_t0 <= t <= era_t1)
 
+    exp_era, built_at = _expected_era(gw, cam)
+    stale_templates = None
+    if exp_era and era and exp_era != era:
+        stale_templates = (f"this camera is REPORTING era {era} but the last build produced "
+                           f"{exp_era} — the worker is running stale templates. Its reads are real "
+                           f"but they are not from the current geometry; restart the worker (or "
+                           f"wait for the templates refetch) before trusting these numbers.")
     era_note = (f"door_version starting {era} [{era_src}] · reads with reason "
                 f"{'/'.join(DOOR_OK_REASONS)} and a non-null floor")
     return {
         "era": era,
         "era_source": era_src,
+        "expected_era": exp_era, "built_at": built_at, "stale_templates": stale_templates,
         "era_filter": era_note,
         "quality_reasons": list(DOOR_OK_REASONS),
         "rows_in_era": len(rows),
@@ -932,6 +958,7 @@ a{color:#0a6;text-decoration:none}a:hover{text-decoration:underline}
 .bars .bar{width:100%;background:#127a3d}
 .bars span{font-size:8px;color:#999;margin-top:1px}
 .blank{color:#999;font-style:italic;font-size:13px;padding:6px 0}
+.warnrow{background:#fff3e0;border-left:3px solid #b06a00;color:#7a5200;padding:6px 8px;border-radius:4px;font:11px/1.5 var(--mono);margin:0 0 6px}
 .camlinks{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
 .cbtn{font:600 11px var(--mono);padding:4px 9px;border:1px solid var(--b);border-radius:12px;text-decoration:none;color:#2a6db0;background:transparent}
 .cbtn:hover{background:rgba(42,109,176,.08)}
@@ -1180,7 +1207,10 @@ function tier2card(t){
     .map(function(k){return esc(k)+'='+exc[k];}).join(', ');
   return '<div class=card style="margin-top:12px">'
     +'<h3>Tier-2 · stops, direction &amp; speed <span class=mut style="font-weight:400;font-size:11px">from gw_door_event</span></h3>'
-    +'<div class=mut style="font-size:11px;margin-bottom:6px">era: <b>'+esc(t.era_filter)+'</b><br>'
+    +(t.stale_templates?('<div class=warnrow><b>STALE TEMPLATES</b> — '+esc(t.stale_templates)+'</div>'):'')
+    +'<div class=mut style="font-size:11px;margin-bottom:6px">era: <b>'+esc(t.era_filter)+'</b>'
+    +(t.expected_era?(' · last build produced <b>'+esc(t.expected_era)+'</b>'+(t.stale_templates?' <span class=bad>(MISMATCH)</span>':' ✓')):'')
+    +'<br>'
     +'rows in era '+t.rows_in_era+' → confident reads <b>'+t.confident_reads+'</b> · reasons seen: '+(cen||'—')
     +(t.floor_order_declared?'':' · <b>no DASH_FLOOR_ORDER declared</b> — non-numeric floors are excluded from speed')
     +'</div>'
