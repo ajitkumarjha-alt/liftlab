@@ -4,7 +4,7 @@
 # FILES NEEDED IN /tmp: apply_gpu_fleet.sh gpu_fleet.py gpu_analyze.py counting.py gpu_door.py
 #                       gpu_watchdog.py liftlab-gpu-fleet.service
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_gpu_fleet.sh gpu_fleet.py gpu_analyze.py counting.py gpu_door.py gpu_watchdog.py liftlab-gpu-fleet.service; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_gpu_fleet.sh gpu_fleet.py gpu_analyze.py counting.py gpu_door.py gpu_watchdog.py gpu_bench.py liftlab-gpu-fleet.service; do curl -fsSL -o /tmp/$f $B/$f; done
 #   sudo ANALYSIS_TOKEN=site-A:<token> bash /tmp/apply_gpu_fleet.sh
 #
 # THIS REPLACES liftlab-gpu (the single-camera unit) WITH liftlab-gpu-fleet. Both running would put
@@ -34,7 +34,7 @@ say "user=$LABUSER venv=$VENVPY model=$MODEL"
 
 "$VENVPY" -m py_compile /tmp/gpu_fleet.py /tmp/gpu_analyze.py || { say "compile failed"; exit 1; }
 install -d -o "$LABUSER" -g "$LABUSER" "$APPDIR"
-for f in gpu_fleet.py gpu_analyze.py counting.py gpu_door.py gpu_watchdog.py; do
+for f in gpu_fleet.py gpu_analyze.py counting.py gpu_door.py gpu_watchdog.py gpu_bench.py; do
   [ -f "/tmp/$f" ] && install -o "$LABUSER" -g "$LABUSER" -m 644 "/tmp/$f" "$APPDIR/$f"
 done
 chmod 755 "$APPDIR/gpu_fleet.py" "$APPDIR/gpu_analyze.py"
@@ -98,6 +98,8 @@ if [ "$WORKERS" -ge 1 ]; then
   say "RESULT: PASS — fleet is running $WORKERS worker(s)."
   say "  Add a camera: /dash -> the camera's tab -> GPU analysis -> Enable. Takes effect in ~30s."
   say "  Watch: journalctl -u liftlab-gpu-fleet -f"
+  say "  Before adding cameras, price the free levers (stop the fleet first for a clean read):"
+  say "    sudo systemctl stop liftlab-gpu-fleet && $VENVPY '$APPDIR'/gpu_bench.py --segments 20 --variants base,fp16,trt,n"
 else
   say "RESULT: CHECK — fleet is active but no workers started. journalctl -u liftlab-gpu-fleet -n 40"
   say "  Collection is STOPPED. To roll back now: systemctl disable --now liftlab-gpu-fleet"
