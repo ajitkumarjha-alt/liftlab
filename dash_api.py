@@ -228,6 +228,181 @@ def _floor_coverage(db, gw):
     return {"total": rows[0]["t"] or 0, "with_floor": rows[0]["f"] or 0}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TIER-2 from gw_door_event — stops, up/down (C17/C18), speed factors (C21/C22),
+# and per-floor demand. Everything here is gated on ONE era and ONE quality bar,
+# and every number it emits carries n + the era it was measured under.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ERA. door_version is `templates_hash[:8] + "+" + geometry_hash[:8]` (gpu_analyze.build_door_engine)
+# — a CONTENT HASH, so ">=" over it is meaningless: hashes have no order, and a rebuild of the same
+# templates can sort either side of any bound. The era is therefore an explicit PREFIX match on the
+# templates half. Reads from any other template set are a different instrument and are excluded, not
+# ranked. Change this constant (and say so on the panel) when a rebuild opens a new era.
+DOOR_ERA = os.environ.get("DASH_DOOR_ERA", "f7b2c37e")
+
+# QUALITY BAR. DoorFloorEngine.process emits reason ∈ ok | single_panel | disagree | ambiguous | no_read.
+#   ok           = two panels read the same floor (agree-or-discard)
+#   single_panel = one panel configured; read succeeded, no cross-check available
+# ch29 currently runs SINGLE-PANEL (PANEL1_DIGIT_CELLS/PANEL1_ARROW_CELL are not calibrated), so
+# EVERY good read it has ever produced is 'single_panel' and NONE are 'ok'. Filtering to reason='ok'
+# alone would return zero rows and render as "no data" — indistinguishable from a dead camera. Both
+# count as confident; the per-reason census below is published so the distinction stays visible.
+DOOR_OK_REASONS = ("ok", "single_panel")
+
+# Floor label -> physical index, for speed. Numeric labels map by int(); anything else (G, LG, MEP,
+# P3) needs a declared order or it is EXCLUDED from speed — never guessed at.
+FLOOR_ORDER = [s.strip() for s in os.environ.get("DASH_FLOOR_ORDER", "").split(",") if s.strip()]
+# Plausibility ceiling for a floors/second segment. The Jul-21 live gate found real OCR slips (1→G,
+# 7→77); a 7→77 misread manufactures a 70-floor "move" in seconds. Such segments are DISCARDED and
+# COUNTED (never clamped — a clamped outlier is a fabricated measurement).
+MAX_FLOORS_PER_S = float(os.environ.get("DASH_MAX_FLOORS_PER_S", "3.0"))
+DOOR_ATTR_S = float(os.environ.get("DASH_DOOR_ATTR_S", "10"))       # how far back a stop may borrow a floor
+DOOR_OPEN_MAX_S = float(os.environ.get("DASH_DOOR_OPEN_MAX_S", "60"))  # cap on an unterminated open window
+
+
+def _floor_idx(label):
+    if label is None:
+        return None
+    s = str(label).strip()
+    if FLOOR_ORDER and s in FLOOR_ORDER:
+        return FLOOR_ORDER.index(s)
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tier2(db, gw, cam, transits):
+    """Tier-2 for one camera, from the gw_door_event stream of ONE era.
+
+    transits: [(ts, direction)] for this cam, ascending — joined to door-open windows for per-floor
+    demand. Returns None when the era has no rows at all (nothing to say), otherwise a dict whose
+    every metric carries its own n plus the era/quality filter that produced it.
+    """
+    rows = _q(db, "SELECT ts, floor, direction, door_state, reason, read_conf FROM gw_door_event "
+                  "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
+              (gw, cam, DOOR_ERA + "%"))
+    if not rows:
+        return None
+
+    # Per-reason census FIRST. If the quality filter matches nothing, this is what tells you it was
+    # the FILTER and not the camera — the failure mode that would otherwise look like an empty panel.
+    census = {}
+    for r in rows:
+        k = r["reason"] or "(none)"
+        census[k] = census.get(k, 0) + 1
+    conf = [r for r in rows if r["floor"] is not None and (r["reason"] in DOOR_OK_REASONS)]
+
+    # ── C21/C22 — speed between CONSECUTIVE confident reads that changed floor ──────────────
+    seg_up, seg_dn = [], []
+    skipped_unmappable = skipped_implausible = 0
+    prev = None
+    for r in conf:
+        if prev is not None and r["floor"] != prev["floor"]:
+            i0, i1 = _floor_idx(prev["floor"]), _floor_idx(r["floor"])
+            dt = (r["ts"] or 0) - (prev["ts"] or 0)
+            if i0 is None or i1 is None:
+                skipped_unmappable += 1
+            elif dt > 0:
+                fps = abs(i1 - i0) / dt
+                if fps > MAX_FLOORS_PER_S:
+                    skipped_implausible += 1        # OCR slip, not a lift that fast
+                else:
+                    (seg_up if i1 > i0 else seg_dn).append(fps)
+        prev = r
+
+    # ── C17/C18 — stops at door-open, split by the arrow shown ─────────────────────────────
+    # A stop is a transition INTO door_state='open'. The floor is the opening row's own read when it
+    # is confident, else the most recent confident read within DOOR_ATTR_S — a door that opens on a
+    # no_read frame is still a real stop, but only if we can say WHERE within living memory.
+    stops = []                                     # {ts, floor, direction, close_ts}
+    unattributed = 0
+    last_conf = None
+    prev_state = None
+    for idx, r in enumerate(rows):
+        if r["floor"] is not None and r["reason"] in DOOR_OK_REASONS:
+            last_conf = r
+        st = r["door_state"]
+        if st == "open" and prev_state != "open":
+            src = r if (r["floor"] is not None and r["reason"] in DOOR_OK_REASONS) else last_conf
+            if src is None or src["floor"] is None or (r["ts"] - src["ts"]) > DOOR_ATTR_S:
+                unattributed += 1
+            else:
+                close_ts = None
+                for nxt in rows[idx + 1:]:
+                    if nxt["door_state"] in ("closing", "closed"):
+                        close_ts = nxt["ts"]
+                        break
+                    if (nxt["ts"] or 0) - (r["ts"] or 0) > DOOR_OPEN_MAX_S:
+                        break
+                stops.append({"ts": r["ts"], "floor": str(src["floor"]),
+                              "direction": src["direction"],
+                              "close_ts": close_ts if close_ts is not None else (r["ts"] + DOOR_OPEN_MAX_S)})
+        if st:
+            prev_state = st
+
+    up_stops = sum(1 for s in stops if s["direction"] == "up")
+    dn_stops = sum(1 for s in stops if s["direction"] == "down")
+    no_arrow = len(stops) - up_stops - dn_stops
+
+    # ── stops per floor + boardings per floor (transits inside each door-open window) ───────
+    per_floor = {}
+    matched_transits = 0
+    ti = 0                                          # both lists are ascending -> single forward pass,
+    for s in stops:                                 # not a rescan per stop (this is the one page everyone loads)
+        f = per_floor.setdefault(s["floor"], {"stops": 0, "up_stops": 0, "down_stops": 0,
+                                              "boarded": 0, "alighted": 0})
+        f["stops"] += 1
+        if s["direction"] == "up":
+            f["up_stops"] += 1
+        elif s["direction"] == "down":
+            f["down_stops"] += 1
+        while ti < len(transits) and transits[ti][0] < s["ts"]:
+            ti += 1                                 # transits before this window belong to no open door
+        j = ti
+        while j < len(transits) and transits[j][0] <= s["close_ts"]:
+            f["boarded" if transits[j][1] == "in" else "alighted"] += 1
+            matched_transits += 1
+            j += 1
+
+    floors = [dict(v, floor=k, floor_idx=_floor_idx(k)) for k, v in per_floor.items()]
+    floors.sort(key=lambda x: (x["floor_idx"] is None, x["floor_idx"], x["floor"]))
+
+    era_note = (f"door_version starting {DOOR_ERA} · reads with reason "
+                f"{'/'.join(DOOR_OK_REASONS)} and a non-null floor")
+    return {
+        "era": DOOR_ERA,
+        "era_filter": era_note,
+        "quality_reasons": list(DOOR_OK_REASONS),
+        "rows_in_era": len(rows),
+        "confident_reads": len(conf),
+        "reason_census": census,
+        # C17/C18
+        "stops": {"n": len(stops), "up": up_stops, "down": dn_stops, "no_arrow": no_arrow,
+                  "unattributed": unattributed},
+        # C21/C22 — separate directions; a lift is not symmetric and averaging them hides that
+        "speed_up": dict(_stats(seg_up), unit="floors/s"),
+        "speed_down": dict(_stats(seg_dn), unit="floors/s"),
+        "speed_excluded": {"unmappable_floor": skipped_unmappable,
+                           "implausible_gt_%.1f_fps" % MAX_FLOORS_PER_S: skipped_implausible},
+        "per_floor": floors,
+        "transits_matched": matched_transits,
+        "transits_total": len(transits),
+        "floor_order_declared": bool(FLOOR_ORDER),
+    }
+
+
+def _transits_for_join(db, gw):
+    """(ts, direction) per cam, ascending — the join side for per-floor demand."""
+    rows = _q(db, "SELECT cam, ts, direction FROM transit_event WHERE gateway_id=? AND ts IS NOT NULL "
+                  "ORDER BY ts", (gw,))
+    by = {}
+    for r in rows:
+        by.setdefault(r["cam"], []).append((r["ts"], r["direction"]))
+    return by
+
+
 def _transit_by_cam(db, gw):
     today = _ist_today_epoch()
     rows = _q(db, "SELECT cam, direction, ts FROM transit_event WHERE gateway_id=?", (gw,))
@@ -278,6 +453,9 @@ def dash_data(gw: str):
     trans = _transit_by_cam(db, gw)
     xfer = _transfer_by_cam(db, gw)
     floor_cov = _floor_coverage(db, gw)
+    tj = _transits_for_join(db, gw)
+    tier2 = {c["cam"]: _tier2(db, gw, c["cam"], tj.get(c["cam"], [])) for c in cams}
+    tier2 = {k: v for k, v in tier2.items() if v}
     ana = _analyzers(db, gw)
     val = _validations(db, gw)
     w = _latest(db, "watch_status", gw)
@@ -338,11 +516,20 @@ def dash_data(gw: str):
                              transfer_median=(x or {}).get("median"), transfer_n=(x or {}).get("n"),
                              transfer_provisional=True))
 
-    # NOT AVAILABLE (Tier-2 ceiling): floor is NULL on every row -> no per-floor family. Say it on the page.
+    # NOT AVAILABLE (Tier-2 ceiling). This panel used to be unconditional, because the only floor
+    # column was gw_event.floor and it was NULL on every row. Floor now arrives on a DIFFERENT stream
+    # (gw_door_event, from the GPU door engine), so the ceiling is only real when THAT stream has
+    # nothing in this era. Leaving it hardcoded would keep claiming Tier-2 is impossible while the
+    # numbers sat one table over.
     unavailable = None
-    if floor_cov["with_floor"] == 0 and floor_cov["total"] > 0:
-        unavailable = {"reason": "needs floor attribution — not built",
-                       "detail": f"gw_event.floor is NULL on all {floor_cov['total']} rows",
+    if not tier2:
+        if floor_cov["with_floor"] == 0 and floor_cov["total"] > 0:
+            detail = (f"gw_event.floor is NULL on all {floor_cov['total']} rows, and gw_door_event "
+                      f"has no reads in era {DOOR_ERA}")
+        else:
+            detail = f"no gw_door_event rows in era {DOOR_ERA}"
+        unavailable = {"reason": "needs floor attribution — no reads in this era",
+                       "detail": detail,
                        "blocks": ["stops per floor", "boardings/alightings per floor",
                                   "C17/C18 probable up/down stops", "C21/C22 speed factors"],
                        "unlock": "floor OCR (template-match the LED digits + direction arrow)"}
@@ -350,7 +537,7 @@ def dash_data(gw: str):
     return JSONResponse({"t": now, "gw": gw, "ist_today": _ist_today_str(),
                          "pi": pi, "relay": relay, "gpu": gpu,
                          "cameras": out_cams, "headline": headline,
-                         "floor_coverage": floor_cov, "unavailable": unavailable})
+                         "floor_coverage": floor_cov, "tier2": tier2, "unavailable": unavailable})
 
 
 @dash_router.get("/dash/{gw}/trends")
@@ -463,6 +650,10 @@ a{color:#0a6;text-decoration:none}a:hover{text-decoration:underline}
 .bars .bar{width:100%;background:#127a3d}
 .bars span{font-size:8px;color:#999;margin-top:1px}
 .blank{color:#999;font-style:italic;font-size:13px;padding:6px 0}
+table.t2{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
+table.t2 th{text-align:right;color:#888;font-weight:500;padding:2px 6px;border-bottom:1px solid #e3e8ec}
+table.t2 th:first-child,table.t2 td:first-child{text-align:left}
+table.t2 td{text-align:right;padding:2px 6px;border-bottom:1px solid #f2f5f7;font-variant-numeric:tabular-nums}
 .foot{margin-top:14px;font-size:12px}
 </style>
 <h1>liftlab · dash <span class=mut id=stamp></span></h1>
@@ -605,7 +796,43 @@ function panel(d){
     +'<div class=card><h3>State</h3>'+state+'</div>'
     +'<div class=card><h3>Camera</h3>'+kv('channel',esc(c.channel))+kv('label',esc(c.label||'—'))
       +kv('snapshot',c.snap?('<span class="'+staleCls(c.snap.age_s,20)+'">'+age(c.snap.age_s)+'</span>'):'—')+'</div>'
-    +'</div></div>';
+    +'</div></div>'
+    + tier2card((d.tier2||{})[c.cam]);
+}
+
+// ── TIER-2 (from the GPU door engine's gw_door_event stream) ──────────────────────────────
+// Every figure states its n. The era filter is printed at the top of the card, not buried in a
+// tooltip: these numbers come from ONE template set, and pooling them with another era would be
+// mixing instruments. The per-reason census is shown so an empty table reads as "the filter
+// excluded everything" rather than "the lift made no stops".
+function t2num(v,unit){return v==null?'—':(v+(unit||''))}
+function tier2card(t){
+  if(!t){return '';}
+  var s=t.stops||{}, su=t.speed_up||{}, sd=t.speed_down||{};
+  var cen=Object.keys(t.reason_census||{}).sort().map(function(k){
+    return esc(k)+' '+t.reason_census[k];}).join(' · ');
+  var rowsHtml=(t.per_floor||[]).map(function(f){
+    return '<tr><td><b>'+esc(f.floor)+'</b></td><td>'+f.stops+'</td><td>'+f.up_stops+'</td>'
+      +'<td>'+f.down_stops+'</td><td class=ok>'+f.boarded+'</td><td>'+f.alighted+'</td></tr>';}).join('');
+  var table=rowsHtml
+    ? '<table class=t2><thead><tr><th>floor</th><th>stops</th><th>↑</th><th>↓</th><th>boarded</th><th>alighted</th></tr></thead><tbody>'+rowsHtml+'</tbody></table>'
+    : '<div class=blank>no attributed stops in this era</div>';
+  var exc=t.speed_excluded||{}, excTxt=Object.keys(exc).filter(function(k){return exc[k]>0})
+    .map(function(k){return esc(k)+'='+exc[k];}).join(', ');
+  return '<div class=card style="margin-top:12px">'
+    +'<h3>Tier-2 · stops, direction &amp; speed <span class=mut style="font-weight:400;font-size:11px">from gw_door_event</span></h3>'
+    +'<div class=mut style="font-size:11px;margin-bottom:6px">era: <b>'+esc(t.era_filter)+'</b><br>'
+    +'rows in era '+t.rows_in_era+' → confident reads <b>'+t.confident_reads+'</b> · reasons seen: '+(cen||'—')
+    +(t.floor_order_declared?'':' · <b>no DASH_FLOOR_ORDER declared</b> — non-numeric floors are excluded from speed')
+    +'</div>'
+    +kv('C17/C18 stops (n='+s.n+')','↑ '+t2num(s.up)+' up · ↓ '+t2num(s.down)+' down'
+        +(s.no_arrow?' · '+s.no_arrow+' no arrow':'')+(s.unattributed?' · <span class=warn>'+s.unattributed+' unattributed</span>':''))
+    +kv('C21 speed up (n='+t2num(su.n)+')',su.n?(su.median+' floors/s median · '+su.min+'–'+su.max):'—')
+    +kv('C22 speed down (n='+t2num(sd.n)+')',sd.n?(sd.median+' floors/s median · '+sd.min+'–'+sd.max):'—')
+    +(excTxt?'<div class=mut style="font-size:11px">speed segments excluded: '+excTxt+'</div>':'')
+    +kv('transits joined to stops',t.transits_matched+' of '+t.transits_total)
+    +table
+    +'</div>';
 }
 
 var mode='cams', trCam='', TR=null;
