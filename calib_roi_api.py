@@ -305,6 +305,13 @@ button:disabled{opacity:.4;cursor:default}
 .warnbox{background:#fff8ec;border:1px solid #e8c88a;color:#7a5200;border-radius:8px;padding:8px 10px;font:12px/1.5 var(--mono);margin-bottom:10px}
 @media(prefers-color-scheme:dark){.warnbox{background:#2a2113;border-color:#5c4a24;color:#e8c88a}}
 a{color:#4c8bf5}
+
+#runlog{background:#0e1418;color:#cfe3d6;font:11px/1.45 var(--mono);padding:8px;border-radius:6px;
+  max-height:230px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:8px 0 0}
+#runlog:empty{display:none}
+.runbtn{font:600 12px system-ui;padding:7px 11px;border:1px solid var(--line);border-radius:8px;
+  background:var(--card);color:var(--fg);cursor:pointer;margin:0 6px 6px 0}
+.runbtn:disabled{opacity:.45;cursor:default}
 </style></head><body>
 <header>
   <h1>roi · __CAM__ @ __GW__</h1>
@@ -346,6 +353,75 @@ a{color:#4c8bf5}
       <div style="margin-top:6px"><button id=refresh>Refresh from live snapshot</button></div>
       <div class=note style="margin-top:6px" id=srcnote></div>
     </div>
+<div class=card id=runcard>
+  <h3>run <span class=note style="font-weight:400" id=runwhy></span></h3>
+  <div id=runbtns></div>
+  <div class=msg id=runmsg></div>
+  <pre id=runlog></pre>
+</div>
+<script>
+// ---- run buttons (wizard piece 4) ----
+// Shared by /calib-roi, /calib-cells and /calib-label. Starts a door_calib subprocess on the cloud
+// and polls its output; polling rather than SSE so a reload or a dropped lobby connection does not
+// lose the run. Buttons disable while anything is running for THIS camera — two collects at once
+// would interleave crops.
+// Self-contained: this block sits ABOVE the page's main <script>, so it cannot rely on that
+// script's GW/CAM having been evaluated yet. The template placeholders are substituted
+// server-side, so reading them here is order-independent.
+var RGW="__GW__", RCAM="__CAM__";
+var RUN={since:0,timer:null,busy:false};
+function runBtnHtml(jobs){
+  return (jobs||[]).map(function(j){
+    return '<button class=runbtn data-job="'+j.id+'" title="'+escR(j.help)+'">'+escR(j.label)+'</button>';
+  }).join('')+'<button class=runbtn id=runstop style="display:none">Stop</button>';
+}
+function escR(s){return s==null?'':(''+s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function runPaint(d){
+  var btns=document.querySelectorAll('.runbtn');
+  for(var i=0;i<btns.length;i++){
+    if(btns[i].id==='runstop'){btns[i].style.display=d.running?'':'none';continue;}
+    btns[i].disabled=d.running||!(d.runner&&d.runner.ok);
+  }
+  document.getElementById('runwhy').textContent=(d.runner&&d.runner.ok)?'':(d.runner?d.runner.reason:'');
+  var m=document.getElementById('runmsg');
+  if(d.running){m.className='msg';m.textContent=d.job+' running… '+Math.round(d.elapsed_s)+'s';}
+  else if(d.rc===0){m.className='msg ok';m.textContent=d.job+' finished OK in '+Math.round(d.elapsed_s)+'s';}
+  else if(d.rc!=null){m.className='msg err';m.textContent=d.job+' FAILED rc='+d.rc+' — see the output';}
+}
+function runPoll(){
+  fetch('/calib-run/'+RGW+'/'+RCAM+'/status?since='+RUN.since).then(function(r){return r.json()}).then(function(d){
+    if(!document.getElementById('runbtns').innerHTML){document.getElementById('runbtns').innerHTML=runBtnHtml(d.jobs);}
+    if(d.lines&&d.lines.length){
+      var pre=document.getElementById('runlog');
+      pre.textContent+=(pre.textContent?'\n':'')+d.lines.join('\n');
+      pre.scrollTop=pre.scrollHeight;
+      RUN.since=d.next_since;
+    }
+    var wasBusy=RUN.busy; RUN.busy=!!d.running;
+    runPaint(d);
+    if(d.running){ if(!RUN.timer)RUN.timer=setInterval(runPoll,1500); }
+    else if(RUN.timer){ clearInterval(RUN.timer); RUN.timer=null;
+      // A finished job usually changed what this page shows (a new frame, new crops, new cells) —
+      // reload the page's own state rather than making the operator guess whether it took.
+      if(wasBusy&&typeof runFinished==='function')runFinished(d);
+    }
+  }).catch(function(){});
+}
+document.addEventListener('click',function(e){
+  var b=e.target; if(!b.classList||!b.classList.contains('runbtn')||b.disabled)return;
+  if(b.id==='runstop'){fetch('/calib-run/'+RGW+'/'+RCAM+'/stop',{method:'POST'}).then(runPoll);return;}
+  var job=b.getAttribute('data-job'); if(!job)return;
+  b.disabled=true;
+  fetch('/calib-run/'+RGW+'/'+RCAM+'/'+job,{method:'POST'}).then(function(r){
+    return r.json().then(function(j){
+      if(!r.ok){document.getElementById('runmsg').className='msg err';
+                document.getElementById('runmsg').textContent=j.detail||'could not start';}
+      runPoll();
+    });
+  }).catch(function(){runPoll()});
+});
+runPoll();
+</script>
     <div class=card>
       <h3>next</h3>
       <div class=note>after saving: <code>door_calib --collect</code> → <a href="/calib-label/__GW__/__CAM__">label the crops</a> → <a href="/calib-cells/__GW__/__CAM__">draw the cells</a> → <code>--build</code>.
@@ -457,6 +533,8 @@ $("save").onclick=function(){
     }).catch(function(){msg("save failed","err")});
 };
 
+// a finished job (notably 'frame') replaces the image this page draws on
+function runFinished(){load();}
 function load(){
   fetch("/calib-roi/"+GW+"/"+CAM+"/state").then(function(r){return r.json()}).then(function(d){
     S=d;
