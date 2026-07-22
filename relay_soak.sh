@@ -32,6 +32,9 @@ CSV="${RELAY_CSV:-/home/askjitk/liftlab-watch/relay_soak.csv}"
 # The raw per-stream kbps is in the CSV for the full picture.
 ARRIVING_KBPS="${RELAY_ARRIVING_KBPS:-10}"     # below this over an interval = no segments = stalled/dead
 STALL_STRIKES_MAX="${RELAY_STALL_STRIKES:-2}"  # alive-but-not-delivering for this many intervals => restart.
+# How long a stream may be alive with NO measurable segment age before that counts as a stall
+# rather than as missing telemetry. Must exceed a cold start (connect + first segment).
+UNKNOWN_GRACE_S="${RELAY_UNKNOWN_GRACE_S:-120}"
 # THE 18h-OUTAGE FIX. ffmpeg can wedge ALIVE with no output (RTSP read hangs, or the PUT socket jams):
 # kill -0 still passes, so the DIED path (below) never fires and the stream stays dark for hours. But
 # `delivering` (segments landing at the VM, bytes up this interval) already SEES it — it drops to ~0
@@ -201,6 +204,8 @@ stat_age(){ printf '%s' "$1" | python3 -c "import sys,json
 try: d=json.load(sys.stdin)
 except Exception: print(-1); sys.exit()
 c=d.get('cams',{}).get('$2') or {}
+a=c.get('age_s')
+if a is not None: print(round(float(a),1)); sys.exit()
 last=c.get('last') or 0
 t=d.get('t') or 0
 print(round(t-last,1) if (last>0 and t>0) else -1)" 2>/dev/null || echo -1; }
@@ -226,10 +231,10 @@ if [ ! -s "$CSV" ]; then
 fi
 
 # ---------- launch producers, set up teardown ----------
-declare -a PIDS; declare -A PREVJ
+declare -a PIDS; declare -A PREVJ; declare -A LAUNCHED
 start_streams(){
   local i alive_now=0
-  for ((i=0;i<NCH;i++)); do PIDS[$i]=$(launch "$i"); PREVJ[${PIDS[$i]}]=$(pid_jiffies "${PIDS[$i]}"); done
+  for ((i=0;i<NCH;i++)); do PIDS[$i]=$(launch "$i"); PREVJ[${PIDS[$i]}]=$(pid_jiffies "${PIDS[$i]}"); LAUNCHED[$i]=$(date +%s); done
   say "launched $NCH direct-PUT sub relays: ${PIDS[*]}"
   # INSTANT-DEATH CHECK. A bad ffmpeg option kills every stream in milliseconds, and the loop below
   # would then relaunch them every INTERVAL forever, logging one truncated tail line per stream — which
@@ -348,16 +353,32 @@ while :; do
           STALL_RESTARTS=$((STALL_RESTARTS+1))
         fi
       elif awk "BEGIN{exit !($age < 0)}"; then
-        # Telemetry unknown (stats call failed / cam not seen since a cloud restart). Do NOT restart —
-        # say so, so an outage of the TELEMETRY never masquerades as seven healthy streams either.
-        STALL[$i]=0
-        [ "$((SEQ % 10))" = 0 ] && say "stream ${cam} age UNKNOWN (live_stats unavailable) — no action taken"
+        # Age unknown. "Do nothing" is right for a TRANSIENT blip, but it must not be right forever:
+        # a stream that has been alive a long time and has NEVER produced a measurable age is not a
+        # telemetry blip, it is a stream that has never delivered. That combination is precisely how
+        # ch29 starved — no segments on disk to age, nothing in the cloud's in-memory counters, so
+        # the detector reported "unknown" on every pass and never acted.
+        ALIVE_FOR=$(( $(date +%s) - ${LAUNCHED[$i]:-0} ))
+        if [ "${LAUNCHED[$i]:-0}" -gt 0 ] && [ "$ALIVE_FOR" -gt "$UNKNOWN_GRACE_S" ]; then
+          STALL[$i]=$(( ${STALL[$i]:-0} + 1 ))
+          say "stream ${cam} alive ${ALIVE_FOR}s with NO measurable segment age — treating as stalled (strike ${STALL[$i]}/${STALL_STRIKES_MAX})"
+          if [ "${STALL[$i]}" -ge "$STALL_STRIKES_MAX" ]; then
+            say "stream ${cam} never delivered — killing+restarting ffmpeg (pid $local_pid). tail: $(tail -1 /tmp/relay_soak_${cam}.log 2>/dev/null)"
+            kill "$local_pid" 2>/dev/null; sleep 0.5; kill -9 "$local_pid" 2>/dev/null
+            np=$(launch "$i"); PIDS[$i]=$np; PREVJ[$np]=$(pid_jiffies "$np"); STALL[$i]=0
+            LAUNCHED[$i]=$(date +%s)
+            STALL_RESTARTS=$((STALL_RESTARTS+1))
+          fi
+        else
+          STALL[$i]=0
+          [ "$((SEQ % 10))" = 0 ] && say "stream ${cam} age unknown, alive only ${ALIVE_FOR}s — within grace, no action"
+        fi
       else
         STALL[$i]=0
       fi
     else
       say "stream ${CAMS[$i]} DIED — restarting (wifi/NVR dropout). tail: $(tail -1 /tmp/relay_soak_${CAMS[$i]}.log 2>/dev/null)"
-      np=$(launch "$i"); PIDS[$i]=$np; PREVJ[$np]=$(pid_jiffies "$np"); STALL[$i]=0
+      np=$(launch "$i"); PIDS[$i]=$np; PREVJ[$np]=$(pid_jiffies "$np"); STALL[$i]=0; LAUNCHED[$i]=$(date +%s)
     fi
   done
   smbps=$(awk -v k="$sumk" 'BEGIN{printf "%.2f",k/1000}')

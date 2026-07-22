@@ -140,9 +140,40 @@ async def live_stats(gw: str, authorization: str = Header("")):
     (b1-b0)/dt = bytes actually landed per stream. Catches uplink rationing that process
     liveness (ffmpeg speed=1x) hides."""
     _auth(gw, authorization)
+    now = time.time()
     cams = {cam: {"bytes": s["bytes"], "segs": s["segs"], "last": s["last"]}
             for (g, cam), s in _STATS.items() if g == gw}
-    return {"gateway": gw, "t": time.time(), "cams": cams}
+    # DURABLE AGE, from the segment files on disk — NOT from _STATS.
+    #
+    # _STATS is a module-level dict: it dies with the process. A stream that stopped delivering
+    # before (or across) a cloud restart never re-registers, so `last` is absent forever, the
+    # relay's stall detector reads "age unknown", and its fail-safe — do nothing on missing
+    # telemetry — becomes a PERMANENT blind spot for exactly the fault it exists to catch. That is
+    # how ch29 sat starving with a working detector.
+    #
+    # The .ts files live in tmpfs, written by the relay itself, and survive a cloud restart. Their
+    # newest mtime is the honest "when did this camera last deliver", independent of this process's
+    # memory. Cameras appear here even when _STATS has never heard of them.
+    base = LIVE_DIR / gw
+    try:
+        for d in base.iterdir():
+            if not d.is_dir():
+                continue
+            newest = None
+            try:
+                for ts in d.glob("*.ts"):
+                    m = ts.stat().st_mtime
+                    if newest is None or m > newest:
+                        newest = m
+            except OSError:
+                continue
+            rec = cams.setdefault(d.name, {"bytes": 0, "segs": 0, "last": 0.0})
+            if newest is not None:
+                rec["age_s"] = round(now - newest, 1)
+                rec["newest_mtime"] = newest
+    except (OSError, FileNotFoundError):
+        pass
+    return {"gateway": gw, "t": now, "cams": cams}
 
 
 @live_router.get("/api/gw/{gw}/lift_channels")

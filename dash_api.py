@@ -280,7 +280,18 @@ def _floor_coverage(db, gw):
 # templates can sort either side of any bound. The era is therefore an explicit PREFIX match on the
 # templates half. Reads from any other template set are a different instrument and are excluded, not
 # ranked. Change this constant (and say so on the panel) when a rebuild opens a new era.
-DOOR_ERA = os.environ.get("DASH_DOOR_ERA", "f7b2c37e")
+# ERA IS PER CAMERA. This was a single global prefix defaulted to ch29's templates hash, which
+# silently filtered out every other camera: ch16 runs e79e50d3+495e8f48 (its own templates, fetched
+# correctly by the fleet — right design, wrong filter), so its reads existed and the dash showed
+# nothing. A camera's era is a property of the camera.
+#
+# DASH_DOOR_ERA accepts:
+#   ""/"auto"                  per-camera, from the newest door_version that camera has posted
+#   "f7b2c37e"                 one prefix for every camera (the old behaviour, for pinning)
+#   "ch29=f7b2c37e,ch16=e79e"  explicit per camera
+# "auto" is the default because the truth already lives in the stream — every row is version-stamped,
+# so the current era can be read rather than configured, and a rebuild moves the era by itself.
+DOOR_ERA = os.environ.get("DASH_DOOR_ERA", "auto")
 
 # QUALITY BAR. DoorFloorEngine.process emits reason ∈ ok | single_panel | disagree | ambiguous | no_read.
 #   ok           = two panels read the same floor (agree-or-discard)
@@ -311,6 +322,33 @@ def _ist_hour(ts):
         return None
 
 
+def _era_for(db, gw, cam):
+    """The templates-hash prefix to filter this camera's door rows by, and where it came from.
+
+    Auto-resolution takes the newest row's door_version — a rebuild therefore moves the era on its
+    own, which is correct: the new templates ARE a new instrument. The panel prints whichever era
+    was used, so an auto-resolved era is never silent."""
+    spec = (DOOR_ERA or "auto").strip()
+    if spec and spec != "auto":
+        if "=" in spec:
+            for part in spec.split(","):
+                k, _, v = part.partition("=")
+                if k.strip() == cam and v.strip():
+                    return v.strip(), "pinned per-camera"
+            return None, "no pin for this camera"        # explicit map that omits the cam
+        return spec, "pinned (all cameras)"
+    # Newest by EVENT TIME, not by insert order. Ordering by id would let a late-arriving or
+    # retried row from a previous era redefine the current one — a stale POST landing after a
+    # rebuild would silently roll the whole dash back to the old templates.
+    rows = _q(db, "SELECT door_version FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                  "AND door_version IS NOT NULL AND door_version<>'' AND ts IS NOT NULL "
+                  "ORDER BY ts DESC LIMIT 1", (gw, cam))
+    if not rows:
+        return None, "no door rows for this camera"
+    dv = str(rows[0]["door_version"])
+    return dv.split("+")[0], "auto (newest door_version)"
+
+
 def _floor_idx(label):
     if label is None:
         return None
@@ -330,9 +368,12 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
     demand. Returns None when the era has no rows at all (nothing to say), otherwise a dict whose
     every metric carries its own n plus the era/quality filter that produced it.
     """
+    era, era_src = _era_for(db, gw, cam)
+    if not era:
+        return None
     rows = _q(db, "SELECT ts, floor, direction, door_state, reason, read_conf FROM gw_door_event "
                   "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
-              (gw, cam, DOOR_ERA + "%"))
+              (gw, cam, era + "%"))
     # Optional DATE RANGE on top of the era. Both sides are filtered together: leaving transits
     # unfiltered while narrowing the door rows would join riders to windows that are no longer in
     # the result, and the per-floor totals would exceed the range they claim to describe.
@@ -449,10 +490,11 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
     era_t1 = rows[-1]["ts"]
     joinable = sum(1 for t, _ in transits if era_t0 <= t <= era_t1)
 
-    era_note = (f"door_version starting {DOOR_ERA} · reads with reason "
+    era_note = (f"door_version starting {era} [{era_src}] · reads with reason "
                 f"{'/'.join(DOOR_OK_REASONS)} and a non-null floor")
     return {
-        "era": DOOR_ERA,
+        "era": era,
+        "era_source": era_src,
         "era_filter": era_note,
         "quality_reasons": list(DOOR_OK_REASONS),
         "rows_in_era": len(rows),
@@ -622,10 +664,10 @@ def dash_data(gw: str):
     unavailable = None
     if not tier2:
         if floor_cov["with_floor"] == 0 and floor_cov["total"] > 0:
-            detail = (f"gw_event.floor is NULL on all {floor_cov['total']} rows, and gw_door_event "
-                      f"has no reads in era {DOOR_ERA}")
+            detail = (f"gw_event.floor is NULL on all {floor_cov['total']} rows, and no camera has "
+                      f"door reads in its own era (DASH_DOOR_ERA={DOOR_ERA})")
         else:
-            detail = f"no gw_door_event rows in era {DOOR_ERA}"
+            detail = f"no camera has gw_door_event rows in its own era (DASH_DOOR_ERA={DOOR_ERA})"
         unavailable = {"reason": "needs floor attribution — no reads in this era",
                        "detail": detail,
                        "blocks": ["stops per floor", "boardings/alightings per floor",
@@ -788,10 +830,18 @@ def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
         return _csv(out, ["cam", "ts_epoch", "ts_ist", "direction", "track_id"], f"{tag}.csv")
 
     if dataset == "floor_events":
-        rows = _q(db, "SELECT cam, ts, floor, direction, door_state, read_conf, panels_agreed, reason, "
-                      "close_travel_s, door_version FROM gw_door_event WHERE gateway_id=? "
-                      "AND door_version LIKE ?" + (" AND cam=?" if cam else "") + " ORDER BY ts",
-                  ([gw, DOOR_ERA + "%", cam] if cam else [gw, DOOR_ERA + "%"]))
+        # Per-camera era, exactly as the panel resolves it — a fleet export spans several cameras
+        # with DIFFERENT eras, so one global LIKE would silently drop whole cameras from the file.
+        cams = [cam] if cam else [c["cam"] for c in _cameras(db, gw)]
+        rows = []
+        for c in cams:
+            era, _src = _era_for(db, gw, c)
+            if not era:
+                continue
+            rows += _q(db, "SELECT cam, ts, floor, direction, door_state, read_conf, panels_agreed, "
+                           "reason, close_travel_s, door_version FROM gw_door_event "
+                           "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
+                       (gw, c, era + "%"))
         db.close()
         out = [(r["cam"], r["ts"], _iso_ist(r["ts"]), r["floor"], r["direction"], r["door_state"],
                 r["read_conf"], r["panels_agreed"], r["reason"], r["close_travel_s"], r["door_version"])
