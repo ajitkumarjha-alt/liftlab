@@ -89,8 +89,15 @@ def fetch_registry():
 
 def start(cam, cfg):
     env = dict(os.environ, CAM=cam, GW=GW,
-               DOOR_STRIDE=str(cfg["stride"]), ANALYZE_FPS=str(cfg["analyze_fps"]),
-               PYTHONUNBUFFERED="1")
+               DOOR_STRIDE=str(cfg["stride"]), PYTHONUNBUFFERED="1")
+    # ANALYZE_FPS is only SET when the registry asks for subsampling. Passing "0.0" is behaviourally
+    # identical to unset (gpu_analyze treats <=0 as "every frame"), but it surfaces as a literal 0.0
+    # on /ops next to workers showing "all(~25)", and two renderings of the same setting read as two
+    # different configurations. Omitting it keeps one visible meaning for "not subsampled".
+    if float(cfg.get("analyze_fps") or 0) > 0:
+        env["ANALYZE_FPS"] = str(cfg["analyze_fps"])
+    else:
+        env.pop("ANALYZE_FPS", None)
     try:
         p = subprocess.Popen([WORKER_PY, WORKER_SCRIPT], env=env, stdin=subprocess.DEVNULL,
                              cwd=os.path.dirname(WORKER_SCRIPT) or ".")
