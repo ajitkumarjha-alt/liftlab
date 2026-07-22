@@ -135,6 +135,7 @@ kbd{font:11px var(--mono);background:var(--line);border-radius:4px;padding:1px 5
   <span class=pill id=prog>—</span>
   <span class=pill id=doneflag></span>
   <a class=pill href="/calib-roi/__GW__/__CAM__">← draw ROIs</a>
+  <a class=pill href="/calib-cells/__GW__/__CAM__">draw cells →</a>
 </header>
 <div class=wrap>
   <div class=imgbox><img id=crop alt="crop"></div>

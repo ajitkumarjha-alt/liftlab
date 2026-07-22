@@ -359,8 +359,8 @@ def panelcheck(gw=None, cam=None, n=8, ref=55, outdir=None):
         fr = _decode_last_frame(sp)                  # None if it raced away / truncated -> skip
         if fr is not None:
             tiles.append(cv2.cvtColor(gd.crop(fr, prois[0]), cv2.COLOR_BGR2GRAY))
-    dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
-    acell = _parse_cells(os.environ.get("ARROW_CELL", ""))
+    dcells = _as_cells(None, "DIGIT_CELLS", gwid, cam)
+    acell = _as_cells(None, "ARROW_CELL", gwid, cam)
     F = 10
 
     def _tile(gray, label, color):
@@ -528,16 +528,35 @@ def _resolve_geometry(fr, door_roi_frame=None, panel_rois=None, gw=None, cam=Non
     return droi, dsrc, prois, psrc
 
 
-def _as_cells(v, envkey):
-    """Normalise cells from a web param OR env into [(x,y,w,h), ...]. Accepts a 'x,y,w,h;...' string,
-    a list of cells, or a single (x,y,w,h)."""
+def _as_cells(v, envkey, gw=None, cam=None):
+    """Normalise cells from a web param OR env OR roi.json into [(x,y,w,h), ...].
+
+    Precedence mirrors the ROIs exactly: explicit argument > env > roi.json (/calib-cells wizard).
+    Env still wins, so ch29's DIGIT_CELLS/ARROW_CELL flow is unchanged. Accepts a 'x,y,w,h;...'
+    string, a list of cells, or a single (x,y,w,h).
+    """
     if v is None:
         v = os.environ.get(envkey, "")
+    if isinstance(v, str) and not v:
+        drawn = (_roi_json(gw, cam).get("cells") or {})
+        key = "arrow_cell" if "ARROW" in envkey else "digit_cells"
+        v = drawn.get(key) or ""
     if isinstance(v, str):
         return _parse_cells(v)
     if v and isinstance(v[0], (list, tuple)):
         return [tuple(c) for c in v]
     return [tuple(v)] if v else []
+
+
+def _cells_src(envkey, gw=None, cam=None):
+    """Where the cells came from — reported so 'built from the wrong geometry' is visible BEFORE a
+    build, not inferred afterwards from bad OCR."""
+    if os.environ.get(envkey, ""):
+        return f"{envkey} env"
+    key = "arrow_cell" if "ARROW" in envkey else "digit_cells"
+    if (_roi_json(gw, cam).get("cells") or {}).get(key):
+        return "roi.json (/calib-cells wizard)"
+    return "UNSET"
 
 
 def render_rois(gw=None, cam=None, door_roi_frame=None, panel_rois=None):
@@ -648,11 +667,14 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
     if not kept:
         raise CalibError(f"no usable labels (all {len(crops)} crops missing or '-') — label at /calib-label/{gw}/{cam}")
 
-    dcells = _as_cells(digit_cells, "DIGIT_CELLS")
-    acell = _as_cells(arrow_cell, "ARROW_CELL")
+    dcells = _as_cells(digit_cells, "DIGIT_CELLS", gw, cam)
+    acell = _as_cells(arrow_cell, "ARROW_CELL", gw, cam)
     if not dcells or not acell:
-        raise CalibError("fixed cells required (no segmentation): digit_cells 'x,y,w,h;x,y,w,h;x,y,w,h' + "
-                         "arrow_cell 'x,y,w,h' (within-panel px — run the cells step to measure them)")
+        raise CalibError(f"fixed cells required (no segmentation): digit_cells 'x,y,w,h;x,y,w,h;x,y,w,h' "
+                         f"+ arrow_cell 'x,y,w,h' (within-panel px). Draw them at "
+                         f"/calib-cells/{gw or GW}/{cam or CAM}, or set DIGIT_CELLS/ARROW_CELL. "
+                         f"digit_cells={_cells_src('DIGIT_CELLS', gw, cam)}, "
+                         f"arrow_cell={_cells_src('ARROW_CELL', gw, cam)}")
     labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in kept]
     tpl, stats = gd.build_templates(labeled, dcells, acell[0], align=(align or os.environ.get("ALIGN", "right")),
                                     min_examples=int(os.environ.get("MIN_GLYPH_EXAMPLES", "3")),
@@ -744,8 +766,8 @@ def labelcheck(gw=None, cam=None, outdir=None):
     import numpy as np
     gwid = gw or GW; cam = cam or CAM
     outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
-    dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
-    acell = _parse_cells(os.environ.get("ARROW_CELL", ""))
+    dcells = _as_cells(None, "DIGIT_CELLS", gwid, cam)
+    acell = _as_cells(None, "ARROW_CELL", gwid, cam)
     if not dcells or not acell:
         raise CalibError("set DIGIT_CELLS + ARROW_CELL")
     lj = outdir / "labels.json"
@@ -814,8 +836,8 @@ def fitcells(gw=None, cam=None, outdir=None, radius=3, iters=3):
     import numpy as np
     gwid = gw or GW; cam = cam or CAM
     outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
-    dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
-    acell0 = _parse_cells(os.environ.get("ARROW_CELL", ""))
+    dcells = _as_cells(None, "DIGIT_CELLS", gwid, cam)
+    acell0 = _as_cells(None, "ARROW_CELL", gwid, cam)
     if not dcells or not acell0:
         raise CalibError("set DIGIT_CELLS + ARROW_CELL (the STARTING geometry to refine)")
     lj = outdir / "labels.json"
@@ -934,8 +956,8 @@ def readtest(gw=None, cam=None, db_path=None):
     if not os.path.exists(tp):
         raise CalibError(f"no templates at {tp} — run --build first")
     tpl = gd.load_templates(tp)
-    dcells = _parse_cells(os.environ.get("DIGIT_CELLS", ""))
-    acell = _parse_cells(os.environ.get("ARROW_CELL", ""))
+    dcells = _as_cells(None, "DIGIT_CELLS", gwid, cam)
+    acell = _as_cells(None, "ARROW_CELL", gwid, cam)
     if not dcells or not acell:
         raise CalibError("set DIGIT_CELLS + ARROW_CELL (the same geometry the GPU runs)")
     shift = int(os.environ.get("DOOR_SHIFT", "2"))

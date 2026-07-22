@@ -790,7 +790,8 @@ function panel(d){
   // needs calibrating, so the flow has to be discoverable from here rather than from a runbook.
   var link='<div style="margin-top:6px"><a href="/validate?cam='+c.cam+'">validate this camera →</a></div>'
     +'<div style="margin-top:4px;font-size:12px">setup: <a href="/calib-roi/'+GW+'/'+c.cam+'">draw ROIs</a>'
-    +' → <a href="/calib-label/'+GW+'/'+c.cam+'">label crops</a></div>';
+    +' → <a href="/calib-label/'+GW+'/'+c.cam+'">label crops</a>'
+    +' → <a href="/calib-cells/'+GW+'/'+c.cam+'">draw cells</a></div>';
 
   document.getElementById('panel').innerHTML=
     '<div class=panelwrap><div>'+snap+link+'</div>'

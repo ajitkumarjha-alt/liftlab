@@ -241,11 +241,23 @@ async def roi_save(gw: str, cam: str, request: Request):
         raise HTTPException(400, "panel_rois: at most two panels (the engine reads panel0 and panel1)")
     panels = [_rect(p, frame_wh, f"panel_rois[{i}]") for i, p in enumerate(panels_in)]
 
-    out = {"door_roi_frame": door, "panel_rois": panels,
-           # Provenance: which frame these were drawn on. A later frame-size change (camera reconfig,
-           # sub-stream resolution change) invalidates them, and this is what makes that detectable.
-           "frame_wh": frame_wh, "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-           "source_image": (img or {}).get("source"), "drawn_on_wh": (img or {}).get("image_wh")}
+    # MERGE, never replace. roi.json is shared with /calib-cells (which stores "cells" here), so a
+    # whole-file write would silently delete a cell geometry the operator had already approved —
+    # and they would only find out from a bad build. Redrawing ROIs must touch ROIs only.
+    out = _load_roi(d)
+    out.update({"door_roi_frame": door, "panel_rois": panels,
+                # Provenance: which frame these were drawn on. A later frame-size change (camera
+                # reconfig, sub-stream resolution change) invalidates them, and this makes that
+                # detectable rather than mysterious.
+                "frame_wh": frame_wh, "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "source_image": (img or {}).get("source"),
+                "drawn_on_wh": (img or {}).get("image_wh")})
+    # Cells are measured WITHIN the panel ROI. Move the panel and the cells no longer describe the
+    # same pixels — so flag them rather than leaving stale geometry that still looks approved.
+    old_panels = _load_roi(d).get("panel_rois")
+    if out.get("cells") and old_panels and old_panels != panels:
+        out["cells"]["stale"] = (f"panel ROI changed {old_panels} -> {panels} after these cells were "
+                                 f"drawn — redraw them at /calib-cells/{gw}/{cam}")
     d.mkdir(parents=True, exist_ok=True)
     tmp = _roi_path(d).with_suffix(".json.tmp")
     tmp.write_text(json.dumps(out, indent=2))
@@ -300,6 +312,7 @@ a{color:#4c8bf5}
   <span class=pill id=dims>—</span>
   <span class=pill id=agepill>—</span>
   <a class=pill href="/calib-label/__GW__/__CAM__">label wizard →</a>
+  <a class=pill href="/calib-cells/__GW__/__CAM__">draw cells →</a>
 </header>
 <div class=wrap>
   <div>
@@ -335,7 +348,7 @@ a{color:#4c8bf5}
     </div>
     <div class=card>
       <h3>next</h3>
-      <div class=note>after saving: <code>door_calib --collect</code> → <a href="/calib-label/__GW__/__CAM__">label the crops</a> → anchor-click → <code>--build</code>.
+      <div class=note>after saving: <code>door_calib --collect</code> → <a href="/calib-label/__GW__/__CAM__">label the crops</a> → <a href="/calib-cells/__GW__/__CAM__">draw the cells</a> → <code>--build</code>.
       roi.json is used only when <code>DOOR_ROI_FRAME</code>/<code>PANEL_ROIS</code> are unset — env still wins.</div>
     </div>
   </div>
