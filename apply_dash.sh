@@ -31,6 +31,17 @@ chown "$OWNER:$OWNER" "$APP/main.py"
 $PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restoring"; cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; exit 1; }
 
 OLDPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || echo 0)
+# ROOT ROUTE CONFLICT. dash_api now serves "/" as a 307 to /dash. FastAPI matches the FIRST
+# registered route, so if main.py defines its own "/" it keeps it and the redirect is DEAD CODE —
+# silently, which is the worst outcome. Say so here rather than let it look deployed.
+if grep -qE '^\s*@app\.(get|route)\("/"' "$APP/main.py"; then
+  say "NOTE: main.py defines its own \"/\" route, which WINS over dash_api's redirect."
+  say "  The / -> /dash redirect will NOT take effect until that handler is changed or removed."
+  say "  Whatever it serves today (the Pi fleet overview) should move to its own path, and"
+  say "  DASH_FLEET_URL set to it so the \"Pi fleet\" link on /dash points there."
+else
+  say "root route: dash_api serves / -> /dash (main.py defines no competing \"/\")"
+fi
 systemctl restart "$SVC"; sleep 4
 if [ "$(systemctl is-active "$SVC")" != active ]; then
   say "cloud FAILED to start — RESTORING $BAK to protect the ingest"

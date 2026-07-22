@@ -19,17 +19,21 @@ Every panel carries its own timestamp.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 DB_PATH = os.environ.get("GATEWAY_DB", "./gateway.db")
 SNAP_DIR = Path(os.environ.get("SNAP_DIR", "/run/liftlab-snap"))
 SNAP_STALE_S = float(os.environ.get("SNAP_STALE_S", "20"))
+# The Pi fleet overview lives in main.py, not here, so its path is configuration rather than a
+# guess. Set DASH_FLEET_URL to wherever that page ends up when it moves off "/".
+FLEET_URL = os.environ.get("DASH_FLEET_URL", "/fleet")
 HB_STALE_S = 120.0                          # analyzer heartbeat older than this = down
 IST = timezone(timedelta(hours=5, minutes=30))   # the building's clock; door ts are +05:30 local ISO
 
@@ -92,6 +96,43 @@ def _q(db, sql, args=()):
 
 def _ist_today_str():
     return datetime.now(IST).date().isoformat()          # 'YYYY-MM-DD' (local ISO date-prefix)
+
+
+def _iso_ist(ep):
+    """Epoch -> local ISO, so a spreadsheet shows the building's clock next to the raw epoch."""
+    try:
+        return datetime.fromtimestamp(ep, IST).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+def _range_bounds(period, from_d="", to_d=""):
+    """(t0, t1, label) as epochs on the BUILDING's clock. period = day|week|month|all, or an explicit
+    from_d/to_d pair of YYYY-MM-DD. Ranges are inclusive of both end dates and align to IST midnight,
+    because "last week" to an operator means seven local days, not 168 hours back from now."""
+    now = datetime.now(IST)
+    if from_d or to_d:
+        try:
+            d0 = datetime.fromisoformat(from_d).replace(tzinfo=IST) if from_d else now - timedelta(days=6)
+            d1 = datetime.fromisoformat(to_d).replace(tzinfo=IST) if to_d else now
+        except ValueError:
+            d0, d1 = now - timedelta(days=6), now
+        label = f"{d0.date()} to {d1.date()}"
+    else:
+        days = {"day": 1, "week": 7, "month": 30}.get(period or "all", 0)
+        if not days:
+            return None, None, "all data"
+        d0, d1 = now - timedelta(days=days - 1), now
+        label = f"last {days} day{'s' if days > 1 else ''} ({d0.date()} to {d1.date()})"
+    t0 = datetime(d0.year, d0.month, d0.day, tzinfo=IST).timestamp()
+    t1 = datetime(d1.year, d1.month, d1.day, tzinfo=IST).timestamp() + 86400
+    return t0, t1, label
+
+
+def _in_range(ep, t0, t1):
+    if t0 is None:
+        return True
+    return ep is not None and t0 <= ep < t1
 
 
 def _ist_today_epoch():
@@ -282,7 +323,7 @@ def _floor_idx(label):
         return None
 
 
-def _tier2(db, gw, cam, transits):
+def _tier2(db, gw, cam, transits, t0=None, t1=None):
     """Tier-2 for one camera, from the gw_door_event stream of ONE era.
 
     transits: [(ts, direction)] for this cam, ascending — joined to door-open windows for per-floor
@@ -292,6 +333,12 @@ def _tier2(db, gw, cam, transits):
     rows = _q(db, "SELECT ts, floor, direction, door_state, reason, read_conf FROM gw_door_event "
                   "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
               (gw, cam, DOOR_ERA + "%"))
+    # Optional DATE RANGE on top of the era. Both sides are filtered together: leaving transits
+    # unfiltered while narrowing the door rows would join riders to windows that are no longer in
+    # the result, and the per-floor totals would exceed the range they claim to describe.
+    if t0 is not None:
+        rows = [r for r in rows if _in_range(r["ts"], t0, t1)]
+        transits = [t for t in transits if _in_range(t[0], t0, t1)]
     if not rows:
         return None
 
@@ -592,9 +639,15 @@ def dash_data(gw: str):
 
 
 @dash_router.get("/dash/{gw}/trends")
-def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1):
-    """Hour-of-day profile + window stats. cam='' -> FLEET (all lift cams). close-travel uses only the
-    current (post-CLOSE_TRAVEL_MAX-boundary) regime for comparability. Every number carries n."""
+def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
+                period: str = "all", from_d: str = "", to_d: str = ""):
+    """Hour-of-day profile + window stats for a DATE RANGE. cam='' -> FLEET (all lift cams).
+
+    period = day | week | month | all, or an explicit from_d/to_d (YYYY-MM-DD). The hour-of-day
+    profile is unchanged in shape — it is now computed over the selected range instead of all
+    history, so "the morning peak" can be asked of last week rather than of everything ever
+    collected. n_days reports how many distinct days actually contributed, which is what the
+    per-hour averages divide by; a range with no data reports zero rather than dividing by one."""
     db = _db()
     cam_filter = ""
     args = [gw]
@@ -607,6 +660,13 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1):
     tr = _q(db, "SELECT ts, direction FROM transit_event WHERE gateway_id=?" +
             (" AND cam=?" if cam else ""), ([gw, cam] if cam else [gw]))
     db.close()
+    # RANGE FILTER. Door cycles carry a local ISO timestamp and transits an epoch, so both are
+    # normalised to epoch before comparing — mixing the two representations is how a range quietly
+    # drops one series and not the other.
+    t0, t1, range_label = _range_bounds(period, from_d, to_d)
+    if t0 is not None:
+        ev = [r for r in ev if _in_range(_epoch(r["os"]), t0, t1)]
+        tr = [r for r in tr if _in_range(r["ts"], t0, t1)]
 
     prof = {h: {"cycles": 0, "boarded": 0, "alighted": 0, "closes": [], "xfer": []} for h in range(24)}
     days = set()
@@ -631,7 +691,10 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1):
             continue
         prof[h]["boarded" if r["direction"] == "in" else "alighted"] += 1
 
-    ndays = max(1, len(days))
+    # Days that actually CONTRIBUTED, reported honestly; the max(1,..) is only the divisor guard.
+    # An empty range must read "0 days" rather than silently averaging over a day that had nothing.
+    n_days_real = len(days)
+    ndays = max(1, n_days_real)
     profile = [{"hour": h, "cycles": prof[h]["cycles"],
                 "boarded": prof[h]["boarded"], "alighted": prof[h]["alighted"],
                 **{f"close_{k}": v for k, v in _stats(prof[h]["closes"]).items()}} for h in range(24)]
@@ -657,16 +720,116 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1):
         if k != "all_day":
             windows[k]["demand_ratio_vs_allday"] = round((windows[k]["cycles_per_hr"] or 0) / ad, 2)
 
-    return JSONResponse({"gw": gw, "cam": cam or "fleet", "n_days": ndays, "profile": profile,
+    return JSONResponse({"gw": gw, "cam": cam or "fleet", "n_days": n_days_real, "profile": profile,
                          "windows": windows,
+                         "range": {"period": period, "from_d": from_d, "to_d": to_d,
+                                   "label": range_label, "t0": t0, "t1": t1,
+                                   "cycles": len(ev), "transits": len(tr)},
                          "boundaries": {"close_travel_max": {"iso": CLOSE_TRAVEL_MAX_BOUNDARY, "epoch": _BOUNDARY_EPOCH,
                                         "note": "CLOSE_TRAVEL_MAX 10->30s; close-travel here uses the post-boundary regime only"}},
                          "data_gaps": [g for g in DATA_GAPS if (cam is None or cam in g.get("cams", []) or not g.get("cams"))]})
 
 
+# ============================================================ CSV export
+# The rows BEHIND every chart and table, filtered to the same range (and, for floor data, the same
+# door era) the screen is showing. Anything else is a different dataset wearing the same name: an
+# export that quietly spans all history would disagree with the chart above it and the chart would
+# get blamed.
+_EXPORT = {
+    "door_cycles": "one row per door cycle (gw_event): the close-travel and load source",
+    "transits":    "one row per counted crossing (transit_event)",
+    "floor_events": "one row per GPU door/floor read (gw_door_event), era-filtered",
+    "per_floor":   "the Tier-2 per-floor aggregate — stops, direction split, riders",
+}
+
+
+def _csv(rows, header, name):
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(header)
+    for r in rows:
+        w.writerow(r)
+    return Response(buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"',
+                             "Cache-Control": "no-store"})
+
+
+@dash_router.get("/dash/{gw}/export.csv")
+def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
+                period: str = "all", from_d: str = "", to_d: str = ""):
+    """Download the underlying rows. dataset = door_cycles | transits | floor_events | per_floor."""
+    if dataset not in _EXPORT:
+        return JSONResponse({"error": f"unknown dataset {dataset!r}", "datasets": _EXPORT}, status_code=400)
+    t0, t1, label = _range_bounds(period, from_d, to_d)
+    db = _db()
+    tag = f"{gw}_{cam or 'fleet'}_{dataset}_{(period or 'all')}"
+    tag = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
+
+    if dataset == "door_cycles":
+        rows = _q(db, "SELECT s.camera cam, e.door_open_start_ts os, e.door_open_full_ts of_, "
+                      "e.door_close_start_ts cs, e.door_close_full_ts cf, e.close_travel_s ct, "
+                      "e.quality q, e.boarded b, e.alighted a "
+                      "FROM gw_event e JOIN gw_source s ON s.id=e.source_id WHERE s.gateway_id=?"
+                      + (" AND s.camera=?" if cam else ""), ([gw, cam] if cam else [gw]))
+        db.close()
+        out = [(r["cam"], r["os"], r["of_"], r["cs"], r["cf"], r["ct"], r["q"], r["b"], r["a"])
+               for r in rows if _in_range(_epoch(r["os"]), t0, t1)]
+        return _csv(out, ["cam", "open_start", "open_full", "close_start", "close_full",
+                          "close_travel_s", "quality", "boarded", "alighted"], f"{tag}.csv")
+
+    if dataset == "transits":
+        rows = _q(db, "SELECT cam, ts, direction, track_id FROM transit_event WHERE gateway_id=?"
+                      + (" AND cam=?" if cam else "") + " ORDER BY ts", ([gw, cam] if cam else [gw]))
+        db.close()
+        out = [(r["cam"], r["ts"], _iso_ist(r["ts"]), r["direction"], r["track_id"])
+               for r in rows if _in_range(r["ts"], t0, t1)]
+        return _csv(out, ["cam", "ts_epoch", "ts_ist", "direction", "track_id"], f"{tag}.csv")
+
+    if dataset == "floor_events":
+        rows = _q(db, "SELECT cam, ts, floor, direction, door_state, read_conf, panels_agreed, reason, "
+                      "close_travel_s, door_version FROM gw_door_event WHERE gateway_id=? "
+                      "AND door_version LIKE ?" + (" AND cam=?" if cam else "") + " ORDER BY ts",
+                  ([gw, DOOR_ERA + "%", cam] if cam else [gw, DOOR_ERA + "%"]))
+        db.close()
+        out = [(r["cam"], r["ts"], _iso_ist(r["ts"]), r["floor"], r["direction"], r["door_state"],
+                r["read_conf"], r["panels_agreed"], r["reason"], r["close_travel_s"], r["door_version"])
+               for r in rows if _in_range(r["ts"], t0, t1)]
+        return _csv(out, ["cam", "ts_epoch", "ts_ist", "floor", "direction", "door_state", "read_conf",
+                          "panels_agreed", "reason", "close_travel_s", "door_version"], f"{tag}.csv")
+
+    # per_floor — the aggregate as displayed, including the by-hour columns the heatmap draws
+    tj = _transits_for_join(db, gw)
+    cams = [cam] if cam else [c["cam"] for c in _cameras(db, gw)]
+    out = []
+    for c in cams:
+        t2 = _tier2(db, gw, c, tj.get(c, []), t0, t1)
+        if not t2:
+            continue
+        for f in t2["per_floor"]:
+            out.append((c, f["floor"], f["floor_idx"], f["stops"], f["up_stops"], f["down_stops"],
+                        f["boarded"], f["alighted"],
+                        " ".join(str(v) for v in f["stops_by_hour"]),
+                        " ".join(str(v) for v in f["riders_by_hour"]), t2["era"]))
+    db.close()
+    return _csv(out, ["cam", "floor", "floor_idx", "stops", "up_stops", "down_stops", "boarded",
+                      "alighted", "stops_by_hour_0_23", "riders_by_hour_0_23", "era"], f"{tag}.csv")
+
+
+@dash_router.get("/")
+def root_redirect():
+    """/ -> /dash. The dashboard is the front door; the fleet overview moved behind a link on it.
+
+    NOTE: if main.py defines its own "/" route it wins over this one (whichever is registered first
+    matches), and this becomes dead code rather than an error — apply_dash.sh checks for that and
+    says so, because a redirect that silently never fires is worse than no redirect."""
+    return RedirectResponse("/dash", status_code=307)
+
+
 @dash_router.get("/dash", response_class=HTMLResponse)
 def dash_page():
-    return _PAGE.replace("__GW__", os.environ.get("DASH_GW", "site-A"))
+    return _PAGE.replace("__GW__", os.environ.get("DASH_GW", "site-A")).replace("__FLEET__", FLEET_URL)
 
 
 _PAGE = r"""<!doctype html><meta charset=utf-8><title>liftlab · dash</title>
@@ -701,6 +864,10 @@ a{color:#0a6;text-decoration:none}a:hover{text-decoration:underline}
 .bars .bar{width:100%;background:#127a3d}
 .bars span{font-size:8px;color:#999;margin-top:1px}
 .blank{color:#999;font-style:italic;font-size:13px;padding:6px 0}
+.dlbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 10px}
+.dlbtn{font:600 11px var(--mono);padding:4px 9px;border:1px solid var(--line);border-radius:12px;text-decoration:none;color:#2a6db0;background:transparent}
+.dlbtn:hover{background:rgba(42,109,176,.08)}
+table.t2 tr.tot td{font-weight:600;border-top:2px solid var(--line)}
 .gpubtn{font:600 12px system-ui;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);cursor:pointer}
 .gpubtn:disabled{opacity:.5;cursor:default}
 /* Chart tooltip. pointerdown as well as pointerover, so a phone tap works — these charts are read
@@ -727,8 +894,9 @@ table.t2 td{text-align:right;padding:2px 6px;border-bottom:1px solid #f2f5f7;fon
 <div id=camview><div class=tabs id=tabs></div><div id=panel></div></div>
 <div id=trendview style="display:none"></div>
 <div id=tip></div>
-<div class=foot mut>deep views: <a href="/ops/__GW__">/ops</a> · <a href="/events">/events</a> ·
-  <a href="/validate">/validate</a> · <a href="/pihealth/__GW__">/pihealth</a></div>
+<div class=foot mut>deep views: <a href="__FLEET__">Pi fleet</a> · <a href="/ops/__GW__">/ops</a> ·
+  <a href="/events">/events</a> · <a href="/validate">/validate</a> ·
+  <a href="/pihealth/__GW__">/pihealth</a></div>
 <script>
 var GW="__GW__", cur=null, DATA=null;
 // DEEP LINK: /dash?cam=ch16 opens that camera's tab. Every wizard page breadcrumbs back here, and
@@ -1091,17 +1259,58 @@ function trCams(){
     +['',].concat(cams).map(function(c){var lbl=c||'fleet';
        return '<div class="tab'+(trCam===c?' on':'')+'" onclick="trCam=\''+c+'\';loadTrends()">'+esc(lbl)+'</div>';}).join('')+'</div>';
 }
+// ---- period picker + table view + CSV (operator batch) ----
+var trPeriod='all', trTable=false;
+function setPeriod(p){trPeriod=p;loadTrends();}
+function toggleTable(){trTable=!trTable;renderTrends();}
+function periodBar(){
+  var opts=[['day','Today'],['week','7 days'],['month','30 days'],['all','All']];
+  return '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:2px 0 8px">'
+    +opts.map(function(o){return '<button class="tog'+(trPeriod===o[0]?' on':'')+'" onclick="setPeriod(\''+o[0]+'\')">'+o[1]+'</button>';}).join('')
+    +'<span style="width:10px"></span>'
+    +'<button class="tog'+(trTable?' on':'')+'" onclick="toggleTable()">'+(trTable?'charts':'table')+'</button>'
+    +'<span class=mut id=rangelab style="font-size:11px;margin-left:6px"></span></div>';
+}
+// Every download carries the SAME cam/period the screen is showing, so a spreadsheet and the chart
+// above it cannot disagree about which rows they describe.
+function dl(ds,label){
+  var q='?dataset='+ds+'&period='+encodeURIComponent(trPeriod)+(trCam?('&cam='+encodeURIComponent(trCam)):'');
+  return '<a class=dlbtn href="/dash/'+GW+'/export.csv'+q+'">⤓ '+label+'</a>';
+}
+function exportBar(){
+  return '<div class=dlbar>'+dl('door_cycles','door cycles')+dl('transits','transits')
+    +dl('floor_events','floor events')+dl('per_floor','per-floor')
+    +'<span class=mut style="font-size:11px">CSV — the rows behind these charts, same range'+(trCam?'':' (fleet)')+'</span></div>';
+}
+function trTableHtml(prof,W){
+  var head='<tr><th>hour</th><th>cycles</th><th>boarded</th><th>alighted</th><th>riders</th>'
+    +'<th>close med (s)</th><th>close p85</th><th>n</th></tr>';
+  var body=prof.map(function(p){
+    return '<tr><td>'+pad2(p.hour)+':00</td><td>'+p.cycles+'</td><td>'+p.boarded+'</td><td>'+p.alighted
+      +'</td><td>'+(p.boarded+p.alighted)+'</td><td>'+(p.close_median==null?'—':p.close_median)
+      +'</td><td>'+(p.close_p85==null?'—':p.close_p85)+'</td><td>'+(p.close_n||0)+'</td></tr>';}).join('');
+  var tot=prof.reduce(function(a,p){a.c+=p.cycles;a.b+=p.boarded;a.a+=p.alighted;return a;},{c:0,b:0,a:0});
+  var foot='<tr class=tot><td>total</td><td>'+tot.c+'</td><td>'+tot.b+'</td><td>'+tot.a+'</td><td>'
+    +(tot.b+tot.a)+'</td><td colspan=3></td></tr>';
+  return '<div class=card><h3>hour-of-day table <span class=mut style="font-weight:400">same aggregates as the charts</span></h3>'
+    +'<div class=hmwrap><table class=t2>'+head+body+foot+'</table></div></div>';
+}
 function renderTrends(){
   if(!TR){document.getElementById('trendview').innerHTML=trCams()+'<div class=mut>loading…</div>';return;}
   var prof=TR.profile, hours=prof.map(function(p){return p.hour}), W=TR.windows;
   var bd=TR.boundaries.close_travel_max.iso.slice(0,10);
   var gaps=(TR.data_gaps||[]);
   var gapbanner=gaps.length?('<div class=mut style="font-size:12px;margin:2px 0 6px;padding:4px 8px;border-left:3px solid #b00;background:rgba(176,0,0,.06)"><b>DATA GAP</b> — '+gaps.map(function(g){return esc(g.note)}).join(' · ')+'. Hour buckets overlapping this window are undercounted (samples MISSING, not low demand).</div>'):'';
-  var h=trCams()
-    +'<div class=mut style="font-size:12px;margin:2px 0 6px">'+esc(TR.cam)+' · '+TR.n_days+' day(s) · close-travel uses the post-'+bd+' regime only (CLOSE_TRAVEL_MAX comparability boundary)</div>'
+  var h=trCams()+periodBar()
+    +'<div class=mut style="font-size:12px;margin:2px 0 6px">'+esc(TR.cam)+' · '+TR.n_days+' day(s) with data · '
+    +((TR.range&&TR.range.label)?esc(TR.range.label)+' · ':'')
+    +((TR.range?TR.range.cycles:0))+' cycles, '+((TR.range?TR.range.transits:0))+' transits in range · '
+    +'close-travel uses the post-'+bd+' regime only (CLOSE_TRAVEL_MAX comparability boundary)</div>'
+    +exportBar()
     +gapbanner
     +'<div class=strip>'+winCard('all-day',W.all_day)+winCard('AM peak',W.am_peak)+winCard('PM peak',W.pm_peak)+'</div>'
     +'<div class=mut style="font-size:11px;margin:2px 0 8px">* transfer PROVISIONAL (transit precision, re-validating). <b>THE PEAK TRAP</b>: the sheet coefficients describe a PEAK design condition, not an all-day average — peak &amp; all-day are shown SEPARATELY; the ratio is itself a finding.</div>'
+    +(trTable?trTableHtml(prof,W):(''
     +'<div class=card>'+svgBars('cycles / hour-of-day — the demand curve',
         'how often this lift’s doors operate — the work rate',
         hours,prof.map(function(p){return p.cycles}),'#127a3d',null,'','cycles')+'</div>'
@@ -1110,7 +1319,7 @@ function renderTrends(){
         hours,prof.map(function(p){return p.boarded+p.alighted}),'#2a6db0',null,'','riders')+'</div>'
     +'<div class=card>'+svgLine('close-travel median / hour-of-day (s)',
         'median seconds for the door to close, per hour — the 2.31s line is Bank C’s compliance cliff',
-        hours,prof.map(function(p){return p.close_median}),'#b06a00',2.31,'2.31 Bank C','s')+'</div>'
+        hours,prof.map(function(p){return p.close_median}),'#b06a00',2.31,'2.31 Bank C','s')+'</div>'))
     +heatCard();
   document.getElementById('trendview').innerHTML=h;
 }
@@ -1145,7 +1354,7 @@ function heatCard(){
 }
 function loadTrends(){
   renderTrends();  // show selector immediately
-  fetch('/dash/'+GW+'/trends'+(trCam?('?cam='+trCam):'')).then(function(r){return r.json()}).then(function(t){TR=t;renderTrends();}).catch(function(){});
+  fetch('/dash/'+GW+'/trends?period='+encodeURIComponent(trPeriod)+(trCam?('&cam='+encodeURIComponent(trCam)):'')).then(function(r){return r.json()}).then(function(t){TR=t;renderTrends();}).catch(function(){});
 }
 
 function render(){ if(!DATA)return; nav(); strip(DATA); headline(DATA); unavail(DATA); if(mode==='cams'){tabs(DATA); panel(DATA);} }
