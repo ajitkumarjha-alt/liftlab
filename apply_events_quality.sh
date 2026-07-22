@@ -6,7 +6,7 @@
 # events_api.py is already mounted in main.py -> file replace + restart, no main.py patch.
 # FILES NEEDED IN /tmp: apply_events_quality.sh events_api.py
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_events_quality.sh events_api.py; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_events_quality.sh events_api.py nav_common.py; do curl -fsSL -o /tmp/$f $B/$f; done
 #   sudo bash /tmp/apply_events_quality.sh
 set -uo pipefail
 APP=/opt/liftlab-b3/cloud
@@ -18,6 +18,17 @@ say(){ echo "[events-quality] $*"; }
 [ -f /tmp/events_api.py ] || { echo "missing /tmp/events_api.py"; exit 2; }
 [ -f "$APP/events_api.py" ] || { echo "events_api.py not at $APP (is this the cloud host?)"; exit 2; }
 id "$OWNER" >/dev/null 2>&1 || OWNER=root
+
+# nav_common.py is a HARD dependency of every page module (the shared header). Installing a page
+# module without it is an ImportError that takes the ENTIRE operator UI down, not just this page.
+if [ -f /tmp/nav_common.py ]; then
+  $PY -m py_compile /tmp/nav_common.py || { say "nav_common.py failed to compile — aborting"; exit 1; }
+  install -o "$OWNER" -g "$OWNER" -m 644 /tmp/nav_common.py "$APP/nav_common.py"
+  say "installed nav_common.py (shared header)"
+elif [ ! -f "$APP/nav_common.py" ]; then
+  say "ABORT: nav_common.py is neither in /tmp nor installed. Every page imports it; continuing"
+  say "  would ImportError the whole UI. Re-curl nav_common.py and run again."; exit 1
+fi
 
 $PY -m py_compile /tmp/events_api.py || { say "compile failed — aborting"; exit 1; }
 # SMOKE-IMPORT the NEW module in the cloud venv BEFORE touching the live file — a broken import fails

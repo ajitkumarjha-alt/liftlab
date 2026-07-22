@@ -4,7 +4,7 @@
 # the GPU box. Backup-first, compile-check, verify by STATUS.
 # FILES NEEDED IN /tmp: apply_analysis.sh analysis_api.py apply_analysis_patch.py ops_api.py
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_analysis.sh analysis_api.py apply_analysis_patch.py ops_api.py; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_analysis.sh analysis_api.py apply_analysis_patch.py ops_api.py nav_common.py; do curl -fsSL -o /tmp/$f $B/$f; done
 #   sudo bash /tmp/apply_analysis.sh
 set -uo pipefail
 APP=/opt/liftlab-b3/cloud
@@ -17,6 +17,17 @@ say(){ echo "[analysis] $*"; }
 for f in analysis_api.py apply_analysis_patch.py ops_api.py; do [ -f "/tmp/$f" ] || { echo "missing /tmp/$f"; exit 2; }; done
 [ -f "$APP/main.py" ] || { echo "main.py not at $APP"; exit 2; }
 id "$OWNER" >/dev/null 2>&1 || OWNER=root
+
+# nav_common.py is a HARD dependency of every page module (the shared header). Installing a page
+# module without it is an ImportError that takes the ENTIRE operator UI down, not just this page.
+if [ -f /tmp/nav_common.py ]; then
+  $PY -m py_compile /tmp/nav_common.py || { say "nav_common.py failed to compile — aborting"; exit 1; }
+  install -o "$OWNER" -g "$OWNER" -m 644 /tmp/nav_common.py "$APP/nav_common.py"
+  say "installed nav_common.py (shared header)"
+elif [ ! -f "$APP/nav_common.py" ]; then
+  say "ABORT: nav_common.py is neither in /tmp nor installed. Every page imports it; continuing"
+  say "  would ImportError the whole UI. Re-curl nav_common.py and run again."; exit 1
+fi
 
 $PY -m py_compile /tmp/analysis_api.py /tmp/ops_api.py || { say "compile failed — aborting"; exit 1; }
 install -o "$OWNER" -g "$OWNER" -m 644 /tmp/analysis_api.py "$APP/analysis_api.py"

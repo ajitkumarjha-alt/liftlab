@@ -13,6 +13,20 @@ for f in /tmp/survey_api.py /tmp/apply_pihealth_patch.py; do
   [ -f "$f" ] || { echo "missing $f — curl it first"; exit 2; }
 done
 
+# the shared-header guard needs these; this script did not define them
+OWNER=liftlab
+id "$OWNER" >/dev/null 2>&1 || OWNER=root
+# nav_common.py is a HARD dependency of every page module (the shared header). Installing a page
+# module without it is an ImportError that takes the ENTIRE operator UI down, not just this page.
+if [ -f /tmp/nav_common.py ]; then
+  $PY -m py_compile /tmp/nav_common.py || { say "nav_common.py failed to compile — aborting"; exit 1; }
+  install -o "$OWNER" -g "$OWNER" -m 644 /tmp/nav_common.py "$APP/nav_common.py"
+  say "installed nav_common.py (shared header)"
+elif [ ! -f "$APP/nav_common.py" ]; then
+  say "ABORT: nav_common.py is neither in /tmp nor installed. Every page imports it; continuing"
+  say "  would ImportError the whole UI. Re-curl nav_common.py and run again."; exit 1
+fi
+
 $PY -m py_compile /tmp/survey_api.py || { say "survey_api.py does NOT compile — aborting"; exit 1; }
 install -o liftlab -g liftlab -m 644 /tmp/survey_api.py "$APP/survey_api.py"
 say "installed survey_api.py (+pi_telemetry, /telemetry)"

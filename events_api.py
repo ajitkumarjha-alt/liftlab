@@ -37,6 +37,7 @@ import sqlite3
 import statistics
 import time
 
+import nav_common as nc
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -256,7 +257,8 @@ def events_dashboard(flagged: int = 0):
 
     body = ("<p class='muted'>No gateway events yet. The Pi posts to "
             "<code>/api/gw/events</code>.</p>" if not blocks else "".join(blocks))
-    return """<!doctype html><meta charset=utf-8><title>liftlab · events</title>
+    return ("""<!doctype html><meta charset=utf-8><title>liftlab · events</title>"""
+            + "<style>" + nc.NAV_CSS + "</style>" + nc.header("") + """
     <meta http-equiv="refresh" content="30">
     <style>:root{--mono:ui-monospace,Consolas,monospace}
     body{background:#fff;color:#1a1a1a;font:14px system-ui;max-width:900px;margin:auto;padding:20px}
@@ -271,7 +273,7 @@ def events_dashboard(flagged: int = 0):
     <p class=muted>Per-camera door events from on-site gateways. Footage stays on site;
     only derived rows arrive here. Live (30s refresh). &nbsp;·&nbsp;
     <a href="/events.csv">download CSV</a> &nbsp;·&nbsp; <a href="/">← fleet dashboard</a></p>
-    """ + body
+    """ + body)
 
 
 @events_router.get("/events.csv")
