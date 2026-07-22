@@ -261,6 +261,15 @@ DOOR_ATTR_S = float(os.environ.get("DASH_DOOR_ATTR_S", "10"))       # how far ba
 DOOR_OPEN_MAX_S = float(os.environ.get("DASH_DOOR_OPEN_MAX_S", "60"))  # cap on an unterminated open window
 
 
+def _ist_hour(ts):
+    """Hour-of-day on the building's clock. Door/transit ts are absolute epoch, and the heatmap is
+    read by people who think in local time, so the bucketing has to be IST — not UTC."""
+    try:
+        return datetime.fromtimestamp(ts, IST).hour
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
 def _floor_idx(label):
     if label is None:
         return None
@@ -312,33 +321,46 @@ def _tier2(db, gw, cam, transits):
                     (seg_up if i1 > i0 else seg_dn).append(fps)
         prev = r
 
-    # ── C17/C18 — stops at door-open, split by the arrow shown ─────────────────────────────
-    # A stop is a transition INTO door_state='open'. The floor is the opening row's own read when it
-    # is confident, else the most recent confident read within DOOR_ATTR_S — a door that opens on a
-    # no_read frame is still a real stop, but only if we can say WHERE within living memory.
-    stops = []                                     # {ts, floor, direction, close_ts}
+    # ── C17/C18 — stops per door CYCLE, split by the arrow shown ────────────────────────────
+    # A stop is one door cycle: the transition out of 'closed' into 'opening'/'open', through to the
+    # return to 'closed'.
+    #
+    # It was previously the 'open' plateau alone — open_ts to the first 'closing' row — and that is
+    # why only 31 of 2484 transits joined. DoorTracker enters 'open' only at openness >= near_open
+    # (0.90) and leaves it the instant openness dips below, so on a jittery edge the fully-open
+    # plateau can be a fraction of a second. Passengers cross throughout 'opening' and 'closing';
+    # attributing them to the plateau discards nearly all of them. The cycle is the passenger
+    # exchange, so the cycle is the window.
+    stops = []                                     # {ts, close_ts, floor, direction}
     unattributed = 0
     last_conf = None
     prev_state = None
+    open_states = ("opening", "open")
     for idx, r in enumerate(rows):
         if r["floor"] is not None and r["reason"] in DOOR_OK_REASONS:
             last_conf = r
         st = r["door_state"]
-        if st == "open" and prev_state != "open":
-            src = r if (r["floor"] is not None and r["reason"] in DOOR_OK_REASONS) else last_conf
-            if src is None or src["floor"] is None or (r["ts"] - src["ts"]) > DOOR_ATTR_S:
+        if st in open_states and prev_state not in open_states:
+            end_ts = None
+            floor_src = r if (r["floor"] is not None and r["reason"] in DOOR_OK_REASONS) else None
+            for nxt in rows[idx + 1:]:
+                if (nxt["ts"] or 0) - (r["ts"] or 0) > DOOR_OPEN_MAX_S:
+                    break
+                # A confident read from INSIDE the cycle is the best floor evidence: the car is
+                # stopped, so the floor cannot change, and mid-cycle frames are often cleaner than
+                # the opening frame (the leaf is out of the panel's way).
+                if floor_src is None and nxt["floor"] is not None and nxt["reason"] in DOOR_OK_REASONS:
+                    floor_src = nxt
+                if nxt["door_state"] == "closed":
+                    end_ts = nxt["ts"]
+                    break
+            src = floor_src or last_conf
+            if src is None or src["floor"] is None or abs(r["ts"] - src["ts"]) > DOOR_ATTR_S:
                 unattributed += 1
             else:
-                close_ts = None
-                for nxt in rows[idx + 1:]:
-                    if nxt["door_state"] in ("closing", "closed"):
-                        close_ts = nxt["ts"]
-                        break
-                    if (nxt["ts"] or 0) - (r["ts"] or 0) > DOOR_OPEN_MAX_S:
-                        break
                 stops.append({"ts": r["ts"], "floor": str(src["floor"]),
                               "direction": src["direction"],
-                              "close_ts": close_ts if close_ts is not None else (r["ts"] + DOOR_OPEN_MAX_S)})
+                              "close_ts": end_ts if end_ts is not None else (r["ts"] + DOOR_OPEN_MAX_S)})
         if st:
             prev_state = st
 
@@ -349,25 +371,36 @@ def _tier2(db, gw, cam, transits):
     # ── stops per floor + boardings per floor (transits inside each door-open window) ───────
     per_floor = {}
     matched_transits = 0
+    open_seconds = 0.0
     ti = 0                                          # both lists are ascending -> single forward pass,
     for s in stops:                                 # not a rescan per stop (this is the one page everyone loads)
         f = per_floor.setdefault(s["floor"], {"stops": 0, "up_stops": 0, "down_stops": 0,
-                                              "boarded": 0, "alighted": 0})
+                                              "boarded": 0, "alighted": 0,
+                                              "stops_by_hour": [0] * 24, "riders_by_hour": [0] * 24})
         f["stops"] += 1
+        hr = _ist_hour(s["ts"])
+        if hr is not None:
+            f["stops_by_hour"][hr] += 1
         if s["direction"] == "up":
             f["up_stops"] += 1
         elif s["direction"] == "down":
             f["down_stops"] += 1
+        open_seconds += max(0.0, (s["close_ts"] or s["ts"]) - s["ts"])
         while ti < len(transits) and transits[ti][0] < s["ts"]:
             ti += 1                                 # transits before this window belong to no open door
         j = ti
         while j < len(transits) and transits[j][0] <= s["close_ts"]:
             f["boarded" if transits[j][1] == "in" else "alighted"] += 1
+            if hr is not None:
+                f["riders_by_hour"][hr] += 1
             matched_transits += 1
             j += 1
 
     floors = [dict(v, floor=k, floor_idx=_floor_idx(k)) for k, v in per_floor.items()]
     floors.sort(key=lambda x: (x["floor_idx"] is None, x["floor_idx"], x["floor"]))
+    era_t0 = rows[0]["ts"]
+    era_t1 = rows[-1]["ts"]
+    joinable = sum(1 for t, _ in transits if era_t0 <= t <= era_t1)
 
     era_note = (f"door_version starting {DOOR_ERA} · reads with reason "
                 f"{'/'.join(DOOR_OK_REASONS)} and a non-null floor")
@@ -387,8 +420,16 @@ def _tier2(db, gw, cam, transits):
         "speed_excluded": {"unmappable_floor": skipped_unmappable,
                            "implausible_gt_%.1f_fps" % MAX_FLOORS_PER_S: skipped_implausible},
         "per_floor": floors,
+        # THE HONEST DENOMINATOR. "31 of 2484" was two problems, not one: the plateau window above,
+        # and a denominator counting every transit this camera has EVER posted — including all the
+        # ones from before this door era existed, which could never join to anything. The joinable
+        # denominator is transits inside the era's own time span; the lifetime total stays for
+        # context but is no longer the thing the ratio is against.
         "transits_matched": matched_transits,
+        "transits_joinable": joinable,
         "transits_total": len(transits),
+        "era_span": [era_t0, era_t1],
+        "door_open_seconds": round(open_seconds, 1),
         "floor_order_declared": bool(FLOOR_ORDER),
     }
 
@@ -650,6 +691,16 @@ a{color:#0a6;text-decoration:none}a:hover{text-decoration:underline}
 .bars .bar{width:100%;background:#127a3d}
 .bars span{font-size:8px;color:#999;margin-top:1px}
 .blank{color:#999;font-style:italic;font-size:13px;padding:6px 0}
+/* Chart tooltip. pointerdown as well as pointerover, so a phone tap works — these charts are read
+   on site as often as at a desk, and hover does not exist there. */
+#tip{position:fixed;z-index:99;display:none;pointer-events:none;background:#11181d;color:#eef3f6;
+  font:11px/1.4 var(--mono,ui-monospace,Menlo,monospace);padding:5px 8px;border-radius:6px;
+  box-shadow:0 2px 10px rgba(0,0,0,.28);max-width:220px}
+.intent{color:#6b7a84;font:12px/1.45 system-ui,sans-serif;margin:-2px 0 6px}
+.hmwrap{overflow-x:auto}
+.tog{font:600 11px var(--mono,monospace);padding:3px 9px;border:1px solid #d6dee3;border-radius:12px;
+  background:transparent;color:#6b7a84;cursor:pointer;margin-left:6px}
+.tog.on{background:#2a6db0;border-color:#2a6db0;color:#fff}
 table.t2{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
 table.t2 th{text-align:right;color:#888;font-weight:500;padding:2px 6px;border-bottom:1px solid #e3e8ec}
 table.t2 th:first-child,table.t2 td:first-child{text-align:left}
@@ -663,6 +714,7 @@ table.t2 td{text-align:right;padding:2px 6px;border-bottom:1px solid #f2f5f7;fon
 <div id=unavail></div>
 <div id=camview><div class=tabs id=tabs></div><div id=panel></div></div>
 <div id=trendview style="display:none"></div>
+<div id=tip></div>
 <div class=foot mut>deep views: <a href="/ops/__GW__">/ops</a> · <a href="/events">/events</a> ·
   <a href="/validate">/validate</a> · <a href="/pihealth/__GW__">/pihealth</a></div>
 <script>
@@ -853,24 +905,125 @@ function setMode(m){mode=m;
 }
 
 // ---- inline SVG charts (CSP-safe, no libs) ----
-function svgBars(title,hours,vals,color,ref,refLab){
-  var W=560,H=140,pad=30,bot=16, mx=Math.max.apply(null,vals.map(function(v){return v||0}).concat([1]));
-  var bw=(W-2*pad)/vals.length;
-  var bars=vals.map(function(v,i){var bh=(H-14-bot)*(v||0)/mx;return '<rect x="'+(pad+i*bw+0.5)+'" y="'+(H-bot-bh)+'" width="'+(bw-1)+'" height="'+bh+'" fill="'+color+'"></rect>';}).join('');
-  var labs=hours.map(function(h,i){return (h%3===0)?'<text x="'+(pad+i*bw+bw/2)+'" y="'+(H-4)+'" font-size="8" fill="#999" text-anchor="middle">'+h+'</text>':''}).join('');
-  var rl=''; if(ref!=null){var y=H-bot-(H-14-bot)*ref/mx;rl='<line x1="'+pad+'" x2="'+(W-pad)+'" y1="'+y+'" y2="'+y+'" stroke="#c0392b" stroke-dasharray="4 3"></line><text x="'+(W-pad)+'" y="'+(y-2)+'" font-size="9" fill="#c0392b" text-anchor="end">'+refLab+'</text>';}
-  return '<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto"><text x="'+pad+'" y="11" font-size="11" fill="#555">'+esc(title)+'</text>'+rl+bars+labs+'</svg>';
+// A "nice" axis maximum, so ticks read 0/25/50/75/100 rather than 0/23.7/47.4/71.1.
+function niceMax(mx){
+  if(!(mx>0))return 1;
+  var e=Math.pow(10,Math.floor(Math.log(mx)/Math.LN10)), f=mx/e;
+  return (f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10)*e;
 }
-function svgLine(title,hours,vals,color,ref,refLab){
-  var W=560,H=150,pad=30,bot=16, real=vals.filter(function(v){return v!=null}), mx=Math.max.apply(null,real.concat([ref||1,1]));
-  var bw=(W-2*pad)/vals.length;
-  function xy(v,i){return [pad+i*bw+bw/2, H-bot-(H-14-bot)*v/mx];}
+function fmtN(v){return (Math.abs(v)>=100||v===Math.round(v))?String(Math.round(v)):v.toFixed(v<1?2:1)}
+function pad2(h){return (h<10?'0':'')+h}
+// y grid + tick labels. Callers scale their marks against the SAME nmx, or the axis lies.
+function yAxis(nmx,W,H,pad,bot,top,unit){
+  var g='',n=4;
+  for(var i=0;i<=n;i++){
+    var v=nmx*i/n, y=H-bot-(H-top-bot)*i/n;
+    g+='<line x1="'+pad+'" x2="'+(W-8)+'" y1="'+y+'" y2="'+y+'" stroke="#808080" stroke-opacity="'+(i?0.18:0.45)+'"></line>'
+     +'<text x="'+(pad-4)+'" y="'+(y+3)+'" font-size="8" fill="#999" text-anchor="end">'+fmtN(v)+'</text>';
+  }
+  if(unit){g+='<text x="'+pad+'" y="'+(top-4)+'" font-size="8" fill="#aaa">'+esc(unit)+'</text>';}
+  return g;
+}
+// Full-height transparent columns: a generous tap target, so a phone user does not have to hit a
+// 2px dot. This is why the charts are usable on site and not only at a desk.
+function hitRects(hours,vals,W,H,pad,bot,top,bw,fmt){
+  return vals.map(function(v,i){
+    return '<rect x="'+(pad+i*bw)+'" y="'+top+'" width="'+bw+'" height="'+(H-bot-top)+'" fill="transparent" data-tip="'+esc(fmt(hours[i],v))+'"></rect>';
+  }).join('');
+}
+function svgBars(title,intent,hours,vals,color,ref,refLab,unit){
+  var W=560,H=160,pad=34,bot=18,top=22;
+  var mx=Math.max.apply(null,vals.map(function(v){return v||0}).concat([1])), nmx=niceMax(mx);
+  var bw=(W-pad-8)/vals.length;
+  var bars=vals.map(function(v,i){var bh=(H-top-bot)*(v||0)/nmx;
+    return '<rect x="'+(pad+i*bw+0.5)+'" y="'+(H-bot-bh)+'" width="'+(bw-1)+'" height="'+bh+'" fill="'+color+'"></rect>';}).join('');
+  var labs=hours.map(function(h,i){return (h%3===0)?'<text x="'+(pad+i*bw+bw/2)+'" y="'+(H-5)+'" font-size="8" fill="#999" text-anchor="middle">'+h+'</text>':''}).join('');
+  var rl=''; if(ref!=null){var y=H-bot-(H-top-bot)*ref/nmx;
+    rl='<line x1="'+pad+'" x2="'+(W-8)+'" y1="'+y+'" y2="'+y+'" stroke="#c0392b" stroke-dasharray="4 3"></line>'
+      +'<text x="'+(W-8)+'" y="'+(y-2)+'" font-size="9" fill="#c0392b" text-anchor="end">'+esc(refLab)+'</text>';}
+  var hits=hitRects(hours,vals,W,H,pad,bot,top,bw,function(h,v){
+    return pad2(h)+':00 — '+(v==null?'no data':fmtN(v)+(unit?' '+unit:''));});
+  return '<div class=intent>'+esc(intent)+'</div>'
+    +'<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto;touch-action:manipulation">'
+    +'<text x="'+pad+'" y="12" font-size="11" fill="#555">'+esc(title)+'</text>'
+    +yAxis(nmx,W,H,pad,bot,top,unit)+rl+bars+labs+hits+'</svg>';
+}
+function svgLine(title,intent,hours,vals,color,ref,refLab,unit){
+  var W=560,H=170,pad=34,bot=18,top=22;
+  var real=vals.filter(function(v){return v!=null});
+  var mx=Math.max.apply(null,real.concat([ref||1,1])), nmx=niceMax(mx);
+  var bw=(W-pad-8)/vals.length;
+  function xy(v,i){return [pad+i*bw+bw/2, H-bot-(H-top-bot)*v/nmx];}
   var pts=vals.map(function(v,i){return v==null?null:xy(v,i).join(',')}).filter(Boolean).join(' ');
-  var dots=vals.map(function(v,i){if(v==null)return '';var c=xy(v,i);return '<circle cx="'+c[0]+'" cy="'+c[1]+'" r="2" fill="'+color+'"></circle>';}).join('');
-  var rl=''; if(ref!=null){var y=H-bot-(H-14-bot)*ref/mx;rl='<line x1="'+pad+'" x2="'+(W-pad)+'" y1="'+y+'" y2="'+y+'" stroke="#c0392b" stroke-dasharray="4 3"></line><text x="'+(W-pad)+'" y="'+(y-2)+'" font-size="9" fill="#c0392b" text-anchor="end">'+refLab+'</text>';}
-  var labs=hours.map(function(h,i){return (h%3===0)?'<text x="'+(pad+i*bw+bw/2)+'" y="'+(H-4)+'" font-size="8" fill="#999" text-anchor="middle">'+h+'</text>':''}).join('');
-  return '<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto"><text x="'+pad+'" y="11" font-size="11" fill="#555">'+esc(title)+'</text>'+rl+'<polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.5"></polyline>'+dots+labs+'</svg>';
+  var dots=vals.map(function(v,i){if(v==null)return '';var c=xy(v,i);
+    return '<circle cx="'+c[0]+'" cy="'+c[1]+'" r="2.5" fill="'+color+'"></circle>';}).join('');
+  var rl=''; if(ref!=null){var y=H-bot-(H-top-bot)*ref/nmx;
+    rl='<line x1="'+pad+'" x2="'+(W-8)+'" y1="'+y+'" y2="'+y+'" stroke="#c0392b" stroke-dasharray="4 3"></line>'
+      +'<text x="'+(W-8)+'" y="'+(y-2)+'" font-size="9" fill="#c0392b" text-anchor="end">'+esc(refLab)+'</text>';}
+  var labs=hours.map(function(h,i){return (h%3===0)?'<text x="'+(pad+i*bw+bw/2)+'" y="'+(H-5)+'" font-size="8" fill="#999" text-anchor="middle">'+h+'</text>':''}).join('');
+  var hits=hitRects(hours,vals,W,H,pad,bot,top,bw,function(h,v){
+    return pad2(h)+':00 — '+(v==null?'no cycles this hour':fmtN(v)+(unit?' '+unit:''));});
+  return '<div class=intent>'+esc(intent)+'</div>'
+    +'<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto;touch-action:manipulation">'
+    +'<text x="'+pad+'" y="12" font-size="11" fill="#555">'+esc(title)+'</text>'
+    +yAxis(nmx,W,H,pad,bot,top,unit)+rl
+    +'<polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.5"></polyline>'
+    +dots+labs+hits+'</svg>';
 }
+// ---- floor x hour heatmap ----
+// A heatmap and not a 3D surface on purpose: the question is "which floors, when". A flat grid
+// answers it at a glance with nothing hidden behind anything else, and every cell is readable at
+// the same weight. A surface rotates prettily and occludes exactly the bars you want to compare.
+function heatColor(t,mode){
+  if(!(t>0))return 'rgba(128,128,128,0.10)';
+  var a=0.14+0.86*Math.pow(t,0.65);          // gamma so mid values stay legible, not washed out
+  return (mode==='riders')?('rgba(42,109,176,'+a.toFixed(3)+')'):('rgba(18,122,61,'+a.toFixed(3)+')');
+}
+function svgHeat(floors,mode){
+  var key=(mode==='riders')?'riders_by_hour':'stops_by_hour';
+  var rows=(floors||[]).slice().sort(function(a,b){        // highest floor on top, like the shaft
+    var ai=a.floor_idx,bi=b.floor_idx;
+    if(ai==null&&bi==null)return String(a.floor)<String(b.floor)?-1:1;
+    if(ai==null)return 1; if(bi==null)return -1; return bi-ai;});
+  var mx=0,tot=0;
+  rows.forEach(function(f){(f[key]||[]).forEach(function(v){tot+=v||0; if(v>mx)mx=v;})});
+  if(!mx){
+    return '<div class=blank>no '+(mode==='riders'?'riders':'stops')+' attributed to a floor yet in this era</div>';
+  }
+  var cw=20,ch=15,padL=44,padT=20,W=padL+24*cw+8,H=padT+rows.length*ch+18;
+  var cells='',ylab='';
+  rows.forEach(function(f,r){
+    ylab+='<text x="'+(padL-5)+'" y="'+(padT+r*ch+11)+'" font-size="9" fill="#777" text-anchor="end">'+esc(f.floor)+'</text>';
+    for(var h=0;h<24;h++){
+      var v=(f[key]||[])[h]||0;
+      cells+='<rect x="'+(padL+h*cw)+'" y="'+(padT+r*ch)+'" width="'+(cw-1)+'" height="'+(ch-1)+'" fill="'+heatColor(v/mx,mode)+'"'
+        +' data-tip="floor '+esc(f.floor)+' · '+pad2(h)+':00 — '+v+' '+(mode==='riders'?'riders':'stops')+'"></rect>';
+    }
+  });
+  var xlab='';
+  for(var h2=0;h2<24;h2+=3){xlab+='<text x="'+(padL+h2*cw+cw/2)+'" y="'+(H-5)+'" font-size="8" fill="#999" text-anchor="middle">'+h2+'</text>';}
+  var leg='';
+  for(var i=0;i<5;i++){leg+='<rect x="'+(padL+i*13)+'" y="'+(padT-13)+'" width="12" height="7" fill="'+heatColor(i/4,mode)+'"></rect>';}
+  leg+='<text x="'+(padL+5*13+5)+'" y="'+(padT-7)+'" font-size="8" fill="#999">0 → '+mx+' per floor-hour</text>';
+  return '<div class=hmwrap><svg viewBox="0 0 '+W+' '+H+'" style="width:100%;min-width:'+W+'px;height:auto;touch-action:manipulation">'
+    +leg+cells+ylab+xlab+'</svg></div>'
+    +'<div class=mut style="font-size:11px">'+tot+' '+(mode==='riders'?'riders':'stops')+' placed on a floor · hours are IST</div>';
+}
+// ONE delegated tooltip for every chart — hover for a mouse, pointerdown for a tap.
+function tipOn(e){
+  var el=document.getElementById('tip'); if(!el)return;
+  var t=(e.target&&e.target.getAttribute)?e.target.getAttribute('data-tip'):null;
+  if(!t){el.style.display='none';return;}
+  el.textContent=t; el.style.display='block';
+  var x=e.clientX+12,y=e.clientY-10;
+  if(x+236>window.innerWidth)x=Math.max(4,window.innerWidth-236);
+  if(y<4)y=4;
+  el.style.left=x+'px'; el.style.top=y+'px';
+}
+document.addEventListener('pointerover',tipOn);
+document.addEventListener('pointerdown',tipOn);
+window.addEventListener('scroll',function(){var e=document.getElementById('tip');if(e)e.style.display='none';},true);
+
 function winCard(name,w){
   if(!w)return '';
   var ratio=(w.demand_ratio_vs_allday!=null)?('  <b class="'+(w.demand_ratio_vs_allday>=1.3?'bad':'')+'">'+w.demand_ratio_vs_allday+'× all-day</b>'):'';
@@ -898,10 +1051,46 @@ function renderTrends(){
     +gapbanner
     +'<div class=strip>'+winCard('all-day',W.all_day)+winCard('AM peak',W.am_peak)+winCard('PM peak',W.pm_peak)+'</div>'
     +'<div class=mut style="font-size:11px;margin:2px 0 8px">* transfer PROVISIONAL (transit precision, re-validating). <b>THE PEAK TRAP</b>: the sheet coefficients describe a PEAK design condition, not an all-day average — peak &amp; all-day are shown SEPARATELY; the ratio is itself a finding.</div>'
-    +'<div class=card>'+svgBars('cycles / hour-of-day — the demand curve',hours,prof.map(function(p){return p.cycles}),'#127a3d',null,'')+'</div>'
-    +'<div class=card>'+svgBars('riders (boardings+alightings) / hour-of-day',hours,prof.map(function(p){return p.boarded+p.alighted}),'#2a6db0',null,'')+'</div>'
-    +'<div class=card>'+svgLine('close-travel median / hour-of-day (s)',hours,prof.map(function(p){return p.close_median}),'#b06a00',2.31,'2.31 Bank C')+'</div>';
+    +'<div class=card>'+svgBars('cycles / hour-of-day — the demand curve',
+        'how often this lift’s doors operate — the work rate',
+        hours,prof.map(function(p){return p.cycles}),'#127a3d',null,'','cycles')+'</div>'
+    +'<div class=card>'+svgBars('riders (boardings+alightings) / hour-of-day',
+        'boardings + alightings counted at this door — usage volume, not unique people',
+        hours,prof.map(function(p){return p.boarded+p.alighted}),'#2a6db0',null,'','riders')+'</div>'
+    +'<div class=card>'+svgLine('close-travel median / hour-of-day (s)',
+        'median seconds for the door to close, per hour — the 2.31s line is Bank C’s compliance cliff',
+        hours,prof.map(function(p){return p.close_median}),'#b06a00',2.31,'2.31 Bank C','s')+'</div>'
+    +heatCard();
   document.getElementById('trendview').innerHTML=h;
+}
+
+// ---- floor x hour intensity ----
+// Defaults to STOPS because stops are attributed today; riders depend on the transit join and the
+// toggle says so rather than silently drawing an empty grid.
+var heatMode='stops';
+function setHeat(m){heatMode=m;renderTrends();}
+function heatCard(){
+  var t2=(DATA&&DATA.tier2)?DATA.tier2[trCam]:null;
+  var head='<div class=card><h3>riders &amp; stops per floor, per hour '
+    +'<button class="tog'+(heatMode==='stops'?' on':'')+'" onclick="setHeat(\'stops\')">stops</button>'
+    +'<button class="tog'+(heatMode==='riders'?' on':'')+'" onclick="setHeat(\'riders\')">riders</button></h3>'
+    +'<div class=intent>which floors are busy, and when — one row per floor, one column per hour</div>';
+  if(!trCam){
+    return head+'<div class=blank>pick a camera above — floors belong to one lift, so a fleet total would mix shafts</div></div>';
+  }
+  if(!t2){
+    return head+'<div class=blank>no door-engine reads for '+esc(trCam)+' in the current era</div></div>';
+  }
+  var note='';
+  if(heatMode==='riders'){
+    var m=t2.transits_matched||0, j=t2.transits_joinable;
+    note='<div class=mut style="font-size:11px;margin-top:4px">riders come from transits joined to a door-open window: <b>'
+      +m+'</b> of <b>'+(j==null?'?':j)+'</b> joinable in this era'
+      +((t2.transits_total!=null&&j!=null&&t2.transits_total>j)?(' (' +t2.transits_total+' lifetime, most predating this era)'):'')
+      +'. Unjoined transits are not on any floor and are absent here.</div>';
+  }
+  return head+svgHeat(t2.per_floor,heatMode)+note
+    +'<div class=mut style="font-size:11px">era: '+esc(t2.era_filter||'')+'</div></div>';
 }
 function loadTrends(){
   renderTrends();  // show selector immediately
