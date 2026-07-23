@@ -248,6 +248,108 @@ def _door_by_cam(db, gw):
     return out
 
 
+def _join_diagnostics(stops, transits, matched):
+    """Item 4: WHY do transits fail to join door windows, quantified. The 5x per-camera rate
+    difference (ch16 ~9.5% vs ch29 ~2%) is not noise, so measure the mechanism rather than guess:
+      - window duration: how long each door-open window is (close_ts - ts)
+      - in-window fraction: transits landing inside ANY window (== the join rate)
+      - nearest-cycle gap: for the transits that MISS, how far to the nearest window edge. Tight
+        clustering just outside a window => an anchoring/width problem (widen or re-anchor);
+        scattered far => genuinely missing door cycles.
+    Both series are ascending, so the nearest-gap scan is a single forward pass, not a rescan.
+    """
+    durs = sorted(max(0.0, (s["close_ts"] or s["ts"]) - s["ts"]) for s in stops)
+    n_tr = len(transits)
+    # nearest gap for each transit to the union of windows (0 if inside one)
+    gaps = []
+    inside = 0
+    si = 0
+    for tts, _d in transits:
+        while si < len(stops) and (stops[si]["close_ts"] or stops[si]["ts"]) < tts:
+            si += 1                                  # advance to the first window that could contain/follow tts
+        best = None
+        for k in (si - 1, si):                       # nearest window is the one ending before, or the next one
+            if 0 <= k < len(stops):
+                lo, hi = stops[k]["ts"], (stops[k]["close_ts"] or stops[k]["ts"])
+                g = 0.0 if lo <= tts <= hi else min(abs(tts - lo), abs(tts - hi))
+                best = g if best is None else min(best, g)
+        if best == 0.0:
+            inside += 1
+        elif best is not None:
+            gaps.append(round(best, 2))
+    gaps.sort()
+    def _p(a, q):
+        return round(a[min(len(a) - 1, int(q * len(a)))], 2) if a else None
+    return {
+        "n_windows": len(stops), "n_transits": n_tr, "matched": matched,
+        "join_rate_pct": round(100.0 * inside / n_tr, 1) if n_tr else None,
+        "window_dur_s": {"median": _p(durs, 0.5), "p85": _p(durs, 0.85),
+                         "min": (durs[0] if durs else None), "max": (durs[-1] if durs else None)},
+        "miss_gap_s": {"n": len(gaps), "median": _p(gaps, 0.5), "p85": _p(gaps, 0.85),
+                       "within_2s": sum(1 for g in gaps if g <= 2.0),
+                       "beyond_10s": sum(1 for g in gaps if g > 10.0)},
+        "reading": (
+            "misses cluster within 2s of a window — window too narrow or mis-anchored (widen/re-anchor)"
+            if gaps and sum(1 for g in gaps if g <= 2.0) >= 0.5 * len(gaps)
+            else "misses scattered far from any window — genuinely missing door cycles (see DoorTracker census)"
+            if gaps else "all transits joined"),
+    }
+
+
+def _door_transition_census(db, gw, cam, era):
+    """WHERE do this camera's door cycles die — walked from the stored door_state sequence, so it
+    works on existing rows with no GPU change. The GPU DoorTracker moves closed -> opening -> open ->
+    closing -> closed; a completed cycle is the full path, and close_travel is only emitted on
+    closing -> closed. If ch16 reaches 'opening' but rarely 'open', near_open (0.90) is too high for
+    its edge; if it reaches 'open'/'closing' but rarely 'closed', close_th (0.10) is too low. This
+    tells which threshold to move instead of guessing.
+
+    door_state changes are captured by the emit-on-change gate (a state change always changes the
+    key), so consecutive rows with a state change are real transitions. Heartbeat re-emits of the
+    SAME state are collapsed here, so a run of identical states counts as one occupancy, not many.
+    """
+    rows = _q(db, "SELECT door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                  "AND door_version LIKE ? AND door_state IS NOT NULL ORDER BY ts, id", (gw, cam, era + "%"))
+    seq = []
+    for r in rows:                                   # collapse consecutive identical states
+        st = r["door_state"]
+        if not seq or seq[-1] != st:
+            seq.append(st)
+    trans, reached = {}, {"opening": 0, "open": 0, "closing": 0}
+    for a, b in zip(seq, seq[1:]):
+        trans[f"{a}->{b}"] = trans.get(f"{a}->{b}", 0) + 1
+        if b in reached:
+            reached[b] += 1
+    # cycle accounting from the transitions that matter
+    opened = trans.get("closed->opening", 0)
+    confirmed_open = trans.get("opening->open", 0)
+    aborted_opening = trans.get("opening->closed", 0)     # blip: opened a crack, never fully
+    began_closing = trans.get("open->closing", 0)
+    completed = trans.get("closing->closed", 0)           # == a cycle (close_travel emitted)
+    reopened = trans.get("closing->open", 0)
+    def _pct(a, b):
+        return round(100.0 * a / b, 1) if b else None
+    return {
+        "era": era, "state_runs": len(seq), "transitions": trans,
+        "cycle_funnel": {
+            "closed->opening": opened, "opening->open": confirmed_open,
+            "open->closing": began_closing, "closing->closed (CYCLE)": completed},
+        "losses": {
+            "opening_never_confirmed": aborted_opening,
+            "open_never_closed": max(0, confirmed_open - began_closing - reopened),
+            "closing_never_completed": max(0, began_closing - completed - reopened),
+            "reopened_mid_close": reopened},
+        "yield": {
+            "open_confirm_rate_pct": _pct(confirmed_open, opened),      # opening -> open
+            "close_complete_rate_pct": _pct(completed, began_closing),  # closing -> closed
+            "cycle_per_open_pct": _pct(completed, opened)},             # end to end
+        "diagnosis": (
+            "few opening->open: near_open threshold too high for this edge" if opened and _pct(confirmed_open, opened) is not None and _pct(confirmed_open, opened) < 50
+            else "few closing->closed: close_th too low, doors never read fully shut" if began_closing and _pct(completed, began_closing) is not None and _pct(completed, began_closing) < 50
+            else "cycles completing normally" if completed else "no completed cycles — see the funnel"),
+    }
+
+
 def _door_gpu_by_cam(db, gw, cams):
     """GPU-era close-travel, from gw_door_event COMPLETED CYCLES (close_travel_s not null), per camera
     and per that camera's own era. This is the live instrument; _door_by_cam is the retired Pi one.
@@ -617,6 +719,7 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
         "speed_down": dict(_stats(seg_dn), unit="floors/s"),
         "speed_excluded": {"unmappable_floor": skipped_unmappable,
                            "implausible_gt_%.1f_fps" % MAX_FLOORS_PER_S: skipped_implausible},
+        "join_diagnostics": _join_diagnostics(stops, transits, matched_transits),
         "per_floor": floors,
         # THE HONEST DENOMINATOR. "31 of 2484" was two problems, not one: the plateau window above,
         # and a denominator counting every transit this camera has EVER posted — including all the
@@ -628,6 +731,7 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
         "transits_total": len(transits),
         "era_span": [era_t0, era_t1],
         "door_open_seconds": round(open_seconds, 1),
+        "transition_census": _door_transition_census(db, gw, cam, era),
         "floor_order_declared": bool(FLOOR_ORDER),
     }
 
@@ -1345,6 +1449,19 @@ function tier2card(t){
     +kv('C22 speed down (n='+t2num(sd.n)+')',sd.n?(sd.median+' floors/s median · '+sd.min+'–'+sd.max):'—')
     +(excTxt?'<div class=mut style="font-size:11px">speed segments excluded: '+excTxt+'</div>':'')
     +kv('transits joined to stops',t.transits_matched+' of '+t.transits_total)
+    +(function(){var c=t.transition_census; if(!c||!c.cycle_funnel)return '';
+      var f=c.cycle_funnel, y=c.yield;
+      return '<div class=warnrow style="background:#eef4fb;border-left-color:#2a6db0;color:#234"><b>door-cycle health</b> — funnel: '
+        +'opening '+f['closed->opening']+' → open '+f['opening->open']+' → closing '+f['open->closing']+' → <b>cycle '+f['closing->closed (CYCLE)']+'</b>'
+        +' · confirm-open '+(y.open_confirm_rate_pct==null?'—':y.open_confirm_rate_pct+'%')
+        +' · complete-close '+(y.close_complete_rate_pct==null?'—':y.close_complete_rate_pct+'%')
+        +'<br><b>'+esc(c.diagnosis)+'</b></div>';})()
+    +(function(){var j=t.join_diagnostics; if(!j)return '';
+      return '<div class=mut style="font-size:11px">join: '+(j.join_rate_pct==null?'—':j.join_rate_pct+'%')
+        +' inside a window (dur median '+(j.window_dur_s.median==null?'—':j.window_dur_s.median+'s')+')'
+        +' · misses: '+j.miss_gap_s.n+', gap median '+(j.miss_gap_s.median==null?'—':j.miss_gap_s.median+'s')
+        +' ('+j.miss_gap_s.within_2s+' within 2s, '+j.miss_gap_s.beyond_10s+' beyond 10s)'
+        +'<br>'+esc(j.reading)+'</div>';})()
     +table
     +'</div>';
 }
