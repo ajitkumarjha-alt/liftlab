@@ -171,7 +171,13 @@ class FloorReader:
     def __init__(self, templates, digit_cells, arrow_cell, min_score=0.55, blank_range=40,
                  arrow_labels=ARROWS, blank_label=BLANK, shift_search=2, margin_min=0.05,
                  blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90,
-                 blank_lit_margin=0.15, confuse_band=0.0, disc_min=0.10):
+                 blank_lit_margin=0.15, confuse_band=0.0, disc_min=0.10, valid_floors=None):
+        # A tower has a FIXED set of floors. A read that assembles to something outside it — a phantom
+        # hundreds digit ("167" on a P3-26 tower), or a glyph scored into a digit cell ("7G") — is a
+        # misread no matter how each cell scored on its own. When the alphabet is known, an off-alphabet
+        # read is emitted as reason='off_alphabet' rather than 'ok', so it is recorded (emit-fact-flag-
+        # quality) but never counted as a confident floor. Empty/None = no whitelist (the old behaviour).
+        self.valid_floors = set(valid_floors) if valid_floors else None
         self.templates = {k: np.asarray(v, dtype=np.float32) for k, v in templates.items()}
         self.digit_cells = list(digit_cells)
         self.arrow_cell = arrow_cell
@@ -388,7 +394,12 @@ class FloorReader:
             arrow, arr_s = self._match(crop(panel_gray, acell), self.arrow_labels)
             if arrow is not None and arr_s >= self.min_score:
                 direction, _ = arrow, scores.append(arr_s)
-        return _out("".join(chars), direction, round(min(scores), 3), "ok")   # STRING: "25","P3","G"
+        floor_str = "".join(chars)
+        if self.valid_floors is not None and floor_str not in self.valid_floors:
+            # Assembled to a floor this tower does not have -> not a confident read. Keep the string
+            # and score for the spot-check page, but flag it so attribution and C21/C22 skip it.
+            return _out(floor_str, direction, round(min(scores), 3), "off_alphabet")
+        return _out(floor_str, direction, round(min(scores), 3), "ok")   # STRING: "25","P3","G"
 
     def debug_cells(self, panel_gray):
         """Diagnostic dump for one panel at the chosen shift: per digit-cell top-3 glyph scores + the
@@ -686,16 +697,18 @@ class DoorFloorEngine:
     def __init__(self, templates, door_roi, panels, min_score=0.55, blank_range=40,
                  door_tracker=None, floor_tracker=None, shift_search=2, margin_min=0.05,
                  blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90,
-                 blank_lit_margin=0.15, confuse_band=0.0, disc_min=0.10):
+                 blank_lit_margin=0.15, confuse_band=0.0, disc_min=0.10, valid_floors=None):
         if not panels:
             raise ValueError("DoorFloorEngine needs at least one panel (panel_roi, digit_cells, arrow_cell)")
         self.door_roi = tuple(door_roi)
+        self.valid_floors = set(valid_floors) if valid_floors else None
         self.readers = [(tuple(proi), FloorReader(templates, dcells, acell, min_score=min_score,
                                                   blank_range=blank_range, shift_search=shift_search,
                                                   margin_min=margin_min, blank_min=blank_min,
                                                   shift_floor=shift_floor, lit_range=lit_range,
                                                   blank_strong=blank_strong, blank_lit_margin=blank_lit_margin,
-                                                  confuse_band=confuse_band, disc_min=disc_min))
+                                                  confuse_band=confuse_band, disc_min=disc_min,
+                                                  valid_floors=valid_floors))
                         for (proi, dcells, acell) in panels]
         self.door = door_tracker if door_tracker is not None else DoorTracker()
         self.floor = floor_tracker if floor_tracker is not None else FloorTracker()

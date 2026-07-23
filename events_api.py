@@ -102,6 +102,21 @@ def gw_events(payload: GwEvents, authorization: str = Header(default="")):
     by a fresh source (one analyze_local window). Receives NO imagery."""
     _auth(payload.gateway_id, authorization)
     db = _db()
+    # Close the stray-attribution mechanism (the ch01 opening): a gw_source is created for whatever
+    # camera the payload names, so an out-of-fleet channel silently gets its own section and openings.
+    # Reject a camera that is not a configured lift channel — but only when we KNOW the set (a
+    # populated channel_map); an empty map means unknown, so accept, same fail-safe as elsewhere.
+    try:
+        chans = [int(r[0]) for r in db.execute(
+                    "SELECT channel FROM channel_map WHERE gateway_id=? AND is_lift=1",
+                    (payload.gateway_id,)).fetchall()]
+        known = {f"ch{n}" for n in chans} | {f"ch{n:02d}" for n in chans}   # match ch1 AND ch01
+    except Exception:
+        known = set()
+    if known and payload.camera not in known:
+        db.close()
+        raise HTTPException(422, f"camera {payload.camera!r} is not a configured lift channel for "
+                                 f"{payload.gateway_id} — refusing to create a source for it")
     sid = db.execute(
         "INSERT INTO gw_source (gateway_id,camera,declared_tz,tz_source,start_ts,created_at)"
         " VALUES (?,?,?,?,?,?)",

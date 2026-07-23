@@ -85,6 +85,28 @@ def _f(v):
         return None
 
 
+def _known_cams(gw):
+    """Lift cameras this gateway is configured for, as {'ch16','ch29',...}. Empty set = channel_map
+    not populated, which callers must treat as 'unknown', not 'nothing valid'."""
+    try:
+        db = _db()
+        rows = db.execute("SELECT channel FROM channel_map WHERE gateway_id=? AND is_lift=1", (gw,)).fetchall()
+        db.close()
+        return {f"ch{int(r['channel'])}" for r in rows} | {f"ch{int(r['channel']):02d}" for r in rows}
+    except Exception:
+        return set()
+
+
+def _reject_unknown_cam(gw, cam):
+    """Refuse a door row for a camera that is not a configured lift channel — the mechanism behind
+    the stray ch01 attribution. Fail-safe: an empty channel_map means we do not KNOW the valid set,
+    so we accept rather than reject everything on a fresh gateway."""
+    known = _known_cams(gw)
+    if known and cam not in known:
+        raise HTTPException(422, f"cam {cam!r} is not a configured lift channel for {gw} "
+                                 f"(known: {sorted(known)}) — refusing to attribute a door event to it")
+
+
 # ---------------- GPU-facing ingest (Bearer) ----------------
 @door_event_router.post("/api/gw/{gw}/door_event")
 async def door_event_ingest(gw: str, request: Request, authorization: str = Header("")):
@@ -96,6 +118,7 @@ async def door_event_ingest(gw: str, request: Request, authorization: str = Head
     ds = d.get("door_state")
     if ds is not None and ds not in DOOR_STATES:
         raise HTTPException(400, "bad door_state")
+    _reject_unknown_cam(gw, cam)
     floor = d.get("floor")                                   # may be null (no_read) — stored as-is, NOT guessed
     floor = str(floor) if floor is not None else None
     direction = d.get("direction")

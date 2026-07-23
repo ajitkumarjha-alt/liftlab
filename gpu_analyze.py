@@ -389,6 +389,11 @@ def build_door_engine(prefetched_tpl=None):
                                 PANEL1_DIGIT_CELLS, PANEL1_ARROW_CELL]))
     version = f"{eng.hash[:8]}+{geom_sig}"          # templates hash + geometry hash = comparability boundary
     log(f"GPU_DOOR: {len(panels)} panel(s) [{mode}]; templates_hash={eng.hash[:12]}; door_version={version}")
+    if FLOOR_ALPHABET:
+        log(f"GPU_DOOR floor whitelist: {len(FLOOR_ALPHABET)} valid floors {FLOOR_ALPHABET[:6]}"
+            f"{'...' if len(FLOOR_ALPHABET) > 6 else ''} — off-alphabet reads flagged, not counted")
+    else:
+        log("GPU_DOOR floor whitelist: NONE (set FLOOR_ORDER/FLOOR_ALPHABET to reject impossible floors)")
     return eng, version
 
 

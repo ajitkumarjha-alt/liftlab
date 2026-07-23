@@ -308,6 +308,25 @@ DOOR_OK_REASONS = ("ok", "single_panel")
 # Floor label -> physical index, for speed. Numeric labels map by int(); anything else (G, LG, MEP,
 # P3) needs a declared order or it is EXCLUDED from speed — never guessed at.
 FLOOR_ORDER = [s.strip() for s in os.environ.get("DASH_FLOOR_ORDER", "").split(",") if s.strip()]
+# Per-camera floor whitelist, applied at READ TIME so the 262 impossible-floor rows already stored
+# (167, 133, "7G") stop polluting the heatmap and C21/C22 immediately — the source fix in gpu_door
+# only protects NEW reads. Format mirrors DASH_DOOR_ERA: "ch16=P3,P2,P1,G,1,...,26;ch29=..." per
+# camera, or a single comma list applied to every camera. Empty = no whitelist (accept every read).
+DASH_FLOOR_ALPHABET = os.environ.get("DASH_FLOOR_ALPHABET", "")
+
+
+def _floor_alphabet(cam):
+    """The set of floors this camera's tower actually has, or None for 'no whitelist'."""
+    spec = DASH_FLOOR_ALPHABET.strip()
+    if not spec:
+        return set(FLOOR_ORDER) or None          # DASH_FLOOR_ORDER doubles as a global alphabet
+    if "=" in spec:
+        for part in spec.split(";"):
+            k, _, v = part.partition("=")
+            if k.strip() == cam and v.strip():
+                return {f.strip() for f in v.split(",") if f.strip()}
+        return None                              # a per-cam map that omits this cam -> no whitelist
+    return {f.strip() for f in spec.split(",") if f.strip()}
 # Plausibility ceiling for a floors/second segment. The Jul-21 live gate found real OCR slips (1→G,
 # 7→77); a 7→77 misread manufactures a 70-floor "move" in seconds. Such segments are DISCARDED and
 # COUNTED (never clamped — a clamped outlier is a fabricated measurement).
@@ -408,7 +427,19 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
     for r in rows:
         k = r["reason"] or "(none)"
         census[k] = census.get(k, 0) + 1
-    conf = [r for r in rows if r["floor"] is not None and (r["reason"] in DOOR_OK_REASONS)]
+    # READ-TIME FLOOR WHITELIST. A read can be reason='ok' and still name a floor the tower does not
+    # have — a stored row from before the gpu_door whitelist, or a rebuild-era misread. Reject it here
+    # too, so already-stored garbage never reaches stops/speed/per-floor. Rejects are counted as
+    # off_alphabet:<floor> in the census, so a filtered read is visible, not silently dropped.
+    alphabet = _floor_alphabet(cam)
+    conf = []
+    for r in rows:
+        if r["floor"] is None or r["reason"] not in DOOR_OK_REASONS:
+            continue
+        if alphabet is not None and str(r["floor"]) not in alphabet:
+            census[f"off_alphabet:{r['floor']}"] = census.get(f"off_alphabet:{r['floor']}", 0) + 1
+            continue
+        conf.append(r)
 
     # ── C21/C22 — speed between CONSECUTIVE confident reads that changed floor ──────────────
     seg_up, seg_dn = [], []
@@ -444,19 +475,22 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
     prev_state = None
     open_states = ("opening", "open")
     for idx, r in enumerate(rows):
-        if r["floor"] is not None and r["reason"] in DOOR_OK_REASONS:
+        if (r["floor"] is not None and r["reason"] in DOOR_OK_REASONS
+                and (alphabet is None or str(r["floor"]) in alphabet)):
             last_conf = r
         st = r["door_state"]
         if st in open_states and prev_state not in open_states:
             end_ts = None
-            floor_src = r if (r["floor"] is not None and r["reason"] in DOOR_OK_REASONS) else None
+            floor_src = r if (r["floor"] is not None and r["reason"] in DOOR_OK_REASONS
+                              and (alphabet is None or str(r["floor"]) in alphabet)) else None
             for nxt in rows[idx + 1:]:
                 if (nxt["ts"] or 0) - (r["ts"] or 0) > DOOR_OPEN_MAX_S:
                     break
                 # A confident read from INSIDE the cycle is the best floor evidence: the car is
                 # stopped, so the floor cannot change, and mid-cycle frames are often cleaner than
                 # the opening frame (the leaf is out of the panel's way).
-                if floor_src is None and nxt["floor"] is not None and nxt["reason"] in DOOR_OK_REASONS:
+                if (floor_src is None and nxt["floor"] is not None and nxt["reason"] in DOOR_OK_REASONS
+                        and (alphabet is None or str(nxt["floor"]) in alphabet)):
                     floor_src = nxt
                 if nxt["door_state"] == "closed":
                     end_ts = nxt["ts"]
@@ -524,6 +558,8 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
         "expected_era": exp_era, "built_at": built_at, "stale_templates": stale_templates,
         "era_filter": era_note,
         "quality_reasons": list(DOOR_OK_REASONS),
+        "floor_whitelist": (sorted(alphabet) if alphabet else None),
+        "off_alphabet_rejected": sum(v for k, v in census.items() if str(k).startswith("off_alphabet")),
         "rows_in_era": len(rows),
         "confident_reads": len(conf),
         "reason_census": census,
@@ -1213,6 +1249,7 @@ function tier2card(t){
     +'<br>'
     +'rows in era '+t.rows_in_era+' → confident reads <b>'+t.confident_reads+'</b> · reasons seen: '+(cen||'—')
     +(t.floor_order_declared?'':' · <b>no DASH_FLOOR_ORDER declared</b> — non-numeric floors are excluded from speed')
+    +(t.floor_whitelist?(' · floor whitelist ON ('+t.floor_whitelist.length+' floors)'+(t.off_alphabet_rejected?(' · <b class=bad>'+t.off_alphabet_rejected+' off-alphabet reads rejected</b>'):'')):' · <b>no floor whitelist</b> — set DASH_FLOOR_ALPHABET to reject impossible floors')
     +'</div>'
     +kv('C17/C18 stops (n='+s.n+')','↑ '+t2num(s.up)+' up · ↓ '+t2num(s.down)+' down'
         +(s.no_arrow?' · '+s.no_arrow+' no arrow':'')+(s.unattributed?' · <span class=warn>'+s.unattributed+' unattributed</span>':''))
