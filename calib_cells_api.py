@@ -443,6 +443,12 @@ __NAV__
       </div>
       <div class=msg id=msg></div>
     </div>
+<div class=card id=fitcard style="display:none">
+  <h3>last fitcells result <span class=note style="font-weight:400" id=fitwhen></span></h3>
+  <div id=fitscores></div>
+  <img id=fitoverlay style="max-width:100%;margin-top:6px;image-rendering:pixelated;border:1px solid var(--line);border-radius:6px" alt="fitcells overlay">
+  <div class=note id=fitnote style="margin-top:4px"></div>
+</div>
 <div class=card id=runcard>
   <h3>run <span class=note style="font-weight:400" id=runwhy></span></h3>
   <div id=runbtns></div>
@@ -645,10 +651,28 @@ function loadCells(){
     D=d.saved.drawn; derive();
     msg("loaded the boxes saved "+(d.saved.saved_at||"earlier"),"ok");
   }
-  setMode("tens"); show();
+  setMode("tens"); show(); loadFit();
 }).catch(function(){$("cropcount").textContent="state failed"});
 }
 // new crops or refitted cells change what this page shows
-function runFinished(){loadCells();}
+function loadFit(){
+  // Durable fitcells score, read from the json door_calib writes. cell_ncc near 1.0 = well aligned;
+  // a low cell is the one still mis-fit. Persists regardless of what scrolled out of the run log.
+  fetch('/calib/'+GW+'/'+CAM+'/_calib_fitcells.json?t='+Date.now()).then(function(r){
+    if(!r.ok)return null; return r.json();
+  }).then(function(j){
+    if(!j){document.getElementById('fitcard').style.display='none';return;}
+    document.getElementById('fitcard').style.display='';
+    var sc=j.cell_ncc||{};
+    document.getElementById('fitscores').innerHTML=Object.keys(sc).map(function(k){
+      var v=sc[k], bad=(v!=null&&v<0.6);
+      return '<span class="kv" style="display:inline-flex;gap:4px;margin-right:10px"><span class=mut>'+k+'</span><b class="'+(bad?'bad':'ok')+'">'+v+'</b></span>';
+    }).join('')||'<span class=mut>no per-cell scores</span>';
+    document.getElementById('fitoverlay').src=(j.overlay_url||('/calib/'+GW+'/'+CAM+'/_calib_fitcells.jpg'))+'?t='+Date.now();
+    document.getElementById('fitwhen').textContent='('+(j.n_samples||0)+' crops, radius '+(j.radius||'?')+', '+(j.iters||'?')+' iters)';
+    document.getElementById('fitnote').textContent=j.note||'';
+  }).catch(function(){document.getElementById('fitcard').style.display='none';});
+}
+function runFinished(){loadCells();loadFit();}
 loadCells();
 </script></body></html>"""
