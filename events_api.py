@@ -285,9 +285,15 @@ def events_dashboard(flagged: int = 0):
     td{padding:5px;border-bottom:1px solid #eee} .muted{color:#666}
     code{color:#b06a00} a{color:#0a6}</style>
     <h1>liftlab · cloud events</h1>
+    <div style="background:#fff8ec;border:1px solid #e8c88a;color:#7a5200;border-radius:8px;padding:8px 10px;margin:8px 0;font-size:12px">
+      <b>RETIRED INSTRUMENT.</b> This page shows the <b>Pi door-watch stream (gw_event)</b>, retired
+      2026-07-21 when door cycles moved to the GPU engine. These rows are HISTORICAL — no new openings
+      arrive here. Live door cycles + close-travel are on the <a href="/dash">dashboard compliance panel</a>
+      (GPU stream, gw_door_event). The two are different instruments and are not comparable.
+    </div>
     <p class=muted>Per-camera door events from on-site gateways. Footage stays on site;
-    only derived rows arrive here. Live (30s refresh). &nbsp;·&nbsp;
-    <a href="/events.csv">download CSV</a> &nbsp;·&nbsp; <a href="/">← fleet dashboard</a></p>
+    only derived rows arrive here. &nbsp;·&nbsp;
+    <a href="/events.csv">download CSV</a> &nbsp;·&nbsp; <a href="/dash">← dashboard</a></p>
     """ + body)
 
 

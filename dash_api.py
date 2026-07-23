@@ -51,6 +51,11 @@ DOOR_SPECS = {
 # Comparability boundaries — data across these isn't directly comparable; charts MARK them and the
 # close-travel headline uses only the current (post-boundary) regime.
 CLOSE_TRAVEL_MAX_BOUNDARY = "2026-07-16T11:48:11+00:00"   # CLOSE_TRAVEL_MAX 10->30 (admits longer real closes)
+# d7a7a49 retired the Pi door-watch and moved door cycles to the GPU engine. gw_event (Pi) and
+# gw_door_event (GPU) are DIFFERENT INSTRUMENTS — different edge detector, clock, sampling — so their
+# close-travel numbers are not comparable and must never be pooled. This is a comparability boundary
+# like the other three; the compliance panel labels every close-travel stat with its instrument.
+DOORWATCH_RETIRED_BOUNDARY = "2026-07-21T00:00:00+00:00"   # d7a7a49; Pi gw_event frozen, GPU gw_door_event live
 _BOUNDARY_EPOCH = datetime.fromisoformat(CLOSE_TRAVEL_MAX_BOUNDARY).timestamp()
 
 # DATA GAPS — windows where NO data was collected (relay/collect blind). Demand/counting/door numbers
@@ -240,6 +245,47 @@ def _door_by_cam(db, gw):
             "min": round(cts[0], 2) if cts else None, "max": round(cts[-1], 2) if cts else None,
             "hist": _hist(cts), "hist_edges": _HIST_EDGES, "spec": spec_out,
         }
+    return out
+
+
+def _door_gpu_by_cam(db, gw, cams):
+    """GPU-era close-travel, from gw_door_event COMPLETED CYCLES (close_travel_s not null), per camera
+    and per that camera's own era. This is the live instrument; _door_by_cam is the retired Pi one.
+    They are reported SEPARATELY and never merged — different sensors on different clocks.
+
+    Distinguishes three states, because condition (b) hinges on it:
+      no era rows          -> the door engine is not running / not configured for this camera
+      era rows, 0 cycles   -> floor reads exist but no usable open->close pair — the REAL gap
+      cycles               -> real close-travel numbers
+    """
+    out = {}
+    for cam in cams:
+        era, era_src = _era_for(db, gw, cam)
+        if not era:
+            out[cam] = {"era": None, "reason": "no gw_door_event rows in any era", "n_rows": 0,
+                        "n_cycles": 0, "n": 0}
+            continue
+        rows = _q(db, "SELECT ts, close_travel_s ct FROM gw_door_event "
+                      "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
+                  (gw, cam, era + "%"))
+        cts = sorted(float(r["ct"]) for r in rows if r["ct"] is not None and r["ct"] > 0)
+        n = len(cts)
+        spec = DOOR_SPECS.get(cam)
+        # Carry the spec even at n=0, so a spec'd camera ALWAYS gets a compliance line — a gap must be
+        # visible on the headline, not silently omitted (condition b). pct_exceed only when there's data.
+        spec_out = None
+        if spec:
+            over = sum(1 for v in cts if v > spec["compliance_s"])
+            spec_out = {**spec, "pct_exceed": (round(100.0 * over / n) if n else None)}
+        out[cam] = {
+            "era": era, "era_source": era_src, "instrument": "GPU door engine (gw_door_event)",
+            "n_rows": len(rows), "n_cycles": n, "n": n,
+            "median": round(_pctl(cts, 0.5), 2) if n else None,
+            "p85": round(_pctl(cts, 0.85), 2) if n else None,
+            "min": round(cts[0], 2) if n else None, "max": round(cts[-1], 2) if n else None,
+            "hist": _hist(cts), "hist_edges": _HIST_EDGES, "spec": spec_out,
+            "reason": (None if n else "era rows exist but NO completed open->close cycle "
+                       "(floor reads without usable pairs) — the gap is real")}
     return out
 
 
@@ -651,7 +697,8 @@ def dash_data(gw: str):
     db = _db()
     now = time.time()
     cams = _cameras(db, gw)
-    door = _door_by_cam(db, gw)
+    door = _door_by_cam(db, gw)                      # Pi-era (gw_event), RETIRED instrument
+    door_gpu = _door_gpu_by_cam(db, gw, [c["cam"] for c in cams])   # GPU-era (gw_door_event), LIVE
     trans = _transit_by_cam(db, gw)
     xfer = _transfer_by_cam(db, gw)
     floor_cov = _floor_coverage(db, gw)
@@ -709,15 +756,30 @@ def dash_data(gw: str):
             "validation": val.get(cam),
         })
 
+    # PROVENANCE SPLIT. Every close-travel stat is tagged with the instrument it came from, and the
+    # Pi-era and GPU-era numbers sit side by side as SEPARATE lines — never averaged. A camera with a
+    # spec appears once per instrument that has data for it, so ch29 shows its retired Pi history AND
+    # its live GPU number, and ch16 (no Pi history) shows only the GPU line — which is the proof that
+    # its cycles exist, or the honest zero if they do not.
     headline = []
     for cam in door:
-        if not door[cam].get("spec"):
+        if not door[cam].get("spec") or not door[cam]["n"]:
             continue
         x = xfer.get(cam)
         headline.append(dict(door[cam]["spec"], cam=cam, median=door[cam]["median"],
                              p85=door[cam]["p85"], n=door[cam]["n"],
+                             instrument="Pi door-watch (gw_event) — RETIRED " + DOORWATCH_RETIRED_BOUNDARY[:10],
+                             era="pi", live=False,
                              transfer_median=(x or {}).get("median"), transfer_n=(x or {}).get("n"),
                              transfer_provisional=True))
+    for cam, g in door_gpu.items():
+        spec = g.get("spec") or DOOR_SPECS.get(cam)
+        if not spec:
+            continue                              # not a compliance-tracked camera
+        headline.append(dict(spec, cam=cam, median=g["median"], p85=g["p85"], n=g["n"],
+                             instrument="GPU door engine (gw_door_event) — LIVE",
+                             era=g["era"], live=True, n_cycles=g["n_cycles"], reason=g.get("reason"),
+                             transfer_median=None, transfer_n=None, transfer_provisional=True))
 
     # NOT AVAILABLE (Tier-2 ceiling). This panel used to be unconditional, because the only floor
     # column was gw_event.floor and it was NULL on every row. Floor now arrives on a DIFFERENT stream
@@ -740,7 +802,10 @@ def dash_data(gw: str):
     return JSONResponse({"t": now, "gw": gw, "ist_today": _ist_today_str(),
                          "pi": pi, "relay": relay, "gpu": gpu,
                          "cameras": out_cams, "headline": headline, "registry": registry,
-                         "floor_coverage": floor_cov, "tier2": tier2, "unavailable": unavailable})
+                         "floor_coverage": floor_cov, "tier2": tier2, "unavailable": unavailable,
+                         "door_gpu": door_gpu,
+                         "boundaries": {"doorwatch_retired": DOORWATCH_RETIRED_BOUNDARY,
+                                        "close_travel_max": CLOSE_TRAVEL_MAX_BOUNDARY}})
 
 
 @dash_router.get("/dash/{gw}/trends")
@@ -1073,12 +1138,19 @@ function strip(d){
 function headline(d){
   if(!d.headline||!d.headline.length){document.getElementById('headline').innerHTML='';return;}
   var h=d.headline.map(function(x){
-    var dl=(x.median==null)?(x.cam+' door close: no clean close measured yet'):
-      (x.cam+' door close: observed median <b>'+x.median+'s</b> (p85 '+x.p85+'s, n='+x.n+')'
+    var tag='<span class="pill '+(x.live?'ok':'mut')+'" style="font-size:10px;margin-right:6px">'
+      +(x.live?'LIVE · GPU · era '+esc((x.era||'').slice(0,8)):'RETIRED · Pi-watch')+'</span>';
+    var dl;
+    if(x.median==null){
+      // A GPU-era line with no cycles is the honest "gap is real" signal condition (b) asks for.
+      dl=x.cam+' door close: '+(x.reason?('<b class=bad>'+esc(x.reason)+'</b>'):'no clean close measured yet');
+    } else {
+      dl=x.cam+' door close: observed median <b>'+x.median+'s</b> (p85 '+x.p85+'s, n='+x.n+')'
        +' · sheet assumes <b>'+x.sheet_s.toFixed(2)+'s</b>'
        +' · Bank '+esc(x.bank)+' non-compliant above <b>'+x.compliance_s.toFixed(2)+'s</b>'
-       +' · <b class="'+((x.pct_exceed||0)>=50?'bad':'warn')+'">'+esc(x.pct_exceed)+'%</b> of observed closes exceed '+x.compliance_s.toFixed(2)+'s');
-    var out='<div class="obs mono">'+dl+'</div>';
+       +' · <b class="'+((x.pct_exceed||0)>=50?'bad':'warn')+'">'+esc(x.pct_exceed)+'%</b> of observed closes exceed '+x.compliance_s.toFixed(2)+'s';
+    }
+    var out='<div class="obs mono">'+tag+dl+'</div>';
     // C26 passenger transfer — beside door-close, same format. PROVISIONAL (transit precision).
     if(x.transfer_sheet_s!=null){
       var tl=(x.transfer_median==null)?(x.cam+' transfer: no counted cycles yet'):
@@ -1089,7 +1161,8 @@ function headline(d){
     }
     return out;
   }).join('<hr style="border:none;border-top:1px solid #eee;margin:8px 0">');
-  document.getElementById('headline').innerHTML='<div class=headline><h3 class=mut style="margin:0 0 6px;font-size:11px;letter-spacing:.1em;text-transform:uppercase">compliance — assumption beside observation, no verdict</h3>'+h+'</div>';
+  var note=(d.boundaries&&d.boundaries.doorwatch_retired)?('<div class=mut style="font-size:11px;margin-top:6px">Pi-watch (gw_event) and GPU engine (gw_door_event) are DIFFERENT INSTRUMENTS, split at '+esc(d.boundaries.doorwatch_retired.slice(0,10))+' (Pi door-watch retired). Their close-travel numbers are shown separately and are NOT comparable.</div>'):'';
+  document.getElementById('headline').innerHTML='<div class=headline><h3 class=mut style="margin:0 0 6px;font-size:11px;letter-spacing:.1em;text-transform:uppercase">compliance — assumption beside observation, no verdict</h3>'+h+note+'</div>';
 }
 
 function unavail(d){
@@ -1132,14 +1205,29 @@ function panel(d){
     ? '<img class=snap src="/snap/'+GW+'/'+c.cam+'.jpg?t='+Date.now()+'"><div class="mut" style="font-size:12px;margin-top:2px">frame <span class="'+staleCls(c.snap.age_s,20)+'">'+age(c.snap.age_s)+'</span></div>'
     : '<div class=snap style="display:flex;align-items:center;justify-content:center;color:#666">no snapshot</div>';
 
-  // DOOR
-  var door=c.door&&c.door.total? (
-    kv('cycles today / total',esc(c.door.today)+' / '+esc(c.door.total))
+  // DOOR — split by instrument. Pi (gw_event) is retired history; GPU (gw_door_event) is live.
+  // ch16 has no Pi history but does have GPU cycles, so this is where its count+median become
+  // visible numbers (condition b) — or an honest "reads but no cycles" if the pairs are missing.
+  var g=(d.door_gpu||{})[c.cam];
+  var piDoor=c.door&&c.door.total? (
+    '<div class=mut style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">Pi-watch · retired</div>'
+    +kv('cycles today / total',esc(c.door.today)+' / '+esc(c.door.total))
     +kv('close median / p85',(c.door.median==null?'—':c.door.median+'s')+' / '+(c.door.p85==null?'—':c.door.p85+'s')+'  (n='+c.door.n+')')
-    +kv('range',(c.door.min==null?'—':c.door.min+'–'+c.door.max+'s'))
     +kv('last cycle',esc((c.door.last_open||'').slice(11,19)||'—'))
     +bars(c.door)
-  ) : '<div class=blank>no door cycles recorded</div>';
+  ) : '';
+  var gpuDoor;
+  if(!g||g.era==null){ gpuDoor='<div class=blank>GPU door engine: no reads in any era</div>'; }
+  else if(g.n_cycles===0){ gpuDoor='<div class=mut style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">GPU engine · era '+esc((g.era||'').slice(0,8))+' · LIVE</div>'
+    +kv('floor-read rows',esc(g.n_rows))
+    +'<div class=blank style="color:#b06a00">'+esc(g.reason||'no completed open→close cycle')+'</div>'; }
+  else { gpuDoor='<div class=mut style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">GPU engine · era '+esc((g.era||'').slice(0,8))+' · LIVE</div>'
+    +kv('close cycles',esc(g.n_cycles))
+    +kv('close median / p85',(g.median==null?'—':g.median+'s')+' / '+(g.p85==null?'—':g.p85+'s')+'  (n='+g.n+')')
+    +kv('range',(g.min==null?'—':g.min+'–'+g.max+'s'))
+    +bars(g); }
+  var door=(piDoor||gpuDoor)?(piDoor+(piDoor&&gpuDoor?'<hr style="border:none;border-top:1px solid var(--b);margin:8px 0">':'')+gpuDoor)
+    : '<div class=blank>no door cycles recorded</div>';
 
   // TRANSIT
   var t=c.transit;
