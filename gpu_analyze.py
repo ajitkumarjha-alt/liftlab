@@ -108,6 +108,15 @@ TRANSIT_STALL_OPENS = int(os.environ.get("TRANSIT_STALL_OPENS", "20"))  # ...whi
 # A raising det.track (the OTHER wedge mode) must be VISIBLE and self-heal, not silently propagate or
 # spin. Count consecutive failures; past this many, dump + exit.
 TRACK_FAIL_MAX = int(os.environ.get("TRACK_FAIL_MAX", "50"))
+# DISCONTINUITY GUARD (third instance of the pattern: relay ffmpeg, door pairing, now counting).
+# Persistent tracker + counter state must NOT survive a segment-clock gap it cannot account for. The
+# Thu-23 silence: the stream starved, segments arrived minutes apart, then recovered — and the
+# ByteTrack/ZoneCounter state carried a corruption across that gap that survived full recovery, so
+# transits stayed zero for 59h. On a wall-clock jump between processed segments larger than this,
+# rebuild the tracker (fresh ByteTrack) and counter, and abandon any open episode — any crossing
+# in-progress across a minutes-long gap is already meaningless. NORMAL operation (~2s cadence) never
+# trips this, so it is behaviour-preserving and NOT a counting_version change.
+SEG_GAP_RESET_S = float(os.environ.get("SEG_GAP_RESET_S", "30"))
 TEMPLATES_URL = f"{CLOUD}/api/gw/{GW}/templates/{CAM}"
 
 
@@ -480,6 +489,8 @@ def main():
     door_opens_since_transit = 0                   # door-open transitions observed since that POST
     door_prev_state = None                         # for edge-detecting door opens
     track_fail_streak = 0                          # consecutive det.track exceptions
+    last_seg_wall = None                            # wall time of the last PROCESSED segment (gap guard)
+    gap_resets = 0                                  # tracker/counter rebuilds on a discontinuity
     started = time.time()
     last_drop_log = time.time()
     last_idle_log = 0.0
@@ -664,8 +675,29 @@ def main():
                 sx, sy = W / CALIB_W, H / CALIB_H
                 ctr = counting.ZoneCounter(scale_zone(ZONE_LANDING, sx, sy), scale_zone(ZONE_CABIN, sx, sy))
                 log(f"frame {W}x{H} -> zones scaled sx={sx:.3f} sy={sy:.3f}")
-            before = len(ctr.transits)
             seg_wall = time.time()                # approx wall time of this segment's arrival
+            # DISCONTINUITY GUARD: a large jump since the last processed segment means the stream
+            # starved/recovered. Rebuild the tracker + counter and drop any open episode so no
+            # corruption carries across the gap (the Thu-23 durable-wedge fix).
+            if last_seg_wall is not None and (seg_wall - last_seg_wall) > SEG_GAP_RESET_S:
+                gap_resets += 1
+                log(f"SEGMENT-CLOCK GAP {seg_wall - last_seg_wall:.0f}s (> {SEG_GAP_RESET_S:.0f}s) — "
+                    f"rebuilding tracker + counter, dropping open episode (reset #{gap_resets}). "
+                    f"State must not survive a discontinuity it cannot account for.")
+                try:
+                    det = counting.YoloDetector(weights=MODEL, conf=CONF, tracker="bytetrack.yaml", device=DEVICE)
+                except Exception as e:
+                    log(f"detector rebuild failed: {type(e).__name__}: {e} — keeping the old one")
+                ctr = None                        # rebuilt below with the same zones
+                episode = None                    # abandon (transits already posted independently)
+                recent.clear(); recent_dets.clear()
+                door_opens_since_transit = 0
+            last_seg_wall = seg_wall
+            if ctr is None:                       # rebuild after a gap reset (or first segment)
+                H, W = frames[0].shape[:2]
+                sx, sy = W / CALIB_W, H / CALIB_H
+                ctr = counting.ZoneCounter(scale_zone(ZONE_LANDING, sx, sy), scale_zone(ZONE_CABIN, sx, sy))
+            before = len(ctr.transits)
             n_fr = len(frames)
             # ANALYZE_FPS subsampling: track every `stride`-th frame. 0/unset -> stride 1 (all frames,
             # current behavior). Cuts the dominant track cost ~proportionally to enable the 7-cam fleet.
