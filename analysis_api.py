@@ -78,7 +78,8 @@ def _db():
                      ("proc_ms", "REAL"), ("track_ms", "REAL"), ("seg_budget_ms", "REAL"),
                      ("fetch_ms", "REAL"), ("decode_ms", "REAL"),
                      ("drop_frac", "REAL"), ("drop_rate_hr", "REAL"),
-                     ("connect_ms", "REAL"), ("transfer_ms", "REAL"), ("analyze_fps", "REAL")):
+                     ("connect_ms", "REAL"), ("transfer_ms", "REAL"), ("analyze_fps", "REAL"),
+                     ("door_opens_since_transit", "INTEGER"), ("s_since_transit_post", "REAL")):
         try:
             db.execute(f"ALTER TABLE analyzer_status ADD COLUMN {col} {typ}")   # migrate pre-existing table
         except sqlite3.OperationalError:
@@ -220,8 +221,9 @@ async def analyzer_status_ingest(gw: str, request: Request, authorization: str =
     db.execute(
         "INSERT INTO analyzer_status (gateway_id,cam,ts,counting_version,uptime_s,segments,dropped,"
         "posted,last_transit_ts,mode,rej_disp,rej_dwell,rej_hist,rej_in,rej_out,proc_ms,track_ms,seg_budget_ms,"
-        "fetch_ms,decode_ms,drop_frac,drop_rate_hr,connect_ms,transfer_ms,analyze_fps) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "fetch_ms,decode_ms,drop_frac,drop_rate_hr,connect_ms,transfer_ms,analyze_fps,"
+        "door_opens_since_transit,s_since_transit_post) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(gateway_id,cam) DO UPDATE SET ts=excluded.ts, counting_version=excluded.counting_version,"
         "uptime_s=excluded.uptime_s, segments=excluded.segments, dropped=excluded.dropped, "
         "posted=excluded.posted, last_transit_ts=excluded.last_transit_ts, mode=excluded.mode, "
@@ -230,13 +232,15 @@ async def analyzer_status_ingest(gw: str, request: Request, authorization: str =
         "track_ms=excluded.track_ms, seg_budget_ms=excluded.seg_budget_ms, "
         "fetch_ms=excluded.fetch_ms, decode_ms=excluded.decode_ms, "
         "drop_frac=excluded.drop_frac, drop_rate_hr=excluded.drop_rate_hr, "
-        "connect_ms=excluded.connect_ms, transfer_ms=excluded.transfer_ms, analyze_fps=excluded.analyze_fps",
+        "connect_ms=excluded.connect_ms, transfer_ms=excluded.transfer_ms, analyze_fps=excluded.analyze_fps, "
+        "door_opens_since_transit=excluded.door_opens_since_transit, s_since_transit_post=excluded.s_since_transit_post",
         (gw, str(d.get("cam", "")), time.time(), d.get("counting_version"), d.get("uptime_s"),
          d.get("segments"), d.get("dropped"), d.get("posted"), d.get("last_transit_ts"), d.get("mode"),
          d.get("rej_disp"), d.get("rej_dwell"), d.get("rej_hist"),
          d.get("rej_in"), d.get("rej_out"), d.get("proc_ms"), d.get("track_ms"), d.get("seg_budget_ms"),
          d.get("fetch_ms"), d.get("decode_ms"), d.get("drop_frac"), d.get("drop_rate_hr"),
-         d.get("connect_ms"), d.get("transfer_ms"), d.get("analyze_fps")))
+         d.get("connect_ms"), d.get("transfer_ms"), d.get("analyze_fps"),
+         d.get("door_opens_since_transit"), d.get("s_since_transit_post")))
     db.commit()
     db.close()
     return {"ok": True}

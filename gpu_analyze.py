@@ -97,6 +97,17 @@ WD_STALL_S = float(os.environ.get("WD_STALL_S", "120"))    # no segment processe
 WD_GRACE_S = float(os.environ.get("WD_GRACE_S", "180"))    # cold start: model load + CUDA init
 SOCK_TIMEOUT_S = float(os.environ.get("SOCK_TIMEOUT_S", "30"))   # default for sockets we don't own
 FETCH_WAIT_S = float(os.environ.get("FETCH_WAIT_S", "60"))  # cap on waiting for a prefetch future
+# OUTPUT-ATTESTING WATCHDOG (the Thu-18:00 lesson). The progress watchdog only proves the loop turns;
+# it cannot see a counting path that has silently died while segments + door analysis keep flowing.
+# So attest OUTPUT: if the lift is demonstrably IN USE (doors cycling) yet no transit has been posted
+# for a long span, the YOLO/tracker path is wedged (a shared CUDA/tracker event returned [] forever on
+# both workers at once, no exception) -> dump stacks and exit for the fleet to restart. Same shape as
+# the relay's alive-but-not-delivering restart.
+TRANSIT_STALL_S = float(os.environ.get("TRANSIT_STALL_S", "1800"))    # no transit for this long...
+TRANSIT_STALL_OPENS = int(os.environ.get("TRANSIT_STALL_OPENS", "20"))  # ...while >= this many door opens = wedged
+# A raising det.track (the OTHER wedge mode) must be VISIBLE and self-heal, not silently propagate or
+# spin. Count consecutive failures; past this many, dump + exit.
+TRACK_FAIL_MAX = int(os.environ.get("TRACK_FAIL_MAX", "50"))
 TEMPLATES_URL = f"{CLOUD}/api/gw/{GW}/templates/{CAM}"
 
 
@@ -465,6 +476,10 @@ def main():
     dropped = 0                                   # segments never processed (pruned/lag) — running count
     segments = 0                                  # segments decoded + processed
     last_transit_ts = 0.0
+    last_transit_post_wall = time.time()          # wall clock of the last successful transit POST
+    door_opens_since_transit = 0                   # door-open transitions observed since that POST
+    door_prev_state = None                         # for edge-detecting door opens
+    track_fail_streak = 0                          # consecutive det.track exceptions
     started = time.time()
     last_drop_log = time.time()
     last_idle_log = 0.0
@@ -501,6 +516,8 @@ def main():
         log(f"WARNING: ANALYZE_FPS={ANALYZE_FPS} subsamples frames -> changes what gets counted. "
             f"COUNTING_VERSION must reflect this (comparability boundary); current={counting.COUNTING_VERSION}")
     log(f"validation mode: {val_state}")
+    log(f"output watchdog: restart if >= {TRANSIT_STALL_OPENS} door opens with no transit for "
+        f"{TRANSIT_STALL_S:.0f}s (counting-path wedge); det.track self-heals after {TRACK_FAIL_MAX} fails")
 
     # GPU_DOOR state (all no-ops unless enabled). Separate stream; independent of counting.
     door_gd = None
@@ -533,6 +550,10 @@ def main():
                            {"cam": CAM, "counting_version": counting.COUNTING_VERSION,
                             "uptime_s": time.time() - started, "segments": segments, "dropped": dropped,
                             "posted": posted, "last_transit_ts": last_transit_ts, "mode": val_state,
+                            # output-attestation signal (self-flag): doors opening but no transit posting
+                            # is the wedge; surfaced here so /ops shows it before the self-restart fires.
+                            "door_opens_since_transit": door_opens_since_transit,
+                            "s_since_transit_post": round(time.time() - last_transit_post_wall, 0),
                             "rej_disp": rej_disp, "rej_dwell": rej_dwell,
                             "rej_in": rej_in, "rej_out": rej_out,
                             "rej_hist": ",".join(str(x) for x in rej_hist),
@@ -664,6 +685,12 @@ def main():
                         drec = None
                         log(f"door process error: {type(e).__name__}: {str(e)[:80]}")
                     if drec is not None:
+                        # OUTPUT-ATTEST: a door opening means the lift is in use, so a transit SHOULD
+                        # follow. Count opens since the last posted transit; many opens with none posted
+                        # = the counting path is wedged while door analysis (independent CV) runs on.
+                        if drec.get("door_state") == "open" and door_prev_state != "open":
+                            door_opens_since_transit += 1
+                        door_prev_state = drec.get("door_state")
                         should, door_prev_key = door_gd.door_event_changed(door_prev_key, drec)
                         if should or (d_off - door_last_emit) >= DOOR_HB_S:
                             post_door_event(drec, door_version, door_thash)
@@ -677,7 +704,20 @@ def main():
                     recent.append(fr)             # buffer frames so a transit can grab a sequence
                 tr_t0 = time.time()
                 wd_phase(f"track {name} fr{i}")
-                dets = det.track(fr)
+                try:
+                    dets = det.track(fr)
+                    track_fail_streak = 0
+                except Exception as e:
+                    # Do NOT swallow silently (the Thu-18:00 failure was invisible). Log, count, and if
+                    # it keeps failing the tracker is wedged — dump + exit so the fleet restarts.
+                    track_fail_streak += 1
+                    log(f"det.track FAILED ({track_fail_streak}/{TRACK_FAIL_MAX}): {type(e).__name__}: {str(e)[:100]}")
+                    if track_fail_streak >= TRACK_FAIL_MAX:
+                        log(f"det.track failed {track_fail_streak}x consecutively — tracker wedged, exiting for restart")
+                        import faulthandler as _fh
+                        _fh.dump_traceback(all_threads=True)
+                        os._exit(1)
+                    dets = []
                 track_ms += (time.time() - tr_t0) * 1000     # YOLO inference — the cost that must fit the budget
                 frame_off = seg_wall - ((rel[-1] - rel[i]) if rel else 0.0)   # REAL per-frame time (not 25fps assumed)
                 if val_state == "validating":                # DETECTION AUDIT: what did YOLO actually see?
@@ -711,6 +751,8 @@ def main():
                                        what="transit")
                         posted += 1
                         last_transit_ts = t.offset_s
+                        last_transit_post_wall = time.time()   # OUTPUT attested — reset the wedge counters
+                        door_opens_since_transit = 0
                     except Exception as e:
                         log(f"transit POST failed (no double-count on retry): {e}")
                     # EPISODE = the door-open record, built in BOTH modes. VALIDATING -> attach imagery +
@@ -763,6 +805,18 @@ def main():
             if _wd is not None:
                 _wd.progress(name)
             wd_phase("loop")
+            # OUTPUT-ATTESTING WEDGE CHECK. Streams are fresh (we just processed a segment) and the door
+            # pass shows the lift IN USE, yet no transit has posted for TRANSIT_STALL_S across
+            # >= TRANSIT_STALL_OPENS door opens -> the YOLO/tracker path is wedged (the Thu-18:00 mode:
+            # returns [] forever, no exception, door analysis unaffected). Restart rather than run blind.
+            if (door_opens_since_transit >= TRANSIT_STALL_OPENS
+                    and time.time() - last_transit_post_wall >= TRANSIT_STALL_S):
+                log(f"COUNTING WEDGED: {door_opens_since_transit} door opens and NO transit posted in "
+                    f"{time.time() - last_transit_post_wall:.0f}s while segments flow — YOLO/tracker path "
+                    f"is producing nothing. Dumping stacks and exiting for restart.")
+                import faulthandler as _fh
+                _fh.dump_traceback(all_threads=True)
+                os._exit(1)
         # close a stale validation episode (door shut) + refresh this cam's mode periodically
         if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
             post_episode(episode, "gap-between-segments"); episode = None
