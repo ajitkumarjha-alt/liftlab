@@ -485,8 +485,10 @@ DOOR_OK_REASONS = ("ok", "single_panel")
 FLOOR_ORDER = [s.strip() for s in os.environ.get("DASH_FLOOR_ORDER", "").split(",") if s.strip()]
 # Per-camera floor whitelist, applied at READ TIME so the 262 impossible-floor rows already stored
 # (167, 133, "7G") stop polluting the heatmap and C21/C22 immediately — the source fix in gpu_door
-# only protects NEW reads. Format mirrors DASH_DOOR_ERA: "ch16=P3,P2,P1,G,1,...,26;ch29=..." per
-# camera, or a single comma list applied to every camera. Empty = no whitelist (accept every read).
+# MANUAL OVERRIDE ONLY. The alphabet is now DERIVED from evidence per camera+era (see
+# _derive_floor_alphabet); this is the escape hatch for the day the derivation is wrong. When set it
+# WINS. Format mirrors DASH_DOOR_ERA: "ch16=P3,P2,P1,G,1,...,26;ch29=..." per camera, or a single
+# comma list for every camera. Empty (the default) = use the derived alphabet.
 DASH_FLOOR_ALPHABET = os.environ.get("DASH_FLOOR_ALPHABET", "")
 
 
@@ -574,6 +576,84 @@ def _floor_idx(label):
         return None
 
 
+def _labels_evidence(gw, cam):
+    """Human-verified evidence from labels.json: the GLYPH set (distinct chars the operator confirmed,
+    arrows stripped) and the LABELED floor strings themselves (each label IS a real floor the human
+    saw). This is the ground truth non-numeric floors (G, P3, MEP) rest on — you cannot corroborate a
+    letter floor by numeric transition, so the human label is its evidence."""
+    try:
+        d = json.loads((CALIB_DIR / gw / cam / "labels.json").read_text())
+    except (OSError, ValueError):
+        return set(), set()
+    glyphs, floors = set(), set()
+    for v in (d or {}).values():
+        f = str(v or "").strip().rstrip("^vV")       # drop the direction arrow
+        if not f or f == "-":
+            continue
+        floors.add(f)
+        glyphs.update(f)
+    return glyphs, floors
+
+
+def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
+    """Derive the valid floor set from EVIDENCE, not a typed list (the ask). A floor string is admitted
+    when it corroborates — never on mere occurrence, which is circular (a misread would whitelist
+    itself). Admission = all glyphs human-verified AND one of:
+      (a) it is a human-LABELED floor (labels.json) — direct evidence, covers non-numeric floors, or
+      (b) it is numeric with >= min_sightings confident sightings AND transition support: at least once
+          it sat next to a temporal-neighbour read reachable at <= max_fps floors/sec (i.e. it appears
+          inside a sequential run, not as a teleport). 129 between two 19s is 110 floors in one read
+          interval -> no support -> rejected; the phantom-hundreds rule falls straight out of this.
+    Returns (admitted:set, detail:{floor: {...}}). max_fps defaults to MAX_FLOORS_PER_S.
+    """
+    if max_fps is None:
+        max_fps = MAX_FLOORS_PER_S
+    glyph_set, labeled = gw_cam_labels
+    seq = [(r["ts"], str(r["floor"])) for r in rows
+           if r["floor"] is not None and r["reason"] in DOOR_OK_REASONS]
+    seen = {}
+    for ts, f in seq:
+        d = seen.setdefault(f, {"n": 0, "first": ts, "last": ts, "supported": False})
+        d["n"] += 1
+        d["first"] = min(d["first"], ts)
+        d["last"] = max(d["last"], ts)
+    # transition support (numeric floors only): reachable from a temporal neighbour at plausible speed
+    for i, (t, f) in enumerate(seq):
+        fi = _floor_idx(f)
+        if fi is None:
+            continue
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(seq):
+                tj, fj = seq[j]
+                fji = _floor_idx(fj)
+                if fji is not None and abs(t - tj) > 0 and abs(fi - fji) / abs(t - tj) <= max_fps:
+                    seen[f]["supported"] = True
+                    break
+    # Admission. The glyph set is NOT a hard gate: a sparse label sample omits digits that real floors
+    # use (labels 12,19,20 never show an 8, yet floor 18 is real), and the reader can only emit glyphs
+    # it has templates for anyway. Corroboration — numeric run + sightings — is the stronger evidence.
+    # So: labeled floors are trusted directly; numeric floors admit on corroboration; a non-numeric
+    # floor the human never labeled has no corroboration path (letters can't be placed on the number
+    # line) and is rejected — which is exactly what kills 7G while keeping a labeled G.
+    admitted, detail = set(), {}
+    for f, d in seen.items():
+        is_labeled = f in labeled
+        numeric = _floor_idx(f) is not None
+        if is_labeled:
+            via = "labeled"; admitted.add(f)
+        elif numeric and d["n"] >= min_sightings and d["supported"]:
+            via = "corroborated"; admitted.add(f)
+        elif numeric and not d["supported"]:
+            via = "reject:no_transition_support (teleport/phantom cell)"
+        elif numeric and d["n"] < min_sightings:
+            via = f"reject:only_{d['n']}_sightings (<{min_sightings})"
+        else:
+            via = "reject:non_numeric_unlabeled (no corroboration path)"
+        detail[f] = {"n": d["n"], "first": d["first"], "last": d["last"],
+                     "supported": d["supported"], "admitted": f in admitted, "via": via}
+    return admitted, detail
+
+
 def _tier2(db, gw, cam, transits, t0=None, t1=None):
     """Tier-2 for one camera, from the gw_door_event stream of ONE era.
 
@@ -606,13 +686,24 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
     # have — a stored row from before the gpu_door whitelist, or a rebuild-era misread. Reject it here
     # too, so already-stored garbage never reaches stops/speed/per-floor. Rejects are counted as
     # off_alphabet:<floor> in the census, so a filtered read is visible, not silently dropped.
-    alphabet = _floor_alphabet(cam)
+    # DERIVED by default, from this era's own evidence (glyphs + labeled floors + read corroboration);
+    # DASH_FLOOR_ALPHABET is an optional manual override for the day the derivation is wrong.
+    manual = _floor_alphabet(cam)
+    derived, alpha_detail = _derive_floor_alphabet(rows, _labels_evidence(gw, cam))
+    if manual is not None:
+        alphabet, alpha_source = manual, "manual override (DASH_FLOOR_ALPHABET)"
+    elif derived:
+        alphabet, alpha_source = derived, "derived from evidence"
+    else:
+        alphabet, alpha_source = None, "none (not enough evidence yet — accepting all)"
     conf = []
     for r in rows:
         if r["floor"] is None or r["reason"] not in DOOR_OK_REASONS:
             continue
         if alphabet is not None and str(r["floor"]) not in alphabet:
-            census[f"off_alphabet:{r['floor']}"] = census.get(f"off_alphabet:{r['floor']}", 0) + 1
+            # visible in the census with the DERIVATION's reason, so a derivation mistake is auditable
+            why = (alpha_detail.get(str(r["floor"]), {}).get("via") or "not_in_alphabet")
+            census[f"not_in_derived_alphabet:{r['floor']} ({why})"] =                 census.get(f"not_in_derived_alphabet:{r['floor']} ({why})", 0) + 1
             continue
         conf.append(r)
 
@@ -734,7 +825,13 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
         "era_filter": era_note,
         "quality_reasons": list(DOOR_OK_REASONS),
         "floor_whitelist": (sorted(alphabet) if alphabet else None),
-        "off_alphabet_rejected": sum(v for k, v in census.items() if str(k).startswith("off_alphabet")),
+        "floor_alphabet_source": alpha_source,
+        "floor_alphabet_detail": [
+            {"floor": f, "n": d["n"], "first": round(d["first"], 0), "last": round(d["last"], 0),
+             "admitted": d["admitted"], "via": d["via"]}
+            for f, d in sorted(alpha_detail.items(), key=lambda kv: (-kv[1]["n"], kv[0]))],
+        "off_alphabet_rejected": sum(v for k, v in census.items()
+                                     if str(k).startswith(("off_alphabet", "not_in_derived_alphabet"))),
         "rows_in_era": len(rows),
         "confident_reads": len(conf),
         "reason_census": census,
@@ -1479,7 +1576,15 @@ function tier2card(t){
     +'<br>'
     +'rows in era '+t.rows_in_era+' → confident reads <b>'+t.confident_reads+'</b> · reasons seen: '+(cen||'—')
     +(t.floor_order_declared?'':' · <b>no DASH_FLOOR_ORDER declared</b> — non-numeric floors are excluded from speed')
-    +(t.floor_whitelist?(' · floor whitelist ON ('+t.floor_whitelist.length+' floors)'+(t.off_alphabet_rejected?(' · <b class=bad>'+t.off_alphabet_rejected+' off-alphabet reads rejected</b>'):'')):' · <b>no floor whitelist</b> — set DASH_FLOOR_ALPHABET to reject impossible floors')
+    +(t.floor_whitelist?(' · floor alphabet ['+esc(t.floor_alphabet_source)+']: <b>'+t.floor_whitelist.join(' ')+'</b>'+(t.off_alphabet_rejected?(' · <b class=bad>'+t.off_alphabet_rejected+' off-alphabet reads rejected</b>'):'')):' · <b>no floor alphabet</b> — not enough evidence derived yet')
+    +(function(){var dt=t.floor_alphabet_detail; if(!dt||!dt.length)return '';
+      var rej=dt.filter(function(d){return !d.admitted;});
+      var adm=dt.filter(function(d){return d.admitted;});
+      function when(x){return new Date(x*1000).toLocaleDateString();}
+      var rows=adm.map(function(d){return '<tr><td><b>'+esc(d.floor)+'</b></td><td>'+d.n+'</td><td>'+esc(d.via)+'</td><td>'+when(d.first)+'–'+when(d.last)+'</td></tr>';}).join('')
+        +rej.map(function(d){return '<tr style="opacity:.6"><td>'+esc(d.floor)+'</td><td>'+d.n+'</td><td class=bad>'+esc(d.via)+'</td><td>'+when(d.first)+'–'+when(d.last)+'</td></tr>';}).join('');
+      return '<details style="margin-top:4px"><summary class=mut style="font-size:11px;cursor:pointer">derived floor alphabet — '+adm.length+' admitted, '+rej.length+' rejected (sightings + evidence)</summary>'
+        +'<table class=t2 style="margin-top:4px"><thead><tr><th>floor</th><th>sightings</th><th>via</th><th>first–last</th></tr></thead><tbody>'+rows+'</tbody></table></details>';})()
     +'</div>'
     +kv('C17/C18 stops (n='+s.n+')','↑ '+t2num(s.up)+' up · ↓ '+t2num(s.down)+' down'
         +(s.no_arrow?' · '+s.no_arrow+' no arrow':'')+(s.unattributed?' · <span class=warn>'+s.unattributed+' unattributed</span>':''))
