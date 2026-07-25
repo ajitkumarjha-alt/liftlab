@@ -371,6 +371,18 @@ function drawData(d){
       +(r.guard_floor!=null?(+r.guard_floor).toFixed(2):'—')+'. No counting or floor OCR until it resumes.</small></div>';
   }else{gb.innerHTML='';}
   var anhtml;
+  function outputAttest(an){
+    // OUTPUT ATTESTATION (the self-flag half of the wedge watchdog): the lift being used (door opens)
+    // with no transit posting is the Thu-23 mode. Surfaced here so a counting stall is visible BEFORE
+    // the worker self-restarts (~20 opens / 1800s). Absent fields (old worker) -> not shown.
+    if(an.door_opens_since_transit==null && an.s_since_transit_post==null) return '';
+    var opens=+an.door_opens_since_transit||0, ssince=+an.s_since_transit_post||0;
+    // amber past half the restart threshold, red near it — a stall in progress, not yet self-healed.
+    var warn=(opens>=10 && ssince>=900), bad=(opens>=20 && ssince>=1800);
+    var c=bad?'bad':(warn?'warn':'');
+    var lab=(opens>0 && ssince>60)?(opens+' door opens, no transit '+Math.round(ssince)+'s'):(opens+' opens since last transit');
+    return kv('output attest', lab+(bad?' — WEDGED (restarting)':(warn?' — counting stall building':'')), c);
+  }
   if(!an){anhtml='<div class=card><h3>GPU analyzer</h3><div class="big bad">no heartbeat</div>'
     +'<div class=kv><span>never reported — worker down or not deployed</span></div></div>';}
   else{var hbage=Math.round(d.t-an.ts),down=hbage>120,ttage=an.last_transit_ts?Math.round(d.t-an.last_transit_ts):null;
@@ -380,6 +392,7 @@ function drawData(d){
       +kv('segments / dropped',esc(an.segments)+' / '+esc(an.dropped),cls(an.dropped,1,1))
       +proc(an)
       +kv('last transit',ttage==null?'—':ttage+'s ago')
+      +outputAttest(an)
       +kv('uptime',an.uptime_s?Math.round(an.uptime_s/60)+'m':'—')+'</div>'
       +rejcard(an);}
   document.getElementById('analyzer').innerHTML=anhtml;
