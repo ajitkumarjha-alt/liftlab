@@ -82,6 +82,15 @@ DOOR_STRIDE = max(1, int(os.environ.get("DOOR_STRIDE", "2")))   # run the door p
 DOOR_HB_S = float(os.environ.get("DOOR_HB_S", "60"))           # emit a row at least this often (liveness)
 FLOORCHECK_PER_HR = int(os.environ.get("FLOORCHECK_PER_HR", "30"))   # sampled reads+crop -> /floorcheck
 FLOOR_ORDER = [s.strip() for s in os.environ.get("FLOOR_ORDER", "").split(",") if s.strip()]  # FloorTracker._idx
+# Valid-floor whitelist. Defaults to FLOOR_ORDER (the ordered floor list IS the valid set); an
+# explicit FLOOR_ALPHABET overrides. Referenced by build_door_engine — it was USED there without
+# ever being defined (a latent NameError that would have crashed GPU_DOOR on the next deploy), and
+# the engine call had lost its valid_floors= wiring entirely. Both fixed here.
+FLOOR_ALPHABET = [s.strip() for s in os.environ.get("FLOOR_ALPHABET", "").split(",") if s.strip()] or FLOOR_ORDER
+# DoorTracker time guards — the fix for implausible close_travel (0.08s sub-frame, 4641s gap-span).
+DOOR_MAX_GAP_S = float(os.environ.get("DOOR_MAX_GAP_S", "15"))       # frame jump mid-cycle -> abandon
+DOOR_MIN_CLOSE_S = float(os.environ.get("DOOR_MIN_CLOSE_S", "0.3"))  # close below this -> withheld
+DOOR_MAX_CLOSE_S = float(os.environ.get("DOOR_MAX_CLOSE_S", "30"))   # close above this -> withheld
 TEMPLATES_REFETCH_S = float(os.environ.get("TEMPLATES_REFETCH_S", "600"))  # re-pull npz; reload if hash changed
 # --- liveness: progress-based, because "active (running)" told us nothing during the 5h44m hang ---
 WD_STALL_S = float(os.environ.get("WD_STALL_S", "120"))    # no segment processed this long -> dump + exit
@@ -377,12 +386,14 @@ def build_door_engine(prefetched_tpl=None):
             mode = ("SINGLE-PANEL (no agree-or-discard) — set PANEL1_DIGIT_CELLS/PANEL1_ARROW_CELL "
                     "from a panel1 anchor read to enable the free confidence check")
         ft = gd.FloorTracker(floor_order=FLOOR_ORDER or None)
+        dtr = gd.DoorTracker(max_gap_s=DOOR_MAX_GAP_S, min_close_s=DOOR_MIN_CLOSE_S,
+                             max_close_s=DOOR_MAX_CLOSE_S)
         eng = gd.DoorFloorEngine(tpl, droi, panels, min_score=DOOR_MIN_SCORE, blank_range=DOOR_BLANK_RANGE,
-                                 floor_tracker=ft, shift_search=DOOR_SHIFT, margin_min=DOOR_MARGIN,
+                                 floor_tracker=ft, door_tracker=dtr, shift_search=DOOR_SHIFT, margin_min=DOOR_MARGIN,
                                  blank_min=DOOR_BLANK_MIN, shift_floor=DOOR_SHIFT_FLOOR,
                                  lit_range=DOOR_LIT_RANGE, blank_strong=DOOR_BLANK_STRONG,
                                  blank_lit_margin=DOOR_BLANK_LIT_MARGIN, confuse_band=DOOR_CONFUSE_BAND,
-                                 disc_min=DOOR_DISC_MIN)
+                                 disc_min=DOOR_DISC_MIN, valid_floors=(FLOOR_ALPHABET or None))
     except Exception as e:
         return None, f"geometry/engine error: {type(e).__name__}: {str(e)[:80]}"
     geom_sig = _hash8("|".join([DOOR_ROI_FRAME, PANEL_ROIS, DIGIT_CELLS, ARROW_CELL,
@@ -394,6 +405,8 @@ def build_door_engine(prefetched_tpl=None):
             f"{'...' if len(FLOOR_ALPHABET) > 6 else ''} — off-alphabet reads flagged, not counted")
     else:
         log("GPU_DOOR floor whitelist: NONE (set FLOOR_ORDER/FLOOR_ALPHABET to reject impossible floors)")
+    log(f"GPU_DOOR time guards: max_gap={DOOR_MAX_GAP_S}s (abandon mid-cycle across a stream gap); "
+        f"close_travel plausible [{DOOR_MIN_CLOSE_S},{DOOR_MAX_CLOSE_S}]s (else emitted null)")
     return eng, version
 
 

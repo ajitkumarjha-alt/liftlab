@@ -259,7 +259,16 @@ def _join_diagnostics(stops, transits, matched):
     Both series are ascending, so the nearest-gap scan is a single forward pass, not a rescan.
     """
     durs = sorted(max(0.0, (s["close_ts"] or s["ts"]) - s["ts"]) for s in stops)
+    # ERA-OVERLAP ONLY. The door cycles span [win_lo, win_hi]; a transit outside that window predates
+    # or postdates the door-read era and can never join. Including it as a "miss" is why ch29 showed a
+    # ~4.5-day gap median. Judge join only over transits that overlap the door-active window.
+    n_all = len(transits)
+    if stops:
+        win_lo = min(s["ts"] for s in stops)
+        win_hi = max((s["close_ts"] or s["ts"]) for s in stops)
+        transits = [t for t in transits if win_lo <= t[0] <= win_hi]
     n_tr = len(transits)
+    excluded_out_of_era = n_all - n_tr
     # nearest gap for each transit to the union of windows (0 if inside one)
     gaps = []
     inside = 0
@@ -281,7 +290,8 @@ def _join_diagnostics(stops, transits, matched):
     def _p(a, q):
         return round(a[min(len(a) - 1, int(q * len(a)))], 2) if a else None
     return {
-        "n_windows": len(stops), "n_transits": n_tr, "matched": matched,
+        "n_windows": len(stops), "n_transits_in_era": n_tr, "n_transits_total": n_all,
+        "excluded_out_of_era": excluded_out_of_era, "matched": matched,
         "join_rate_pct": round(100.0 * inside / n_tr, 1) if n_tr else None,
         "window_dur_s": {"median": _p(durs, 0.5), "p85": _p(durs, 0.85),
                          "min": (durs[0] if durs else None), "max": (durs[-1] if durs else None)},
@@ -343,8 +353,14 @@ def _door_transition_census(db, gw, cam, era):
             "open_confirm_rate_pct": _pct(confirmed_open, opened),      # opening -> open
             "close_complete_rate_pct": _pct(completed, began_closing),  # closing -> closed
             "cycle_per_open_pct": _pct(completed, opened)},             # end to end
+        "pairing_suspect": (began_closing > opened or completed > confirmed_open),
         "diagnosis": (
-            "few opening->open: near_open threshold too high for this edge" if opened and _pct(confirmed_open, opened) is not None and _pct(confirmed_open, opened) < 50
+            # closings/cycles cannot legitimately exceed openings/opens — that is the tracker pairing
+            # edges across gaps or noise (the 0.08s / 4641s close_travel). Grade it RED, not normal.
+            "PAIRING SUSPECT: more closings than openings (or cycles than opens) — the tracker is "
+            "pairing edges across gaps/noise; close_travel is unreliable (time-guard fix pending deploy)"
+            if (began_closing > opened or completed > confirmed_open)
+            else "few opening->open: near_open threshold too high for this edge" if opened and _pct(confirmed_open, opened) is not None and _pct(confirmed_open, opened) < 50
             else "few closing->closed: close_th too low, doors never read fully shut" if began_closing and _pct(completed, began_closing) is not None and _pct(completed, began_closing) < 50
             else "cycles completing normally" if completed else "no completed cycles — see the funnel"),
     }
@@ -372,6 +388,13 @@ def _door_gpu_by_cam(db, gw, cams):
                   (gw, cam, era + "%"))
         cts = sorted(float(r["ct"]) for r in rows if r["ct"] is not None and r["ct"] > 0)
         n = len(cts)
+        # SUSPECT GUARD. The GPU tracker paired edges across gaps/noise, so stored close_travel can be
+        # sub-frame (0.08s) or gap-spanning (thousands of s). Flag the line so nobody quotes 0.08s, and
+        # compute a plausible-only median (0.3-30s) beside the raw one so a usable number survives.
+        PLAUS_LO, PLAUS_HI = 0.3, 30.0
+        impossible = [v for v in cts if v < PLAUS_LO or v > PLAUS_HI]
+        plaus = [v for v in cts if PLAUS_LO <= v <= PLAUS_HI]
+        suspect = (len(impossible) > 0)
         spec = DOOR_SPECS.get(cam)
         # Carry the spec even at n=0, so a spec'd camera ALWAYS gets a compliance line — a gap must be
         # visible on the headline, not silently omitted (condition b). pct_exceed only when there's data.
@@ -386,6 +409,10 @@ def _door_gpu_by_cam(db, gw, cams):
             "p85": round(_pctl(cts, 0.85), 2) if n else None,
             "min": round(cts[0], 2) if n else None, "max": round(cts[-1], 2) if n else None,
             "hist": _hist(cts), "hist_edges": _HIST_EDGES, "spec": spec_out,
+            "measurement_suspect": suspect, "n_impossible": len(impossible),
+            "plausible_n": len(plaus),
+            "plausible_median": (round(_pctl(plaus, 0.5), 2) if plaus else None),
+            "plausible_p85": (round(_pctl(plaus, 0.85), 2) if plaus else None),
             "reason": (None if n else "era rows exist but NO completed open->close cycle "
                        "(floor reads without usable pairs) — the gap is real")}
     return out
@@ -883,6 +910,9 @@ def dash_data(gw: str):
         headline.append(dict(spec, cam=cam, median=g["median"], p85=g["p85"], n=g["n"],
                              instrument="GPU door engine (gw_door_event) — LIVE",
                              era=g["era"], live=True, n_cycles=g["n_cycles"], reason=g.get("reason"),
+                             measurement_suspect=g.get("measurement_suspect"),
+                             n_impossible=g.get("n_impossible"), plausible_n=g.get("plausible_n"),
+                             plausible_median=g.get("plausible_median"),
                              transfer_median=None, transfer_n=None, transfer_provisional=True))
 
     # NOT AVAILABLE (Tier-2 ceiling). This panel used to be unconditional, because the only floor
@@ -1242,19 +1272,27 @@ function strip(d){
 function headline(d){
   if(!d.headline||!d.headline.length){document.getElementById('headline').innerHTML='';return;}
   var h=d.headline.map(function(x){
+    var susp=x.measurement_suspect?'<span class="pill bad" style="font-size:10px;margin-right:6px">MEASUREMENT SUSPECT</span>':'';
     var tag='<span class="pill '+(x.live?'ok':'mut')+'" style="font-size:10px;margin-right:6px">'
       +(x.live?'LIVE · GPU · era '+esc((x.era||'').slice(0,8)):'RETIRED · Pi-watch')+'</span>';
     var dl;
     if(x.median==null){
       // A GPU-era line with no cycles is the honest "gap is real" signal condition (b) asks for.
       dl=x.cam+' door close: '+(x.reason?('<b class=bad>'+esc(x.reason)+'</b>'):'no clean close measured yet');
+    } else if(x.measurement_suspect){
+      // Do NOT lead with the raw median (0.08s is an artifact). Show the plausible-only number and
+      // name why the raw one is not to be quoted.
+      dl=x.cam+' door close: <b class=bad>raw median '+x.median+'s NOT USABLE</b> — '+esc(x.n_impossible)
+       +' of '+x.n+' cycles are physically impossible (sub-frame or gap-spanning, tracker pairing bug).'
+       +' Plausible-only: '+(x.plausible_median==null?'—':('median <b>'+x.plausible_median+'s</b> (n='+x.plausible_n+')'))
+       +' · not quotable until the time-guard fix repopulates the stream.';
     } else {
       dl=x.cam+' door close: observed median <b>'+x.median+'s</b> (p85 '+x.p85+'s, n='+x.n+')'
        +' · sheet assumes <b>'+x.sheet_s.toFixed(2)+'s</b>'
        +' · Bank '+esc(x.bank)+' non-compliant above <b>'+x.compliance_s.toFixed(2)+'s</b>'
        +' · <b class="'+((x.pct_exceed||0)>=50?'bad':'warn')+'">'+esc(x.pct_exceed)+'%</b> of observed closes exceed '+x.compliance_s.toFixed(2)+'s';
     }
-    var out='<div class="obs mono">'+tag+dl+'</div>';
+    var out='<div class="obs mono">'+tag+susp+dl+'</div>';
     // C26 passenger transfer — beside door-close, same format. PROVISIONAL (transit precision).
     if(x.transfer_sheet_s!=null){
       var tl=(x.transfer_median==null)?(x.cam+' transfer: no counted cycles yet'):
@@ -1458,7 +1496,8 @@ function tier2card(t){
         +'<br><b>'+esc(c.diagnosis)+'</b></div>';})()
     +(function(){var j=t.join_diagnostics; if(!j)return '';
       return '<div class=mut style="font-size:11px">join: '+(j.join_rate_pct==null?'—':j.join_rate_pct+'%')
-        +' inside a window (dur median '+(j.window_dur_s.median==null?'—':j.window_dur_s.median+'s')+')'
+        +' of '+j.n_transits_in_era+' in-era transits inside a window (dur median '+(j.window_dur_s.median==null?'—':j.window_dur_s.median+'s')+')'
+        +(j.excluded_out_of_era?(' · '+j.excluded_out_of_era+' transits excluded as out-of-era'):'')
         +' · misses: '+j.miss_gap_s.n+', gap median '+(j.miss_gap_s.median==null?'—':j.miss_gap_s.median+'s')
         +' ('+j.miss_gap_s.within_2s+' within 2s, '+j.miss_gap_s.beyond_10s+' beyond 10s)'
         +'<br>'+esc(j.reading)+'</div>';})()

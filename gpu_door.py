@@ -80,16 +80,27 @@ class DoorTracker:
     door timestamps + close_travel_s. Thresholds are hysteretic to reject jitter."""
 
     def __init__(self, min_strength=0.30, open_th=0.50, near_open=0.90, close_th=0.10,
-                 ref_window=600, min_span_col=6.0):
+                 ref_window=600, min_span_col=6.0, max_gap_s=15.0,
+                 min_close_s=0.3, max_close_s=30.0, min_open_s=0.15, max_open_s=30.0):
         self.min_strength = min_strength      # min FRACTION of rows with a clear edge (door_edge_column strength)
         self.open_th = open_th                # openness rising past this = opening under way
         self.near_open = near_open            # reached this = fully open (open_full)
         self.close_th = close_th              # fell below this = fully closed (close_full)
         self.min_span_col = min_span_col      # need this many px between closed and open refs to trust openness
+        # TIME GUARDS. The tracker paired close_start->close_full across arbitrary gaps: a stream gap
+        # while in 'closing' produced a 77-minute "close" (4641s), and a single noisy frame entering
+        # AND completing 'closing' produced a sub-frame 0.08s "close". Neither is physical.
+        self.max_gap_s = max_gap_s            # analyzed-frame jump > this while mid-cycle -> abandon (missed the real cycle)
+        self.min_close_s = min_close_s        # close_travel below this = a one-frame artifact -> WITHHELD
+        self.max_close_s = max_close_s        # close_travel above this = spans a gap -> WITHHELD
+        self.min_open_s = min_open_s
+        self.max_open_s = max_open_s
         self._cols = deque(maxlen=ref_window)  # recent edge columns -> rolling refs
         self.state = "closed"                 # closed | opening | open | closing
         self._ev = {}                         # timestamps of the cycle in progress
+        self._last_t = None                   # wall-clock of the last analyzed frame that advanced state
         self.cycles = []
+        self.abandoned = 0                    # cycles dropped on a time gap (visibility, not silent)
 
     def _refs(self):
         if len(self._cols) < 20:
@@ -111,6 +122,18 @@ class DoorTracker:
         o = self.openness(col)
         if o is None:
             return None
+        # TIME-GAP GUARD. If we haven't seen a usable frame in max_gap_s while a cycle is in progress,
+        # the door almost certainly opened/closed unseen (dropped segments, a stall, low edge strength).
+        # Pairing the next edge to the pre-gap one is what produced the 4641s close. Abandon the cycle
+        # and re-derive state from the current openness — never fabricate a close across the blind span.
+        if (self._last_t is not None and (t - self._last_t) > self.max_gap_s
+                and self.state != "closed"):
+            self._ev = {}
+            self.state = "open" if o >= self.near_open else ("closed" if o < self.close_th else "opening")
+            self.abandoned += 1
+            self._last_t = t
+            return None
+        self._last_t = t
         st = self.state
         if st == "closed":
             if o >= self.open_th:
@@ -139,9 +162,21 @@ class DoorTracker:
         if not all(k in e for k in need):
             return None
         cyc = {k: e[k] for k in need}
-        cyc["close_travel_s"] = round(e["close_full"] - e["close_start"], 3)
-        cyc["open_travel_s"] = round(e["open_full"] - e["open_start"], 3)
+        ct = round(e["close_full"] - e["close_start"], 3)
+        ot = round(e["open_full"] - e["open_start"], 3)
         cyc["dwell_s"] = round(e["close_start"] - e["open_full"], 3)
+        cyc["open_travel_s"] = ot
+        # EMIT THE FACT, WITHHOLD AN IMPLAUSIBLE MEASUREMENT (same discipline as the cloud ingest for
+        # gw_event). A cycle happened — that is real and kept — but a close_travel outside the physical
+        # band is a pairing/noise artifact, not a measurement, so it is set null and reasoned rather
+        # than fed to the compliance median. 0.08s (sub-frame) and gap-spanning values both fail here.
+        if ct < self.min_close_s or ct > self.max_close_s:
+            cyc["close_travel_s"] = None
+            cyc["close_quality"] = (f"withheld: close_travel {ct}s outside "
+                                    f"[{self.min_close_s},{self.max_close_s}]s (pairing/noise artifact)")
+        else:
+            cyc["close_travel_s"] = ct
+            cyc["close_quality"] = "ok"
         self.cycles.append(cyc)
         return cyc
 
