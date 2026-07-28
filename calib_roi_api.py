@@ -266,6 +266,55 @@ async def roi_save(gw: str, cam: str, request: Request):
     return {"ok": True, **out}
 
 
+@calib_roi_router.post("/calib-roi/{gw}/{cam}/zones")
+async def zones_save(gw: str, cam: str, request: Request):
+    """Counting zones (landing + cabin polygons, FRAME px) -> roi.json. MERGE like /save — door,
+    panels and cells untouched. A separate endpoint so zones can be added to an already-calibrated
+    camera without redrawing ROIs. The registry serves them, the fleet passes them through, and
+    gpu_analyze refuses to count without them — ch29's built-in polygons scaled onto another
+    camera's optics ARE the ch16 undercount this closes.
+
+    Body: {"zone_landing": [[x,y],...>=3], "zone_cabin": [[x,y],...>=3], "provenance": "..."?}
+    """
+    d = _dir(gw, cam)
+    body = await request.json()
+    frame_wh = _frame_wh(d)
+    if not frame_wh:
+        # Without the true frame size the worker cannot scale the polygons; a wrong scale counts
+        # wrong silently — refuse, same principle as /save.
+        raise HTTPException(409, "true frame size unknown (_calib_rois.json absent) — run "
+                                 "door_calib --frames 1 once, then save zones")
+
+    def _poly(v, name):
+        if not (isinstance(v, list) and len(v) >= 3
+                and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in v)):
+            raise HTTPException(400, f"{name}: need a polygon of >=3 [x,y] points")
+        pts = []
+        for x, y in v:
+            try:
+                xi, yi = int(round(float(x))), int(round(float(y)))
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"{name}: non-numeric point")
+            if not (0 <= xi <= frame_wh[0] and 0 <= yi <= frame_wh[1]):
+                raise HTTPException(400, f"{name}: point ({xi},{yi}) outside frame {frame_wh}")
+            pts.append([xi, yi])
+        return pts
+
+    zl = _poly(body.get("zone_landing"), "zone_landing")
+    zc = _poly(body.get("zone_cabin"), "zone_cabin")
+    out = _load_roi(d)
+    out.update({"zone_landing": zl, "zone_cabin": zc, "zone_frame": frame_wh,
+                "zones_saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    if body.get("provenance"):
+        out["zones_provenance"] = str(body["provenance"])[:200]
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = _roi_path(d).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(out, indent=2))
+    os.replace(tmp, _roi_path(d))           # atomic
+    return {"ok": True, "zone_landing": zl, "zone_cabin": zc, "zone_frame": frame_wh,
+            "note": "registry hash changes on next poll — the fleet restarts this worker with zones"}
+
+
 @calib_roi_router.get("/calib-roi/{gw}/{cam}", response_class=HTMLResponse)
 def roi_page(gw: str, cam: str):
     _safe(gw, cam)

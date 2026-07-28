@@ -85,10 +85,11 @@ def fetch_registry():
             g = c.get("geometry") or {}
             out[cam] = {"enabled": bool(c.get("enabled")), "stride": int(c.get("stride") or 2),
                         "analyze_fps": float(c.get("analyze_fps") or 0),
-                        # Door geometry travels with the camera, from roi.json via the registry, so a
-                        # fleet-spawned worker can read floors without anyone editing a unit file.
+                        # Door geometry AND counting zones travel with the camera, from roi.json via
+                        # the registry, so a fleet-spawned worker needs no unit-file edits for either.
                         "geometry": {k: str(v) for k, v in sorted(g.items()) if k in
-                                     ("door_roi_frame", "panel_rois", "digit_cells", "arrow_cell")}}
+                                     ("door_roi_frame", "panel_rois", "digit_cells", "arrow_cell",
+                                      "zone_landing", "zone_cabin", "zone_frame")}}
     return {"cams": out, "hash": d.get("hash")}
 
 
@@ -101,7 +102,12 @@ def start(cam, cfg):
     # lift's panel — the exact failure the built-in PANEL_ROIS default already caused once.
     geom = cfg.get("geometry") or {}
     for key, envname in (("door_roi_frame", "DOOR_ROI_FRAME"), ("panel_rois", "PANEL_ROIS"),
-                         ("digit_cells", "DIGIT_CELLS"), ("arrow_cell", "ARROW_CELL")):
+                         ("digit_cells", "DIGIT_CELLS"), ("arrow_cell", "ARROW_CELL"),
+                         # Zones: same absent-means-UNSET rule — a stale inherited value would count
+                         # this camera with another lift's polygons, the exact ch16 undercount this
+                         # plumbing exists to end.
+                         ("zone_landing", "ZONE_LANDING"), ("zone_cabin", "ZONE_CABIN"),
+                         ("zone_frame", "ZONE_FRAME")):
         if geom.get(key):
             env[envname] = geom[key]
         else:
@@ -124,8 +130,11 @@ def start(cam, cfg):
         return
     _procs[cam] = {"proc": p, "started": time.time(), "cfg": dict(cfg),
                    "restarts": _procs.get(cam, {}).get("restarts", 0), "last_exit": None}
+    zones = ("registry" if (geom.get("zone_landing") and geom.get("zone_cabin"))
+             else ("builtin-ch29" if cam == "ch29" else "NONE — counting OFF (save zones into roi.json)"))
     log(f"{cam}: started pid={p.pid} stride={cfg['stride']} analyze_fps={cfg['analyze_fps']} "
-        f"door={'ON' if env.get('GPU_DOOR') == '1' else 'off (geometry incomplete — draw it at /calib-roi)'}")
+        f"door={'ON' if env.get('GPU_DOOR') == '1' else 'off (geometry incomplete — draw it at /calib-roi)'} "
+        f"zones={zones}")
 
 
 def stop(cam, why):

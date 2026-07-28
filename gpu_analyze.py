@@ -51,8 +51,37 @@ PREFETCH_N = int(os.environ.get("PREFETCH_N", "2"))   # fetch this many segments
 # GETS COUNTED (tracking continuity / dwell) -> it is a COUNTING_VERSION bump; don't touch mid-validation.
 ANALYZE_FPS = float(os.environ.get("ANALYZE_FPS", "0"))
 CALIB_W, CALIB_H = 1920, 1080
+# CH29'S polygons (desk-rig 2026-07-11, geometry-verified 2026-07-15). Built-in fallback for ch29
+# ONLY — scaling one lift's polygons onto another camera's optics counts wrong (the ch16 undercount).
 ZONE_CABIN = [[630, 870], [932, 747], [1042, 733], [1308, 1056], [587, 1056], [548, 914]]
 ZONE_LANDING = [[514, 394], [834, 322], [722, 529], [732, 684], [761, 776], [618, 827]]
+# Zones travel with the camera via the registry (roi.json), like door geometry (baa0ca7). The fleet
+# sets ZONE_LANDING/ZONE_CABIN (JSON [[x,y],...]) + ZONE_FRAME ("w,h" the polygons were drawn at).
+# No zones and not ch29 -> counting OFF, loudly; the door/floor pass is independent and unaffected.
+
+
+def _parse_zone_env(s):
+    try:
+        v = json.loads(s)
+    except (ValueError, TypeError):
+        return None
+    ok = (isinstance(v, list) and len(v) >= 3
+          and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in v))
+    return [[float(x), float(y)] for x, y in v] if ok else None
+
+
+_ZL_ENV = _parse_zone_env(os.environ.get("ZONE_LANDING", "") or "null")
+_ZC_ENV = _parse_zone_env(os.environ.get("ZONE_CABIN", "") or "null")
+try:
+    ZONE_FRAME_W, ZONE_FRAME_H = [float(x) for x in os.environ.get("ZONE_FRAME", "").split(",")]
+except ValueError:
+    ZONE_FRAME_W, ZONE_FRAME_H = CALIB_W, CALIB_H
+if _ZL_ENV and _ZC_ENV:
+    ZONES_SOURCE = "registry"
+elif CAM == "ch29":
+    ZONES_SOURCE = "builtin-ch29"
+else:
+    ZONES_SOURCE = "none"
 HDRS = {"Authorization": "Bearer " + TOKEN}
 BASE = f"{CLOUD}/api/gw/{GW}/live/{CAM}"
 
@@ -306,6 +335,20 @@ def scale_zone(poly, sx, sy):
     return [[x * sx, y * sy] for x, y in poly]
 
 
+def make_counter(W, H):
+    """ZoneCounter with THIS camera's zones scaled to the decode size — or None when the camera has
+    no zones (counting OFF beats counting with another lift's polygons; door pass unaffected)."""
+    if ZONES_SOURCE == "none":
+        return None
+    if ZONES_SOURCE == "registry":
+        zl, zc, fw, fh = _ZL_ENV, _ZC_ENV, ZONE_FRAME_W, ZONE_FRAME_H
+    else:
+        zl, zc, fw, fh = ZONE_LANDING, ZONE_CABIN, CALIB_W, CALIB_H
+    sx, sy = W / fw, H / fh
+    log(f"zones[{ZONES_SOURCE}] drawn {fw:.0f}x{fh:.0f} -> frame {W}x{H} (sx={sx:.3f} sy={sy:.3f})")
+    return counting.ZoneCounter(scale_zone(zl, sx, sy), scale_zone(zc, sx, sy))
+
+
 USE_NVDEC = os.environ.get("USE_NVDEC", "0") == "1"
 _NVDEC_WH = {}
 
@@ -476,6 +519,12 @@ def main():
     det = counting.YoloDetector(weights=MODEL, conf=CONF, tracker="bytetrack.yaml", device=DEVICE)
     log(f"detector on device={DEVICE} — verify with nvidia-smi (non-zero GPU-Util = actually on the L4)")
     ctr = None                                   # ZoneCounter, built once we know the frame size
+    if ZONES_SOURCE == "none":
+        log(f"ZONES: NONE for {CAM} — transit counting OFF (door pass unaffected). Draw zones and "
+            f"save them into roi.json so the registry carries them; ch29's built-ins on another "
+            f"camera's optics are the undercount, not a fallback.")
+    else:
+        log(f"ZONES: {ZONES_SOURCE}")
     posted = 0
     val_state = get_val_state()
     last_val_poll = time.time()
@@ -559,6 +608,7 @@ def main():
             _tot = segments + dropped
             http_post_json(f"{CLOUD}/api/gw/{GW}/analyzer_status",
                            {"cam": CAM, "counting_version": counting.COUNTING_VERSION,
+                            "zones": ZONES_SOURCE,   # registry | builtin-ch29 | none (counting OFF)
                             "uptime_s": time.time() - started, "segments": segments, "dropped": dropped,
                             "posted": posted, "last_transit_ts": last_transit_ts, "mode": val_state,
                             # output-attestation signal (self-flag): doors opening but no transit posting
@@ -670,11 +720,9 @@ def main():
                 seen.add(name); continue
             segments += 1
             track_ms = 0.0
-            if ctr is None:
+            if ctr is None and ZONES_SOURCE != "none":
                 H, W = frames[0].shape[:2]
-                sx, sy = W / CALIB_W, H / CALIB_H
-                ctr = counting.ZoneCounter(scale_zone(ZONE_LANDING, sx, sy), scale_zone(ZONE_CABIN, sx, sy))
-                log(f"frame {W}x{H} -> zones scaled sx={sx:.3f} sy={sy:.3f}")
+                ctr = make_counter(W, H)
             seg_wall = time.time()                # approx wall time of this segment's arrival
             # DISCONTINUITY GUARD: a large jump since the last processed segment means the stream
             # starved/recovered. Rebuild the tracker + counter and drop any open episode so no
@@ -693,11 +741,10 @@ def main():
                 recent.clear(); recent_dets.clear()
                 door_opens_since_transit = 0
             last_seg_wall = seg_wall
-            if ctr is None:                       # rebuild after a gap reset (or first segment)
+            if ctr is None and ZONES_SOURCE != "none":   # rebuild after a gap reset (or first segment)
                 H, W = frames[0].shape[:2]
-                sx, sy = W / CALIB_W, H / CALIB_H
-                ctr = counting.ZoneCounter(scale_zone(ZONE_LANDING, sx, sy), scale_zone(ZONE_CABIN, sx, sy))
-            before = len(ctr.transits)
+                ctr = make_counter(W, H)
+            before = len(ctr.transits) if ctr else 0
             n_fr = len(frames)
             # ANALYZE_FPS subsampling: track every `stride`-th frame. 0/unset -> stride 1 (all frames,
             # current behavior). Cuts the dominant track cost ~proportionally to enable the 7-cam fleet.
@@ -730,6 +777,8 @@ def main():
                         if FLOORCHECK_PER_HR > 0 and (d_off - last_fc_ts) >= (3600.0 / FLOORCHECK_PER_HR):
                             post_floorcheck(drec, fr, panel0_roi, door_version)
                             last_fc_ts = d_off
+                if ctr is None:
+                    continue                      # no zones for this camera — counting OFF (door pass above ran)
                 if i % stride != 0:
                     continue                      # subsampled out (analyze_fps); keeps decode, skips track
                 if val_state == "validating":
@@ -808,9 +857,10 @@ def main():
                         for j in capture_seq(recent, VAL_SEQ_PER_TRANSIT):
                             if len(episode["imgs"]) < VAL_MAX_IMGS:
                                 episode["imgs"].append(j)
-            b, a = ctr.counts()
-            if len(ctr.transits) > before:
-                log(f"{name}: +{len(ctr.transits)-before} transits (cum boarded={b} alighted={a}, posted={posted})")
+            if ctr is not None:
+                b, a = ctr.counts()
+                if len(ctr.transits) > before:
+                    log(f"{name}: +{len(ctr.transits)-before} transits (cum boarded={b} alighted={a}, posted={posted})")
             seg_ms = (time.time() - seg_t0) * 1000          # NON-OVERLAPPED wall: max(fetch_wait, 0)+decode+track+post
             proc_times.append(seg_ms); track_times.append(track_ms)
             fetch_times.append(fetch_ms); decode_times.append(decode_ms)

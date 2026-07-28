@@ -80,6 +80,22 @@ def _geometry(gw, cam):
     # already flags this; carry the flag so a worker is not configured from geometry known stale.
     if cells.get("stale"):
         out["cells_stale"] = str(cells["stale"])[:200]
+
+    # Counting zones travel the same way (the ch16 undercount was ch29's polygons scaled onto a
+    # different camera's optics). BOTH-or-neither: a counter needs landing AND cabin. Served as the
+    # exact JSON strings gpu_analyze parses; zone_frame is the size the polygons were drawn at.
+    def _poly(v):
+        ok = (isinstance(v, list) and len(v) >= 3
+              and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in v))
+        return json.dumps([[int(round(float(x))), int(round(float(y)))] for x, y in v]) if ok else None
+
+    zl, zc = _poly(d.get("zone_landing")), _poly(d.get("zone_cabin"))
+    if zl and zc:
+        out["zone_landing"] = zl
+        out["zone_cabin"] = zc
+        zf = d.get("zone_frame") or d.get("frame_wh")
+        if isinstance(zf, (list, tuple)) and len(zf) == 2:
+            out["zone_frame"] = f"{int(zf[0])},{int(zf[1])}"
     return out
 
 camera_registry_router = APIRouter()
