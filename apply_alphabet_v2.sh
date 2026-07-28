@@ -67,14 +67,26 @@ say "3/5 install"
 install -o "$OWNER" -g "$OWNER" -m 644 "$V2" "$APP/dash_api.py"
 
 say "4/5 restart ($SVC — dash blips NOW)"
+# Port from the RESOLVED ExecStart (house discipline), not a hard 9090.
+PORT=$(systemctl show -p ExecStart --value "$SVC" | sed -n 's/.*--port \([0-9]\{2,5\}\).*/\1/p')
+PORT=${PORT:-9090}
+URL="http://127.0.0.1:$PORT/dash/site-A/data"
+say "health probe target: $URL (parsed from ExecStart)"
 say "restart at: $(date -u +%FT%TZ) UTC / $(TZ=Asia/Kolkata date +%FT%T) IST"
 systemctl restart "$SVC"
-sleep 4
-CODE=$(curl -s -o "$AFTER" -w '%{http_code}' http://127.0.0.1:9090/dash/site-A/data || echo 000)
+# Cold start is a RACE (proven 2026-07-28: ss showed uvicorn on 127.0.0.1:9090 minutes after a
+# "failed" probe): a single early probe reads HTTP 000 — port not bound YET — and restores a
+# service that is healthy ten seconds later. Poll, don't sample: 30 attempts, 1s apart.
+CODE=000
+for i in $(seq 1 30); do
+  sleep 1
+  CODE=$(curl -s -o "$AFTER" -w '%{http_code}' --max-time 5 "$URL") || CODE=000
+  [ "$CODE" = "200" ] && break
+done
 if systemctl is-active --quiet "$SVC" && [ "$CODE" = "200" ]; then
-  say "service UP at $(date -u +%FT%TZ) UTC (HTTP $CODE)"
+  say "service UP at $(date -u +%FT%TZ) UTC (HTTP $CODE after $i probes)"
 else
-  say "SERVICE NOT HEALTHY (active=$(systemctl is-active "$SVC"), HTTP $CODE) — RESTORING"
+  say "SERVICE NOT HEALTHY after 30 probes (active=$(systemctl is-active "$SVC"), HTTP $CODE) — RESTORING"
   cp -p "$APP/dash_api.py.bak.$TS" "$APP/dash_api.py"
   systemctl restart "$SVC"
   exit 1

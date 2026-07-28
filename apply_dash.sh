@@ -80,13 +80,19 @@ if [ -z "$PORT" ]; then
   say "RESULT: PASS (verify at https://lift.gargi.online/dash). MainPID $OLDPID -> $NEWPID"; exit 0
 fi
 BASE="http://127.0.0.1:$PORT"; code(){ curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$@"; }
-PAGE=$(code "$BASE/dash"); DATA=$(code "$BASE/dash/site-A/data")
+# Cold start is a RACE (proven 2026-07-28: ss showed uvicorn bound minutes after a 000 probe; the
+# old "probes 000 = wrong port" verdict misdiagnosed it). Poll before judging, don't sample once.
+DATA=000
+for i in $(seq 1 30); do
+  DATA=$(code "$BASE/dash/site-A/data"); [ "$DATA" = 200 ] && break; sleep 1
+done
+PAGE=$(code "$BASE/dash")
 EV=$(code "$BASE/events")     # confirm the deep views still answer (ingest surface healthy)
-say "AFTER (port $PORT): /dash=$PAGE  /dash/site-A/data=$DATA  /events=$EV  (MainPID $OLDPID -> $NEWPID)"
+say "AFTER (port $PORT, $i probes): /dash=$PAGE  /dash/site-A/data=$DATA  /events=$EV  (MainPID $OLDPID -> $NEWPID)"
 if [ "$PAGE" = 200 ] && [ "$DATA" = 200 ]; then
   say "RESULT: PASS — /dash live at https://lift.gargi.online/dash (tabbed by camera, 15s refresh)."
 elif [ "$PAGE" = 000 ] && [ "$DATA" = 000 ]; then
-  say "RESULT: CHECK — probes 000 = wrong port (NOT dead routes); cloud active. Verify via the public URL."; exit 1
+  say "RESULT: CHECK — still 000 after 30 probes: not accepting on :$PORT (cold-start hang or wrong port). journalctl -u $SVC -n 40"; exit 1
 else
   say "RESULT: CHECK — restore $BAK; journalctl -u $SVC -n 40"; exit 1
 fi
