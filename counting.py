@@ -65,7 +65,10 @@ class YoloDetector:
                  tracker: str = "bytetrack.yaml", device=None):
         from ultralytics import YOLO
         self.model = YOLO(weights)
-        if device is not None:
+        # .to() is a PyTorch-weights operation: exported engines (.engine/.onnx) raise TypeError on
+        # it and take their device at predict time instead — which track() below already provides
+        # via kw["device"]. Suffix-gated so the .pt production path is byte-identical.
+        if device is not None and str(weights).endswith(".pt"):
             self.model.to(device)          # move weights onto the GPU; Pi/desk-rig pass None = CPU
         self.conf = conf
         self.tracker = tracker

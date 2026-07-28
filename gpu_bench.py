@@ -246,6 +246,15 @@ def main():
         if base is None:
             base = r
         results.append(r)
+        # Print AS EACH COMPLETES: a later variant crashing (the .engine .to() TypeError) must not
+        # eat the numbers already paid for.
+        _mean = statistics.fmean(r["ms"])
+        _p95 = sorted(r["ms"])[int(0.95 * (len(r["ms"]) - 1))]
+        _seg = _mean * (len(frames) / max(1, a.segments))
+        _tr = r["transits"] if r["transits"] is not None else "—"
+        log(f"   -> {v}: {_mean:.1f} ms/frame (p95 {_p95:.1f}) | {_seg:.0f} ms/segment "
+            f"({_seg / SEG_BUDGET_MS:.2f}x budget, {int(SEG_BUDGET_MS // _seg) if _seg > 0 else 0} cams fit) "
+            f"| transits={_tr} in/out={r['boarded']}/{r['alighted']}  [banked]")
         del det
 
     # ---- report ----
