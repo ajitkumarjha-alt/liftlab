@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Model benchmark — price the two FREE levers before anyone touches ANALYZE_FPS.
 
-    python gpu_bench.py --segments 20 --variants base,fp16,trt,n
+    ANALYSIS_TOKEN=<the worker's token> python gpu_bench.py --segments 20 --variants base,fp16,trt,n
+
+Frames come from the CLOUD, the same way gpu_analyze fetches them (the local /dev/shm ring died
+with the dumb-streamer rework): the bench polls the live playlist and downloads N segments up
+front, decodes ONCE, and only then runs the variants — so fetch cost never pollutes the variant
+comparison. --clips <glob> still works for pre-downloaded .ts files. Counting zones are primed
+from the registry for CAM before gpu_analyze imports, so the bench counts with the exact zones
+production uses; a camera with no zones runs SPEED-ONLY and says so.
 
 Measures, on THE SAME FRAMES, for each model variant:
   SPEED     ms/frame of model.track(), the only cost that has to fit the 2s segment budget
@@ -30,19 +37,19 @@ Variants:
 """
 import argparse
 import glob
+import json
 import os
 import statistics
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
-os.environ.setdefault("ANALYSIS_TOKEN", "bench")     # gpu_analyze requires it at import; unused here
-
-LIVE_DIR = Path(os.environ.get("LIVE_DIR", "/dev/shm/liftlab-live"))
 GW = os.environ.get("GW", "site-A")
 CAM = os.environ.get("CAM", "ch29")
 CONF = float(os.environ.get("CONF", "0.35"))
 DEVICE = os.environ.get("DEVICE", "cuda")
+CLOUD = os.environ.get("CLOUD_URL", "https://lift.gargi.online").rstrip("/")
 SEG_BUDGET_MS = float(os.environ.get("SEG_DUR_S", "2")) * 1000
 
 
@@ -50,32 +57,84 @@ def log(m):
     print(m, flush=True)
 
 
+def _token():
+    """The worker's analysis token. Forgiving about the 'site-A:tok' vs bare-token confusion: the
+    Bearer the cloud compares against is the BARE token, so strip a matching gateway prefix."""
+    t = os.environ.get("ANALYSIS_TOKEN", "")
+    if ":" in t and t.split(":", 1)[0] == GW:
+        t = t.split(":", 1)[1]
+        log(f"(ANALYSIS_TOKEN had the '{GW}:' prefix — using the bare token)")
+    return t
+
+
+def prime_zone_env():
+    """Zones for CAM from the registry -> env, BEFORE gpu_analyze imports (its module-level parse
+    reads env). The bench then counts with the same zones production uses. Explicit env wins."""
+    if os.environ.get("ZONE_LANDING") and os.environ.get("ZONE_CABIN"):
+        return "env"
+    try:
+        req = urllib.request.Request(f"{CLOUD}/api/gw/{GW}/cameras",
+                                     headers={"Authorization": "Bearer " + _token()})
+        d = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        for c in d.get("cameras", []):
+            if c.get("cam") == CAM:
+                g = c.get("geometry") or {}
+                if g.get("zone_landing") and g.get("zone_cabin"):
+                    os.environ["ZONE_LANDING"] = g["zone_landing"]
+                    os.environ["ZONE_CABIN"] = g["zone_cabin"]
+                    if g.get("zone_frame"):
+                        os.environ["ZONE_FRAME"] = g["zone_frame"]
+                    return "registry"
+    except Exception as e:
+        log(f"registry zones unavailable ({type(e).__name__}: {str(e)[:80]})")
+    return "none"
+
+
 def load_frames(n_segments, clips=""):
     """Decode N segments ONCE. Every variant then sees byte-identical frames — a benchmark that
-    re-decodes per variant is comparing decode jitter as much as inference."""
-    import gpu_analyze as ga          # production decode + zone scaling, so this measures the real path
-    paths = []
+    re-decodes per variant is comparing decode jitter as much as inference.
+
+    Cloud path: poll the live playlist and download new segments until N are collected (the
+    playlist is a rotating ring of a few, so this takes ~n_segments x SEG_DUR_S of wall time).
+    All fetching finishes BEFORE any variant runs — fetch cost cannot pollute the comparison."""
+    import gpu_analyze as ga          # production fetch + decode, so this measures the real path
+    blobs = []
     if clips:
-        paths = sorted(glob.glob(clips))[:n_segments]
-    else:
-        d = LIVE_DIR / GW / CAM
-        segs = glob.glob(str(d / "*.ts"))
-        # The live ring rotates in seconds; a file globbed a moment ago can vanish before the read.
-        stat = []
-        for p in segs:
+        for p in sorted(glob.glob(clips))[:n_segments]:
             try:
-                stat.append((os.path.getmtime(p), p))
+                blobs.append(Path(p).read_bytes())
             except OSError:
-                pass
-        paths = [p for _, p in sorted(stat, reverse=True)[:n_segments]]
-    if not paths:
-        raise SystemExit(f"no segments: looked in {LIVE_DIR/GW/CAM} (or --clips). Is the relay delivering?")
+                continue
+        if not blobs:
+            raise SystemExit(f"no readable files matched --clips {clips}")
+    else:
+        seen = set()
+        deadline = time.time() + max(120, n_segments * 6)
+        log(f"collecting {n_segments} segments from {ga.BASE} (live ring — takes about "
+            f"{n_segments * int(float(os.environ.get('SEG_DUR_S', '2')))}s of wall time)…")
+        while len(blobs) < n_segments and time.time() < deadline:
+            got_new = False
+            for nm in ga.playlist_segments():
+                if nm in seen:
+                    continue
+                seen.add(nm)
+                got_new = True
+                try:
+                    blobs.append(ga.http_get(f"{ga.BASE}/{nm}"))
+                    log(f"  fetched {nm} ({len(blobs)}/{n_segments})")
+                except Exception as e:
+                    log(f"  fetch {nm} failed: {type(e).__name__}: {str(e)[:80]}")
+                if len(blobs) >= n_segments:
+                    break
+            if not got_new and len(blobs) < n_segments:
+                time.sleep(1.0)
+        if not blobs:
+            raise SystemExit(f"no segments collected from {ga.BASE} — is the relay delivering? "
+                             f"(check /ops segment age)")
+        if len(blobs) < n_segments:
+            log(f"NOTE: collected only {len(blobs)}/{n_segments} before the deadline — proceeding")
     frames = []
-    for p in paths:
-        try:
-            data = Path(p).read_bytes()
-        except OSError:
-            continue                   # rotated out mid-scan
+    for data in blobs:
         fr, _rel = ga.decode_segment(data)
         frames.extend(fr)
     if not frames:
@@ -112,19 +171,22 @@ def build(variant, base_model):
 
 
 def run(det, frames, ga):
-    """Track every frame, timing ONLY the model call, and count transits with the production logic."""
-    import counting
+    """Track every frame, timing ONLY the model call, and count transits with the production logic.
+    Zones come from ga.make_counter — the registry-primed production path; a camera with no zones
+    returns counting fields as None (SPEED-ONLY, reported as such rather than counted wrong)."""
     H, W = frames[0].shape[:2]
-    sx, sy = W / ga.CALIB_W, H / ga.CALIB_H
-    ctr = counting.ZoneCounter(ga.scale_zone(ga.ZONE_LANDING, sx, sy),
-                               ga.scale_zone(ga.ZONE_CABIN, sx, sy))
+    ctr = ga.make_counter(W, H)
     times, per_frame_dets = [], []
     for i, f in enumerate(frames):
         t0 = time.perf_counter()
         dets = det.track(f)
         times.append((time.perf_counter() - t0) * 1000)
         per_frame_dets.append(len(dets))
-        ctr.update(dets, offset_s=i / 25.0)        # uniform clock: only RELATIVE order matters here
+        if ctr is not None:
+            ctr.update(dets, offset_s=i / 25.0)    # uniform clock: only RELATIVE order matters here
+    if ctr is None:
+        return {"ms": times, "dets": per_frame_dets, "boarded": None, "alighted": None,
+                "transits": None, "rejections": None}
     b, a = ctr.counts()
     return {"ms": times, "dets": per_frame_dets, "boarded": b, "alighted": a,
             "transits": len(ctr.transits), "rejections": len(ctr.rejections)}
@@ -150,7 +212,23 @@ def main():
         log(f"WARNING: {n_workers} gpu_analyze worker(s) are running and competing for this GPU.")
         log("         Stop the fleet for a clean read: sudo systemctl stop liftlab-gpu-fleet\n")
 
-    log(f"loading frames from {'clips' if a.clips else LIVE_DIR/GW/CAM} …")
+    # Token BEFORE any gpu_analyze import: ga reads ANALYSIS_TOKEN at module level for its Bearer
+    # header, so the bare-token normalization has to land in the env first. --clips mode needs no
+    # network, so a placeholder satisfies the import.
+    bare = _token()
+    if bare:
+        os.environ["ANALYSIS_TOKEN"] = bare
+    elif a.clips:
+        os.environ.setdefault("ANALYSIS_TOKEN", "bench")   # import-only; never sent anywhere
+    else:
+        raise SystemExit("cloud fetch needs the worker's token: ANALYSIS_TOKEN=<token> "
+                         "(the fleet unit env has it), or use --clips <glob> of local .ts files")
+    zones_src = prime_zone_env()
+    log(f"zones for {CAM}: {zones_src}" + ("" if zones_src != "none" and CAM != "ch29" else
+        " (ch29 falls back to built-ins; any other cam runs SPEED-ONLY without zones)"
+        if zones_src == "none" else ""))
+
+    log(f"loading frames from {'clips' if a.clips else 'cloud live playlist'} …")
     frames, ga = load_frames(a.segments, a.clips)
     H, W = frames[0].shape[:2]
     log(f"{len(frames)} frames at {W}x{H}; conf={CONF} device={DEVICE} budget={SEG_BUDGET_MS:.0f}ms/segment\n")
@@ -190,14 +268,23 @@ def main():
         else:
             same = sum(1 for x, y in zip(r["dets"], base["dets"]) if x == y)
             agree = f"{100.0 * same / max(1, len(base['dets'])):.1f}%"
+        tr = f"{r['transits']:9d}" if r["transits"] is not None else f"{'—':>9s}"
+        io = (f"{str(r['boarded'])+'/'+str(r['alighted']):>9s}" if r["boarded"] is not None
+              else f"{'—':>9s}")
         log(f"{r['v']:7s} {mean:9.1f} {p95:7.1f} {seg_ms:8.0f} {ratio:8.2f}x {cams:9d} "
-            f"{r['transits']:9d} {str(r['boarded'])+'/'+str(r['alighted']):>9s} {agree:>10s}")
+            f"{tr} {io} {agree:>10s}")
     log("=" * 96)
 
     # ---- the verdict that actually decides this ----
     log("\nCOUNTING EQUIVALENCE (the thing that decides whether a lever is free):")
+    if base is not None and base.get("transits") is None:
+        log(f"  SPEED-ONLY run — no zones for {CAM}, so counting was not compared. Per-frame")
+        log(f"  detection agreement (table above) is the only equivalence signal this run carries;")
+        log(f"  save zones for {CAM} and re-run before treating any lever as counting-free.")
     for r in results:
         if r.get("skip") or r is base:
+            continue
+        if r.get("transits") is None or base.get("transits") is None:
             continue
         d_t = r["transits"] - base["transits"]
         d_b = r["boarded"] - base["boarded"]
