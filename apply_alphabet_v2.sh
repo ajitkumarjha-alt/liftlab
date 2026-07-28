@@ -66,34 +66,68 @@ say "backup: dash_api.py.bak.$TS"
 say "3/5 install"
 install -o "$OWNER" -g "$OWNER" -m 644 "$V2" "$APP/dash_api.py"
 
-say "4/5 restart ($SVC — dash blips NOW)"
+say "4/5 unit fast-stop + restart ($SVC — dash blips NOW)"
+# SHUTDOWN DRAIN (journal-proven 2026-07-28): the relay's segment PUTs never pause, so uvicorn's
+# graceful shutdown never finishes draining — a restart hangs in stop for minutes and every
+# fixed-length probe window expires INSIDE the drain, restoring a module that never even started.
+# Fix at the unit: cap uvicorn's drain at 5s (in-flight PUTs finish; the stream never will) with a
+# 15s systemd backstop. These persist even if this apply restores — they fix every future apply.
+UNIT=/etc/systemd/system/$SVC.service
+if grep -q '^ExecStart=.*uvicorn' "$UNIT" 2>/dev/null \
+   && ! grep -q -- '--timeout-graceful-shutdown' "$UNIT"; then
+  if "$PY" -m uvicorn --help 2>/dev/null | grep -q -- '--timeout-graceful-shutdown'; then
+    cp -p "$UNIT" "$UNIT.bak-alpha.$TS"
+    sed -i 's|^\(ExecStart=.*uvicorn[^#]*\)$|\1 --timeout-graceful-shutdown 5|' "$UNIT"
+    say "unit: ExecStart += --timeout-graceful-shutdown 5 (backup $UNIT.bak-alpha.$TS)"
+  else
+    say "unit: uvicorn too old for --timeout-graceful-shutdown — TimeoutStopSec backstop only"
+  fi
+fi
+mkdir -p "/etc/systemd/system/$SVC.service.d"
+printf '[Service]\nTimeoutStopSec=15\n' > "/etc/systemd/system/$SVC.service.d/fast-stop.conf"
+systemctl daemon-reload
 # Port from the RESOLVED ExecStart (house discipline), not a hard 9090.
 PORT=$(systemctl show -p ExecStart --value "$SVC" | sed -n 's/.*--port \([0-9]\{2,5\}\).*/\1/p')
 PORT=${PORT:-9090}
-URL="http://127.0.0.1:$PORT/dash/site-A/data"
-say "health probe target: $URL (parsed from ExecStart)"
-say "restart at: $(date -u +%FT%TZ) UTC / $(TZ=Asia/Kolkata date +%FT%T) IST"
+LIVE="http://127.0.0.1:$PORT/openapi.json"       # cheap liveness probe — no DB behind it
+DATA="http://127.0.0.1:$PORT/dash/site-A/data"
+OLDPID=$(systemctl show -p MainPID --value "$SVC")
+say "restart at: $(date -u +%FT%TZ) UTC / $(TZ=Asia/Kolkata date +%FT%T) IST (old MainPID $OLDPID)"
 systemctl restart "$SVC"
-# Cold start is a RACE (proven 2026-07-28: ss showed uvicorn on 127.0.0.1:9090 minutes after a
-# "failed" probe): a single early probe reads HTTP 000 — port not bound YET — and restores a
-# service that is healthy ten seconds later. Poll, don't sample: 30 attempts, 1s apart.
-CODE=000
-for i in $(seq 1 30); do
+# Two-phase verdict so "old still draining" is never mistaken for "new failed to bind":
+# phase 1 — a NEW MainPID must exist; phase 2 — the new process must answer HTTP 200.
+NEWPID=$OLDPID
+for i in $(seq 1 120); do
+  NEWPID=$(systemctl show -p MainPID --value "$SVC")
+  [ -n "$NEWPID" ] && [ "$NEWPID" != "$OLDPID" ] && [ "$NEWPID" != 0 ] && break
   sleep 1
-  CODE=$(curl -s -o "$AFTER" -w '%{http_code}' --max-time 5 "$URL") || CODE=000
+done
+if [ -z "$NEWPID" ] || [ "$NEWPID" = "$OLDPID" ] || [ "$NEWPID" = 0 ]; then
+  say "NO NEW MainPID after 120s (still '$NEWPID' — old drain or failed start) — RESTORING"
+  cp -p "$APP/dash_api.py.bak.$TS" "$APP/dash_api.py"
+  systemctl restart "$SVC"
+  exit 1
+fi
+say "new MainPID $NEWPID after ${i}s — probing $LIVE"
+CODE=000
+for i in $(seq 1 60); do
+  sleep 1
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$LIVE") || CODE=000
   [ "$CODE" = "200" ] && break
 done
 if systemctl is-active --quiet "$SVC" && [ "$CODE" = "200" ]; then
-  say "service UP at $(date -u +%FT%TZ) UTC (HTTP $CODE after $i probes)"
+  curl -s -o "$AFTER" --max-time 15 "$DATA" || true
+  say "service UP at $(date -u +%FT%TZ) UTC (MainPID $OLDPID -> $NEWPID, openapi 200 after $i probes)"
 else
-  say "SERVICE NOT HEALTHY after 30 probes (active=$(systemctl is-active "$SVC"), HTTP $CODE) — RESTORING"
+  say "NEW PID $NEWPID NOT ANSWERING after 60 probes (active=$(systemctl is-active "$SVC"), HTTP $CODE) — RESTORING"
   cp -p "$APP/dash_api.py.bak.$TS" "$APP/dash_api.py"
   systemctl restart "$SVC"
   exit 1
 fi
 
 say "5/5 before/after admitted-set diff (ch16)"
-python3 - "$BEFORE" "$AFTER" <<'PYEOF'
+[ -s "$AFTER" ] || curl -s -o "$AFTER" --max-time 15 "$DATA" || true
+python3 - "$BEFORE" "$AFTER" <<'PYEOF' || say "diff step failed (snapshot missing?) — service is UP regardless"
 import json, sys
 def wl(p):
     d = json.load(open(p))
