@@ -57,6 +57,28 @@ CLOSE_TRAVEL_MAX_BOUNDARY = "2026-07-16T11:48:11+00:00"   # CLOSE_TRAVEL_MAX 10-
 # like the other three; the compliance panel labels every close-travel stat with its instrument.
 DOORWATCH_RETIRED_BOUNDARY = "2026-07-21T00:00:00+00:00"   # d7a7a49; Pi gw_event frozen, GPU gw_door_event live
 _BOUNDARY_EPOCH = datetime.fromisoformat(CLOSE_TRAVEL_MAX_BOUNDARY).timestamp()
+# 5f1488a's DoorTracker TIME GUARDS (max_gap 15s, plausible close 0.3-30s) changed what gets
+# EMITTED without changing the era (templates/geometry untouched), so an era-filtered close-travel
+# pool mixes pre-guard mispairings (0.08s / 4641s cycles) with clean rows — 115/154 impossible
+# drowned the LIVE median. This boundary cuts the pool at the guard deploy: set it to that moment
+# (ISO8601 with offset, or bare epoch seconds). Unset = no cut, old behavior + honest labeling.
+DOOR_GUARD_BOUNDARY = os.environ.get("DASH_DOOR_GUARD_TS", "").strip()
+
+
+def _guard_epoch():
+    if not DOOR_GUARD_BOUNDARY:
+        return None
+    try:
+        return float(DOOR_GUARD_BOUNDARY)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(DOOR_GUARD_BOUNDARY).timestamp()
+    except ValueError:
+        return None
+
+
+_GUARD_EPOCH = _guard_epoch()
 
 # DATA GAPS — windows where NO data was collected (relay/collect blind). Demand/counting/door numbers
 # in these windows are MISSING, not zero; charts must mark them so a dip isn't read as low demand.
@@ -318,8 +340,12 @@ def _door_transition_census(db, gw, cam, era):
     key), so consecutive rows with a state change are real transitions. Heartbeat re-emits of the
     SAME state are collapsed here, so a run of identical states counts as one occupancy, not many.
     """
-    rows = _q(db, "SELECT door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
+    rows = _q(db, "SELECT ts, door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
                   "AND door_version LIKE ? AND door_state IS NOT NULL ORDER BY ts, id", (gw, cam, era + "%"))
+    # Same guard-regime cut as the close-travel pool: pre-guard transitions are the mispairing era's
+    # artifacts; a funnel over them diagnoses a tracker that no longer runs.
+    if _GUARD_EPOCH is not None:
+        rows = [r for r in rows if r["ts"] is not None and float(r["ts"]) >= _GUARD_EPOCH]
     seq = []
     for r in rows:                                   # collapse consecutive identical states
         st = r["door_state"]
@@ -340,7 +366,8 @@ def _door_transition_census(db, gw, cam, era):
     def _pct(a, b):
         return round(100.0 * a / b, 1) if b else None
     return {
-        "era": era, "state_runs": len(seq), "transitions": trans,
+        "era": era, "guard_boundary": (DOOR_GUARD_BOUNDARY or None),
+        "state_runs": len(seq), "transitions": trans,
         "cycle_funnel": {
             "closed->opening": opened, "opening->open": confirmed_open,
             "open->closing": began_closing, "closing->closed (CYCLE)": completed},
@@ -357,8 +384,13 @@ def _door_transition_census(db, gw, cam, era):
         "diagnosis": (
             # closings/cycles cannot legitimately exceed openings/opens — that is the tracker pairing
             # edges across gaps or noise (the 0.08s / 4641s close_travel). Grade it RED, not normal.
-            "PAIRING SUSPECT: more closings than openings (or cycles than opens) — the tracker is "
-            "pairing edges across gaps/noise; close_travel is unreliable (time-guard fix pending deploy)"
+            # The time-guards ARE deployed (5f1488a): post-boundary this means a CURRENT pairing
+            # problem; without the boundary set it usually means pre-guard rows dominate the era.
+            ("PAIRING SUSPECT (post-guard rows only) — the guards are live, so this is a CURRENT "
+             "pairing problem, not stale garbage; close_travel unreliable"
+             if _GUARD_EPOCH is not None else
+             "PAIRING SUSPECT: more closings than openings — era mixes pre-time-guard rows with "
+             "clean ones; set DASH_DOOR_GUARD_TS to the 5f1488a deploy moment to cut them")
             if (began_closing > opened or completed > confirmed_open)
             else "few opening->open: near_open threshold too high for this edge" if opened and _pct(confirmed_open, opened) is not None and _pct(confirmed_open, opened) < 50
             else "few closing->closed: close_th too low, doors never read fully shut" if began_closing and _pct(completed, began_closing) is not None and _pct(completed, began_closing) < 50
@@ -386,11 +418,22 @@ def _door_gpu_by_cam(db, gw, cams):
         rows = _q(db, "SELECT ts, close_travel_s ct FROM gw_door_event "
                       "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
                   (gw, cam, era + "%"))
-        cts = sorted(float(r["ct"]) for r in rows if r["ct"] is not None and r["ct"] > 0)
+        # GUARD-REGIME CUT. The 5f1488a time-guards changed what gets emitted without moving the era,
+        # so pre-guard mispairings share the era with clean rows. With DASH_DOOR_GUARD_TS set, the
+        # quotable pool is post-guard rows only; the excluded count stays visible, never silent.
+        n_preguard = 0
+        pool = rows
+        if _GUARD_EPOCH is not None:
+            pool = [r for r in rows if r["ts"] is not None and float(r["ts"]) >= _GUARD_EPOCH]
+            n_preguard = sum(1 for r in rows if r["ct"] is not None
+                             and (r["ts"] is None or float(r["ts"]) < _GUARD_EPOCH))
+        cts = sorted(float(r["ct"]) for r in pool if r["ct"] is not None and r["ct"] > 0)
         n = len(cts)
         # SUSPECT GUARD. The GPU tracker paired edges across gaps/noise, so stored close_travel can be
         # sub-frame (0.08s) or gap-spanning (thousands of s). Flag the line so nobody quotes 0.08s, and
         # compute a plausible-only median (0.3-30s) beside the raw one so a usable number survives.
+        # Post-boundary the GPU withholds out-of-band closes, so an impossible value AFTER the cut is
+        # a REAL, current pairing problem — not stale garbage.
         PLAUS_LO, PLAUS_HI = 0.3, 30.0
         impossible = [v for v in cts if v < PLAUS_LO or v > PLAUS_HI]
         plaus = [v for v in cts if PLAUS_LO <= v <= PLAUS_HI]
@@ -413,6 +456,8 @@ def _door_gpu_by_cam(db, gw, cams):
             "plausible_n": len(plaus),
             "plausible_median": (round(_pctl(plaus, 0.5), 2) if plaus else None),
             "plausible_p85": (round(_pctl(plaus, 0.85), 2) if plaus else None),
+            "guard_boundary": (DOOR_GUARD_BOUNDARY or None),
+            "n_preguard_excluded": n_preguard,
             "reason": (None if n else "era rows exist but NO completed open->close cycle "
                        "(floor reads without usable pairs) — the gap is real")}
     return out
