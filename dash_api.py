@@ -627,8 +627,10 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
           plausible-speed edges between consecutive reads — reaches a human-labeled floor. A shadow
           band is an island: every edge into the real graph is a teleport.
       (d) FLIP-KILL: F<->X alternation between glyph-image floors at a physically impossible speed
-          (>=2 such flips) is confusion caught in the act; the lower-confidence member is quarantined
-          with its twin recorded.
+          AND an implausible floor gap (adjacent floors are images too — travel increments are not
+          flips) is confusion caught in the act; >=2 such flips quarantine the lower-confidence
+          member — but only toward a twin that is itself admitted, evaluated to fixpoint so kills
+          never cascade off already-dead floors. Twin recorded.
     Both are QUARANTINE, not verdicts: detail carries twin/anchored, and stronger later evidence (a
     labeled crop, a strong-margin read) re-admits on the next derive.
     Returns (admitted:set, detail:{floor: {...}}). max_fps defaults to MAX_FLOORS_PER_S.
@@ -663,6 +665,10 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
     # 162->17 pair at 8h would "plausibly" weld the shadow island onto the real graph.
     edge_window = float(os.environ.get("DASH_ALPHA_EDGE_WINDOW_S", "15"))
     flip_window = float(os.environ.get("DASH_ALPHA_FLIP_WINDOW_S", "45"))
+    # A flip is only confusion evidence when the floor gap is IMPLAUSIBLE. Adjacent floors are
+    # single-glyph images too (21/22, 28/29), and a panel incrementing during fast travel produces
+    # 1 floor in <0.33s = ">max_fps" — the 2026-07-28 over-fire killed real 11/21/25/26/28 that way.
+    flip_min_gap = float(os.environ.get("DASH_ALPHA_FLIP_MIN_GAP", "5"))
     parent = {f: f for f in seen if _floor_idx(f) is not None}
 
     def _root(x):
@@ -687,7 +693,7 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
                 ra, rb = _root(f1), _root(f2)
                 if ra != rb:
                     parent[ra] = rb
-        elif dt <= flip_window and _glyph_image(f1, f2):
+        elif dt <= flip_window and abs(i1 - i2) >= flip_min_gap and _glyph_image(f1, f2):
             for a, b in ((f1, f2), (f2, f1)):
                 fd = flips.setdefault(a, {"twin": b, "n": 0})
                 if fd["twin"] == b:
@@ -713,28 +719,25 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
     # anchor_roots empty (no labeled floor appears in this era's numeric reads) disables the anchor
     # rule rather than rejecting everything — a failsafe, and the panel's via strings make it visible.
     admitted, detail = set(), {}
+    comp_size = {}
+    for f in parent:
+        r = _root(f)
+        comp_size[r] = comp_size.get(r, 0) + 1
     for f, d in seen.items():
         is_labeled = f in labeled
         numeric = _floor_idx(f) is not None
         anchored = (not anchor_roots) or (f in parent and _root(f) in anchor_roots)
-        fl = flips.get(f)
-        shadow_of = None
-        if numeric and not is_labeled and fl and fl["n"] >= 2:
-            tw = fl["twin"]
-            tw_anchored = (tw in labeled) or (not anchor_roots) or (
-                tw in parent and _root(tw) in anchor_roots)
-            cf, ct = _mean_conf(f), _mean_conf(tw)
-            if (tw_anchored and not anchored) or (
-                    tw_anchored == anchored and cf is not None and ct is not None and cf < ct):
-                shadow_of = tw
+        # Island evidence needs an island: a size-1 component has no mutually-corroborating members
+        # to convict it, so a lone sparse floor (57 with no <=15s neighbour) falls back to plain
+        # corroboration instead of dying unanchored. Real shadow bands cluster (77-79, 12x, 16x).
+        lone = numeric and f in parent and comp_size.get(_root(f), 1) <= 1
         if is_labeled:
             via = "labeled"; admitted.add(f)
-        elif numeric and shadow_of is not None:
-            via = f"quarantine:glyph_shadow_of_{shadow_of} ({fl['n']} impossible-speed flips)"
-        elif numeric and d["n"] >= min_sightings and d["supported"] and not anchored:
+        elif numeric and d["n"] >= min_sightings and d["supported"] and not anchored and not lone:
             via = "quarantine:unanchored_island (no plausible-speed path to a labeled floor)"
         elif numeric and d["n"] >= min_sightings and d["supported"]:
-            via = "corroborated"; admitted.add(f)
+            via = "corroborated" if anchored else "corroborated (lone component — island rule n/a)"
+            admitted.add(f)
         elif numeric and not d["supported"]:
             via = "reject:no_transition_support (teleport/phantom cell)"
         elif numeric and d["n"] < min_sightings:
@@ -745,8 +748,44 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
                      "supported": d["supported"], "admitted": f in admitted, "via": via}
         if numeric:
             detail[f]["anchored"] = anchored
-        if shadow_of is not None:
-            detail[f]["twin"] = shadow_of
+    # Flip-kill AFTER base admission, to fixpoint: a floor dies only toward a twin that is ITSELF
+    # currently admitted (the 2026-07-28 over-fire chained kills off already-dead floors: 25 died
+    # as shadow of a 26 that was itself quarantined) and only with strictly lower mean confidence
+    # (labeled floors never die). Per round, defer any kill whose twin is also up for killing this
+    # round — the chain's top dies first and its dependents re-evaluate against the survivors.
+    while True:
+        kills = []
+        for f in admitted:
+            if f in labeled:
+                continue
+            fl = flips.get(f)
+            if not fl or fl["n"] < 2:
+                continue
+            tw = fl["twin"]
+            if tw not in admitted:
+                continue
+            cf, ct = _mean_conf(f), _mean_conf(tw)
+            if cf is not None and ct is not None and cf < ct:
+                kills.append((f, tw, fl["n"]))
+        pending = {k[0] for k in kills}
+        apply_now = [(f, tw, n) for f, tw, n in kills if tw not in pending]
+        if not apply_now:
+            break
+        for f, tw, n in apply_now:
+            admitted.discard(f)
+            detail[f]["admitted"] = False
+            detail[f]["via"] = f"quarantine:glyph_shadow_of_{tw} ({n} impossible-speed flips)"
+            detail[f]["twin"] = tw
+    # Label upgrade: an island-quarantined floor with qualifying flip evidence against an ADMITTED
+    # twin gets the more specific glyph_shadow label (same quarantine, better diagnostics + twin).
+    for f, dd in detail.items():
+        fl = flips.get(f)
+        if (dd["via"].startswith("quarantine:unanchored_island") and fl and fl["n"] >= 2
+                and fl["twin"] in admitted):
+            cf, ct = _mean_conf(f), _mean_conf(fl["twin"])
+            if cf is not None and ct is not None and cf < ct:
+                dd["via"] = f"quarantine:glyph_shadow_of_{fl['twin']} ({fl['n']} impossible-speed flips)"
+                dd["twin"] = fl["twin"]
     return admitted, detail
 
 

@@ -13,7 +13,7 @@ APP=/opt/liftlab-b3/cloud
 PY=$APP/.venv/bin/python
 SVC=liftlab-cloud
 OWNER=liftlab
-V2_PIN=465a8609cb565696799a52401459f249   # the reviewed artifact; guards a stale/partial staged copy
+V2_PIN=ca1cd6a7867e461d9538e4c1a7ee46ee   # the reviewed artifact; guards a stale/partial staged copy
 BEFORE=/home/ajit_kumarjha/alpha_before.json
 AFTER=/home/ajit_kumarjha/alpha_after.json
 say(){ echo "[alpha-v2] $*"; }
