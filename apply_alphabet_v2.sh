@@ -6,7 +6,7 @@
 # .bak -> smoke-import -> install -> restart (times printed) -> verify-or-restore -> before/after diff.
 # FILES NEEDED: /tmp/dash_api.py (fetched) OR the pre-staged /home/ajit_kumarjha/dash_api.py.v2 (md5-pinned)
 # CURL: B=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts; \
-#       for f in apply_alphabet_v2.sh dash_api.py; do curl -fsSL -o /tmp/$f $B/$f; done
+#       for f in apply_alphabet_v2.sh dash_api.py; T=$(date +%s); do curl -fsSL -o /tmp/$f "$B/$f?$T"; done
 #   sudo bash /tmp/apply_alphabet_v2.sh
 set -uo pipefail
 APP=/opt/liftlab-b3/cloud
