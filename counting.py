@@ -64,10 +64,16 @@ class YoloDetector:
     def __init__(self, weights: str = "yolo11n.pt", conf: float = 0.35,
                  tracker: str = "bytetrack.yaml", device=None):
         from ultralytics import YOLO
-        self.model = YOLO(weights)
-        # .to() is a PyTorch-weights operation: exported engines (.engine/.onnx) raise TypeError on
-        # it and take their device at predict time instead — which track() below already provides
-        # via kw["device"]. Suffix-gated so the .pt production path is byte-identical.
+        # Exported engines (.engine/.onnx) carry no task metadata — ultralytics guesses 'detect'
+        # with a warning. Pin it instead of trusting the guess. Same suffix gate as below: the .pt
+        # production path is byte-identical.
+        if str(weights).endswith(".pt"):
+            self.model = YOLO(weights)
+        else:
+            self.model = YOLO(weights, task="detect")
+        # .to() is a PyTorch-weights operation: exported engines raise TypeError on it and take
+        # their device at predict time instead — which track() below already provides via
+        # kw["device"].
         if device is not None and str(weights).endswith(".pt"):
             self.model.to(device)          # move weights onto the GPU; Pi/desk-rig pass None = CPU
         self.conf = conf
