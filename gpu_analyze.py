@@ -603,6 +603,17 @@ def main():
     def _mean(d):
         return round(sum(d) / len(d), 1) if d else None
 
+    def _p(d, q):
+        """Rolling percentile. connect_p10 is the DISCRIMINATOR for the fetch-bound question: a
+        pooled session reusing connections has a p10 near the bare TTFB (tens of ms); p10 stuck at
+        the mean means NO fetch ever rides a warm socket (client reuse broken), while a low p10
+        with a high p90 means reuse works and the slow fetches are SERVER latency (event-loop
+        contention on the cloud app), which no client fix can touch."""
+        if not d:
+            return None
+        s = sorted(d)
+        return round(s[min(len(s) - 1, int(q * (len(s) - 1)))], 1)
+
     def heartbeat():                              # so a DEAD worker is visible on /ops, not silent
         try:
             _tot = segments + dropped
@@ -620,6 +631,7 @@ def main():
                             "rej_hist": ",".join(str(x) for x in rej_hist),
                             "proc_ms": _mean(proc_times), "fetch_ms": _mean(fetch_times),
                             "connect_ms": _mean(connect_times), "transfer_ms": _mean(transfer_times),
+                            "connect_p10": _p(connect_times, 0.10), "connect_p90": _p(connect_times, 0.90),
                             "decode_ms": _mean(decode_times), "track_ms": _mean(track_times),
                             "seg_budget_ms": SEG_BUDGET_MS, "analyze_fps": ANALYZE_FPS or None,
                             # the two gate numbers (since process start): fraction of segments lost, and
