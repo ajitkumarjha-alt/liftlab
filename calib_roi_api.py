@@ -278,12 +278,16 @@ async def zones_save(gw: str, cam: str, request: Request):
     """
     d = _dir(gw, cam)
     body = await request.json()
-    frame_wh = _frame_wh(d)
-    if not frame_wh:
-        # Without the true frame size the worker cannot scale the polygons; a wrong scale counts
-        # wrong silently — refuse, same principle as /save.
-        raise HTTPException(409, "true frame size unknown (_calib_rois.json absent) — run "
-                                 "door_calib --frames 1 once, then save zones")
+    # The frame the polygons were DRAWN at. Defaults to the calib frame size, but the body may
+    # declare its own (e.g. ch29's verified polygons were drawn on the 1920x1080 MAIN stream while
+    # the calib wizard works on the sub frame) — polygons must carry their drawn frame or the
+    # worker scales them wrong, silently.
+    frame_wh = body.get("zone_frame") or _frame_wh(d)
+    if not (isinstance(frame_wh, (list, tuple)) and len(frame_wh) == 2
+            and all(isinstance(x, (int, float)) and x > 0 for x in frame_wh)):
+        raise HTTPException(409, "frame size unknown — pass \"zone_frame\": [w,h] (the size the "
+                                 "polygons were drawn at) or run door_calib --frames 1 once")
+    frame_wh = [int(frame_wh[0]), int(frame_wh[1])]
 
     def _poly(v, name):
         if not (isinstance(v, list) and len(v) >= 3
