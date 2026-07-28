@@ -50,20 +50,37 @@ BAK="$APP/main.py.bak.$(date +%Y%m%d-%H%M%S)"; cp "$APP/main.py" "$BAK"
 $PY /tmp/apply_camera_registry_patch.py || { say "patch failed — restoring"; cp "$BAK" "$APP/main.py"; exit 1; }
 chown "$OWNER:$OWNER" "$APP/main.py"
 $PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restoring"; cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; exit 1; }
-systemctl restart "$SVC"; sleep 4
-if [ "$(systemctl is-active "$SVC")" != active ]; then
-  say "cloud FAILED — RESTORING $BAK"; cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"
+# Two-phase verdict (drain/cold-start lesson 2026-07-28): (1) a NEW MainPID must exist — the old
+# process drains under the relay's PUT stream; (2) the new process must answer. A sleep-then-
+# single-sample probe reads 000 mid-drain/mid-bind and misdiagnoses a healthy install.
+OLDPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || echo 0)
+systemctl restart "$SVC"
+NEWPID=$OLDPID
+for i in $(seq 1 120); do
+  NEWPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || echo 0)
+  [ -n "$NEWPID" ] && [ "$NEWPID" != "$OLDPID" ] && [ "$NEWPID" != 0 ] && break
+  sleep 1
+done
+if [ -z "$NEWPID" ] || [ "$NEWPID" = "$OLDPID" ] || [ "$NEWPID" = 0 ]; then
+  say "no NEW MainPID after 120s — RESTORING $BAK"; cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"
   systemctl restart "$SVC"; say "restored. journalctl -u $SVC -n 40"; exit 1
 fi
 PORT=""
-MPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null)
-[ -n "$MPID" ] && [ "$MPID" != 0 ] && PORT=$(ss -tlnpH 2>/dev/null | grep -F "pid=$MPID," | grep -oP ':\K[0-9]+' | head -1)
+for i in $(seq 1 30); do   # the new PID binds a few seconds in — poll ss, don't sample once
+  PORT=$(ss -tlnpH 2>/dev/null | grep -F "pid=$NEWPID," | grep -oP ':\K[0-9]+' | head -1)
+  [ -n "$PORT" ] && break
+  sleep 1
+done
 [ -n "$PORT" ] || PORT=$(systemctl cat "$SVC" 2>/dev/null | grep -oP '\-\-port[=\s]+\K[0-9]+' | head -1)
 if [ -z "$PORT" ]; then say "RESULT: PASS (port unknown, not probed). Toggle on https://lift.gargi.online/dash"; exit 0; fi
 code(){ curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$@"; }
+LIVE=000
+for i in $(seq 1 60); do
+  LIVE=$(code "http://127.0.0.1:$PORT/openapi.json"); [ "$LIVE" = 200 ] && break; sleep 1
+done
 UN=$(code "http://127.0.0.1:$PORT/api/gw/site-A/cameras")            # no token -> must be 401
 DASH=$(code "http://127.0.0.1:$PORT/dash/site-A/data")
-say "AFTER (port $PORT): /cameras(no token)=$UN (want 401)  /dash/data=$DASH"
+say "AFTER (port $PORT, openapi $LIVE after $i probes, MainPID $OLDPID -> $NEWPID): /cameras(no token)=$UN (want 401)  /dash/data=$DASH"
 if [ "$UN" = 401 ] && [ "$DASH" = 200 ]; then
   say "RESULT: PASS — registry live. Enable a camera at https://lift.gargi.online/dash (GPU analysis)."
   say "  THEN deploy the fleet on liftlab-gpu: sudo ANALYSIS_TOKEN=... bash /tmp/apply_gpu_fleet.sh"

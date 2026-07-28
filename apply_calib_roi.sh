@@ -91,36 +91,49 @@ chown "$OWNER:$OWNER" "$APP/main.py"
 $PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restoring"; cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; exit 1; }
 
 OLDPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || echo 0)
-systemctl restart "$SVC"; sleep 4
-if [ "$(systemctl is-active "$SVC")" != active ]; then
-  say "cloud FAILED to start — RESTORING $BAK to protect the ingest"
+systemctl restart "$SVC"
+# Two-phase verdict (drain/cold-start lesson 2026-07-28): (1) a NEW MainPID must exist — the old
+# process drains under the relay's PUT stream; (2) the new process must answer. A sleep-then-
+# single-sample probe reads 000 mid-drain/mid-bind and misdiagnoses a healthy install.
+NEWPID=$OLDPID
+for i in $(seq 1 120); do
+  NEWPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || echo 0)
+  [ -n "$NEWPID" ] && [ "$NEWPID" != "$OLDPID" ] && [ "$NEWPID" != 0 ] && break
+  sleep 1
+done
+if [ -z "$NEWPID" ] || [ "$NEWPID" = "$OLDPID" ] || [ "$NEWPID" = 0 ]; then
+  say "no NEW MainPID after 120s — RESTORING $BAK to protect the ingest"
   cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; systemctl restart "$SVC"
   say "restored. journalctl -u $SVC -n 40"; exit 1
 fi
 
 PORT=""
-MPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null)
-if [ -n "$MPID" ] && [ "$MPID" != 0 ]; then
-  PORT=$(ss -tlnpH 2>/dev/null | grep -F "pid=$MPID," | grep -oP ':\K[0-9]+' | head -1)
-fi
+for i in $(seq 1 30); do   # the new PID binds a few seconds in — poll ss, don't sample once
+  PORT=$(ss -tlnpH 2>/dev/null | grep -F "pid=$NEWPID," | grep -oP ':\K[0-9]+' | head -1)
+  [ -n "$PORT" ] && break
+  sleep 1
+done
 [ -n "$PORT" ] || PORT=$(systemctl cat "$SVC" 2>/dev/null | grep -oP '\-\-port[=\s]+\K[0-9]+' | head -1)
-NEWPID=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || echo 0)
 CAM="${CAM:-ch16}"
 if [ -z "$PORT" ]; then
   say "AFTER: cloud=active (came-up verified); port unknown -> routes not HTTP-probed. NOT a failure."
   say "RESULT: PASS. Draw at https://lift.gargi.online/calib-roi/site-A/$CAM . MainPID $OLDPID -> $NEWPID"; exit 0
 fi
 BASE="http://127.0.0.1:$PORT"; code(){ curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$@"; }
+LIVE=000
+for i in $(seq 1 60); do
+  LIVE=$(code "$BASE/openapi.json"); [ "$LIVE" = 200 ] && break; sleep 1
+done
 PAGE=$(code "$BASE/calib-roi/site-A/$CAM"); ST=$(code "$BASE/calib-roi/site-A/$CAM/state")
-LBL=$(code "$BASE/calib-label/site-A/ch29"); OPS=$(code "$BASE/ops")
-say "AFTER (port $PORT): /calib-roi=$PAGE  /state=$ST  /calib-label=$LBL  /ops=$OPS  (MainPID $OLDPID -> $NEWPID)"
+LBL=$(code "$BASE/calib-label/site-A/ch29"); OPS=$(code "$BASE/ops/site-A")   # /ops is per-gw; bare /ops 404s
+say "AFTER (port $PORT, openapi $LIVE after $i probes): /calib-roi=$PAGE  /state=$ST  /calib-label=$LBL  /ops=$OPS  (MainPID $OLDPID -> $NEWPID)"
 if [ "$PAGE" = 200 ] && [ "$ST" = 200 ] && [ "$LBL" = 200 ]; then
   say "RESULT: PASS — draw ROIs at https://lift.gargi.online/calib-roi/site-A/$CAM"
   say "  Flow: draw 2 boxes -> Save -> door_calib --collect -> /calib-label -> anchor -> --build"
   say "  NOTE: for the most accurate boxes run 'door_calib --frames 1' on $CAM FIRST — that writes a"
   say "  NATIVE-resolution frame. The live-snapshot fallback is rescaled (~1.5 frame px per drawn px)."
 elif [ "$PAGE" = 000 ]; then
-  say "RESULT: CHECK — probes 000 = wrong port (NOT dead routes); cloud active. Verify via the public URL."; exit 1
+  say "RESULT: CHECK — still 000 after the openapi poll: not accepting on :$PORT (cold-start hang or wrong port). journalctl -u $SVC -n 40"; exit 1
 else
   say "RESULT: CHECK — restore $BAK; journalctl -u $SVC -n 40"; exit 1
 fi
