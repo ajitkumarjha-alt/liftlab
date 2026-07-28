@@ -34,10 +34,12 @@ fi
 say "installing from: $V2"
 
 say "1/5 smoke-import in the cloud venv (pre-install)"
-# importlib refuses a non-.py extension (spec comes back None), so check a .py-named copy from /tmp
+# importlib refuses a non-.py extension (spec comes back None), so check a .py-named copy from /tmp.
+# cd + PYTHONPATH give the candidate its real directory context (nav_common et al) — the proven
+# apply_dash.sh pattern — so the smoke exercises the actual deps, router and openapi, pre-install.
 TMP=$(mktemp /tmp/dash_api_v2_check.XXXXXX.py)
 cp "$V2" "$TMP"; chmod 644 "$TMP"
-sudo -u "$OWNER" "$PY" - "$TMP" <<'PYEOF'
+( cd "$APP" && sudo -u "$OWNER" env PYTHONPATH="$APP" "$PY" - "$TMP" ) <<'PYEOF'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("dash_api_v2", sys.argv[1])
 if spec is None or spec.loader is None:
@@ -46,7 +48,9 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 assert hasattr(m, "_derive_floor_alphabet") and hasattr(m, "_glyph_image")
 assert m._glyph_image("79", "19") and m._glyph_image("129", "29") and not m._glyph_image("162", "16")
-print("smoke-import OK")
+from fastapi import FastAPI
+a = FastAPI(); a.include_router(m.dash_router); a.openapi()
+print("smoke-import OK (module + router + openapi)")
 PYEOF
 RC=$?; rm -f "$TMP"
 [ $RC = 0 ] || { say "smoke-import FAILED — nothing installed"; exit 1; }
