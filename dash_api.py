@@ -595,6 +595,20 @@ def _labels_evidence(gw, cam):
     return glyphs, floors
 
 
+def _glyph_image(a, b):
+    """True when one floor string is reachable from the other by ONE systematic misread: a single
+    same-position glyph substitution (19->79) or a spurious leading '1' (29->129) — the two failure
+    shapes the ch16 flip data actually shows. Longer edits are not images; they stay out of the
+    shadow machinery and must earn rejection on their own evidence."""
+    if len(a) == len(b):
+        return sum(1 for x, y in zip(a, b) if x != y) == 1
+    if len(a) == len(b) + 1:
+        return a == "1" + b
+    if len(b) == len(a) + 1:
+        return b == "1" + a
+    return False
+
+
 def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
     """Derive the valid floor set from EVIDENCE, not a typed list (the ask). A floor string is admitted
     when it corroborates — never on mere occurrence, which is circular (a misread would whitelist
@@ -604,6 +618,19 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
           it sat next to a temporal-neighbour read reachable at <= max_fps floors/sec (i.e. it appears
           inside a sequential run, not as a teleport). 129 between two 19s is 110 floors in one read
           interval -> no support -> rejected; the phantom-hundreds rule falls straight out of this.
+
+    v2 (2026-07-28): transition support alone is defeated by SYSTEMATIC misreads — a stable
+    single-glyph confusion maps a real run onto a well-formed image run (19->18->17 read as
+    79->78->77), which supplies its own internal support. Two rules use evidence from OUTSIDE the
+    run's internal structure:
+      (c) ANCHORED SUPPORT: corroboration only counts if the floor's component — over short
+          plausible-speed edges between consecutive reads — reaches a human-labeled floor. A shadow
+          band is an island: every edge into the real graph is a teleport.
+      (d) FLIP-KILL: F<->X alternation between glyph-image floors at a physically impossible speed
+          (>=2 such flips) is confusion caught in the act; the lower-confidence member is quarantined
+          with its twin recorded.
+    Both are QUARANTINE, not verdicts: detail carries twin/anchored, and stronger later evidence (a
+    labeled crop, a strong-margin read) re-admits on the next derive.
     Returns (admitted:set, detail:{floor: {...}}). max_fps defaults to MAX_FLOORS_PER_S.
     """
     if max_fps is None:
@@ -629,18 +656,83 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
                 if fji is not None and abs(t - tj) > 0 and abs(fi - fji) / abs(t - tj) <= max_fps:
                     seen[f]["supported"] = True
                     break
+    # ── v2: anchored components + impossible-speed flips (rules, no floor lists) ─────────────────
+    # Component edges demand BOTH plausible speed AND a short gap: consecutive floor-bearing reads
+    # during real travel are seconds apart (emit-on-change fires per floor), so a pair spanning a
+    # long gap is a data gap, not an observed traversal — without the gap cap, an overnight
+    # 162->17 pair at 8h would "plausibly" weld the shadow island onto the real graph.
+    edge_window = float(os.environ.get("DASH_ALPHA_EDGE_WINDOW_S", "15"))
+    flip_window = float(os.environ.get("DASH_ALPHA_FLIP_WINDOW_S", "45"))
+    parent = {f: f for f in seen if _floor_idx(f) is not None}
+
+    def _root(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    flips = {}
+    for i in range(len(seq) - 1):
+        (t1, f1), (t2, f2) = seq[i], seq[i + 1]
+        if f1 == f2:
+            continue
+        i1, i2 = _floor_idx(f1), _floor_idx(f2)
+        if i1 is None or i2 is None:
+            continue
+        dt = t2 - t1
+        if dt <= 0:
+            continue
+        if abs(i1 - i2) / dt <= max_fps:
+            if dt <= edge_window:
+                ra, rb = _root(f1), _root(f2)
+                if ra != rb:
+                    parent[ra] = rb
+        elif dt <= flip_window and _glyph_image(f1, f2):
+            for a, b in ((f1, f2), (f2, f1)):
+                fd = flips.setdefault(a, {"twin": b, "n": 0})
+                if fd["twin"] == b:
+                    fd["n"] += 1
+    anchor_roots = {_root(f) for f in labeled if f in parent}
+    conf_sum = {}
+    for r in rows:
+        if r["floor"] is not None and r["reason"] in DOOR_OK_REASONS and r["read_conf"] is not None:
+            s = conf_sum.setdefault(str(r["floor"]), [0.0, 0])
+            s[0] += r["read_conf"]
+            s[1] += 1
+
+    def _mean_conf(f):
+        s = conf_sum.get(f)
+        return s[0] / s[1] if s and s[1] else None
+
     # Admission. The glyph set is NOT a hard gate: a sparse label sample omits digits that real floors
     # use (labels 12,19,20 never show an 8, yet floor 18 is real), and the reader can only emit glyphs
     # it has templates for anyway. Corroboration — numeric run + sightings — is the stronger evidence.
     # So: labeled floors are trusted directly; numeric floors admit on corroboration; a non-numeric
     # floor the human never labeled has no corroboration path (letters can't be placed on the number
     # line) and is rejected — which is exactly what kills 7G while keeping a labeled G.
+    # anchor_roots empty (no labeled floor appears in this era's numeric reads) disables the anchor
+    # rule rather than rejecting everything — a failsafe, and the panel's via strings make it visible.
     admitted, detail = set(), {}
     for f, d in seen.items():
         is_labeled = f in labeled
         numeric = _floor_idx(f) is not None
+        anchored = (not anchor_roots) or (f in parent and _root(f) in anchor_roots)
+        fl = flips.get(f)
+        shadow_of = None
+        if numeric and not is_labeled and fl and fl["n"] >= 2:
+            tw = fl["twin"]
+            tw_anchored = (tw in labeled) or (not anchor_roots) or (
+                tw in parent and _root(tw) in anchor_roots)
+            cf, ct = _mean_conf(f), _mean_conf(tw)
+            if (tw_anchored and not anchored) or (
+                    tw_anchored == anchored and cf is not None and ct is not None and cf < ct):
+                shadow_of = tw
         if is_labeled:
             via = "labeled"; admitted.add(f)
+        elif numeric and shadow_of is not None:
+            via = f"quarantine:glyph_shadow_of_{shadow_of} ({fl['n']} impossible-speed flips)"
+        elif numeric and d["n"] >= min_sightings and d["supported"] and not anchored:
+            via = "quarantine:unanchored_island (no plausible-speed path to a labeled floor)"
         elif numeric and d["n"] >= min_sightings and d["supported"]:
             via = "corroborated"; admitted.add(f)
         elif numeric and not d["supported"]:
@@ -651,6 +743,10 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
             via = "reject:non_numeric_unlabeled (no corroboration path)"
         detail[f] = {"n": d["n"], "first": d["first"], "last": d["last"],
                      "supported": d["supported"], "admitted": f in admitted, "via": via}
+        if numeric:
+            detail[f]["anchored"] = anchored
+        if shadow_of is not None:
+            detail[f]["twin"] = shadow_of
     return admitted, detail
 
 
@@ -828,7 +924,9 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
         "floor_alphabet_source": alpha_source,
         "floor_alphabet_detail": [
             {"floor": f, "n": d["n"], "first": round(d["first"], 0), "last": round(d["last"], 0),
-             "admitted": d["admitted"], "via": d["via"]}
+             "admitted": d["admitted"], "via": d["via"],
+             **({"twin": d["twin"]} if "twin" in d else {}),
+             **({"anchored": d["anchored"]} if "anchored" in d else {})}
             for f, d in sorted(alpha_detail.items(), key=lambda kv: (-kv[1]["n"], kv[0]))],
         "off_alphabet_rejected": sum(v for k, v in census.items()
                                      if str(k).startswith(("off_alphabet", "not_in_derived_alphabet"))),
