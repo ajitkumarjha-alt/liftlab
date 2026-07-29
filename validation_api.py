@@ -299,6 +299,21 @@ def validate_page():
         db.execute("UPDATE validation_item SET status='superseded' WHERE status='pending' AND "
                    "(counting_version IS NULL OR counting_version!=?)", (CURRENT_COUNTING_VERSION,))
         db.commit()
+    # ORPHAN IMAGERY SWEEP (2026-07-29). The purge above only sees version-superseded PENDING rows;
+    # an out-of-band supersede (the ch37 zone-edit ran as direct SQL, bypassing every API path) left
+    # superseded items' imagery resident on disk. The privacy invariant is: imagery exists ONLY for
+    # pending items. Enforce it structurally on every render — any path that forgets to delete
+    # (manual SQL, new tools, a crash between UPDATE and rmtree) self-heals here instead of
+    # persisting residents' faces outside the deletion path.
+    try:
+        pending_ids = {str(r["id"]) for r in db.execute(
+            "SELECT id FROM validation_item WHERE status='pending'").fetchall()}
+        if IMG_DIR.exists():
+            for d in IMG_DIR.iterdir():
+                if d.is_dir() and d.name not in pending_ids:
+                    shutil.rmtree(d, ignore_errors=True)
+    except OSError:
+        pass
     # LIVE cameras must NOT have pending review items — they were counted by the validated logic. Any
     # pending left over from before go-live (or a race) -> 'auto' + drop images (privacy). Self-heals the
     # queue: a go-live purges its camera's pending here on the next load.
