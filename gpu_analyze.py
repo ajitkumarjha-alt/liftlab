@@ -202,9 +202,9 @@ def http_get(url, timeout=15):
 
 
 def http_get_timed(url, timeout=15):
-    """Fetch bytes + split the cost: (body, connect_ms, transfer_ms). connect_ms = time to response
-    headers (TCP+TLS+TTFB) — with keep-alive it drops to ~0 on a reused connection, which is the whole
-    point; transfer_ms = body read. Non-2xx -> urllib.error.HTTPError so the caller's 404 path is unchanged."""
+    """Fetch bytes + split the cost: (body, headers_ms, transfer_ms). headers_ms = time to response
+    headers (TCP+TLS+TTFB) — named for what it measures; it drops to the path-RTT floor on a reused
+    connection; transfer_ms = body read. Non-2xx -> urllib.error.HTTPError so the caller's 404 path is unchanged."""
     if _HAS_SESSION:
         t0 = time.time()
         r = _SESSION.get(url, timeout=timeout, stream=True)   # returns once headers are in
@@ -572,7 +572,7 @@ def main():
     # / drop_rate quantify how often a 2s segment is lost (mid-close = a silently wrong door event).
     proc_times = deque(maxlen=60)                 # rolling per-segment NON-OVERLAPPED wall ms (the throughput cost)
     fetch_times = deque(maxlen=60)                # rolling fetch DURATION ms (overlapped w/ track via prefetch)
-    connect_times = deque(maxlen=60)              # rolling connect ms (TCP+TLS+TTFB) — ~0 with keep-alive = fixed
+    headers_times = deque(maxlen=60)              # rolling time-to-headers ms (TCP+TLS+TTFB) — ~0 warm; was "connect_ms"
     transfer_times = deque(maxlen=60)             # rolling body-transfer ms
     decode_times = deque(maxlen=60)               # rolling HEVC decode ms
     track_times = deque(maxlen=60)                # rolling YOLO track ms         (the only true GPU-compute cost)
@@ -617,7 +617,7 @@ def main():
         return round(sum(d) / len(d), 1) if d else None
 
     def _p(d, q):
-        """Rolling percentile. connect_p10 is the DISCRIMINATOR for the fetch-bound question: a
+        """Rolling percentile. headers_p10 is the DISCRIMINATOR for the fetch-bound question: a
         pooled session reusing connections has a p10 near the bare TTFB (tens of ms); p10 stuck at
         the mean means NO fetch ever rides a warm socket (client reuse broken), while a low p10
         with a high p90 means reuse works and the slow fetches are SERVER latency (event-loop
@@ -643,8 +643,12 @@ def main():
                             "rej_in": rej_in, "rej_out": rej_out,
                             "rej_hist": ",".join(str(x) for x in rej_hist),
                             "proc_ms": _mean(proc_times), "fetch_ms": _mean(fetch_times),
-                            "connect_ms": _mean(connect_times), "transfer_ms": _mean(transfer_times),
-                            "connect_p10": _p(connect_times, 0.10), "connect_p90": _p(connect_times, 0.90),
+                            # headers_ms was "connect_ms" — renamed because it measures time to
+                            # RESPONSE HEADERS (TCP+TLS+TTFB), and the fetch saga proved the old
+                            # name misled: warm-socket "connects" of ~250ms were path RTT, not
+                            # handshakes. Cloud ingest accepts both during the deploy overlap.
+                            "headers_ms": _mean(headers_times), "transfer_ms": _mean(transfer_times),
+                            "headers_p10": _p(headers_times, 0.10), "headers_p90": _p(headers_times, 0.90),
                             "decode_ms": _mean(decode_times), "track_ms": _mean(track_times),
                             "seg_budget_ms": SEG_BUDGET_MS, "analyze_fps": ANALYZE_FPS or None,
                             # the two gate numbers (since process start): fraction of segments lost, and
@@ -723,7 +727,7 @@ def main():
                 # thread died in a way that never resolved the future, the main loop waited
                 # forever — silent, GPU idle, unit "active". Exactly the 07:50 signature.
                 wd_phase(f"fetch-wait {name}")
-                data, connect_ms, transfer_ms = prefetched.pop(name).result(timeout=FETCH_WAIT_S)
+                data, headers_ms, transfer_ms = prefetched.pop(name).result(timeout=FETCH_WAIT_S)
             except _FuturesTimeout:
                 log(f"segment {name} prefetch WAIT EXCEEDED {FETCH_WAIT_S:.0f}s — abandoning (watchdog will "
                     f"dump+exit if this repeats); the fetch thread is wedged")
@@ -736,7 +740,7 @@ def main():
                 log(f"segment {name} HTTP {e.code}"); continue
             except Exception as e:
                 log(f"segment {name} fetch failed: {type(e).__name__}: {e}"); continue
-            fetch_ms = connect_ms + transfer_ms   # fetch DURATION (ran overlapped w/ the prior track)
+            fetch_ms = headers_ms + transfer_ms   # fetch DURATION (ran overlapped w/ the prior track)
             dec_t0 = time.time()
             wd_phase(f"decode {name}")
             frames, rel = decode_segment(data)
@@ -889,20 +893,20 @@ def main():
             seg_ms = (time.time() - seg_t0) * 1000          # NON-OVERLAPPED wall: max(fetch_wait, 0)+decode+track+post
             proc_times.append(seg_ms); track_times.append(track_ms)
             fetch_times.append(fetch_ms); decode_times.append(decode_ms)
-            connect_times.append(connect_ms); transfer_times.append(transfer_ms)
+            headers_times.append(headers_ms); transfer_times.append(transfer_ms)
             if time.time() - last_timing_log > 30 and proc_times:
                 pm = sum(proc_times) / len(proc_times); tm = sum(track_times) / len(track_times)
                 fm = sum(fetch_times) / len(fetch_times); dm = sum(decode_times) / len(decode_times)
-                cm = sum(connect_times) / len(connect_times); xm = sum(transfer_times) / len(transfer_times)
+                cm = sum(headers_times) / len(headers_times); xm = sum(transfer_times) / len(transfer_times)
                 ratio = pm / SEG_BUDGET_MS
                 _tot = segments + dropped
                 dfrac = dropped / _tot if _tot else 0.0
                 verdict = "OVER-BUDGET (cannot keep pace)" if ratio > 1.0 else "within budget"
                 bound = "FETCH-bound" if fm > tm else "COMPUTE-bound (GPU)"
-                # fetch split proves the fix: connect~0 => keep-alive working, cost is transfer; connect high => still handshaking
+                # fetch split: headers≈RTT floor when warm (fetch saga verdict: physics, not handshakes); high = cold sockets or server TTFB
                 log(f"seg timing: throughput={pm:.0f}ms (was fetch+track serial) [decode={dm:.0f} track={tm:.0f} n={n_fr}fr] "
                     f"vs budget={SEG_BUDGET_MS:.0f}ms -> {ratio:.2f}x {verdict}; {bound} "
-                    f"fetch={fm:.0f}ms[connect={cm:.0f} transfer={xm:.0f}]; drop_frac={dfrac:.3%} dropped_total={dropped}")
+                    f"fetch={fm:.0f}ms[headers={cm:.0f} transfer={xm:.0f}]; drop_frac={dfrac:.3%} dropped_total={dropped}")
                 last_timing_log = time.time()
             seen.add(name)
             # THE liveness signal: one fully-processed segment (fetched, decoded, tracked, door-passed,

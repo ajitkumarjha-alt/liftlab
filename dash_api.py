@@ -1295,14 +1295,33 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                 "FROM gw_event e JOIN gw_source s ON s.id=e.source_id WHERE s.gateway_id=?" + cam_filter, args)
     tr = _q(db, "SELECT ts, direction FROM transit_event WHERE gateway_id=?" +
             (" AND cam=?" if cam else ""), ([gw, cam] if cam else [gw]))
-    db.close()
+    # COUNTING-ERA SPANS, derived from validation_item stamps (first/last episode per version) —
+    # never from a hardcoded date. A range that spans more than one era pools transits counted by
+    # DIFFERENT logic; the payload names every era in range so the UI can label the pooling, and an
+    # all-history view with two eras is a crossing by definition.
+    era_rows = _q(db, "SELECT counting_version v, MIN(ts_start) lo, MAX(ts_start) hi, COUNT(*) n "
+                      "FROM validation_item WHERE gateway_id=? AND counting_version IS NOT NULL"
+                      + (" AND cam=?" if cam else "") + " GROUP BY counting_version ORDER BY MIN(ts_start)",
+                  ([gw, cam] if cam else [gw]))
     # RANGE FILTER. Door cycles carry a local ISO timestamp and transits an epoch, so both are
     # normalised to epoch before comparing — mixing the two representations is how a range quietly
     # drops one series and not the other.
     t0, t1, range_label = _range_bounds(period, from_d, to_d)
+    # Range-scoped Tier-2 for the heatmap: the join side reuses the transit rows already loaded
+    # above (same cam, same table) instead of re-querying the fleet. Without this the heatmap kept
+    # drawing all-history from /data while every other panel obeyed the picker.
+    tier2_range = None
+    if cam:
+        tjoin = sorted((r["ts"], r["direction"]) for r in tr if r["ts"] is not None)
+        tier2_range = _tier2(db, gw, cam, tjoin, t0, t1)
+    db.close()
     if t0 is not None:
         ev = [r for r in ev if _in_range(_epoch(r["os"]), t0, t1)]
         tr = [r for r in tr if _in_range(r["ts"], t0, t1)]
+    eras_in_range = [{"version": e["v"], "first_seen": _iso_ist(e["lo"]), "last_seen": _iso_ist(e["hi"]),
+                     "n_episodes": e["n"]}
+                     for e in era_rows if e["lo"] is not None
+                     and (t0 is None or (e["lo"] < t1 and e["hi"] >= t0))]
 
     prof = {h: {"cycles": 0, "boarded": 0, "alighted": 0, "closes": [], "xfer": []} for h in range(24)}
     days = set()
@@ -1357,7 +1376,10 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
             windows[k]["demand_ratio_vs_allday"] = round((windows[k]["cycles_per_hr"] or 0) / ad, 2)
 
     return JSONResponse({"gw": gw, "cam": cam or "fleet", "n_days": n_days_real, "profile": profile,
-                         "windows": windows,
+                         "windows": windows, "tier2_range": tier2_range,
+                         "counting_eras": {"in_range": eras_in_range, "crossing": len(eras_in_range) > 1,
+                                           "note": "spans derived from validation_item episode stamps; "
+                                                   "a crossing range pools transits counted by different logic"},
                          "range": {"period": period, "from_d": from_d, "to_d": to_d,
                                    "label": range_label, "t0": t0, "t1": t1,
                                    "cycles": len(ev), "transits": len(tr)},
@@ -1414,7 +1436,8 @@ def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
         return JSONResponse({"error": f"unknown dataset {dataset!r}", "datasets": _EXPORT}, status_code=400)
     t0, t1, label = _range_bounds(period, from_d, to_d)
     db = _db()
-    tag = f"{gw}_{cam or 'fleet'}_{dataset}_{(period or 'all')}"
+    rng = f"{from_d or 'start'}_to_{to_d or 'today'}" if (from_d or to_d) else (period or "all")
+    tag = f"{gw}_{cam or 'fleet'}_{dataset}_{rng}"
     tag = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
 
     if dataset == "door_cycles":
@@ -1993,23 +2016,45 @@ function trCams(){
     +['',].concat(cams).map(function(c){var lbl=c||'fleet';
        return '<div class="tab'+(trCam===c?' on':'')+'" onclick="trCam=\''+c+'\';loadTrends()">'+esc(lbl)+'</div>';}).join('')+'</div>';
 }
-// ---- period picker + table view + CSV (operator batch) ----
-var trPeriod='all', trTable=false;
-function setPeriod(p){trPeriod=p;loadTrends();}
+// ---- period picker + explicit date range + table view + CSV (operator batch) ----
+// A picked date pair OVERRIDES the period buttons (the server prefers from_d/to_d too); picking a
+// period clears the dates so the two can never silently disagree about what the screen shows.
+var trPeriod='all', trFrom='', trTo='', trTable=false;
+function setPeriod(p){trPeriod=p;trFrom='';trTo='';loadTrends();}
+function setDates(){
+  trFrom=(document.getElementById('dfrom')||{}).value||'';
+  trTo=(document.getElementById('dto')||{}).value||'';
+  if(trFrom||trTo)trPeriod='';
+  loadTrends();
+}
+function clearDates(){trFrom='';trTo='';trPeriod='all';loadTrends();}
+// ONE query builder for the trends fetch AND every CSV link — the chart and its export can never
+// describe different rows. from_d/to_d are YYYY-MM-DD (IST calendar days, inclusive both ends).
+function trQuery(){
+  return 'period='+encodeURIComponent(trPeriod||'all')
+    +(trFrom?('&from_d='+encodeURIComponent(trFrom)):'')
+    +(trTo?('&to_d='+encodeURIComponent(trTo)):'')
+    +(trCam?('&cam='+encodeURIComponent(trCam)):'');
+}
 function toggleTable(){trTable=!trTable;renderTrends();}
 function periodBar(){
   var opts=[['day','Today'],['week','7 days'],['month','30 days'],['all','All']];
+  var dstyle='font:inherit;font-size:11px;padding:2px 4px;border:1px solid #bbb;border-radius:4px;background:transparent;color:inherit';
   return '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:2px 0 8px">'
     +opts.map(function(o){return '<button class="tog'+(trPeriod===o[0]?' on':'')+'" onclick="setPeriod(\''+o[0]+'\')">'+o[1]+'</button>';}).join('')
+    +'<span style="width:10px"></span>'
+    +'<input type=date id=dfrom value="'+trFrom+'" onchange="setDates()" style="'+dstyle+'">'
+    +'<span class=mut style="font-size:11px">to</span>'
+    +'<input type=date id=dto value="'+trTo+'" onchange="setDates()" style="'+dstyle+'">'
+    +((trFrom||trTo)?'<button class=tog onclick="clearDates()">✕ dates</button>':'')
     +'<span style="width:10px"></span>'
     +'<button class="tog'+(trTable?' on':'')+'" onclick="toggleTable()">'+(trTable?'charts':'table')+'</button>'
     +'<span class=mut id=rangelab style="font-size:11px;margin-left:6px"></span></div>';
 }
-// Every download carries the SAME cam/period the screen is showing, so a spreadsheet and the chart
-// above it cannot disagree about which rows they describe.
+// Every download carries the SAME cam/period/date-range the screen is showing, so a spreadsheet
+// and the chart above it cannot disagree about which rows they describe.
 function dl(ds,label){
-  var q='?dataset='+ds+'&period='+encodeURIComponent(trPeriod)+(trCam?('&cam='+encodeURIComponent(trCam)):'');
-  return '<a class=dlbtn href="/dash/'+GW+'/export.csv'+q+'">⤓ '+label+'</a>';
+  return '<a class=dlbtn href="/dash/'+GW+'/export.csv?dataset='+ds+'&'+trQuery()+'">⤓ '+label+'</a>';
 }
 function exportBar(){
   return '<div class=dlbar>'+dl('door_cycles','door cycles')+dl('transits','transits')
@@ -2035,6 +2080,12 @@ function renderTrends(){
   var bd=TR.boundaries.close_travel_max.iso.slice(0,10);
   var gaps=(TR.data_gaps||[]);
   var gapbanner=gaps.length?('<div class=mut style="font-size:12px;margin:2px 0 6px;padding:4px 8px;border-left:3px solid #b00;background:rgba(176,0,0,.06)"><b>DATA GAP</b> — '+gaps.map(function(g){return esc(g.note)}).join(' · ')+'. Hour buckets overlapping this window are undercounted (samples MISSING, not low demand).</div>'):'';
+  // ERA BOUNDARY: a range spanning >1 counting version pools transits counted by different logic.
+  // Labeled every time, never silent — the whole reason the picker can be trusted for the study.
+  var eras=((TR.counting_eras||{}).in_range)||[];
+  var erabanner=(TR.counting_eras&&TR.counting_eras.crossing)?('<div class=mut style="font-size:12px;margin:2px 0 6px;padding:4px 8px;border-left:3px solid #b06a00;background:rgba(176,106,0,.07)"><b>ERA BOUNDARY IN RANGE</b> — pools transits counted under '+eras.length+' different counting versions: '
+    +eras.map(function(e){return '<b>'+esc(e.version)+'</b> ('+String(e.first_seen||'').slice(0,10)+' → '+String(e.last_seen||'').slice(0,10)+', '+e.n_episodes+' validated eps)'}).join(' · ')
+    +'. Hourly totals mix counting logics; validated precision applies per era, never to the pool. Narrow the dates to one era for comparable numbers.</div>'):'';
   var h=trCams()+periodBar()
     +'<div class=mut style="font-size:12px;margin:2px 0 6px">'+esc(TR.cam)+' · '+TR.n_days+' day(s) with data · '
     +((TR.range&&TR.range.label)?esc(TR.range.label)+' · ':'')
@@ -2042,6 +2093,7 @@ function renderTrends(){
     +'close-travel uses the post-'+bd+' regime only (CLOSE_TRAVEL_MAX comparability boundary)</div>'
     +exportBar()
     +gapbanner
+    +erabanner
     +'<div class=strip>'+winCard('all-day',W.all_day)+winCard('AM peak',W.am_peak)+winCard('PM peak',W.pm_peak)+'</div>'
     +'<div class=mut style="font-size:11px;margin:2px 0 8px">* transfer PROVISIONAL (transit precision, re-validating). <b>THE PEAK TRAP</b>: the sheet coefficients describe a PEAK design condition, not an all-day average — peak &amp; all-day are shown SEPARATELY; the ratio is itself a finding.</div>'
     +(trTable?trTableHtml(prof,W):(''
@@ -2064,7 +2116,11 @@ function renderTrends(){
 var heatMode='stops';
 function setHeat(m){heatMode=m;renderTrends();}
 function heatCard(){
-  var t2=(DATA&&DATA.tier2)?DATA.tier2[trCam]:null;
+  // Range-scoped tier2 from /trends once it has loaded for the shown camera — INCLUDING when the
+  // range is empty (an empty range must show empty, not quietly fall back to all-history). The
+  // /data (all-history) copy only bridges the moment between switching cameras and the fetch.
+  var trReady=(TR&&trCam&&TR.cam===trCam);
+  var t2=trReady?TR.tier2_range:((DATA&&DATA.tier2)?DATA.tier2[trCam]:null);
   var head='<div class=card><h3>riders &amp; stops per floor, per hour '
     +'<button class="tog'+(heatMode==='stops'?' on':'')+'" onclick="setHeat(\'stops\')">stops</button>'
     +'<button class="tog'+(heatMode==='riders'?' on':'')+'" onclick="setHeat(\'riders\')">riders</button></h3>'
@@ -2073,7 +2129,8 @@ function heatCard(){
     return head+'<div class=blank>pick a camera above — floors belong to one lift, so a fleet total would mix shafts</div></div>';
   }
   if(!t2){
-    return head+'<div class=blank>no door-engine reads for '+esc(trCam)+' in the current era</div></div>';
+    return head+'<div class=blank>no door-engine reads for '+esc(trCam)+' in the current era'
+      +(trReady&&TR.range&&TR.range.label?' within '+esc(TR.range.label):'')+'</div></div>';
   }
   var note='';
   if(heatMode==='riders'){
@@ -2084,11 +2141,12 @@ function heatCard(){
       +'. Unjoined transits are not on any floor and are absent here.</div>';
   }
   return head+svgHeat(t2.per_floor,heatMode)+note
-    +'<div class=mut style="font-size:11px">era: '+esc(t2.era_filter||'')+'</div></div>';
+    +'<div class=mut style="font-size:11px">era: '+esc(t2.era_filter||'')
+    +(trReady&&TR.range&&TR.range.label?' · range: '+esc(TR.range.label):' · all history (range loading)')+'</div></div>';
 }
 function loadTrends(){
   renderTrends();  // show selector immediately
-  fetch('/dash/'+GW+'/trends?period='+encodeURIComponent(trPeriod)+(trCam?('&cam='+encodeURIComponent(trCam)):'')).then(function(r){return r.json()}).then(function(t){TR=t;renderTrends();}).catch(function(){});
+  fetch('/dash/'+GW+'/trends?'+trQuery()).then(function(r){return r.json()}).then(function(t){TR=t;renderTrends();}).catch(function(){});
 }
 
 function render(){ if(!DATA)return; nav(); strip(DATA); headline(DATA); unavail(DATA); if(mode==='cams'){tabs(DATA); panel(DATA);} }
