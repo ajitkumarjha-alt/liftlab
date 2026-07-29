@@ -65,14 +65,43 @@ BAK="$APP/main.py.bak.$(date +%Y%m%d-%H%M%S)"; cp "$APP/main.py" "$BAK"
 $PY /tmp/apply_validation_patch.py || { say "patch failed — restoring"; cp "$BAK" "$APP/main.py"; exit 1; }
 chown "$OWNER:$OWNER" "$APP/main.py"
 $PY -c "import ast; ast.parse(open('$APP/main.py').read())" || { say "main.py broke — restoring"; cp "$BAK" "$APP/main.py"; chown "$OWNER:$OWNER" "$APP/main.py"; exit 1; }
-# VALIDATION_IMG_DIR + COUNTING_VERSION into the service env (matches this install).
-# COUNTING_VERSION MUST equal counting.COUNTING_VERSION on the GPU, else new verdicts are filtered as
-# a foreign version. A model/logic change is a comparability boundary -> bump both together.
-CV="${COUNTING_VERSION:-2026-07-17-yolo11m-dwell-disp}"
-mkdir -p "/etc/systemd/system/$SVC.service.d"
-printf '[Service]\nEnvironment=VALIDATION_IMG_DIR=%s\nEnvironment=COUNTING_VERSION=%s\n' \
-    "$IMGDIR" "$CV" > "/etc/systemd/system/$SVC.service.d/validation.conf"
-say "cloud COUNTING_VERSION pinned to: $CV  (must match the GPU's counting.py)"
+# ---- 4b. service env drop-in. This installer owns ONLY VALIDATION_IMG_DIR.
+# COUNTING_VERSION is the GPU-side deploy's concern (bumped in lockstep with counting.py). This
+# installer must NEVER write a version string of its own: a hardcoded default here rewrote the
+# live drop-in with a retired era (2026-07-29 incident) and black-holed ingest — GPU verdicts
+# arrived stamped with the live era and the cloud filtered every one as a foreign version.
+# It only PRESERVES the version the service is already running with, migrating it once into
+# counting-version.conf so re-running this installer can never change the era again.
+DROPIN_DIR="/etc/systemd/system/$SVC.service.d"
+CVCONF="$DROPIN_DIR/counting-version.conf"
+live_cv(){  # the era the service is ACTUALLY running with (live process env beats config files)
+  local mpid cv=""
+  mpid=$(systemctl show -p MainPID --value "$SVC" 2>/dev/null)
+  if [ -n "$mpid" ] && [ "$mpid" != 0 ] && [ -r "/proc/$mpid/environ" ]; then
+    cv=$(tr '\0' '\n' < "/proc/$mpid/environ" | grep -m1 '^COUNTING_VERSION=' | cut -d= -f2-)
+  fi
+  [ -n "$cv" ] || cv=$(systemctl show -p Environment --value "$SVC" 2>/dev/null \
+                         | tr ' ' '\n' | grep -m1 '^COUNTING_VERSION=' | cut -d= -f2- | tr -d '"')
+  printf '%s' "$cv"
+}
+CV=$(live_cv)   # read BEFORE rewriting validation.conf — it may be the only place the era lives
+mkdir -p "$DROPIN_DIR"
+if [ -f "$CVCONF" ]; then
+  FILE_CV=$(grep -m1 -oP '^Environment=COUNTING_VERSION=\K.*' "$CVCONF" || true)
+  if [ -n "$CV" ] && [ "$FILE_CV" != "$CV" ]; then
+    say "WARNING: $CVCONF says '$FILE_CV' but the running service has '$CV'."
+    say "  Leaving the file alone (the GPU-side deploy owns it) — reconcile before trusting new verdicts."
+  fi
+elif [ -n "$CV" ]; then
+  printf '[Service]\nEnvironment=COUNTING_VERSION=%s\n' "$CV" > "$CVCONF"
+  say "preserved running COUNTING_VERSION into $CVCONF: $CV"
+else
+  say "WARNING: no COUNTING_VERSION found in the process env, unit config, or $CVCONF."
+  say "  NOT inventing one — new verdicts will be version-filtered until the GPU-side deploy sets it:"
+  say "  printf '[Service]\\nEnvironment=COUNTING_VERSION=<era>\\n' > $CVCONF && systemctl daemon-reload && systemctl restart $SVC"
+fi
+printf '[Service]\nEnvironment=VALIDATION_IMG_DIR=%s\n' "$IMGDIR" > "$DROPIN_DIR/validation.conf"
+say "validation.conf now carries ONLY VALIDATION_IMG_DIR=$IMGDIR (era untouched: ${CV:-unset})"
 
 # ---- 5. restart + VERIFY it came up; if not, RESTORE main.py and restart (self-heal the ingest) ----
 systemctl daemon-reload
