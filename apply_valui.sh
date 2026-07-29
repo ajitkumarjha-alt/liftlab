@@ -15,6 +15,35 @@ OWNER=liftlab
 IMGDIR="${VALIDATION_IMG_DIR:-/var/lib/liftlab/validation_img}"
 say(){ echo "[valui] $*"; }
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
+
+# ---- 0. SELF-CHECK: refuse to run a stale copy of THIS SCRIPT. On 2026-07-29 a stale
+# /tmp/apply_valui.sh (predating the era fix) re-ran and reverted the live COUNTING_VERSION a
+# second time. The only authority for this installer is pi-scripts HEAD — verify this very file
+# is byte-identical to it BEFORE doing anything. A failed fetch REFUSES too: "can't verify" must
+# never degrade into "runs anyway". Emergency override (offline, copy known fresh):
+#   SKIP_SELF_CHECK=1 sudo bash /tmp/apply_valui.sh
+RAWB=https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts
+if [ "${SKIP_SELF_CHECK:-0}" != 1 ]; then
+  REF=$(mktemp)
+  if curl -fsSL --max-time 20 -o "$REF" "$RAWB/apply_valui.sh?self_check=$(date +%s)"; then
+    if ! cmp -s "$REF" "$0"; then
+      say "STALE COPY REFUSED: this file is not pi-scripts HEAD."
+      say "  running: $(md5sum "$0"   | cut -d' ' -f1)  ($0)"
+      say "  HEAD:    $(md5sum "$REF" | cut -d' ' -f1)"
+      say "  Re-curl the fresh fileset (see header) and re-run. Nothing was touched."
+      rm -f "$REF"; exit 3
+    fi
+    rm -f "$REF"
+    say "self-check passed: running copy matches pi-scripts HEAD"
+  else
+    rm -f "$REF"
+    say "SELF-CHECK FAILED: could not fetch pi-scripts HEAD to verify this copy is current."
+    say "  REFUSING to run unverified — a stale copy reverted the live era twice on 2026-07-29."
+    say "  Fix network, or if this copy is CERTAINLY fresh: SKIP_SELF_CHECK=1 sudo bash $0"
+    exit 3
+  fi
+fi
+
 for f in validation_api.py apply_validation_patch.py ops_api.py; do [ -f "/tmp/$f" ] || { echo "missing /tmp/$f"; exit 2; }; done
 [ -f "$APP/main.py" ] || { echo "main.py not at $APP"; exit 2; }
 id "$OWNER" >/dev/null 2>&1 || OWNER=root
