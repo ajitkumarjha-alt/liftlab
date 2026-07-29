@@ -138,8 +138,9 @@ def snapmeta(gw: str):
     cams = {}
     if d.exists():
         for jpg in sorted(d.glob("*.jpg")):
-            if jpg.stem == "zonecheck" or jpg.stem.startswith("_"):
-                continue                            # verification image, not a live stream
+            if jpg.stem == "zonecheck" or jpg.stem.startswith("_") or "." in jpg.stem:
+                continue                            # verification image or temp litter (<cam>.jpg.tmp.jpg),
+                                                    # not a live stream — camera names never contain dots
             age = now - jpg.stat().st_mtime
             cams[jpg.stem] = {"age_s": round(age, 1), "stale": age > SNAP_STALE_S}
     return {"cams": cams, "t": now}

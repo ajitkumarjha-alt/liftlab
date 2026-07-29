@@ -48,11 +48,14 @@ def newest_seg(camdir: Path):
 
 
 def decode(seg: str, out: Path) -> bool:
-    tmp = str(out) + ".tmp.jpg"
+    # temp must NOT end in .jpg: snapmeta globs *.jpg, so a lingering/mid-write temp named
+    # <cam>.jpg.tmp.jpg shows up as a phantom camera tile. -f image2 tells ffmpeg the output
+    # muxer explicitly, since the .tmp extension no longer implies jpeg.
+    tmp = str(out) + ".tmp"
     try:
         r = subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-i", seg, "-frames:v", "1",
-             "-vf", "scale=" + WIDTH + ":-2", "-q:v", "6", tmp],
+             "-vf", "scale=" + WIDTH + ":-2", "-q:v", "6", "-f", "image2", tmp],
             timeout=10, stdin=subprocess.DEVNULL)
     except Exception:
         return False
