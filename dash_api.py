@@ -919,14 +919,23 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
     # have — a stored row from before the gpu_door whitelist, or a rebuild-era misread. Reject it here
     # too, so already-stored garbage never reaches stops/speed/per-floor. Rejects are counted as
     # off_alphabet:<floor> in the census, so a filtered read is visible, not silently dropped.
-    # DERIVED by default, from this era's own evidence (glyphs + labeled floors + read corroboration);
     # DASH_FLOOR_ALPHABET is an optional manual override for the day the derivation is wrong.
+    #
+    # ALPHABET EVIDENCE IS ALL-ERA BY DESIGN (2026-07-29): floors are physical — a tracker-logic or
+    # template change moves door_version, not the building. Deriving admission from the current era
+    # alone made every young era start floor-blind fleet-wide (the e79e50d3h2 blank: weeks of
+    # corroboration discarded at each logic tag). METRICS stay era+range-scoped (the rows above);
+    # only ADMISSION evidence spans eras. Cross-era welds cannot happen: the derivation's edge and
+    # flip rules cap neighbour gaps at seconds, and an era change is a restart-sized gap. Labels
+    # (labels.json) were always era-independent.
     manual = _floor_alphabet(cam)
-    derived, alpha_detail = _derive_floor_alphabet(rows, _labels_evidence(gw, cam))
+    alpha_rows = _q(db, "SELECT ts, floor, reason FROM gw_door_event "
+                        "WHERE gateway_id=? AND cam=? AND floor IS NOT NULL ORDER BY ts", (gw, cam))
+    derived, alpha_detail = _derive_floor_alphabet(alpha_rows, _labels_evidence(gw, cam))
     if manual is not None:
         alphabet, alpha_source = manual, "manual override (DASH_FLOOR_ALPHABET)"
     elif derived:
-        alphabet, alpha_source = derived, "derived from evidence"
+        alphabet, alpha_source = derived, "derived from all-era evidence"
     else:
         alphabet, alpha_source = None, "none (not enough evidence yet — accepting all)"
     conf = []
