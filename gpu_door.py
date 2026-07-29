@@ -73,15 +73,31 @@ def door_edge_column(gray_roi):
 
 
 # ============================================================ 2. DoorTracker (openness -> cycles)
+# Tracker LOGIC revision — folded into door_version's ERA PREFIX by the worker, so a logic change
+# moves the comparability boundary the way a template rebuild does. The 5f1488a time-guards changed
+# emissions WITHOUT moving the era and pre-guard rows poisoned the pool for a week; never again.
+# h2 = close-start hysteresis band + debounce (2026-07-29 flap fix).
+TRACKER_LOGIC = "h2"
+
+
 class DoorTracker:
     """Consumes (t_wall, edge_col, strength) and emits door CYCLES. openness is the edge column
     normalised against ROLLING closed/open references (drift-free — a stale reference can't strand a
     cycle the way the Pi's frozen baseline does). A cycle is emitted on return-to-closed with the four
-    door timestamps + close_travel_s. Thresholds are hysteretic to reject jitter."""
+    door timestamps + close_travel_s. Thresholds are hysteretic to reject jitter.
+
+    h2 hysteresis (the 3-camera flap fix): 'open -> closing' no longer triggers on one frame dipping
+    under near_open — a person occluding the leaf minted closing<->open flap chains (p50 gap 0.32s)
+    and each flap could complete as a garbage cycle. Now the descent must reach close_start_th (a
+    real hysteresis band under near_open) and have persisted close_debounce_s; close_start is
+    stamped at the NEAR_OPEN crossing (_below_since), so close_travel keeps its near_open->close_th
+    definition and the compliance number's meaning is unchanged. A descent that plummets straight
+    past close_th while still 'open' completes as a fast cycle rather than stranding the state."""
 
     def __init__(self, min_strength=0.30, open_th=0.50, near_open=0.90, close_th=0.10,
                  ref_window=600, min_span_col=6.0, max_gap_s=15.0,
-                 min_close_s=0.3, max_close_s=30.0, min_open_s=0.15, max_open_s=30.0):
+                 min_close_s=0.3, max_close_s=30.0, min_open_s=0.15, max_open_s=30.0,
+                 close_start_th=0.75, close_debounce_s=0.4):
         self.min_strength = min_strength      # min FRACTION of rows with a clear edge (door_edge_column strength)
         self.open_th = open_th                # openness rising past this = opening under way
         self.near_open = near_open            # reached this = fully open (open_full)
@@ -95,6 +111,9 @@ class DoorTracker:
         self.max_close_s = max_close_s        # close_travel above this = spans a gap -> WITHHELD
         self.min_open_s = min_open_s
         self.max_open_s = max_open_s
+        self.close_start_th = close_start_th  # descent must reach this (not just dip under near_open)...
+        self.close_debounce_s = close_debounce_s   # ...and have persisted this long, to enter 'closing'
+        self._below_since = None              # when the current descent left near_open (close_start anchor)
         self._cols = deque(maxlen=ref_window)  # recent edge columns -> rolling refs
         self.state = "closed"                 # closed | opening | open | closing
         self._ev = {}                         # timestamps of the cycle in progress
@@ -130,6 +149,7 @@ class DoorTracker:
                 and self.state != "closed"):
             self._ev = {}
             self.state = "open" if o >= self.near_open else ("closed" if o < self.close_th else "opening")
+            self._below_since = None
             self.abandoned += 1
             self._last_t = t
             return None
@@ -144,8 +164,28 @@ class DoorTracker:
             elif o < self.close_th:
                 self.state = "closed"; self._ev = {}          # aborted (blip) — not a cycle
         elif st == "open":
-            if o < self.near_open:
-                self.state = "closing"; self._ev["close_start"] = t
+            # h2 HYSTERESIS. A dip under near_open is a CANDIDATE descent, not a closing: people
+            # occluding the leaf oscillate 0.85<->0.92 and the old one-frame trigger minted flap
+            # chains. 'closing' needs the descent to reach close_start_th AND to have persisted
+            # close_debounce_s. close_start is stamped at the near_open crossing (_below_since), so
+            # close_travel keeps its meaning. A shallow dip that recovers resets cleanly.
+            if o >= self.near_open:
+                self._below_since = None
+            else:
+                if self._below_since is None:
+                    self._below_since = t
+                if o < self.close_th:
+                    # plummeted straight through while still 'open' (fast/suppressed descent):
+                    # complete the cycle rather than strand the state machine at 'open'
+                    self._ev["close_start"] = self._below_since
+                    self._ev["close_full"] = t
+                    self.state = "closed"
+                    self._below_since = None
+                    return self._emit()
+                if o < self.close_start_th and (t - self._below_since) >= self.close_debounce_s:
+                    self.state = "closing"
+                    self._ev["close_start"] = self._below_since
+                    self._below_since = None
         elif st == "closing":
             if o < self.close_th:
                 self._ev["close_full"] = t
@@ -153,6 +193,7 @@ class DoorTracker:
                 return self._emit()
             elif o >= self.near_open:
                 self.state = "open"; self._ev.pop("close_start", None)   # re-opened mid-close
+                self._below_since = None
         return None
 
     def _emit(self):

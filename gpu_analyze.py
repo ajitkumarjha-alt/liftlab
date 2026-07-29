@@ -120,6 +120,12 @@ FLOOR_ALPHABET = [s.strip() for s in os.environ.get("FLOOR_ALPHABET", "").split(
 DOOR_MAX_GAP_S = float(os.environ.get("DOOR_MAX_GAP_S", "15"))       # frame jump mid-cycle -> abandon
 DOOR_MIN_CLOSE_S = float(os.environ.get("DOOR_MIN_CLOSE_S", "0.3"))  # close below this -> withheld
 DOOR_MAX_CLOSE_S = float(os.environ.get("DOOR_MAX_CLOSE_S", "30"))   # close above this -> withheld
+# h2 hysteresis + recalibration knobs (2026-07-29 flap fix; census: complete-close 43.6% on ch29 =
+# close_th too low for its edge contrast — these four make the levels tunable without a deploy).
+DOOR_NEAR_OPEN = float(os.environ.get("DOOR_NEAR_OPEN", "0.90"))     # fully-open level (open_full)
+DOOR_CLOSE_TH = float(os.environ.get("DOOR_CLOSE_TH", "0.10"))       # fully-closed level (close_full)
+DOOR_CLOSE_START_TH = float(os.environ.get("DOOR_CLOSE_START_TH", "0.75"))   # descent must REACH this to enter closing
+DOOR_CLOSE_DEBOUNCE_S = float(os.environ.get("DOOR_CLOSE_DEBOUNCE_S", "0.4"))  # ...and persist this long
 TEMPLATES_REFETCH_S = float(os.environ.get("TEMPLATES_REFETCH_S", "600"))  # re-pull npz; reload if hash changed
 # --- liveness: progress-based, because "active (running)" told us nothing during the 5h44m hang ---
 WD_STALL_S = float(os.environ.get("WD_STALL_S", "120"))    # no segment processed this long -> dump + exit
@@ -450,7 +456,10 @@ def build_door_engine(prefetched_tpl=None):
                     "from a panel1 anchor read to enable the free confidence check")
         ft = gd.FloorTracker(floor_order=FLOOR_ORDER or None)
         dtr = gd.DoorTracker(max_gap_s=DOOR_MAX_GAP_S, min_close_s=DOOR_MIN_CLOSE_S,
-                             max_close_s=DOOR_MAX_CLOSE_S)
+                             max_close_s=DOOR_MAX_CLOSE_S,
+                             near_open=DOOR_NEAR_OPEN, close_th=DOOR_CLOSE_TH,
+                             close_start_th=DOOR_CLOSE_START_TH,
+                             close_debounce_s=DOOR_CLOSE_DEBOUNCE_S)
         eng = gd.DoorFloorEngine(tpl, droi, panels, min_score=DOOR_MIN_SCORE, blank_range=DOOR_BLANK_RANGE,
                                  floor_tracker=ft, door_tracker=dtr, shift_search=DOOR_SHIFT, margin_min=DOOR_MARGIN,
                                  blank_min=DOOR_BLANK_MIN, shift_floor=DOOR_SHIFT_FLOOR,
@@ -461,7 +470,11 @@ def build_door_engine(prefetched_tpl=None):
         return None, f"geometry/engine error: {type(e).__name__}: {str(e)[:80]}"
     geom_sig = _hash8("|".join([DOOR_ROI_FRAME, PANEL_ROIS, DIGIT_CELLS, ARROW_CELL,
                                 PANEL1_DIGIT_CELLS, PANEL1_ARROW_CELL]))
-    version = f"{eng.hash[:8]}+{geom_sig}"          # templates hash + geometry hash = comparability boundary
+    # Templates hash + TRACKER LOGIC revision + geometry hash. The logic tag rides the ERA PREFIX
+    # (before the '+'), so a DoorTracker logic change moves the comparability boundary exactly like
+    # a template rebuild — the 5f1488a guards changed emissions without moving the era and poisoned
+    # the pool for a week; the h2 deploy starts a fresh era by construction.
+    version = f"{eng.hash[:8]}{gd.TRACKER_LOGIC}+{geom_sig}"
     log(f"GPU_DOOR: {len(panels)} panel(s) [{mode}]; templates_hash={eng.hash[:12]}; door_version={version}")
     if FLOOR_ALPHABET:
         log(f"GPU_DOOR floor whitelist: {len(FLOOR_ALPHABET)} valid floors {FLOOR_ALPHABET[:6]}"
