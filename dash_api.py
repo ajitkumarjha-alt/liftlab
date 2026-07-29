@@ -380,18 +380,19 @@ def _door_transition_census(db, gw, cam, era):
             "open_confirm_rate_pct": _pct(confirmed_open, opened),      # opening -> open
             "close_complete_rate_pct": _pct(completed, began_closing),  # closing -> closed
             "cycle_per_open_pct": _pct(completed, opened)},             # end to end
-        "pairing_suspect": (began_closing > opened or completed > confirmed_open),
+        # A reopen (closing->open) legitimately mints an extra closing per cycle — obstruction
+        # reopens run 30%+ here — so raw closings>openings is NOT a defect on its own. Suspect only
+        # the excess reopens can't account for (2026-07-29 census: the old unadjusted flag fired on
+        # three healthy-ish cameras at once).
+        "pairing_suspect": (began_closing > opened + reopened or completed > confirmed_open + reopened),
         "diagnosis": (
-            # closings/cycles cannot legitimately exceed openings/opens — that is the tracker pairing
-            # edges across gaps or noise (the 0.08s / 4641s close_travel). Grade it RED, not normal.
-            # The time-guards ARE deployed (5f1488a): post-boundary this means a CURRENT pairing
-            # problem; without the boundary set it usually means pre-guard rows dominate the era.
-            ("PAIRING SUSPECT (post-guard rows only) — the guards are live, so this is a CURRENT "
-             "pairing problem, not stale garbage; close_travel unreliable"
+            ("PAIRING SUSPECT: closings exceed openings BEYOND what reopens account for — spurious "
+             "closing entries (threshold flap); close_travel unreliable pending the tracker "
+             "hysteresis pass"
              if _GUARD_EPOCH is not None else
-             "PAIRING SUSPECT: more closings than openings — era mixes pre-time-guard rows with "
-             "clean ones; set DASH_DOOR_GUARD_TS to the 5f1488a deploy moment to cut them")
-            if (began_closing > opened or completed > confirmed_open)
+             "PAIRING SUSPECT beyond reopens: era may mix pre-time-guard rows — set "
+             "DASH_DOOR_GUARD_TS to the 5f1488a deploy moment before concluding")
+            if (began_closing > opened + reopened or completed > confirmed_open + reopened)
             else "few opening->open: near_open threshold too high for this edge" if opened and _pct(confirmed_open, opened) is not None and _pct(confirmed_open, opened) < 50
             else "few closing->closed: close_th too low, doors never read fully shut" if began_closing and _pct(completed, began_closing) is not None and _pct(completed, began_closing) < 50
             else "cycles completing normally" if completed else "no completed cycles — see the funnel"),
@@ -415,28 +416,75 @@ def _door_gpu_by_cam(db, gw, cams):
             out[cam] = {"era": None, "reason": "no gw_door_event rows in any era", "n_rows": 0,
                         "n_cycles": 0, "n": 0}
             continue
-        rows = _q(db, "SELECT ts, close_travel_s ct FROM gw_door_event "
-                      "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
-                  (gw, cam, era + "%"))
+        rows = _q(db, "SELECT ts, door_state, close_travel_s ct FROM gw_door_event "
+                      "WHERE gateway_id=? AND cam=? AND door_version LIKE ? AND door_state IS NOT NULL "
+                      "ORDER BY ts, id", (gw, cam, era + "%"))
         # GUARD-REGIME CUT. The 5f1488a time-guards changed what gets emitted without moving the era,
         # so pre-guard mispairings share the era with clean rows. With DASH_DOOR_GUARD_TS set, the
         # quotable pool is post-guard rows only; the excluded count stays visible, never silent.
         n_preguard = 0
-        pool = rows
         if _GUARD_EPOCH is not None:
-            pool = [r for r in rows if r["ts"] is not None and float(r["ts"]) >= _GUARD_EPOCH]
             n_preguard = sum(1 for r in rows if r["ct"] is not None
                              and (r["ts"] is None or float(r["ts"]) < _GUARD_EPOCH))
-        cts = sorted(float(r["ct"]) for r in pool if r["ct"] is not None and r["ct"] > 0)
-        n = len(cts)
-        # SUSPECT GUARD. The GPU tracker paired edges across gaps/noise, so stored close_travel can be
-        # sub-frame (0.08s) or gap-spanning (thousands of s). Flag the line so nobody quotes 0.08s, and
-        # compute a plausible-only median (0.3-30s) beside the raw one so a usable number survives.
-        # Post-boundary the GPU withholds out-of-band closes, so an impossible value AFTER the cut is
-        # a REAL, current pairing problem — not stale garbage.
+            rows = [r for r in rows if r["ts"] is not None and float(r["ts"]) >= _GUARD_EPOCH]
+        # FLAP-AWARE CYCLE CLASSIFICATION (2026-07-29 census finding: the reopen-split alone still
+        # let flap-born cycles poison the clean pool — ch29 "clean" median 0.08s, sub-frame). Walk
+        # the state stream, classify each completed close:
+        #   FLAP     any closing->open bounce under DASH_FLAP_GAP_S inside the cycle, or the open
+        #            dwell before closing was under DASH_MIN_OPEN_DWELL_S (the closing began from a
+        #            state that was never really open) -> excluded, counted
+        #   REOPENED a real (>= flap-gap) closing->open obstruction reopen -> excluded from the
+        #            sheet-comparable headline (the sheet assumes unobstructed closes), reported —
+        #            the reopen RATE is itself a finding the sheet never contemplated
+        #   CLEAN    everything else -> the quotable pool
+        min_dwell = float(os.environ.get("DASH_MIN_OPEN_DWELL_S", "1.5"))
+        flap_gap = float(os.environ.get("DASH_FLAP_GAP_S", "1.0"))
+        seq = []
+        for r in rows:
+            if not seq or seq[-1][1] != r["door_state"]:
+                seq.append([float(r["ts"]), r["door_state"], r["ct"]])
+            elif r["ct"] is not None and seq[-1][2] is None:
+                seq[-1][2] = r["ct"]
+        clean, reopened_cts, flap_cts = [], [], []
+        open_since = None
+        flap_w = reopen_w = False
+        dwell = None
+        for k, (t, st, ct) in enumerate(seq):
+            prev = seq[k - 1][1] if k else None
+            if st == "opening" and prev == "closed":
+                flap_w = reopen_w = False
+                open_since = None
+                dwell = None
+            elif st == "open":
+                open_since = t
+                if prev == "closing":
+                    if (t - seq[k - 1][0]) < flap_gap:
+                        flap_w = True
+                    else:
+                        reopen_w = True
+            elif st == "closing" and prev == "open":
+                dwell = (t - open_since) if open_since is not None else None
+                if dwell is not None and dwell < min_dwell:
+                    flap_w = True
+            elif st == "closed" and prev == "closing":
+                v = seq[k - 1][2] if seq[k - 1][2] is not None else ct
+                if v is not None and float(v) > 0:
+                    v = float(v)
+                    if flap_w:
+                        flap_cts.append(v)
+                    elif reopen_w:
+                        reopened_cts.append(v)
+                    else:
+                        clean.append(v)
+                flap_w = reopen_w = False
+                dwell = None
+        all_cts = sorted(clean + reopened_cts + flap_cts)
         PLAUS_LO, PLAUS_HI = 0.3, 30.0
-        impossible = [v for v in cts if v < PLAUS_LO or v > PLAUS_HI]
-        plaus = [v for v in cts if PLAUS_LO <= v <= PLAUS_HI]
+        cts = sorted(v for v in clean if PLAUS_LO <= v <= PLAUS_HI)   # THE quotable pool
+        impossible = [v for v in clean if v < PLAUS_LO or v > PLAUS_HI]
+        plaus = [v for v in all_cts if PLAUS_LO <= v <= PLAUS_HI]
+        n = len(cts)
+        # An impossible value surviving the flap filter AND the guards is a real, current defect.
         suspect = (len(impossible) > 0)
         spec = DOOR_SPECS.get(cam)
         # Carry the spec even at n=0, so a spec'd camera ALWAYS gets a compliance line — a gap must be
@@ -447,19 +495,24 @@ def _door_gpu_by_cam(db, gw, cams):
             spec_out = {**spec, "pct_exceed": (round(100.0 * over / n) if n else None)}
         out[cam] = {
             "era": era, "era_source": era_src, "instrument": "GPU door engine (gw_door_event)",
-            "n_rows": len(rows), "n_cycles": n, "n": n,
+            "n_rows": len(rows), "n_cycles": len(all_cts), "n": n,
+            "pool": "clean cycles (flap + reopen excluded)",
             "median": round(_pctl(cts, 0.5), 2) if n else None,
             "p85": round(_pctl(cts, 0.85), 2) if n else None,
             "min": round(cts[0], 2) if n else None, "max": round(cts[-1], 2) if n else None,
             "hist": _hist(cts), "hist_edges": _HIST_EDGES, "spec": spec_out,
+            "n_flap_excluded": len(flap_cts), "n_reopened_excluded": len(reopened_cts),
+            "reopen_rate_pct": (round(100.0 * len(reopened_cts) / len(all_cts))
+                                if all_cts else None),
+            "reopened_median": (round(_pctl(sorted(reopened_cts), 0.5), 2) if reopened_cts else None),
             "measurement_suspect": suspect, "n_impossible": len(impossible),
             "plausible_n": len(plaus),
             "plausible_median": (round(_pctl(plaus, 0.5), 2) if plaus else None),
             "plausible_p85": (round(_pctl(plaus, 0.85), 2) if plaus else None),
             "guard_boundary": (DOOR_GUARD_BOUNDARY or None),
             "n_preguard_excluded": n_preguard,
-            "reason": (None if n else "era rows exist but NO completed open->close cycle "
-                       "(floor reads without usable pairs) — the gap is real")}
+            "reason": (None if n else "era rows exist but NO clean completed cycle "
+                       "(all cycles flap/reopen-classed, or no usable pairs) — see the funnel")}
     return out
 
 

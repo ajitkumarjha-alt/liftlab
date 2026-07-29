@@ -104,20 +104,37 @@ def census(db, cam):
           f"  ({sum(1 for g in gaps if g < 1.0)}/{len(gaps)} gaps sub-second)" if gaps else
           "   open<->closing chains: none")
 
-    # close_travel split: clean vs reopened cycles (window = since the last closed->opening)
-    clean, dirty = [], []
-    reop_in_window = 0
+    # close_travel split, FLAP-AWARE (2026-07-29: the reopen-split alone let flap-born cycles
+    # poison CLEAN — ch29 "clean" median 0.08s): FLAP = sub-1s closing->open bounce in-window OR
+    # open dwell < 1.5s before the closing (never really open); REOPENED = real (>=1s) reopen;
+    # CLEAN = the quotable pool.
+    FLAP_GAP, MIN_DWELL = 1.0, 1.5
+    clean, dirty, flap = [], [], []
+    open_since = None
+    flap_w = reopen_w = False
     for k, (t, st, ct) in enumerate(seq):
-        if st == "opening" and k and seq[k - 1][1] == "closed":
-            reop_in_window = 0
-        if st == "open" and k and seq[k - 1][1] == "closing":
-            reop_in_window += 1
-        if st == "closed" and k and seq[k - 1][1] == "closing":
+        prev = seq[k - 1][1] if k else None
+        if st == "opening" and prev == "closed":
+            flap_w = reopen_w = False
+            open_since = None
+        elif st == "open":
+            open_since = t
+            if prev == "closing":
+                if (t - seq[k - 1][0]) < FLAP_GAP:
+                    flap_w = True
+                else:
+                    reopen_w = True
+        elif st == "closing" and prev == "open":
+            if open_since is not None and (t - open_since) < MIN_DWELL:
+                flap_w = True
+        elif st == "closed" and prev == "closing":
             v = seq[k - 1][2] if seq[k - 1][2] is not None else ct
             if v is not None and v > 0:
-                (dirty if reop_in_window else clean).append(float(v))
-    print(f"   close_travel CLEAN cycles: n {len(clean)} median {pctl(clean, .5)}s p85 {pctl(clean, .85)}s")
-    print(f"   close_travel REOPENED cycles: n {len(dirty)} median {pctl(dirty, .5)}s p85 {pctl(dirty, .85)}s")
+                (flap if flap_w else dirty if reopen_w else clean).append(float(v))
+            flap_w = reopen_w = False
+    print(f"   close_travel CLEAN: n {len(clean)} median {pctl(clean, .5)}s p85 {pctl(clean, .85)}s")
+    print(f"   close_travel REOPENED (real, >=1s): n {len(dirty)} median {pctl(dirty, .5)}s p85 {pctl(dirty, .85)}s")
+    print(f"   close_travel FLAP-EXCLUDED: n {len(flap)} median {pctl(flap, .5)}s")
     if clean:
         over = sum(1 for v in clean if v > 2.31)
         print(f"   CLEAN pct>2.31s: {round(100.0 * over / len(clean))}%  <- the quotable compliance shape")
