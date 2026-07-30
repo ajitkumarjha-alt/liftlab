@@ -119,6 +119,67 @@ PANEL_ROIS_DEFAULT = "124,116,51,92;379,44,40,89"
 TEMPLATES_DIR = os.environ.get("TEMPLATES_DIR", "/var/lib/liftlab/templates")
 
 
+def _png_wh(path):
+    """(w, h) straight from a PNG IHDR — no decode. None on anything unreadable."""
+    import struct as _struct
+    try:
+        with open(path, "rb") as f:
+            head = f.read(26)
+    except OSError:
+        return None
+    if len(head) < 26 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        return None
+    w, h = _struct.unpack(">II", head[16:24])
+    return int(w), int(h)
+
+
+def _cells_space(gw=None, cam=None, cells_explicit=False):
+    """The panel space the ACTIVE cells were drawn in, mirroring _as_cells precedence.
+
+    Explicit/env cells carry no recorded space (a 'x,y,w,h' string has no panel in it), so for
+    those the current panel0 ROI dims are the only available statement of the space — GUESSED,
+    and said so. roi.json cells carry panel_wh recorded by the /calib-cells wizard at draw time
+    — STATED. Returns (drawn_space, drawn_src, current_roi_dims, roi_src); either pair may be
+    (None, <why>)."""
+    prois, psrc = _panel_rois(gw, cam)
+    cur, cur_src = ((int(prois[0][2]), int(prois[0][3])), psrc) if prois else (None, psrc)
+    if cells_explicit:
+        return None, "explicit cells param (no recorded draw space)", cur, cur_src
+    if os.environ.get("DIGIT_CELLS", ""):
+        return None, "DIGIT_CELLS env (no recorded draw space)", cur, cur_src
+    wh = (_roi_json(gw, cam).get("cells") or {}).get("panel_wh")
+    if wh:
+        return (int(wh[0]), int(wh[1])), "roi.json cells.panel_wh (recorded at draw)", cur, cur_src
+    return None, "no recorded draw space", cur, cur_src
+
+
+def _sha16(path):
+    """First 16 hex chars of the file's sha256 — the content identity a label binds to."""
+    import hashlib as _hl
+    try:
+        return _hl.sha256(Path(path).read_bytes()).hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def _load_bind(outdir):
+    """labels_bind.json: crop filename -> sha16 of the png the label was SAVED against.
+    Filenames are reused (collect_crops restarts numbering on an emptied store — the ch16
+    label-inheritance postmortem, 2026-07-30), so the binding, not the filename, is the
+    key of record. Missing/corrupt file => {} (legacy dir, nothing bound yet)."""
+    try:
+        v = json.loads((outdir / "labels_bind.json").read_text())
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_bind(outdir, bind):
+    tmp = (outdir / "labels_bind.json").with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(bind, indent=2, sort_keys=True))
+    os.replace(tmp, outdir / "labels_bind.json")
+
+
 def _parse_cells(s):
     out = []
     for part in (s or "").split(";"):
@@ -641,7 +702,17 @@ def collect_crops(gw=None, cam=None, nframes=40, fresh=False, door_roi_frame=Non
             cv2.imwrite(str(outdir / "_calib_doormap.jpg"), md)
     except Exception as e:
         print(f"[collect] montage skipped ({type(e).__name__}: {e}) — crops on disk are unaffected")
+    # A stale montage under the SAME url is how a finished collect looked like "nothing was
+    # collected" (ch16 2026-07-30: crops fresh, montage 07-22). Compare, flag, never trust silence.
+    mont = outdir / "_calib_glyphs0.jpg"
+    newest_crop = max((os.path.getmtime(c) for c in allc), default=None)
+    montage_stale = bool(newest_crop) and ((not mont.exists())
+                                           or os.path.getmtime(mont) < newest_crop - 1)
+    if montage_stale:
+        print(f"[collect] WARNING: _calib_glyphs0.jpg is OLDER than the newest crop — the montage "
+              f"shows a previous population; the {len(allc)} crops on disk are the truth")
     result = {"gw": gw, "cam": cam, "added": added, "total": len(allc),
+              "montage_stale": montage_stale,
               "glyphs_url": _url(gw, cam, "_calib_glyphs0.jpg"),
               "doormap_url": (_url(gw, cam, "_calib_doormap.jpg") if md is not None else None)}
     return _write_result(outdir, "_calib_collect.json", result)
@@ -684,6 +755,36 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
     if not kept:
         raise CalibError(f"no usable labels (all {len(crops)} crops missing or '-') — label at /calib-label/{gw}/{cam}")
 
+    # LABEL->CONTENT BINDING (2026-07-30, ch16 label-inheritance postmortem): labels.json is keyed
+    # by FILENAME and collect_crops restarts numbering on an emptied store, so a re-Collect can
+    # silently re-attach every old label to brand-new pixels (ch16: 59 fresh crops wearing the old
+    # 121-crop trip labels). A label whose bind entry MISMATCHES its crop's current content is
+    # stale-inherited: excluded, always, loudly. A label with NO bind entry is legacy: accepted and
+    # counted, so established cams keep building until migrated (alphabet_audit --migrate-labels).
+    # Governs the labels.json path only — explicit --labels is positional by declaration.
+    n_stale = n_unbound = 0
+    if not labels:
+        bind = _load_bind(outdir)
+        checked = []
+        for c, lab in kept:
+            b = bind.get(Path(c).name)
+            if b is None:
+                n_unbound += 1
+                checked.append((c, lab))
+            elif _sha16(c) != b:
+                n_stale += 1
+            else:
+                checked.append((c, lab))
+        if n_stale or n_unbound:
+            print(f"[build] label binding: {n_stale} STALE-INHERITED labels EXCLUDED (content "
+                  f"changed under the filename), {n_unbound} unbound legacy labels accepted; "
+                  f"{len(checked) - n_unbound}/{len(kept)} verified against content")
+        kept = checked
+        if not kept:
+            raise CalibError("every label failed the content-binding check — the crops changed "
+                             "since the labels were saved (re-Collect inheritance). Relabel at "
+                             f"/calib-label/{gw}/{cam} (saving re-binds automatically).")
+
     dcells = _as_cells(digit_cells, "DIGIT_CELLS", gw, cam)
     acell = _as_cells(arrow_cell, "ARROW_CELL", gw, cam)
     if not dcells or not acell:
@@ -692,7 +793,68 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
                          f"/calib-cells/{gw or GW}/{cam or CAM}, or set DIGIT_CELLS/ARROW_CELL. "
                          f"digit_cells={_cells_src('DIGIT_CELLS', gw, cam)}, "
                          f"arrow_cell={_cells_src('ARROW_CELL', gw, cam)}")
-    labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in kept]
+    # ---- STANDING DIMS FILTER (2026-07-30, ch16 wrong-space postmortem) ----
+    # Cells are WITHIN-PANEL px: cutting them out of a crop taken in a DIFFERENT panel space is
+    # garbage by construction (the ch16 07-26 nudge left old-space cells live for days, silently).
+    # Two invariants, both loud:
+    #   1. the cells' own recorded draw space must match the current panel ROI — else the CELLS
+    #      are wrong-space and no crop filtering can save the build: refuse.
+    #   2. every crop must match the cells' space (>1px either axis = a different geometry era):
+    #      skip it, count it, print the histogram. Skipping is NOT quarantine — the crop stays
+    #      labeled and trusted in labels.json; it is just uncuttable by the CURRENT cells, and
+    #      becomes buildable again if that geometry is ever restored.
+    drawn, drawn_src, cur_roi, cur_src = _cells_space(gw, cam, cells_explicit=bool(digit_cells))
+    if drawn and cur_roi and (abs(drawn[0] - cur_roi[0]) > 1 or abs(drawn[1] - cur_roi[1]) > 1):
+        raise CalibError(f"WRONG-SPACE CELLS: cells were drawn in {drawn[0]}x{drawn[1]} "
+                         f"({drawn_src}) but the current panel0 ROI is {cur_roi[0]}x{cur_roi[1]} "
+                         f"({cur_src}) — the ch16 07-26 failure shape. Redraw at "
+                         f"/calib-cells/{gw}/{cam} before building.")
+    want, want_src = (drawn, drawn_src) if drawn else (cur_roi, cur_src)
+    skipped_dims = {}
+    if want is None:
+        print(f"[build] dims filter OFF — no panel space to compare against ({drawn_src}; "
+              f"panel ROI: {cur_src}). Every crop will be cut blind.")
+        dims_kept = kept
+    else:
+        dims_kept = []
+        for c, lab in kept:
+            wh = _png_wh(c)
+            if wh and abs(wh[0] - want[0]) <= 1 and abs(wh[1] - want[1]) <= 1:
+                dims_kept.append((c, lab))
+            else:
+                k = f"{wh[0]}x{wh[1]}" if wh else "unreadable"
+                skipped_dims[k] = skipped_dims.get(k, 0) + 1
+        print(f"[build] dims filter vs {want[0]}x{want[1]} ({want_src}): "
+              f"kept {len(dims_kept)}/{len(kept)} labeled crops"
+              + (f"; skipped by dims: {skipped_dims}" if skipped_dims else "; nothing skipped"))
+    # REFUSE a thin build. 12 = the floor below which even a minimal alphabet (two digits + both
+    # arrows) cannot reach min_examples=3 per glyph — a build from fewer LOOKS like working
+    # software while reading garbage; a refusal is diagnosable.
+    min_build = int(os.environ.get("MIN_BUILD_CROPS", "12"))
+    if len(dims_kept) < min_build:
+        raise CalibError(f"REFUSING BUILD: only {len(dims_kept)} crops survive the dims filter "
+                         f"(floor MIN_BUILD_CROPS={min_build}; {len(kept)} labeled, skipped by "
+                         f"dims: {skipped_dims or 'none'}). Collect fresh crops in the current "
+                         f"geometry, then rebuild.")
+    # REFUSE silent glyph loss: a glyph with labeled evidence that the filter starves to n=0
+    # would vanish from the alphabet without a trace. ALLOW_GLYPH_LOSS='M,E' acknowledges
+    # specific losses explicitly (or '*' for all) — targeted, auditable, never implicit.
+    def _glyphset(prs):
+        out = {}
+        for _, lab in prs:
+            for g in gd._label_to_glyphs(str(lab)):
+                out[g] = out.get(g, 0) + 1
+        return out
+    g_before, g_after = _glyphset(kept), _glyphset(dims_kept)
+    lost = sorted(g for g in g_before if g_after.get(g, 0) == 0)
+    allow = {x.strip() for x in os.environ.get("ALLOW_GLYPH_LOSS", "").split(",") if x.strip()}
+    if lost and "*" not in allow and set(lost) - allow:
+        raise CalibError(f"REFUSING BUILD: glyphs {sorted(set(lost) - allow)} drop to n=0 under "
+                         f"the dims filter (had {[g_before[g] for g in lost]} crops in another "
+                         f"space). Set ALLOW_GLYPH_LOSS={','.join(lost)} to acknowledge, or "
+                         f"collect + label crops covering them first.")
+
+    labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in dims_kept]
     tpl, stats = gd.build_templates(labeled, dcells, acell[0], align=(align or os.environ.get("ALIGN", "right")),
                                     min_examples=int(os.environ.get("MIN_GLYPH_EXAMPLES", "3")),
                                     exemplars=int(os.environ.get("GLYPH_EXEMPLARS", "3")))
@@ -706,7 +868,13 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
     # templates instead of silently charting its output as current.
     thash = gd.templates_hash(tpl)
     result = {"gw": gw, "cam": cam, "stats": stats, "n_templates": len(tpl), "out_path": outp,
-              "n_labeled": len(kept), "n_excluded": int(excluded), "n_crops": len(crops),
+              "label_binding": {"n_stale_excluded": n_stale, "n_unbound_legacy": n_unbound},
+              "dims_filter": {"expected": (list(want) if want else None), "source": want_src,
+                              "n_kept": len(dims_kept), "n_labeled": len(kept),
+                              "skipped_by_dims": skipped_dims,
+                              "cells_draw_space": (list(drawn) if drawn else None),
+                              "panel_roi_dims": (list(cur_roi) if cur_roi else None)},
+              "n_labeled": len(dims_kept), "n_excluded": int(excluded), "n_crops": len(crops),
               "templates_hash": thash, "era": thash[:8], "built_at": time.time(),
               "fetch_url": f"{CLOUD}/api/gw/{gw}/templates/{cam}"}
     return _write_result(outdir, "_calib_build.json", result)
@@ -750,6 +918,7 @@ def foldback(gw=None, cam=None, outdir=None, db_path=None):
             labels = json.loads(lj.read_text())
         except (OSError, ValueError):
             labels = {}
+    bind = _load_bind(outdir)
     existing = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
     n = 1 + max([int(Path(g).stem.split("_")[-1]) for g in existing], default=-1)   # continue numbering
     added = 0
@@ -766,8 +935,10 @@ def foldback(gw=None, cam=None, outdir=None, db_path=None):
         fname = f"_calib_crop_{n:03d}.png"
         cv2.imwrite(str(outdir / fname), arr)                # the reviewed panel crop -> a labeled calib crop
         labels[fname] = lab
+        bind[fname] = _sha16(outdir / fname)                 # bind the label to THIS content, not the filename
         folded.add(r["id"]); n += 1; added += 1
     lj.write_text(json.dumps(labels, indent=2, sort_keys=True))
+    _save_bind(outdir, bind)
     folded_path.write_text(json.dumps(sorted(folded)))
     result = {"gw": gwid, "cam": cam, "added": added, "reviewed_total": len(rows),
               "already_folded": len(folded) - added, "labels": len(labels),

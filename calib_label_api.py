@@ -71,6 +71,32 @@ def _save_labels(d, labels):
     os.replace(tmp, _labels_path(d))
 
 
+def _bind_label(d, crop):
+    """Bind the label to the crop's CURRENT pixels (sha256[:16] of the png, stdlib only —
+    this module stays deps-free). labels.json is keyed by FILENAME, and collect restarts
+    numbering on an emptied store, so a re-Collect re-attaches old labels to new pixels
+    (the ch16 2026-07-30 inheritance). A hand-label is a statement about content; the
+    binding records which content. door_calib's build EXCLUDES labels whose binding no
+    longer matches, so an inherited label dies at build time instead of becoming a
+    template. Best-effort: a binding failure must not lose the label save itself."""
+    import hashlib
+    try:
+        sha = hashlib.sha256((d / crop).read_bytes()).hexdigest()[:16]
+        p = d / "labels_bind.json"
+        try:
+            bind = json.loads(p.read_text())
+            if not isinstance(bind, dict):
+                bind = {}
+        except (OSError, ValueError):
+            bind = {}
+        bind[crop] = sha
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(bind, indent=2, sort_keys=True))
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
 @calib_label_router.get("/calib-label/{gw}/{cam}/state")
 def label_state(gw: str, cam: str):
     d = _dir(gw, cam)
@@ -95,6 +121,7 @@ async def save_label(gw: str, cam: str, request: Request):
     labels = _load_labels(d)
     labels[crop] = label
     _save_labels(d, labels)
+    _bind_label(d, crop)
     labeled = sum(1 for c in _crops(d) if labels.get(c))
     return {"ok": True, "crop": crop, "label": label, "n_labeled": labeled}
 
