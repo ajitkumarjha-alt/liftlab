@@ -1185,7 +1185,7 @@ def fitcells(gw=None, cam=None, outdir=None, radius=3, iters=3):
     return result
 
 
-def readtest(gw=None, cam=None, db_path=None):
+def readtest(gw=None, cam=None, db_path=None, all_rows=False):
     """REPRODUCE: run the CURRENT reader on the REVIEWED /floorcheck crops (fixtures with known labels)
     and dump per-sample diagnostics — expected vs read, the chosen shift, per digit-cell top-3 glyph
     scores + blank score, arrow scores. Isolates the failure mechanism (shift misalignment vs template
@@ -1217,41 +1217,78 @@ def readtest(gw=None, cam=None, db_path=None):
                          disc_min=float(os.environ.get("DOOR_DISC_MIN", "0.10")))
     dbp = _gateway_db(db_path)
     db = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True); db.row_factory = sqlite3.Row
+    # all_rows: replay EVERY retained crop, reviewed or not (2026-07-30, ch29 '7G'
+    # forensics — reviewed_label was 0 fleet-wide, and threshold evidence needs the score
+    # DISTRIBUTION, not ground truth). Correctness is only scored where a review exists.
+    where = "" if all_rows else "AND reviewed_label IS NOT NULL AND reviewed_label!='' "
     try:
-        rows = db.execute("SELECT id,reviewed_label,floor,crop_jpeg FROM floor_sample WHERE gateway_id=? AND cam=? "
-                          "AND reviewed_label IS NOT NULL AND reviewed_label!='' ORDER BY id DESC LIMIT ?",
-                          (gwid, cam, int(os.environ.get("READTEST_N", "40")))).fetchall()
+        rows = db.execute(f"SELECT id,reviewed_label,floor,crop_jpeg FROM floor_sample "
+                          f"WHERE gateway_id=? AND cam=? {where}ORDER BY id DESC LIMIT ?",
+                          (gwid, cam, int(os.environ.get("READTEST_N", "400" if all_rows else "40")))).fetchall()
     except sqlite3.OperationalError as e:
         db.close(); raise CalibError(f"floor_sample not available ({e}) — review samples at /floorcheck first")
     db.close()
-    print(f"[readtest] reader: shift_search={shift} margin_min={margin} min_score={minsc}; {len(rows)} reviewed fixtures")
+    print(f"[readtest] reader: shift_search={shift} margin_min={margin} min_score={minsc}; "
+          f"{len(rows)} {'crops (ALL retained)' if all_rows else 'reviewed fixtures'}")
     correct = total = 0
+    per_cell = {}
     for r in rows:
         if not r["crop_jpeg"]:
             continue
         arr = cv2.imdecode(np.frombuffer(bytes(r["crop_jpeg"]), np.uint8), cv2.IMREAD_GRAYSCALE)
         if arr is None:
             continue
-        total += 1
-        lab = str(r["reviewed_label"]).strip()
-        exp = lab.rstrip("^vV") if lab and lab[-1] in "^vV" else lab   # expected floor string (drop arrow)
+        lab = str(r["reviewed_label"] or "").strip()
+        exp = (lab.rstrip("^vV") if lab and lab[-1] in "^vV" else lab) if lab else None
         res = rdr.read_panel(arr)
         dbg = rdr.debug_cells(arr)
         got = res["floor"]
-        ok = (got == exp)
-        correct += ok
-        print(f"[readtest] #{r['id']:>5} expect {lab!r:7} -> read {str(got)!r:7}/{res.get('direction')} "
-              f"status={res['status']} shift={dbg['shift']} {'OK' if ok else 'XX'}")
+        if exp is not None:
+            total += 1
+            correct += (got == exp)
+            mark = "OK" if got == exp else "XX"
+        else:
+            mark = f"(stored {str(r['floor'])!r}, unreviewed)"
+        print(f"[readtest] #{r['id']:>5} expect {(lab or '?')!r:7} -> read {str(got)!r:7}/{res.get('direction')} "
+              f"status={res['status']} shift={dbg['shift']} {mark}")
         for c in dbg["cells"]:
             if "top" in c:
                 print(f"           cell{c['i']} top3={c['top']} blank={c['blank']} contrast={c['contrast']}")
+                try:
+                    t1lab, t1sc = c["top"][0][0], float(c["top"][0][1])
+                    b = float(c["blank"]) if c["blank"] is not None else None
+                    per_cell.setdefault(c["i"], []).append((b, t1lab, t1sc))
+                except (TypeError, ValueError, IndexError, KeyError):
+                    pass
             else:
                 print(f"           cell{c['i']} {c.get('verdict')}")
         if dbg.get("arrow"):
             print(f"           arrow {dbg['arrow']}")
-    print(f"[readtest] {correct}/{total} correct on reviewed fixtures "
-          f"(try DOOR_SHIFT=0 to isolate the shift search; DOOR_MARGIN to tune the ambiguous gate)")
-    return {"correct": correct, "total": total, "shift_search": shift, "margin_min": margin}
+    # PER-CELL AGGREGATE — the threshold evidence: how often blank loses and by how much.
+    # A pile of small positive (top1 - blank) margins on a cell that should mostly be blank
+    # IS the phantom mechanism, and the margin distribution says where the camera's
+    # blank_lit_margin / blank_min need to sit.
+    summary = {}
+    if per_cell:
+        from collections import Counter
+        print("[readtest] per-cell blank-vs-top1 (threshold evidence):")
+        for i in sorted(per_cell):
+            v = per_cell[i]
+            wb = [(b, l, t) for b, l, t in v if b is not None]
+            margins = sorted(t - b for b, l, t in wb)
+            med = round(margins[len(margins) // 2], 3) if margins else None
+            labs = Counter(l for _, l, _ in v).most_common(3)
+            summary[f"cell{i}"] = {"n": len(v), "blank_scored": len(wb),
+                                   "blank_wins": sum(1 for b, l, t in wb if b >= t),
+                                   "median_top1_minus_blank": med, "top1_labels": labs}
+            print(f"           cell{i}: n={len(v)} blank_scored={len(wb)} "
+                  f"blank_wins={summary[f'cell{i}']['blank_wins']} "
+                  f"median(top1-blank)={med} top1_labels={labs}")
+    if total:
+        print(f"[readtest] {correct}/{total} correct on reviewed fixtures "
+              f"(try DOOR_SHIFT=0 to isolate the shift search; DOOR_MARGIN to tune the ambiguous gate)")
+    return {"correct": correct, "total": total, "shift_search": shift, "margin_min": margin,
+            "per_cell_summary": summary, "n_replayed": len(rows), "all_rows": bool(all_rows)}
 
 
 def main():
@@ -1269,6 +1306,9 @@ def main():
     ap.add_argument("--anchor-crop", type=int, default=None, dest="anchor_crop", help="crop index to draw the derived cells on")
     ap.add_argument("--foldback", action="store_true", help="fold REVIEWED /floorcheck samples into the calib set (then --build)")
     ap.add_argument("--readtest", action="store_true", help="run the current reader on reviewed /floorcheck fixtures + dump per-cell scores")
+    ap.add_argument("--readtest-all", action="store_true", dest="readtest_all",
+                    help="readtest over ALL retained floor_sample crops (reviewed or not) + per-cell "
+                         "blank-vs-top1 aggregate — the threshold evidence, cloud-side, no fleet deploy")
     ap.add_argument("--labelcheck", action="store_true", help="flag probable MISLABELS (crop vs its glyph template) for re-review")
     ap.add_argument("--fitcells", action="store_true", help="AUTO-FIT per-cell geometry from labeled crops (ends anchor guessing)")
     ap.add_argument("--build", action="store_true", help="build templates.npz from collected crops + --labels")
@@ -1290,8 +1330,8 @@ def main():
         if a.foldback:
             foldback()
             return
-        if a.readtest:
-            readtest()
+        if a.readtest or a.readtest_all:
+            readtest(all_rows=a.readtest_all)
             return
         if a.labelcheck:
             labelcheck()

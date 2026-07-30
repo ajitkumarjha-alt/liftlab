@@ -118,7 +118,7 @@ def _rect(v, what):
     return [x, y, w, h]
 
 
-def _derive_cells(tens, units, arrow, hundreds, panel_wh):
+def _derive_cells(tens, units, arrow, hundreds, panel_wh, synth_d0=True):
     """Drawn boxes -> the cell geometry door_calib will crop with.
 
     NORMALISE WHAT IS PHYSICALLY FIXED, PRESERVE WHAT IS PHYSICALLY VARIABLE.
@@ -234,6 +234,13 @@ def _derive_cells(tens, units, arrow, hundreds, panel_wh):
                         f"that is more likely a bad drag than a real slant. Check the overlay.")
 
     cells = [list(_fit(xs[i], ys[i], cell_w, height, f"d{i}")) for i in range(3)]
+    # DROP THE SYNTHESIZED HUNDREDS CELL (2026-07-30, ch16 '1G'/'162' postmortem): when the
+    # operator did not draw a hundreds box, d0 is an EXTRAPOLATION — and in a <=99-floor
+    # tower it is always-blank in service, i.e. a pure phantom-glyph surface with no upside.
+    # Removed by construction, not by score. A DRAWN hundreds box is always honored.
+    if hundreds is None and not synth_d0:
+        cells = cells[1:]
+        kept.append("d0 omitted: synthesized hundreds cell dropped (verified sub-100 FLOOR_RANGE)")
     arrow_cell = list(_fit(arrow_left, arrow[1], arrow[2], height, "arrow"))
     top = ref_y
 
@@ -299,14 +306,32 @@ def cells_state(gw: str, cam: str):
     })
 
 
-async def _drawn(request, d, crop):
+# Cameras whose tower the OPERATOR states has no hundreds digit (<=99 floors), e.g.
+# NO_HUNDREDS_CAMS="ch16,ch29". Deliberately its OWN env, not FLOOR_RANGE: dropping a
+# never-drawn cell is a geometry statement about the tower; FLOOR_RANGE is a read-rejection
+# cap that is currently forbidden to enforce — coupling them would activate both at once.
+_NO_HUNDREDS = {x.strip() for x in os.environ.get("NO_HUNDREDS_CAMS", "").split(",") if x.strip()}
+
+
+def _want_synth_d0(cam):
+    """Whether to keep the SYNTHESIZED (never-drawn) hundreds cell. False only when the
+    operator explicitly lists the camera in NO_HUNDREDS_CAMS — ch16's '1G'/'162' phantoms
+    came from an extrapolated d0 that is always-blank in a <=99-floor tower: pure phantom
+    surface, no upside. Unlisted cameras keep today's 3-cell behavior — geometry never
+    changes on a guessed tower height."""
+    return cam not in _NO_HUNDREDS
+
+
+async def _drawn(request, d, crop, cam):
     body = await request.json()
     panel_wh = _panel_wh(d, crop)
     tens = _rect(body.get("tens"), "TENS")
     units = _rect(body.get("units"), "UNITS")
     arrow = _rect(body.get("arrow"), "ARROW")
     hundreds = _rect(body.get("hundreds"), "HUNDREDS") if body.get("hundreds") else None
-    return _derive_cells(tens, units, arrow, hundreds, panel_wh), (tens, units, arrow, hundreds)
+    return (_derive_cells(tens, units, arrow, hundreds, panel_wh,
+                          synth_d0=_want_synth_d0(cam)),
+            (tens, units, arrow, hundreds))
 
 
 @calib_cells_router.post("/calib-cells/{gw}/{cam}/derive")
@@ -315,7 +340,7 @@ async def cells_derive(gw: str, cam: str, request: Request, crop: str = ""):
     preview it shows is the server's arithmetic, not a JS copy of it."""
     d = _dir(gw, cam)
     _safe(crop)
-    res, _ = await _drawn(request, d, crop)
+    res, _ = await _drawn(request, d, crop, cam)
     return res
 
 
@@ -323,7 +348,7 @@ async def cells_derive(gw: str, cam: str, request: Request, crop: str = ""):
 async def cells_save(gw: str, cam: str, request: Request, crop: str = ""):
     d = _dir(gw, cam)
     _safe(crop)
-    res, drawn = await _drawn(request, d, crop)
+    res, drawn = await _drawn(request, d, crop, cam)
     roi = _load_roi(d)
     roi["cells"] = {
         "digit_cells": res["digit_cells"], "arrow_cell": res["arrow_cell"],
