@@ -42,6 +42,40 @@ DOOR_STATES = {"closed", "opening", "open", "closing"}
 # confirmed label folds back into the calib crops (door_calib --foldback) -> a self-improving loop.
 LABEL_RE = re.compile(r"^(-|[A-Za-z0-9]+[\^vV]?)$")
 
+# FLOOR ADMISSION AT THE INSERT BOUNDARY (2026-07-30, ch29 emitted '7G' x87 / '77' x13 as
+# CONFIDENT reads and nothing rejected them on write). Grammar: G, P<digit>, or 1-2 digits;
+# numeric floors additionally range-checked per camera via FLOOR_RANGE env
+# ("ch29:1-56,ch16:1-47"). NOTE: camera_registry.door_levels is DoorTracker thresholds
+# (close_th etc.), NOT a floor list — until a registry floor-range field exists, env is the
+# authority. An illegal read is NOT coerced and NOT dropped: floor -> NULL and the raw value
+# moves into reason as 'invalid_label:<raw>' — the row stays as evidence of a bad read.
+_FLOOR_OK = re.compile(r"^(G|P[0-9]|[0-9]{1,2})$")
+_FLOOR_RANGE = {}
+for _part in os.environ.get("FLOOR_RANGE", "").split(","):
+    if ":" in _part:
+        _c, _r = _part.split(":", 1)
+        if "-" in _r:
+            try:
+                _lo, _hi = _r.split("-", 1)
+                _FLOOR_RANGE[_c.strip()] = (int(_lo), int(_hi))
+            except ValueError:
+                pass
+
+
+def _admit_floor(cam, floor, reason):
+    """(floor, reason) after admission. None floor passes through untouched (an abstention
+    is already honest)."""
+    if floor is None:
+        return None, reason
+    f = str(floor)
+    ok = bool(_FLOOR_OK.match(f))
+    if ok and f.isdigit() and cam in _FLOOR_RANGE:
+        lo, hi = _FLOOR_RANGE[cam]
+        ok = lo <= int(f) <= hi
+    if ok:
+        return f, reason
+    return None, f"invalid_label:{f[:24]}"
+
 door_event_router = APIRouter()
 
 
@@ -129,6 +163,8 @@ async def door_event_ingest(gw: str, request: Request, authorization: str = Head
     _reject_unknown_cam(gw, cam)
     floor = d.get("floor")                                   # may be null (no_read) — stored as-is, NOT guessed
     floor = str(floor) if floor is not None else None
+    floor, _reason_adm = _admit_floor(cam, floor, str(d.get("reason", "")))
+    d["reason"] = _reason_adm
     direction = d.get("direction")
     direction = str(direction) if direction in ("up", "down") else None
     cand = d.get("candidates")
@@ -161,17 +197,36 @@ async def floorcheck_ingest(gw: str, request: Request, authorization: str = Head
         except (ValueError, TypeError):
             blob = None
     floor = d.get("floor")
+    floor, _reason_adm = _admit_floor(cam, (str(floor) if floor is not None else None),
+                                      str(d.get("reason", "")))
     db = _db()
     db.execute("INSERT INTO floor_sample (gateway_id,cam,ts,floor,direction,read_conf,panels_agreed,reason,"
                "door_version,crop_jpeg,received_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-               (gw, cam, float(d.get("ts", time.time())), (str(floor) if floor is not None else None),
+               (gw, cam, float(d.get("ts", time.time())), floor,
                 (str(d.get("direction")) if d.get("direction") in ("up", "down") else None),
-                _f(d.get("read_conf")), 1 if d.get("panels_agreed") else 0, str(d.get("reason", "")),
+                _f(d.get("read_conf")), 1 if d.get("panels_agreed") else 0, _reason_adm,
                 str(d.get("door_version", "")), blob, time.time()))
-    # prune this cam's ephemeral spot-check images to the last FLOORCHECK_KEEP
-    db.execute("DELETE FROM floor_sample WHERE gateway_id=? AND cam=? AND id NOT IN "
-               "(SELECT id FROM floor_sample WHERE gateway_id=? AND cam=? ORDER BY id DESC LIMIT ?)",
-               (gw, cam, gw, cam, FLOORCHECK_KEEP))
+    # RETENTION (2026-07-30 defect fix). The old prune deleted unconditionally by id — a
+    # growth loop whose evidence self-deletes in ~10h cannot grow, and rare glyphs are the
+    # least likely to appear in any 300-sample window, so the cap selected AGAINST exactly
+    # the samples the loop exists to collect. Now:
+    #   * reviewed rows are NEVER pruned — the one durable output of human effort here;
+    #   * "interesting" rows (abstentions, ambiguous, invalid labels, null-conf) keep their
+    #     own newest-N pool so routine confident reads cannot flush them;
+    #   * routine rows keep the newest FLOORCHECK_KEEP as before.
+    # One week per camera at the 30/hr sample rate = FLOORCHECK_KEEP=5040 (env; ~3-4 KB per
+    # crop_jpeg -> roughly 15-20 MB per camera-week). Deletion remains terminal — there is
+    # no archive — which is why reviewed rows are exempt rather than archived.
+    keep_interesting = int(os.environ.get("FLOORCHECK_KEEP_INTERESTING", str(FLOORCHECK_KEEP)))
+    db.execute(
+        "DELETE FROM floor_sample WHERE gateway_id=? AND cam=? "
+        "AND (reviewed_label IS NULL OR reviewed_label='') "
+        "AND id NOT IN (SELECT id FROM floor_sample WHERE gateway_id=? AND cam=? "
+        "               ORDER BY id DESC LIMIT ?) "
+        "AND id NOT IN (SELECT id FROM floor_sample WHERE gateway_id=? AND cam=? "
+        "               AND (read_conf IS NULL OR reason NOT IN ('single_panel','ok')) "
+        "               ORDER BY id DESC LIMIT ?)",
+        (gw, cam, gw, cam, FLOORCHECK_KEEP, gw, cam, keep_interesting))
     db.commit()
     db.close()
     return {"ok": True}

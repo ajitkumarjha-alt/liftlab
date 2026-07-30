@@ -49,6 +49,21 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import door_calib as _dc
+
+# COUPLED-DEPLOY GUARD: this script and door_calib.py ship as ONE set. Importing private
+# helpers from an older door_calib must fail with a version statement, not a raw
+# ImportError on a private name (7135ec9 died on _cells_space against the 79ff9893
+# install — an undeclared dependency is a partial install path).
+_REQUIRED_DC = ("_cells_space", "_gateway_db", "_load_bind", "_save_bind", "_sha16",
+                "_png_wh", "_calib_dir", "_chown_tree", "_write_result")
+_missing_dc = [s for s in _REQUIRED_DC if not hasattr(_dc, s)]
+if _missing_dc:
+    raise SystemExit(
+        f"alphabet_audit needs door_calib from commit 5f89c4e or later "
+        f"(blob md5 8d543c7506f374928b90a06afcaeb448): the installed door_calib.py lacks "
+        f"{_missing_dc}. Install the coupled set from the same gated block — do not mix.")
+
 from door_calib import (CALIB_DIR, CAM, GW, CalibError, _calib_dir, _cells_space,
                         _chown_tree, _gateway_db, _load_bind, _png_wh, _save_bind,
                         _sha16, _write_result)
@@ -64,6 +79,14 @@ def _iso(ts):
     if not ts:
         return None
     return f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))} {TZ_NAME}"
+
+
+def _iso_utc(ts):
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts)) if ts else None
+
+
+def _iso_ist(ts):
+    return time.strftime("%Y-%m-%d %H:%M:%S IST(+05:30)", time.gmtime(ts + 19800)) if ts else None
 
 
 def _labels(outdir):
@@ -147,26 +170,31 @@ def derive_boundary(gw, cam, db_path, min_side_hours=24, min_side_rows=200):
 
 
 def _resolve_boundary(gw, cam, boundary, db_path):
-    """(epoch, info-dict). Explicit --boundary wins but is labelled stated-vs-guessed;
-    otherwise derive from evidence and REFUSE to run on a weak derivation — a refused
-    audit is diagnosable, a misclassified boundary day is not."""
+    """(epoch-or-None, info-dict). Explicit --boundary wins, labelled stated-vs-guessed.
+    Otherwise derive from the gw_door_event with_floor step; if the data cannot supply a
+    STRONG step, the boundary is declared UNKNOWN (epoch None) and time-based flagging is
+    disabled — never defaulted, never fallen back to file mtimes. An unknown boundary is
+    survivable: the dims filter and label binding are time-free."""
     derived = derive_boundary(gw, cam, db_path)
     if boundary:
         dt = datetime.fromisoformat(boundary)
         stated = dt.tzinfo is not None
         bts = dt.timestamp()
         return bts, {"epoch": bts, "iso": _iso(bts),
+                     "iso_utc": _iso_utc(bts), "iso_ist": _iso_ist(bts),
                      "source": ("explicit --boundary (offset STATED)" if stated else
                                 f"explicit --boundary (NAIVE — interpreted in {TZ_NAME} "
                                 f"{TZ_OFFSET}, zone GUESSED from server)"),
                      "derived_for_comparison": derived}
-    if derived is None:
-        raise CalibError("cannot derive the boundary from gw_door_event (no DB / too little "
-                         "data) — pass --boundary explicitly (with a UTC/IST offset)")
-    if derived["quality"] == "WEAK":
-        raise CalibError(f"derived boundary is WEAK (with_floor drop {derived['drop']} at "
-                         f"{derived['iso']}) — not enough of a step to trust. Pass --boundary "
-                         f"explicitly (with an offset). Candidate: {derived}")
+    if derived is None or derived["quality"] == "WEAK":
+        return None, {"epoch": None, "iso": None,
+                      "source": "UNKNOWN — underivable from data (no strong with_floor step "
+                                "within gw_door_event retention; floor_sample holds only "
+                                "~10h). Time-based flagging DISABLED — declared unknown, "
+                                "NOT defaulted, NOT inferred from mtimes.",
+                      "candidate_rejected": derived}
+    derived["iso_utc"] = _iso_utc(derived["epoch"])
+    derived["iso_ist"] = _iso_ist(derived["epoch"])
     return derived["epoch"], derived
 
 
