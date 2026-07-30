@@ -613,17 +613,34 @@ def collect_crops(gw=None, cam=None, nframes=40, fresh=False, door_roi_frame=Non
                 f2 = _decode_last_frame(seg)
                 if f2 is not None:
                     doors.append(gd.crop(f2, droi))
+                    if len(doors) > 36:              # montage shows 36; a full-res door crop per frame
+                        doors.pop(0)                 # held for the whole run is the other half of the OOM
                     cv2.imwrite(str(outdir / f"_calib_crop_{n:03d}.png"),
                                 cv2.cvtColor(gd.crop(f2, prois[0]), cv2.COLOR_BGR2GRAY))
                     n += 1; added += 1
         time.sleep(2)                         # ~one per 2s segment
     allc = sorted(glob.glob(str(outdir / "_calib_crop_*.png")))
-    pmont = _montage([cv2.cvtColor(cv2.imread(c, cv2.IMREAD_GRAYSCALE), cv2.COLOR_GRAY2BGR) for c in allc], cols=5, factor=8)
-    if pmont is not None:
-        cv2.imwrite(str(outdir / "_calib_glyphs0.jpg"), pmont)
-    md = _montage(doors, cols=6, factor=2)
-    if md is not None:
-        cv2.imwrite(str(outdir / "_calib_doormap.jpg"), md)
+    # MONTAGES ARE COSMETIC; THE CROPS ON DISK ARE THE DELIVERABLE. This used to upscale EVERY crop
+    # 8x and hold all of them (plus padded copies) in memory at once — ~1GB by 120 crops. The runner
+    # spawns collect inside the WEB APP's cgroup, so that transient is an OOM SIGKILL: rc=-9 with
+    # every crop already safely written (ch16, 2026-07-30). Newest MONTAGE_MAX tiles at half the old
+    # upscale keeps the montage useful and the peak tens of MB; and a montage failure of any kind
+    # must never fail the collect that produced the crops.
+    montage_max = int(os.environ.get("CALIB_MONTAGE_MAX", "60"))
+    md = None
+    try:
+        tiles = [cv2.cvtColor(cv2.imread(c, cv2.IMREAD_GRAYSCALE), cv2.COLOR_GRAY2BGR)
+                 for c in allc[-montage_max:]]
+        pmont = _montage(tiles, cols=5, factor=4)
+        del tiles
+        if pmont is not None:
+            cv2.imwrite(str(outdir / "_calib_glyphs0.jpg"), pmont)
+            del pmont
+        md = _montage(doors, cols=6, factor=2)
+        if md is not None:
+            cv2.imwrite(str(outdir / "_calib_doormap.jpg"), md)
+    except Exception as e:
+        print(f"[collect] montage skipped ({type(e).__name__}: {e}) — crops on disk are unaffected")
     result = {"gw": gw, "cam": cam, "added": added, "total": len(allc),
               "glyphs_url": _url(gw, cam, "_calib_glyphs0.jpg"),
               "doormap_url": (_url(gw, cam, "_calib_doormap.jpg") if md is not None else None)}
