@@ -122,7 +122,33 @@ def _db():
         db.execute("ALTER TABLE camera_registry ADD COLUMN door_levels TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass                                      # already there
+    try:                                          # migration: per-camera floor range (2026-07-30)
+        db.execute("ALTER TABLE camera_registry ADD COLUMN floor_range TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass                                      # already there
     return db
+
+
+def _parse_floor_range(v):
+    """Canonical 'lo-hi' from operator input, or '' to clear. OPERATOR-ENTERED from the tower
+    fact sheet, never derived from observed reads — deriving from reads would bless the
+    phantoms (ch16's 7X band and ch29's 68 both look legitimate in the read stream).
+    Consumed by the door_event admission validator: numeric floors outside the range become
+    reason='invalid_label'. Absent range = numerics pass through unchecked, by design —
+    grammar catches 20.2% of ch16's phantom load, range detection lifts it to 25.8%."""
+    if v in (None, "", {}):
+        return ""
+    s = str(v).strip()
+    if "-" not in s:
+        raise HTTPException(400, "floor_range must be 'lo-hi' (e.g. '1-60') or empty to clear")
+    lo, hi = s.split("-", 1)
+    try:
+        lo, hi = int(lo), int(hi)
+    except ValueError:
+        raise HTTPException(400, "floor_range bounds must be integers")
+    if not (1 <= lo < hi <= 999):
+        raise HTTPException(400, "floor_range must satisfy 1 <= lo < hi <= 999")
+    return f"{lo}-{hi}"
 
 
 # DoorTracker level knobs an operator may set per camera, with sane bounds. Bounds are wide on
@@ -177,8 +203,8 @@ def _safe(*p):
 
 def _rows(db, gw):
     return [dict(r) for r in db.execute(
-        "SELECT cam, enabled, stride, analyze_fps, note, updated_at, door_levels FROM camera_registry "
-        "WHERE gateway_id=? ORDER BY cam", (gw,)).fetchall()]
+        "SELECT cam, enabled, stride, analyze_fps, note, updated_at, door_levels, floor_range "
+        "FROM camera_registry WHERE gateway_id=? ORDER BY cam", (gw,)).fetchall()]
 
 
 def _payload(rows, gw):
@@ -192,7 +218,8 @@ def _payload(rows, gw):
         except ValueError:
             levels = {}
         c = {"cam": r["cam"], "enabled": bool(r["enabled"]), "stride": int(r["stride"] or 2),
-             "analyze_fps": float(r["analyze_fps"] or 0), "door_levels": levels}
+             "analyze_fps": float(r["analyze_fps"] or 0), "door_levels": levels,
+             "floor_range": (r.get("floor_range") or "")}
         c["geometry"] = _geometry(gw, r["cam"])
         cams.append(c)
     # door_levels is in the hash: a level change must restart that worker (env is read at import),
@@ -223,7 +250,7 @@ async def cameras_set(gw: str, cam: str, request: Request):
     _safe(gw, cam)
     d = await request.json()
     db = _db()
-    cur = db.execute("SELECT enabled, stride, analyze_fps, door_levels FROM camera_registry "
+    cur = db.execute("SELECT enabled, stride, analyze_fps, door_levels, floor_range FROM camera_registry "
                      "WHERE gateway_id=? AND cam=?", (gw, cam)).fetchone()
     enabled = bool(d.get("enabled", cur["enabled"] if cur else False))
     stride = int(d.get("stride", (cur["stride"] if cur else 2) or 2))
@@ -234,6 +261,11 @@ async def cameras_set(gw: str, cam: str, request: Request):
         levels_json = json.dumps(_parse_levels(d["door_levels"]), sort_keys=True)
     else:
         levels_json = (cur["door_levels"] if cur else "") or "{}"
+    # floor_range: absent = keep stored; explicit '' = clear (a tower fact was retracted)
+    if "floor_range" in d:
+        floor_range = _parse_floor_range(d["floor_range"])
+    else:
+        floor_range = (cur["floor_range"] if cur else "") or ""
     if not (1 <= stride <= 25):
         db.close()
         raise HTTPException(400, "stride must be 1..25 (frames between door-pass reads)")
@@ -249,12 +281,14 @@ async def cameras_set(gw: str, cam: str, request: Request):
             # which looks like a model problem rather than an over-subscription problem.
             raise HTTPException(409, f"{n} cameras already enabled (max {MAX_ENABLED} for this GPU) — "
                                      f"disable one first, or raise FLEET_MAX_ENABLED if the box grew")
-    db.execute("INSERT INTO camera_registry (gateway_id,cam,enabled,stride,analyze_fps,note,updated_at,door_levels) "
-               "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(gateway_id,cam) DO UPDATE SET "
+    db.execute("INSERT INTO camera_registry (gateway_id,cam,enabled,stride,analyze_fps,note,updated_at,"
+               "door_levels,floor_range) "
+               "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(gateway_id,cam) DO UPDATE SET "
                "enabled=excluded.enabled, stride=excluded.stride, analyze_fps=excluded.analyze_fps, "
-               "note=excluded.note, updated_at=excluded.updated_at, door_levels=excluded.door_levels",
+               "note=excluded.note, updated_at=excluded.updated_at, door_levels=excluded.door_levels, "
+               "floor_range=excluded.floor_range",
                (gw, cam, 1 if enabled else 0, stride, afps, str(d.get("note", ""))[:200], time.time(),
-                levels_json))
+                levels_json, floor_range))
     db.commit()
     rows = _rows(db, gw)
     db.close()

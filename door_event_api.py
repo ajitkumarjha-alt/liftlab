@@ -62,16 +62,45 @@ for _part in os.environ.get("FLOOR_RANGE", "").split(","):
                 pass
 
 
-def _admit_floor(cam, floor, reason):
+_FR_CACHE = {}
+
+
+def _floor_range_for(gw, cam):
+    """The camera's verified numeric range: camera_registry.floor_range (operator-entered
+    from the tower fact sheet) first, FLOOR_RANGE env as fallback, None when neither is set
+    — and None means numerics PASS THROUGH; the validator never rejects on a guessed range.
+    60s TTL cache: this sits on the ingest hot path."""
+    now = time.time()
+    hit = _FR_CACHE.get((gw, cam))
+    if hit and now - hit[1] < 60:
+        return hit[0]
+    rng = _FLOOR_RANGE.get(cam)
+    try:
+        db = _db()
+        row = db.execute("SELECT floor_range FROM camera_registry WHERE gateway_id=? AND cam=?",
+                         (gw, cam)).fetchone()
+        db.close()
+        v = (row["floor_range"] if row else "") or ""
+        if "-" in v:
+            lo, hi = v.split("-", 1)
+            rng = (int(lo), int(hi))
+    except Exception:
+        pass                       # registry absent/unmigrated -> env/None; never guess
+    _FR_CACHE[(gw, cam)] = (rng, now)
+    return rng
+
+
+def _admit_floor(gw, cam, floor, reason):
     """(floor, reason) after admission. None floor passes through untouched (an abstention
     is already honest)."""
     if floor is None:
         return None, reason
     f = str(floor)
     ok = bool(_FLOOR_OK.match(f))
-    if ok and f.isdigit() and cam in _FLOOR_RANGE:
-        lo, hi = _FLOOR_RANGE[cam]
-        ok = lo <= int(f) <= hi
+    if ok and f.isdigit():
+        rng = _floor_range_for(gw, cam)
+        if rng is not None:
+            ok = rng[0] <= int(f) <= rng[1]
     if ok:
         return f, reason
     return None, f"invalid_label:{f[:24]}"
@@ -163,7 +192,7 @@ async def door_event_ingest(gw: str, request: Request, authorization: str = Head
     _reject_unknown_cam(gw, cam)
     floor = d.get("floor")                                   # may be null (no_read) — stored as-is, NOT guessed
     floor = str(floor) if floor is not None else None
-    floor, _reason_adm = _admit_floor(cam, floor, str(d.get("reason", "")))
+    floor, _reason_adm = _admit_floor(gw, cam, floor, str(d.get("reason", "")))
     d["reason"] = _reason_adm
     direction = d.get("direction")
     direction = str(direction) if direction in ("up", "down") else None
@@ -197,7 +226,7 @@ async def floorcheck_ingest(gw: str, request: Request, authorization: str = Head
         except (ValueError, TypeError):
             blob = None
     floor = d.get("floor")
-    floor, _reason_adm = _admit_floor(cam, (str(floor) if floor is not None else None),
+    floor, _reason_adm = _admit_floor(gw, cam, (str(floor) if floor is not None else None),
                                       str(d.get("reason", "")))
     db = _db()
     db.execute("INSERT INTO floor_sample (gateway_id,cam,ts,floor,direction,read_conf,panels_agreed,reason,"
