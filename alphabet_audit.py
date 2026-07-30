@@ -608,6 +608,27 @@ def provenance(gw=None, cam=None, archive="crops-pre-nudge-0722"):
                                             arch_labels.get(f) == labels.get(f)),
                      "binding": bstat})
 
+    # DANGLING INDEX REFERENCES — second instance of the class (ch16 cells.anchor_crop
+    # pointed at _calib_crop_060.png over a 59-crop store; labels.json was the first).
+    # Any json in the calib dir that names a crop that is not on disk is flagged; a
+    # re-Collect can strand or silently re-point such references.
+    import re as _re
+    _self_reports = {"_alphabet_audit.json", "_label_provenance.json", "_label_void.json",
+                     "_label_migrate.json"}
+    dangling = {}
+    for jf in sorted(glob.glob(str(outdir / "*.json"))):
+        name = Path(jf).name
+        if name in _self_reports:
+            continue
+        try:
+            txt = Path(jf).read_text()
+        except OSError:
+            continue
+        bad = sorted(r for r in set(_re.findall(r"_calib_crop_\d+\.png", txt))
+                     if r not in store_set)
+        if bad:
+            dangling[name] = bad
+
     labeled_rows = [r for r in rows if r["label"] and r["label"] != "-"]
     proven_hand = [r["crop"] for r in rows if r["binding"] == "match"]
     inherited = bool(overlap) and (bool(orphans) or
@@ -640,6 +661,7 @@ def provenance(gw=None, cam=None, archive="crops-pre-nudge-0722"):
                           "has_own_labels_json": arch_labels is not None,
                           "filename_overlap_with_store": len(overlap)},
               "per_index": rows,
+              "dangling_crop_refs": dangling,
               "timezone": {"name": TZ_NAME, "utc_offset": TZ_OFFSET}}
     return _write_result(outdir, "_label_provenance.json", result)
 
@@ -747,6 +769,9 @@ def main():
         print(f'archive: {ar["n_pngs"]} pngs, own labels.json={ar["has_own_labels_json"]}, '
               f'filename overlap with store: {ar["filename_overlap_with_store"]}')
         print(f'auto-label (b): impossible — {r["auto_label_note"]}')
+        if r["dangling_crop_refs"]:
+            print(f'DANGLING CROP REFERENCES (fix or re-derive before trusting): '
+                  f'{r["dangling_crop_refs"]}')
         print(f'\nVERDICT: {r["verdict"]}')
         return
     if a.void_labels:

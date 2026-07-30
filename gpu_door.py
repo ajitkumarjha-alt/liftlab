@@ -407,16 +407,21 @@ class FloorReader:
         import cv2
         dx, dy = self._best_shift(panel_gray)        # absorb rigid panel jitter before reading
 
+        chars, scores, dbg = [], [], []              # dbg: per-cell top-2 + blank, EVERY read — the
+                                                     # candidates column was ambiguous-only, which made
+                                                     # the ch16/ch29 phantom-tens forensics impossible
+
         def _out(floor, direction, score, status, candidates=None):
             return {"floor": floor, "direction": direction, "score": score, "status": status,
-                    "candidates": candidates, "n_cells": len(self.digit_cells), "shift": [dx, dy]}
+                    "candidates": candidates, "cells": dbg,
+                    "n_cells": len(self.digit_cells), "shift": [dx, dy]}
 
-        chars, scores = [], []
         for i, cell in enumerate(self.digit_cells):  # glyphs at the searched shift; blank at ZERO shift
             ci = crop(panel_gray, (cell[0] + dx, cell[1] + dy, cell[2], cell[3]))
             if ci.size == 0:
                 return _out(None, None, None, "no_read")
             if (int(ci.max()) - int(ci.min())) < self.blank_range:
+                dbg.append([["flat", round((int(ci.max()) - int(ci.min())) / 255.0, 3)]])
                 continue                             # flat/dark cell -> BLANK (NCC undefined on 0 variance)
             c = cv2.resize(ci, (self._tsz[1], self._tsz[0]))
             top1 = top2 = -2.0
@@ -441,7 +446,11 @@ class FloorReader:
             if b is not None and b >= top1 and (
                     (not lit and b >= self.blank_min)
                     or (lit and b >= self.blank_strong and b >= top1 + self.blank_lit_margin)):
+                dbg.append([["blank", round(b, 3)], [lab1, round(top1, 3)]])
                 continue                             # blank explains this cell -> BLANK
+            dbg.append([[lab1, round(top1, 3) if top1 > -2 else None],
+                        ([lab2, round(top2, 3)] if lab2 is not None else None),
+                        ["blank", round(b, 3) if b is not None else None]])
             if lab1 is None or top1 < self.min_score:
                 return _out(None, None, None, "no_read")   # a lit cell we can't confidently name
             # CONFUSABLE-PAIR diff-region tiebreak (opt-in, confuse_band>0): whole-cell NCC can pick the
@@ -817,6 +826,14 @@ class DoorFloorEngine:
                 floor, direction, conf, agreed, reason = r0["floor"], r0["direction"], r0["score"], False, "single_panel"
             elif r0["status"] == "ambiguous":
                 reason, candidates = "ambiguous", r0["candidates"]
+        # DIAGNOSABILITY (2026-07-30): the candidates column was populated only on
+        # reason='ambiguous', so confident phantoms ('1G', '7G') left no per-cell trace and
+        # the DB could not answer "what did each cell score". When the ambiguous top-2 isn't
+        # using the slot, carry panel0's per-cell top-2 + blank instead (a dict, so the two
+        # shapes stay distinguishable). Pure metadata: floor/reason/conf are untouched, so
+        # this does NOT move the door era.
+        if candidates is None and reads and reads[0].get("cells"):
+            candidates = {"cells": reads[0]["cells"], "shift": reads[0].get("shift")}
         stop = self.floor.update(t, floor, direction) if floor else None
         out = {"t": t, "floor": floor, "direction": direction, "door_state": self.door.state,
                "openness": (round(float(openness), 3) if openness is not None else None),
