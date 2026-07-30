@@ -14,6 +14,16 @@ FIELDS
   stride       door-pass stride (DOOR_STRIDE): 2 = ~12fps of the 25fps decode
   analyze_fps  counting subsample; 0 = every frame. THE fleet capacity knob — 7 cameras do not fit
                at 25fps, so this is what gets turned down, not `stride`.
+  door_levels  OPTIONAL per-camera DoorTracker levels, e.g. {"close_th": 0.20}. Door edge contrast
+               is per-camera physics (2026-07-30: h2 tripled close-completion on ch16/ch27 and
+               REGRESSED ch29 to 0.9% — ch29's edge never reads below the global close_th, so
+               closes never complete), so the fully-shut/fully-open levels are per-camera DATA.
+               Keys: near_open, close_th, close_start_th, close_debounce_s. Omitted keys keep the
+               worker's env/defaults. NON-DEFAULT LEVELS MOVE THE DOOR ERA (gpu_analyze stamps a
+               levels tag into the door_version prefix): completion rates under different levels
+               are different instruments and must never pool. Recalibration procedure: raise
+               close_th stepwise; the target is ch27's born-clean-era funnel (~13% with_travel/closed,
+               mean travel ~4.2s) — matching THAT shape, not maximizing completions, is the verdict.
 
 A row is the operator's intent. The fleet's job is to converge on it, and — critically — to do
 NOTHING when it cannot read it. See gpu_fleet.py: an unreachable cloud must never stop a camera
@@ -108,7 +118,48 @@ def _db():
       gateway_id TEXT, cam TEXT, enabled INTEGER DEFAULT 0, stride INTEGER DEFAULT 2,
       analyze_fps REAL DEFAULT 0, note TEXT, updated_at REAL,
       PRIMARY KEY (gateway_id, cam))""")
+    try:                                          # migration: pre-door_levels tables lack the column
+        db.execute("ALTER TABLE camera_registry ADD COLUMN door_levels TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass                                      # already there
     return db
+
+
+# DoorTracker level knobs an operator may set per camera, with sane bounds. Bounds are wide on
+# purpose — they reject typos (close_th=20 for 0.20), not judgement calls.
+_LEVEL_KEYS = {"near_open": (0.5, 1.0), "close_th": (0.01, 0.6),
+               "close_start_th": (0.2, 0.95), "close_debounce_s": (0.0, 5.0)}
+
+
+def _parse_levels(v):
+    """Validated canonical door_levels dict from operator input; {} means 'use defaults'.
+    Raises HTTPException(400) with the reason — a bad level silently dropped would look exactly
+    like the recalibration not working."""
+    if v in (None, "", {}):
+        return {}
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            raise HTTPException(400, "door_levels must be a JSON object")
+    if not isinstance(v, dict):
+        raise HTTPException(400, "door_levels must be an object of {level: number}")
+    out = {}
+    for k, x in v.items():
+        if k not in _LEVEL_KEYS:
+            raise HTTPException(400, f"unknown door level '{k}' (valid: {sorted(_LEVEL_KEYS)})")
+        lo, hi = _LEVEL_KEYS[k]
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"door level '{k}' must be a number")
+        if not (lo <= x <= hi):
+            raise HTTPException(400, f"door level '{k}'={x} outside [{lo}, {hi}]")
+        out[k] = x
+    # ordering sanity where both ends are being set: shut must sit below the closing-entry level
+    if "close_th" in out and "close_start_th" in out and out["close_th"] >= out["close_start_th"]:
+        raise HTTPException(400, "close_th must be below close_start_th")
+    return out
 
 
 def _auth(gw, authorization):
@@ -126,7 +177,7 @@ def _safe(*p):
 
 def _rows(db, gw):
     return [dict(r) for r in db.execute(
-        "SELECT cam, enabled, stride, analyze_fps, note, updated_at FROM camera_registry "
+        "SELECT cam, enabled, stride, analyze_fps, note, updated_at, door_levels FROM camera_registry "
         "WHERE gateway_id=? ORDER BY cam", (gw,)).fetchall()]
 
 
@@ -136,12 +187,19 @@ def _payload(rows, gw):
     make an edited comment look like a restart-worthy change."""
     cams = []
     for r in rows:
+        try:
+            levels = json.loads(r.get("door_levels") or "{}")
+        except ValueError:
+            levels = {}
         c = {"cam": r["cam"], "enabled": bool(r["enabled"]), "stride": int(r["stride"] or 2),
-             "analyze_fps": float(r["analyze_fps"] or 0)}
+             "analyze_fps": float(r["analyze_fps"] or 0), "door_levels": levels}
         c["geometry"] = _geometry(gw, r["cam"])
         cams.append(c)
+    # door_levels is in the hash: a level change must restart that worker (env is read at import),
+    # and the worker's fresh door_version era-splits the data from the moment it lands.
     h = hashlib.sha256(json.dumps(sorted(
         (c["cam"], c["enabled"], c["stride"], c["analyze_fps"],
+         json.dumps(c["door_levels"], sort_keys=True),
          json.dumps(c["geometry"], sort_keys=True)) for c in cams)).encode()).hexdigest()[:12]
     return cams, h
 
@@ -165,11 +223,17 @@ async def cameras_set(gw: str, cam: str, request: Request):
     _safe(gw, cam)
     d = await request.json()
     db = _db()
-    cur = db.execute("SELECT enabled, stride, analyze_fps FROM camera_registry WHERE gateway_id=? AND cam=?",
-                     (gw, cam)).fetchone()
+    cur = db.execute("SELECT enabled, stride, analyze_fps, door_levels FROM camera_registry "
+                     "WHERE gateway_id=? AND cam=?", (gw, cam)).fetchone()
     enabled = bool(d.get("enabled", cur["enabled"] if cur else False))
     stride = int(d.get("stride", (cur["stride"] if cur else 2) or 2))
     afps = float(d.get("analyze_fps", (cur["analyze_fps"] if cur else 0) or 0))
+    # door_levels: absent = keep stored; explicit null/{} = clear back to defaults (an intentional
+    # de-calibration is a config change too, and it also moves the era back).
+    if "door_levels" in d:
+        levels_json = json.dumps(_parse_levels(d["door_levels"]), sort_keys=True)
+    else:
+        levels_json = (cur["door_levels"] if cur else "") or "{}"
     if not (1 <= stride <= 25):
         db.close()
         raise HTTPException(400, "stride must be 1..25 (frames between door-pass reads)")
@@ -185,15 +249,17 @@ async def cameras_set(gw: str, cam: str, request: Request):
             # which looks like a model problem rather than an over-subscription problem.
             raise HTTPException(409, f"{n} cameras already enabled (max {MAX_ENABLED} for this GPU) — "
                                      f"disable one first, or raise FLEET_MAX_ENABLED if the box grew")
-    db.execute("INSERT INTO camera_registry (gateway_id,cam,enabled,stride,analyze_fps,note,updated_at) "
-               "VALUES (?,?,?,?,?,?,?) ON CONFLICT(gateway_id,cam) DO UPDATE SET "
+    db.execute("INSERT INTO camera_registry (gateway_id,cam,enabled,stride,analyze_fps,note,updated_at,door_levels) "
+               "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(gateway_id,cam) DO UPDATE SET "
                "enabled=excluded.enabled, stride=excluded.stride, analyze_fps=excluded.analyze_fps, "
-               "note=excluded.note, updated_at=excluded.updated_at",
-               (gw, cam, 1 if enabled else 0, stride, afps, str(d.get("note", ""))[:200], time.time()))
+               "note=excluded.note, updated_at=excluded.updated_at, door_levels=excluded.door_levels",
+               (gw, cam, 1 if enabled else 0, stride, afps, str(d.get("note", ""))[:200], time.time(),
+                levels_json))
     db.commit()
     rows = _rows(db, gw)
     db.close()
     cams, h = _payload(rows, gw)
     return {"ok": True, "cam": cam, "enabled": enabled, "stride": stride, "analyze_fps": afps,
-            "hash": h, "cameras": cams,
-            "note": "the GPU fleet picks this up on its next poll (~30s); nothing restarts"}
+            "door_levels": json.loads(levels_json), "hash": h, "cameras": cams,
+            "note": "the GPU fleet picks this up on its next poll (~30s); a door_levels change "
+                    "restarts that worker and MOVES ITS DOOR ERA (fresh comparability pool)"}

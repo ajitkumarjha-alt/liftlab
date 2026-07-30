@@ -210,6 +210,30 @@ def ops_data(gw: str):
                    "last_ts": last["ts"] if last else None}
     except sqlite3.OperationalError:
         pass                                       # transit_event not created yet (analysis not deployed)
+    # PER-CAMERA transit recency vs THIS HOUR's historical rate — the wedge tell. Computed from
+    # transit_event itself (not the worker heartbeat: a wedged worker heartbeats happily, and a dead
+    # one says nothing), so this stays honest through every failure mode above it. The 07-29/07-30
+    # wedges were invisible for ~4h because the only signals were per-gateway totals and a SQL query
+    # someone had to think to run; a per-cam age that goes amber against the camera's own hourly norm
+    # is the glanceable version. Rate = same-IST-hour transits over the trailing 14 days.
+    transit_percam = {}
+    try:
+        now_s = time.time()
+        h_ist = int(((now_s + 19800) % 86400) // 3600)          # building's clock (+05:30)
+        for r in db.execute("SELECT cam, MAX(ts) last_ts FROM transit_event WHERE gateway_id=? "
+                            "GROUP BY cam", (gw,)).fetchall():
+            transit_percam[r["cam"]] = {"last_ts": r["last_ts"],
+                                        "age_s": round(now_s - (r["last_ts"] or now_s), 0),
+                                        "hist_rate_hr": None}
+        for r in db.execute(
+                "SELECT cam, COUNT(*) n, MIN(ts) t0 FROM transit_event WHERE gateway_id=? AND ts>=? "
+                "AND ((CAST(ts AS INTEGER)+19800)%86400)/3600=? GROUP BY cam",
+                (gw, now_s - 14 * 86400, h_ist)).fetchall():
+            days = max(1.0, min(14.0, (now_s - (r["t0"] or now_s)) / 86400.0))
+            if r["cam"] in transit_percam:
+                transit_percam[r["cam"]]["hist_rate_hr"] = round(r["n"] / days, 1)
+    except sqlite3.OperationalError:
+        pass
     validation = {}
     try:
         for r in db.execute("SELECT cam,state,n_reviewed,n_exact,provenance FROM camera_validation "
@@ -230,6 +254,7 @@ def ops_data(gw: str):
         "live_seg_age": _live_seg_age(gw),         # ground-truth per-cam newest-segment age (seconds)
         "seg_stale_s": SEG_STALE_S,
         "transit": transit,
+        "transit_percam": transit_percam,
         "validation": validation,
         "analyzer": analyzer,
         "relay_series": _series(db, "relay_status", "ts,sum_delivered_mbps,soc_temp,door_fps,streams_delivering", gw),
@@ -407,12 +432,30 @@ function drawData(d){
     return '<div class=card><h3>'+cam+' provenance</h3>'
       +'<div class="big '+(v.state==='live'?'ok':'warn')+'">'+esc(v.state)+'</div>'
       +kv('precision',prov)+(v.state!=='live'?'<div class=kv><a href="/validate">review →</a></div>':'')+'</div>';}).join('');
+  // PER-CAM WEDGE GLANCE: last transit age judged against THIS camera's norm for THIS hour of day.
+  // Rate-relative on purpose — a 40min silence is red on a camera doing 30/hr at 9am and meaningless
+  // at 3am. Thresholds: amber past 3x the expected inter-arrival (floor 10min), red past 6x (floor
+  // 20min); no/low history (<1/hr) renders grey — never a false alarm on a quiet hour.
+  var pc=d.transit_percam||{};
+  var pch=Object.keys(pc).sort().map(function(c){
+    var p=pc[c],rate=p.hist_rate_hr,age=+p.age_s;
+    var agestr=age>=5400?(age/3600).toFixed(1)+'h':Math.round(age/60)+'m';
+    var cc='',tag='';
+    if(rate!=null&&rate>=1){
+      var ia=3600/rate;
+      if(age>Math.max(1200,6*ia)){cc='bad';tag=' — WEDGE?';}
+      else if(age>Math.max(600,3*ia)){cc='warn';tag=' — stalling?';}
+      else cc='ok';
+    }
+    return kv(c,agestr+' ago · '+(rate!=null?('~'+rate+'/hr this hour'):'no history this hour')+tag,cc);
+  }).join('');
+  var pccard=pch?('<div class=card><h3>last transit per camera <span class=pill>vs this hour\'s norm</span></h3>'+pch+'</div>'):'';
   document.getElementById('transit').innerHTML = (tr ?
     ('<div class=card><h3>boarded (24h)</h3><div class="big ok">'+esc(tr.boarded)+'</div></div>'
     +'<div class=card><h3>alighted (24h)</h3><div class=big>'+esc(tr.alighted)+'</div></div>'
     +'<div class=card><h3>last transit</h3>'+kv('ago',tr.last_ts?Math.round(d.t-tr.last_ts)+'s':'—')
     +kv('source','GPU L4')+'</div>')
-    : '<div class=card><h3>transit</h3><div class=kv><span>GPU analyzer not reporting yet</span></div></div>') + vcards;
+    : '<div class=card><h3>transit</h3><div class=kv><span>GPU analyzer not reporting yet</span></div></div>') + pccard + vcards;
   // DOOR WATCH — RETIRED. Once liftlab-watch is stopped, watch_status stops advancing and every tile
   // here goes permanently red. A panel that is always red is a panel people learn to ignore, and it
   // would sit next to the seg-age badges that ARE the truth of the pipe. So past a threshold we stop
