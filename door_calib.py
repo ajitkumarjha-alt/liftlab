@@ -931,7 +931,8 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
     # templates instead of silently charting its output as current.
     thash = gd.templates_hash(tpl)
     result = {"gw": gw, "cam": cam, "stats": stats, "n_templates": len(tpl), "out_path": outp,
-              "label_binding": {"n_stale_excluded": n_stale, "n_unbound_legacy": n_unbound},
+              "label_binding": {"n_stale_excluded": n_stale, "n_unbound_accepted": n_unbound_ok,
+                                "n_unbound_excluded": n_unbound_excl},
               "dims_filter": {"expected": (list(want) if want else None), "source": want_src,
                               "n_kept": len(dims_kept), "n_labeled": len(kept),
                               "skipped_by_dims": skipped_dims,
