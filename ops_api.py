@@ -234,6 +234,36 @@ def ops_data(gw: str):
                 transit_percam[r["cam"]]["hist_rate_hr"] = round(r["n"] / days, 1)
     except sqlite3.OperationalError:
         pass
+    # FLOOR-READ COLLAPSE (the ch16 lesson: camera nudged 07-26, with_floor 54% -> 0 under an
+    # UNCHANGED door_version — config hashes can't see the scene — and nobody noticed for four
+    # days). Per camera: with_floor rate of the last 6h vs its own trailing 7 days. Only a camera
+    # with a REAL baseline (>=20% over >=200 rows) can collapse: never-door-calibrated cameras
+    # (ch30/32/34/37) have no floor reads by construction and must stay grey, not permanently red.
+    floor_percam = {}
+    try:
+        fnow = time.time()
+        base = {r["cam"]: r for r in db.execute(
+            "SELECT cam, COUNT(*) n, SUM(floor IS NOT NULL) wf FROM gw_door_event "
+            "WHERE gateway_id=? AND ts>=? AND ts<? GROUP BY cam",
+            (gw, fnow - 7 * 86400, fnow - 6 * 3600)).fetchall()}
+        recent = {r["cam"]: r for r in db.execute(
+            "SELECT cam, COUNT(*) n, SUM(floor IS NOT NULL) wf FROM gw_door_event "
+            "WHERE gateway_id=? AND ts>=? GROUP BY cam", (gw, fnow - 6 * 3600)).fetchall()}
+        for c in sorted(set(base) | set(recent)):
+            b, r = base.get(c), recent.get(c)
+            bn = b["n"] if b else 0
+            br = ((b["wf"] or 0) / bn) if bn else None
+            rn = r["n"] if r else 0
+            rr = ((r["wf"] or 0) / rn) if rn else None
+            e = {"recent_n": rn, "recent_rate": (round(rr, 3) if rr is not None else None),
+                 "base_n": bn, "base_rate": (round(br, 3) if br is not None else None),
+                 "collapsed": False, "degraded": False}
+            if br is not None and br >= 0.2 and bn >= 200 and rr is not None and rn >= 50:
+                e["collapsed"] = rr <= br * 0.25
+                e["degraded"] = (not e["collapsed"]) and rr <= br * 0.5
+            floor_percam[c] = e
+    except sqlite3.OperationalError:
+        pass
     validation = {}
     try:
         for r in db.execute("SELECT cam,state,n_reviewed,n_exact,provenance FROM camera_validation "
@@ -255,6 +285,7 @@ def ops_data(gw: str):
         "seg_stale_s": SEG_STALE_S,
         "transit": transit,
         "transit_percam": transit_percam,
+        "floor_percam": floor_percam,
         "validation": validation,
         "analyzer": analyzer,
         "relay_series": _series(db, "relay_status", "ts,sum_delivered_mbps,soc_temp,door_fps,streams_delivering", gw),
@@ -450,12 +481,25 @@ function drawData(d){
     return kv(c,agestr+' ago · '+(rate!=null?('~'+rate+'/hr this hour'):'no history this hour')+tag,cc);
   }).join('');
   var pccard=pch?('<div class=card><h3>last transit per camera <span class=pill>vs this hour\'s norm</span></h3>'+pch+'</div>'):'';
+  // FLOOR-READ GLANCE: with_floor rate 6h vs the camera's own 7d baseline. Red = collapse (the
+  // ch16 nudge signature: doors flowing, floors zero, door_version unchanged). Grey = no baseline
+  // (never door-calibrated) — silence, not alarm, for cameras that cannot have floors yet.
+  var fp=d.floor_percam||{};
+  var fph=Object.keys(fp).sort().map(function(c){
+    var p=fp[c];
+    var lab=(p.recent_rate==null?'no rows 6h':(Math.round(p.recent_rate*100)+'% of '+p.recent_n))
+      +' · 7d '+(p.base_rate==null?'—':(Math.round(p.base_rate*100)+'%'));
+    var cc=p.collapsed?'bad':(p.degraded?'warn':((p.base_rate!=null&&p.base_rate>=0.2)?'ok':''));
+    var tag=p.collapsed?' — FLOOR READS COLLAPSED (nudged camera? stale geometry?)':(p.degraded?' — degraded':'');
+    return kv(c,lab+tag,cc);
+  }).join('');
+  var fpcard=fph?('<div class=card><h3>floor reads per camera <span class=pill>6h vs 7d baseline</span></h3>'+fph+'</div>'):'';
   document.getElementById('transit').innerHTML = (tr ?
     ('<div class=card><h3>boarded (24h)</h3><div class="big ok">'+esc(tr.boarded)+'</div></div>'
     +'<div class=card><h3>alighted (24h)</h3><div class=big>'+esc(tr.alighted)+'</div></div>'
     +'<div class=card><h3>last transit</h3>'+kv('ago',tr.last_ts?Math.round(d.t-tr.last_ts)+'s':'—')
     +kv('source','GPU L4')+'</div>')
-    : '<div class=card><h3>transit</h3><div class=kv><span>GPU analyzer not reporting yet</span></div></div>') + pccard + vcards;
+    : '<div class=card><h3>transit</h3><div class=kv><span>GPU analyzer not reporting yet</span></div></div>') + pccard + fpcard + vcards;
   // DOOR WATCH — RETIRED. Once liftlab-watch is stopped, watch_status stops advancing and every tile
   // here goes permanently red. A panel that is always red is a panel people learn to ignore, and it
   // would sit next to the seg-age badges that ARE the truth of the pipe. So past a threshold we stop
