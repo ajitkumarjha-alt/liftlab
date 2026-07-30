@@ -635,12 +635,28 @@ def _expected_era(gw, cam):
     return (era or None), d.get("built_at")
 
 
-def _era_for(db, gw, cam):
+def _era_for(db, gw, cam, override=""):
     """The templates-hash prefix to filter this camera's door rows by, and where it came from.
 
     Auto-resolution takes the newest row's door_version — a rebuild therefore moves the era on its
     own, which is correct: the new templates ARE a new instrument. The panel prints whichever era
-    was used, so an auto-resolved era is never silent."""
+    was used, so an auto-resolved era is never silent.
+
+    override (2026-07-30): a REQUEST-level era selection, same format as DASH_DOOR_ERA ("cam=era,..."
+    or a single era). Auto-newest made yesterday's h2 rollover HIDE a week of history on every camera
+    — 41,789 pre-h2 ch16 rows unreachable from the UI read as data loss. The selector makes viewing
+    an old era a deliberate act; it changes only what THIS response aggregates, never what is stored."""
+    ov = (override or "").strip()
+    if ov and ov != "auto":
+        if "=" in ov:
+            for part in ov.split(","):
+                k, _, v = part.partition("=")
+                if k.strip() == cam and v.strip():
+                    return v.strip(), "selected in the UI (per-camera)"
+            # a per-cam selection that omits this cam falls through to the normal resolution —
+            # picking an era for ch16 must not blank every other camera's panel
+        else:
+            return ov, "selected in the UI"
     spec = (DOOR_ERA or "auto").strip()
     if spec and spec != "auto":
         if "=" in spec:
@@ -887,16 +903,29 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
     return admitted, detail
 
 
-def _tier2(db, gw, cam, transits, t0=None, t1=None):
+def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
     """Tier-2 for one camera, from the gw_door_event stream of ONE era.
 
     transits: [(ts, direction)] for this cam, ascending — joined to door-open windows for per-floor
     demand. Returns None when the era has no rows at all (nothing to say), otherwise a dict whose
     every metric carries its own n plus the era/quality filter that produced it.
+    era_override: request-level era selection (see _era_for) — metrics from any era, deliberately.
     """
-    era, era_src = _era_for(db, gw, cam)
+    era, era_src = _era_for(db, gw, cam, era_override)
     if not era:
         return None
+    # Era census for the selector: every era this camera has EVER written, with span + row count,
+    # so the UI can offer "view that week" instead of auto-newest silently hiding it.
+    era_census = {}
+    for r in _q(db, "SELECT door_version dv, COUNT(*) n, MIN(ts) t0, MAX(ts) t1 FROM gw_door_event "
+                    "WHERE gateway_id=? AND cam=? AND door_version IS NOT NULL AND door_version<>'' "
+                    "GROUP BY door_version", (gw, cam)):
+        p = str(r["dv"]).split("+")[0]
+        e = era_census.setdefault(p, {"era": p, "rows": 0, "first": r["t0"], "last": r["t1"]})
+        e["rows"] += r["n"]
+        e["first"] = min(e["first"], r["t0"])
+        e["last"] = max(e["last"], r["t1"])
+    eras_list = sorted(era_census.values(), key=lambda e: (e["last"] or 0), reverse=True)
     rows = _q(db, "SELECT ts, floor, direction, door_state, reason, read_conf FROM gw_door_event "
                   "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
               (gw, cam, era + "%"))
@@ -929,7 +958,10 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
     # flip rules cap neighbour gaps at seconds, and an era change is a restart-sized gap. Labels
     # (labels.json) were always era-independent.
     manual = _floor_alphabet(cam)
-    alpha_rows = _q(db, "SELECT ts, floor, reason FROM gw_door_event "
+    # read_conf is REQUIRED by _derive_floor_alphabet (flip-kill mean-confidence, line ~802) — a
+    # sqlite3.Row raises IndexError on a missing column, and the 2026-07-29 all-era widening shipped
+    # without it, 500ing every dash_data call. Keep this SELECT in lockstep with the derivation.
+    alpha_rows = _q(db, "SELECT ts, floor, reason, read_conf FROM gw_door_event "
                         "WHERE gateway_id=? AND cam=? AND floor IS NOT NULL ORDER BY ts", (gw, cam))
     derived, alpha_detail = _derive_floor_alphabet(alpha_rows, _labels_evidence(gw, cam))
     if manual is not None:
@@ -1063,6 +1095,7 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None):
     return {
         "era": era,
         "era_source": era_src,
+        "eras": eras_list,                        # every era this camera ever wrote (selector data)
         "expected_era": exp_era, "built_at": built_at, "stale_templates": stale_templates,
         "era_filter": era_note,
         "quality_reasons": list(DOOR_OK_REASONS),
@@ -1165,7 +1198,7 @@ def _latest(db, table, gw):
 
 
 @dash_router.get("/dash/{gw}/data")
-def dash_data(gw: str):
+def dash_data(gw: str, era: str = ""):
     db = _db()
     now = time.time()
     cams = _cameras(db, gw)
@@ -1176,7 +1209,7 @@ def dash_data(gw: str):
     floor_cov = _floor_coverage(db, gw)
     registry = _registry(db, gw)
     tj = _transits_for_join(db, gw)
-    tier2 = {c["cam"]: _tier2(db, gw, c["cam"], tj.get(c["cam"], [])) for c in cams}
+    tier2 = {c["cam"]: _tier2(db, gw, c["cam"], tj.get(c["cam"], []), era_override=era) for c in cams}
     tier2 = {k: v for k, v in tier2.items() if v}
     ana = _analyzers(db, gw)
     val = _validations(db, gw)
@@ -1285,7 +1318,7 @@ def dash_data(gw: str):
 
 @dash_router.get("/dash/{gw}/trends")
 def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
-                period: str = "all", from_d: str = "", to_d: str = ""):
+                period: str = "all", from_d: str = "", to_d: str = "", era: str = ""):
     """Hour-of-day profile + window stats for a DATE RANGE. cam='' -> FLEET (all lift cams).
 
     period = day | week | month | all, or an explicit from_d/to_d (YYYY-MM-DD). The hour-of-day
@@ -1304,6 +1337,19 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                 "FROM gw_event e JOIN gw_source s ON s.id=e.source_id WHERE s.gateway_id=?" + cam_filter, args)
     tr = _q(db, "SELECT ts, direction FROM transit_event WHERE gateway_id=?" +
             (" AND cam=?" if cam else ""), ([gw, cam] if cam else [gw]))
+    # GPU DOOR CYCLES. gw_event froze at the Pi-watch retirement (2026-07-21) but this profile kept
+    # reading ONLY it, so every post-retirement range showed "0 cycles" while gw_door_event held
+    # hundreds (07-30 ch16: 0 shown vs 253 with_travel in the DB — read as data loss, was a view
+    # bug). One completed close (close_travel_s NOT NULL) = one cycle, era-scoped per camera exactly
+    # like the panel, era override honoured. The instruments never overlap in time, so the hourly
+    # cycle counts can share buckets; close-travel values must NOT pool — see close_instrument.
+    gpu_cyc = []
+    for c in ([cam] if cam else [x["cam"] for x in _cameras(db, gw)]):
+        e, _esrc = _era_for(db, gw, c, era)
+        if e:
+            gpu_cyc += _q(db, "SELECT ts, close_travel_s ct FROM gw_door_event WHERE gateway_id=? "
+                              "AND cam=? AND door_version LIKE ? AND close_travel_s IS NOT NULL",
+                          (gw, c, e + "%"))
     # COUNTING-ERA SPANS, derived from validation_item stamps (first/last episode per version) —
     # never from a hardcoded date. A range that spans more than one era pools transits counted by
     # DIFFERENT logic; the payload names every era in range so the UI can label the pooling, and an
@@ -1322,11 +1368,12 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
     tier2_range = None
     if cam:
         tjoin = sorted((r["ts"], r["direction"]) for r in tr if r["ts"] is not None)
-        tier2_range = _tier2(db, gw, cam, tjoin, t0, t1)
+        tier2_range = _tier2(db, gw, cam, tjoin, t0, t1, era_override=era)
     db.close()
     if t0 is not None:
         ev = [r for r in ev if _in_range(_epoch(r["os"]), t0, t1)]
         tr = [r for r in tr if _in_range(r["ts"], t0, t1)]
+        gpu_cyc = [r for r in gpu_cyc if _in_range(r["ts"], t0, t1)]
     eras_in_range = [{"version": e["v"], "first_seen": _iso_ist(e["lo"]), "last_seen": _iso_ist(e["hi"]),
                      "n_episodes": e["n"]}
                      for e in era_rows if e["lo"] is not None
@@ -1334,6 +1381,11 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
 
     prof = {h: {"cycles": 0, "boarded": 0, "alighted": 0, "closes": [], "xfer": []} for h in range(24)}
     days = set()
+    # ONE instrument per close-travel series: Pi (gw_event) and GPU (gw_door_event) measure the same
+    # name with different edges/clocks and must never share a bucket. When the range has any GPU
+    # cycles the GPU is the close instrument (it is the live one); a purely pre-retirement range
+    # stays Pi. Cycle COUNTS may share buckets — the tables never overlap in time.
+    close_instrument = "gpu" if gpu_cyc else ("pi" if ev else None)
     for r in ev:
         h = _local_hour(r["os"])
         if h is None:
@@ -1342,17 +1394,27 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
         prof[h]["cycles"] += 1                                   # every opening = demand (flagged included)
         ep = _epoch(r["os"])
         clean = (r["q"] is None or r["q"] == "ok")
-        if r["ct"] is not None and clean and ep is not None and ep >= _BOUNDARY_EPOCH:
+        if (close_instrument == "pi" and r["ct"] is not None and clean
+                and ep is not None and ep >= _BOUNDARY_EPOCH):
             prof[h]["closes"].append(float(r["ct"]))             # comparable regime only
         load = (r["b"] or 0) + (r["a"] or 0)
         o, c = _epoch(r["of"]), _epoch(r["cs"])
         if load > 0 and o is not None and c is not None and c > o:
             prof[h]["xfer"].append((c - o) / load)
+    for r in gpu_cyc:
+        h = _ist_hour(r["ts"])
+        if h is None:
+            continue
+        days.add(datetime.fromtimestamp(r["ts"], IST).date().isoformat())
+        prof[h]["cycles"] += 1                                   # one completed close = one cycle
+        if close_instrument == "gpu" and r["ct"] is not None:
+            prof[h]["closes"].append(float(r["ct"]))
     for r in tr:
         try:
             h = datetime.fromtimestamp(r["ts"], IST).hour
         except Exception:
             continue
+        days.add(datetime.fromtimestamp(r["ts"], IST).date().isoformat())
         prof[h]["boarded" if r["direction"] == "in" else "alighted"] += 1
 
     # Days that actually CONTRIBUTED, reported honestly; the max(1,..) is only the divisor guard.
@@ -1391,7 +1453,11 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                                                    "a crossing range pools transits counted by different logic"},
                          "range": {"period": period, "from_d": from_d, "to_d": to_d,
                                    "label": range_label, "t0": t0, "t1": t1,
-                                   "cycles": len(ev), "transits": len(tr)},
+                                   "cycles": len(ev) + len(gpu_cyc), "transits": len(tr),
+                                   # provenance of the cycle count + which instrument the close
+                                   # series uses — a pooled close median would be two instruments
+                                   "cycles_pi": len(ev), "cycles_gpu": len(gpu_cyc),
+                                   "close_instrument": close_instrument},
                          "boundaries": {"close_travel_max": {"iso": CLOSE_TRAVEL_MAX_BOUNDARY, "epoch": _BOUNDARY_EPOCH,
                                         "note": "CLOSE_TRAVEL_MAX 10->30s; close-travel here uses the post-boundary regime only"}},
                          "data_gaps": [g for g in DATA_GAPS if (cam is None or cam in g.get("cams", []) or not g.get("cams"))]})
@@ -1439,14 +1505,19 @@ def dash_cams(gw: str):
 
 @dash_router.get("/dash/{gw}/export.csv")
 def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
-                period: str = "all", from_d: str = "", to_d: str = ""):
-    """Download the underlying rows. dataset = door_cycles | transits | floor_events | per_floor."""
+                period: str = "all", from_d: str = "", to_d: str = "", era: str = ""):
+    """Download the underlying rows. dataset = door_cycles | transits | floor_events | per_floor.
+
+    era applies to the era-scoped datasets (floor_events, per_floor): "" = each camera's current
+    era exactly as the panel resolves it; an explicit spec ("ch16=abc123h1" or a bare era) selects
+    one deliberately; era=all (floor_events only) exports EVERY era with an `era` label column —
+    the whole history in one Excel-able file, comparability carried per row instead of by the URL."""
     if dataset not in _EXPORT:
         return JSONResponse({"error": f"unknown dataset {dataset!r}", "datasets": _EXPORT}, status_code=400)
     t0, t1, label = _range_bounds(period, from_d, to_d)
     db = _db()
     rng = f"{from_d or 'start'}_to_{to_d or 'today'}" if (from_d or to_d) else (period or "all")
-    tag = f"{gw}_{cam or 'fleet'}_{dataset}_{rng}"
+    tag = f"{gw}_{cam or 'fleet'}_{dataset}_{rng}" + ("_all-eras" if era.strip() == "all" else "")
     tag = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
 
     if dataset == "door_cycles":
@@ -1472,29 +1543,41 @@ def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
     if dataset == "floor_events":
         # Per-camera era, exactly as the panel resolves it — a fleet export spans several cameras
         # with DIFFERENT eras, so one global LIKE would silently drop whole cameras from the file.
+        # era=all: NO era filter — every row ever written, with an explicit era column, so history
+        # is visible in one file and rows from different instruments are labelled, never pooled
+        # silently (the 07-30 "where did my 41,789 pre-h2 rows go" — they were era-hidden, not lost).
         cams = [cam] if cam else [c["cam"] for c in _cameras(db, gw)]
         rows = []
-        for c in cams:
-            era, _src = _era_for(db, gw, c)
-            if not era:
-                continue
-            rows += _q(db, "SELECT cam, ts, floor, direction, door_state, read_conf, panels_agreed, "
-                           "reason, close_travel_s, door_version FROM gw_door_event "
-                           "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
-                       (gw, c, era + "%"))
+        if era.strip() == "all":
+            for c in cams:
+                rows += _q(db, "SELECT cam, ts, floor, direction, door_state, read_conf, panels_agreed, "
+                               "reason, close_travel_s, door_version FROM gw_door_event "
+                               "WHERE gateway_id=? AND cam=? ORDER BY ts", (gw, c))
+        else:
+            for c in cams:
+                e, _src = _era_for(db, gw, c, era)
+                if not e:
+                    continue
+                rows += _q(db, "SELECT cam, ts, floor, direction, door_state, read_conf, panels_agreed, "
+                               "reason, close_travel_s, door_version FROM gw_door_event "
+                               "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
+                           (gw, c, e + "%"))
         db.close()
         out = [(r["cam"], r["ts"], _iso_ist(r["ts"]), r["floor"], r["direction"], r["door_state"],
-                r["read_conf"], r["panels_agreed"], r["reason"], r["close_travel_s"], r["door_version"])
+                r["read_conf"], r["panels_agreed"], r["reason"], r["close_travel_s"], r["door_version"],
+                str(r["door_version"] or "").split("+")[0])
                for r in rows if _in_range(r["ts"], t0, t1)]
         return _csv(out, ["cam", "ts_epoch", "ts_ist", "floor", "direction", "door_state", "read_conf",
-                          "panels_agreed", "reason", "close_travel_s", "door_version"], f"{tag}.csv")
+                          "panels_agreed", "reason", "close_travel_s", "door_version", "era"], f"{tag}.csv")
 
     # per_floor — the aggregate as displayed, including the by-hour columns the heatmap draws
     tj = _transits_for_join(db, gw)
     cams = [cam] if cam else [c["cam"] for c in _cameras(db, gw)]
     out = []
     for c in cams:
-        t2 = _tier2(db, gw, c, tj.get(c, []), t0, t1)
+        # era=all is a floor_events concept; per_floor is one era's aggregate by construction
+        t2 = _tier2(db, gw, c, tj.get(c, []), t0, t1,
+                    era_override=("" if era.strip() == "all" else era))
         if not t2:
             continue
         for f in t2["per_floor"]:
@@ -1782,7 +1865,31 @@ function panel(d){
     +'<div class=card><h3>Camera</h3>'+kv('channel',esc(c.channel))+kv('label',esc(c.label||'—'))
       +kv('snapshot',c.snap?('<span class="'+staleCls(c.snap.age_s,20)+'">'+age(c.snap.age_s)+'</span>'):'—')+'</div>'
     +'</div></div>'
-    + tier2card((d.tier2||{})[c.cam]);
+    + tier2card((d.tier2||{})[c.cam], c.cam);
+}
+
+// ── ERA SELECTOR ─────────────────────────────────────────────────────────────────────────
+// Auto-newest is right for operations and wrong for archaeology: the h2 rollover hid a week of
+// rows on every camera and read as data loss. ERA[cam] holds a deliberate selection; '' = auto.
+// The selection rides every data/trends/CSV fetch, so the panel, heatmap and exports always
+// describe the same rows.
+var ERA={};
+function eraQuery(){
+  var parts=Object.keys(ERA).filter(function(c){return ERA[c]}).map(function(c){return c+'='+ERA[c]});
+  return parts.length?('era='+encodeURIComponent(parts.join(','))):'';
+}
+function setEra(cam,v){ERA[cam]=v;load();if(TR)loadTrends();}
+function eraSelector(t,cam){
+  var es=t.eras||[];
+  if(es.length<2)return '';                     // one era = nothing to select
+  function d(x){return x?new Date(x*1000).toLocaleDateString():'?'}
+  var opts='<option value="">auto — newest ('+esc(t.eras[0].era)+')</option>'
+    +es.map(function(e){
+      return '<option value="'+esc(e.era)+'"'+((ERA[cam]||'')===e.era?' selected':'')+'>'
+        +esc(e.era)+' · '+e.rows+' rows · '+d(e.first)+'–'+d(e.last)+'</option>';}).join('');
+  return '<span style="margin-left:8px">era: <select onchange="setEra(\''+esc(cam)+'\',this.value)" '
+    +'style="font:inherit;font-size:11px">'+opts+'</select></span>'
+    +((ERA[cam])?' <b class=warn>viewing a selected era, not the live one</b>':'');
 }
 
 // ── GPU camera registry (wizard piece 5) ─────────────────────────────────────────────────
@@ -1822,7 +1929,7 @@ document.addEventListener('click',function(e){
 // mixing instruments. The per-reason census is shown so an empty table reads as "the filter
 // excluded everything" rather than "the lift made no stops".
 function t2num(v,unit){return v==null?'—':(v+(unit||''))}
-function tier2card(t){
+function tier2card(t,cam){
   if(!t){return '';}
   var s=t.stops||{}, su=t.speed_up||{}, sd=t.speed_down||{};
   var cen=Object.keys(t.reason_census||{}).sort().map(function(k){
@@ -1839,6 +1946,7 @@ function tier2card(t){
     +'<h3>Tier-2 · stops, direction &amp; speed <span class=mut style="font-weight:400;font-size:11px">from gw_door_event</span></h3>'
     +(t.stale_templates?('<div class=warnrow><b>STALE TEMPLATES</b> — '+esc(t.stale_templates)+'</div>'):'')
     +'<div class=mut style="font-size:11px;margin-bottom:6px">era: <b>'+esc(t.era_filter)+'</b>'
+    +(cam?eraSelector(t,cam):'')
     +(t.expected_era?(' · last build produced <b>'+esc(t.expected_era)+'</b>'+(t.stale_templates?' <span class=bad>(MISMATCH)</span>':' ✓')):'')
     +'<br>'
     +'rows in era '+t.rows_in_era+' → confident reads <b>'+t.confident_reads+'</b> · reasons seen: '+(cen||'—')
@@ -2040,10 +2148,12 @@ function clearDates(){trFrom='';trTo='';trPeriod='all';loadTrends();}
 // ONE query builder for the trends fetch AND every CSV link — the chart and its export can never
 // describe different rows. from_d/to_d are YYYY-MM-DD (IST calendar days, inclusive both ends).
 function trQuery(){
+  var eq=eraQuery();
   return 'period='+encodeURIComponent(trPeriod||'all')
     +(trFrom?('&from_d='+encodeURIComponent(trFrom)):'')
     +(trTo?('&to_d='+encodeURIComponent(trTo)):'')
-    +(trCam?('&cam='+encodeURIComponent(trCam)):'');
+    +(trCam?('&cam='+encodeURIComponent(trCam)):'')
+    +(eq?('&'+eq):'');
 }
 function toggleTable(){trTable=!trTable;renderTrends();}
 function periodBar(){
@@ -2066,8 +2176,14 @@ function dl(ds,label){
   return '<a class=dlbtn href="/dash/'+GW+'/export.csv?dataset='+ds+'&'+trQuery()+'">⤓ '+label+'</a>';
 }
 function exportBar(){
+  // floor events ALL ERAS: no era filter, an `era` label column per row — full history in one
+  // file, so Excel gets everything at once and the era discipline travels as data, not as a URL.
+  var allEras='<a class=dlbtn href="/dash/'+GW+'/export.csv?dataset=floor_events&era=all'
+    +'&period='+encodeURIComponent(trPeriod||'all')
+    +(trFrom?('&from_d='+encodeURIComponent(trFrom)):'')+(trTo?('&to_d='+encodeURIComponent(trTo)):'')
+    +(trCam?('&cam='+encodeURIComponent(trCam)):'')+'">⤓ floor events — ALL eras, labelled</a>';
   return '<div class=dlbar>'+dl('door_cycles','door cycles')+dl('transits','transits')
-    +dl('floor_events','floor events')+dl('per_floor','per-floor')
+    +dl('floor_events','floor events')+dl('per_floor','per-floor')+allEras
     +'<span class=mut style="font-size:11px">CSV — the rows behind these charts, same range'+(trCam?'':' (fleet)')+'</span></div>';
 }
 function trTableHtml(prof,W){
@@ -2160,7 +2276,8 @@ function loadTrends(){
 
 function render(){ if(!DATA)return; nav(); strip(DATA); headline(DATA); unavail(DATA); if(mode==='cams'){tabs(DATA); panel(DATA);} }
 function load(){
-  fetch('/dash/'+GW+'/data').then(function(r){return r.json()}).then(function(d){
+  var eq=eraQuery();
+  fetch('/dash/'+GW+'/data'+(eq?('?'+eq):'')).then(function(r){return r.json()}).then(function(d){
     DATA=d; document.getElementById('stamp').textContent='· '+d.ist_today+' · updated '+new Date().toLocaleTimeString();
     render();
   }).catch(function(){document.getElementById('stamp').textContent='· FETCH FAILED';});

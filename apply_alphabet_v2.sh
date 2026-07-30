@@ -13,7 +13,9 @@ APP=/opt/liftlab-b3/cloud
 PY=$APP/.venv/bin/python
 SVC=liftlab-cloud
 OWNER=liftlab
-V2_PIN=ca1cd6a7867e461d9538e4c1a7ee46ee   # the reviewed artifact; guards a stale/partial staged copy
+V2_PIN=77e3a44fc61786634fdc64bcb456ac3b   # 2026-07-30 build (read_conf fix + era selector); the OLD pin
+                                          # ca1cd6a7 was the artifact that 500'd — a stale staged copy
+                                          # matching it must refuse to install, hence the re-pin
 BEFORE=/home/ajit_kumarjha/alpha_before.json
 AFTER=/home/ajit_kumarjha/alpha_after.json
 say(){ echo "[alpha-v2] $*"; }
@@ -55,8 +57,10 @@ PYEOF
 RC=$?; rm -f "$TMP"
 [ $RC = 0 ] || { say "smoke-import FAILED — nothing installed"; exit 1; }
 
-# BEFORE snapshot from the still-running OLD code, if one wasn't captured already
-[ -f "$BEFORE" ] || curl -s -o "$BEFORE" http://127.0.0.1:9090/dash/site-A/data || true
+# BEFORE snapshot from the still-running OLD code, if one wasn't captured already. -f: a 500 body
+# is not a snapshot — writing it anyway is what fed the diff step non-JSON and crashed it.
+[ -s "$BEFORE" ] || curl -fs -o "$BEFORE" --max-time 15 http://127.0.0.1:9090/dash/site-A/data \
+  || say "BEFORE snapshot unavailable (old code not answering /dash data — expected when this apply fixes a 500)"
 
 say "2/5 backup"
 TS=$(date -u +%Y%m%d-%H%M%S)
@@ -115,27 +119,72 @@ for i in $(seq 1 60); do
   CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$LIVE") || CODE=000
   [ "$CODE" = "200" ] && break
 done
-if systemctl is-active --quiet "$SVC" && [ "$CODE" = "200" ]; then
-  curl -s -o "$AFTER" --max-time 15 "$DATA" || true
-  say "service UP at $(date -u +%FT%TZ) UTC (MainPID $OLDPID -> $NEWPID, openapi 200 after $i probes)"
-else
+if ! systemctl is-active --quiet "$SVC" || [ "$CODE" != "200" ]; then
   say "NEW PID $NEWPID NOT ANSWERING after 60 probes (active=$(systemctl is-active "$SVC"), HTTP $CODE) — RESTORING"
+  cp -p "$APP/dash_api.py.bak.$TS" "$APP/dash_api.py"
+  systemctl restart "$SVC"
+  exit 1
+fi
+# PHASE 3 — the endpoint that actually fronts the DB and the derivation. openapi.json proved the
+# module IMPORTS; the 2026-07-29 regression (alpha_rows missing read_conf) imported perfectly and
+# 500'd on every request all night. A handler that 500s is a broken install: probe it LIVE, require
+# 200 AND parseable JSON, restore on anything else. This same body becomes the AFTER snapshot.
+say "openapi 200 — phase 3: live GET $DATA"
+DCODE=000
+for j in $(seq 1 30); do
+  DCODE=$(curl -s -o "$AFTER" -w '%{http_code}' --max-time 20 "$DATA") || DCODE=000
+  [ "$DCODE" = "200" ] && break
+  sleep 2
+done
+if [ "$DCODE" = "200" ] && "$PY" -c "import json,sys; json.load(open(sys.argv[1]))" "$AFTER" 2>/dev/null; then
+  say "service UP at $(date -u +%FT%TZ) UTC (MainPID $OLDPID -> $NEWPID, openapi 200 after $i probes, "
+  say "dash data 200 + valid JSON after $j probes)"
+else
+  say "DASH DATA PROBE FAILED (HTTP $DCODE, or body not JSON) — module imports but the handler is "
+  say "broken; exactly the failure smoke-import cannot see. RESTORING"
   cp -p "$APP/dash_api.py.bak.$TS" "$APP/dash_api.py"
   systemctl restart "$SVC"
   exit 1
 fi
 
 say "5/5 before/after admitted-set diff (ch16)"
-[ -s "$AFTER" ] || curl -s -o "$AFTER" --max-time 15 "$DATA" || true
-python3 - "$BEFORE" "$AFTER" <<'PYEOF' || say "diff step failed (snapshot missing?) — service is UP regardless"
+# The AFTER side is guaranteed by phase 3 (200 + valid JSON), so a failure HERE is a real acceptance
+# failure and now says WHY instead of dying on json.load with "Expecting value: line 1 column 1"
+# — which is how this step spent a week failing "non-fatally" while being the only automatic check.
+python3 - "$BEFORE" "$AFTER" <<'PYEOF' || { say "DIFF/ACCEPTANCE FAILED — service is UP but the AFTER payload is not what phase 3 just verified; investigate before trusting the derive"; }
 import json, sys
-def wl(p):
-    d = json.load(open(p))
+
+def load(path, name):
+    """The snapshot as parsed JSON, or None WITH THE REASON PRINTED — an unexplained diff failure
+    is an acceptance check nobody believes."""
+    try:
+        raw = open(path, "rb").read()
+    except OSError as e:
+        print("%s: unreadable (%s)" % (name, e)); return None
+    if not raw.strip():
+        print("%s: EMPTY — curl wrote nothing (endpoint was 500ing / timed out)" % name); return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        print("%s: NOT JSON, first 120 bytes: %r" % (name, raw[:120])); return None
+
+def wl(d):
     t = (d.get("tier2") or {}).get("ch16") or {}
     return set(t.get("floor_whitelist") or []), t
-b, _ = wl(sys.argv[1])
-a, t = wl(sys.argv[2])
+
+after = load(sys.argv[2], "AFTER")
+if after is None:
+    sys.exit(1)                                    # phase 3 verified this — a failure here is real
+a, t = wl(after)
 key = lambda s: (len(s), s)
+before = load(sys.argv[1], "BEFORE")
+if before is None:
+    # Degrade honestly: no before-picture (old code was 500ing, or first run) — show the after
+    # state so the operator still gets the admitted set, and say what is missing.
+    print("no usable BEFORE snapshot — showing AFTER only (n=%d): %s"
+          % (len(a), " ".join(sorted(a, key=key)) or "(empty)"))
+    sys.exit(0)
+b, _ = wl(before)
 print("BEFORE n=%d  AFTER n=%d" % (len(b), len(a)))
 print("REMOVED:", " ".join(sorted(b - a, key=key)) or "(none)")
 print("ADDED:  ", " ".join(sorted(a - b, key=key)) or "(none)")
