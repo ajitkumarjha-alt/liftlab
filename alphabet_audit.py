@@ -50,10 +50,9 @@ from datetime import datetime
 from pathlib import Path
 
 from door_calib import (CALIB_DIR, CAM, GW, CalibError, _calib_dir, _cells_space,
-                        _chown_tree, _load_bind, _png_wh, _save_bind, _sha16,
-                        _write_result)
+                        _chown_tree, _gateway_db, _load_bind, _png_wh, _save_bind,
+                        _sha16, _write_result)
 
-GATEWAY_DB = os.environ.get("GATEWAY_DB", "/opt/liftlab-b3/cloud/gateway.db")
 _LOCAL = datetime.now().astimezone()
 TZ_NAME = _LOCAL.tzname() or time.strftime("%Z")
 TZ_OFFSET = _LOCAL.strftime("%z")
@@ -72,6 +71,28 @@ def _labels(outdir):
         return json.loads((outdir / "labels.json").read_text())
     except (OSError, ValueError):
         return {}
+
+
+def _resolve_db(db_path):
+    """The gateway DB with NO guessing and PROOF it is the right kind of file. The
+    previous default read a stray db (sudo strips $GATEWAY_DB) and produced a confident
+    fleet-wide wrong conclusion — so now: explicit path or $GATEWAY_DB (absolute,
+    existing, via door_calib._gateway_db) AND the file must actually contain
+    gw_door_event, or this aborts rather than warns. Returns (path, header-dict); the
+    header (path, size, mtime) prints on every report."""
+    import sqlite3
+    dbp = _gateway_db(db_path)
+    db = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    db.close()
+    if "gw_door_event" not in tables:
+        raise CalibError(f"{dbp} has NO gw_door_event table — this is not a gateway DB "
+                         f"(tables: {sorted(tables)[:12] or 'none'}). Refusing to continue "
+                         f"on the wrong file; point GATEWAY_DB/--db at the ingest DB.")
+    st = os.stat(dbp)
+    return dbp, {"path": dbp, "size_bytes": st.st_size, "mtime_iso": _iso(st.st_mtime),
+                 "has_floor_sample": "floor_sample" in tables,
+                 "resolved_from": "--db (explicit)" if db_path else "$GATEWAY_DB"}
 
 
 def derive_boundary(gw, cam, db_path, min_side_hours=24, min_side_rows=200):
@@ -258,7 +279,8 @@ def _glyph_counts(label_by_crop, exclude=()):
 
 
 def audit(gw=None, cam=None, boundary=None, old_space="110x170", new_dims=None,
-          archive="crops-pre-nudge-0722", db_path=None):
+          archive="crops-pre-nudge-0722", db_path=None,
+          expect_glyphs="0,1,2,3,4,5,6,7,8,9,up,down"):
     """Full contamination report as a JSON-able dict; writes _alphabet_audit.json next
     to the crops. Read-only on all evidence."""
     gwid, cam = gw or GW, cam or CAM
@@ -271,7 +293,7 @@ def audit(gw=None, cam=None, boundary=None, old_space="110x170", new_dims=None,
         quarantined_already = set(json.loads((outdir / "quarantine.json").read_text()))
     except (OSError, ValueError):
         quarantined_already = set()
-    dbp = db_path or GATEWAY_DB
+    dbp, db_info = _resolve_db(db_path)
     bts, boundary_info = _resolve_boundary(gwid, cam, boundary, dbp)
     w0, h0 = (int(x) for x in old_space.lower().split("x"))
     old_dims = {(w0, h0), (h0, w0)}
@@ -347,6 +369,11 @@ def audit(gw=None, cam=None, boundary=None, old_space="110x170", new_dims=None,
     min_ex = int(os.environ.get("MIN_GLYPH_EXAMPLES", "3"))
     buildable_admissible = sorted(g for g, n in buildable.items() if n >= min_ex)
     fresh_collect_needed = len(buildable_crops) == 0 or not buildable_admissible
+    # COVERAGE, not just volume: 59 crops from one short window can miss whole digits.
+    # A coverage gap left unstated presents as a geometry failure at acceptance.
+    expected = [x.strip() for x in expect_glyphs.split(",") if x.strip()]
+    missing_glyphs = [g for g in expected if buildable.get(g, 0) == 0]
+    short_glyphs = {g: buildable[g] for g in expected if 0 < buildable.get(g, 0) < min_ex}
 
     # archive reconcile: the crops-pre-nudge-0722 sweep should have taken the WHOLE
     # pre-boundary old-space population — anything old-space still live in the active
@@ -413,10 +440,13 @@ def audit(gw=None, cam=None, boundary=None, old_space="110x170", new_dims=None,
         "manual_confirmation_needed": [r["crop"] for r in manual_q],
         "inventory": inventory,
         "glyphs": glyphs, "total_loss_glyphs": total_loss, "thin_after_quarantine": thin_after,
+        "gateway_db": db_info,
         "buildable": {"n_crops": len(buildable_crops), "per_glyph": buildable,
                       "admissible_at_min_examples": buildable_admissible,
                       "min_examples": min_ex,
-                      "fresh_collect_needed": fresh_collect_needed},
+                      "fresh_collect_needed": fresh_collect_needed,
+                      "expected_glyphs": expected, "missing_glyphs": missing_glyphs,
+                      "short_glyphs": short_glyphs},
         "archive_reconcile": archive_reconcile,
         "current_build": build and {"era": build.get("era"), "built_at": build.get("built_at"),
                                     "built_at_iso": _iso(build.get("built_at")),
@@ -439,14 +469,15 @@ QUARANTINE_CRITERION = ("--quarantine acts on CONTAMINATED crops only (old-space
 
 
 def quarantine(gw=None, cam=None, boundary=None, old_space="110x170", new_dims=None,
-               archive="crops-pre-nudge-0722", db_path=None, reason=None, yes=False):
+               archive="crops-pre-nudge-0722", db_path=None, reason=None, yes=False,
+               expect_glyphs="0,1,2,3,4,5,6,7,8,9,up,down"):
     """Apply the audit's AUTO-quarantinable verdicts only — see QUARANTINE_CRITERION
     (printed, and enforced here: the selection is auto_quarantinable, never 'flagged').
     Without yes=True this is a preview: prints the target set, WRITES NOTHING.
     quarantine.json gains the evidence, labels.json entry -> '-'. Backup first, atomic
     writes, idempotent, never touches a png. Crops convicted only by a clustered mtime
     are SKIPPED and listed for manual confirmation."""
-    result = audit(gw, cam, boundary, old_space, new_dims, archive, db_path)
+    result = audit(gw, cam, boundary, old_space, new_dims, archive, db_path, expect_glyphs)
     gwid, cam = gw or GW, cam or CAM
     outdir = _calib_dir(gwid, cam)
     targets = [r for r in result["inventory"] if r["auto_quarantinable"]]
@@ -594,6 +625,8 @@ def void_labels(gw=None, cam=None, yes=False):
     outdir = _calib_dir(gwid, cam)
     labels = _labels(outdir)
     plan = {"gw": gwid, "cam": cam, "n_labels_voided": len(labels),
+            "labels_being_voided": {k: v for k, v in sorted(labels.items())
+                                    if str(v or "").strip()},
             "moves": [f"{n} -> {n}.void.<ts>" for n in ("labels.json", "labels_bind.json")
                       if (outdir / n).exists()]}
     if not yes:
@@ -654,7 +687,12 @@ def main():
                     help="post-nudge panel dims WxH (default: current panel0 ROI)")
     ap.add_argument("--archive", default="crops-pre-nudge-0722",
                     help="subdir holding the already-swept pre-nudge crops")
-    ap.add_argument("--db", default=None, help="gateway.db path (default $GATEWAY_DB)")
+    ap.add_argument("--db", default=None,
+                    help="gateway.db ABSOLUTE path (else $GATEWAY_DB; unset/relative/wrong-kind "
+                         "ABORTS — run as `sudo GATEWAY_DB=/var/lib/liftlab/gateway.db ...`)")
+    ap.add_argument("--expect-glyphs", default="0,1,2,3,4,5,6,7,8,9,up,down",
+                    dest="expect_glyphs",
+                    help="glyphs the coverage check requires (add building letters, e.g. ',G,P,M,E')")
     ap.add_argument("--quarantine", action="store_true",
                     help=QUARANTINE_CRITERION + " Preview without --yes.")
     ap.add_argument("--provenance", action="store_true",
@@ -694,11 +732,16 @@ def main():
 
     if a.quarantine:
         r = quarantine(a.gw, a.cam, a.boundary, a.old_space, a.new_dims, a.archive, a.db,
-                       yes=a.yes)
+                       yes=a.yes, expect_glyphs=a.expect_glyphs)
     else:
-        r = audit(a.gw, a.cam, a.boundary, a.old_space, a.new_dims, a.archive, a.db)
+        r = audit(a.gw, a.cam, a.boundary, a.old_space, a.new_dims, a.archive, a.db,
+                  a.expect_glyphs)
 
     b = r["boundary"]
+    g = r["gateway_db"]
+    print(f'gateway db: {g["path"]} ({g["size_bytes"]} bytes, mtime {g["mtime_iso"]}, '
+          f'floor_sample={"present" if g["has_floor_sample"] else "ABSENT"}) '
+          f'[{g["resolved_from"]}]')
     print(f'timezone: {r["timezone"]["name"]} (UTC{r["timezone"]["utc_offset"]})')
     print(f'boundary: {b.get("iso")}  [{b.get("source")}]')
     if b.get("with_floor_before") is not None:
@@ -733,6 +776,11 @@ def main():
           f'{bd["n_crops"]} crops; per glyph: {bd["per_glyph"] or "{}"}; '
           f'admissible at min_examples={bd["min_examples"]}: '
           f'{bd["admissible_at_min_examples"] or "NONE"}')
+    if bd["missing_glyphs"] or bd["short_glyphs"]:
+        print(f'COVERAGE GAP vs expected {bd["expected_glyphs"]}: missing '
+              f'{bd["missing_glyphs"] or "none"}; below min_examples {bd["short_glyphs"] or "none"} '
+              f'— another Collect is needed for DIVERSITY, not volume; left unfixed this '
+              f'presents as a geometry failure at acceptance')
     if bd["fresh_collect_needed"]:
         print('PLAIN STATEMENT: the redraw does NOT restore floor attribution — it only '
               'enables a fresh Collect. Templates must be rebuilt from crops that do not '

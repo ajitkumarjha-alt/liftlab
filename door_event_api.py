@@ -26,7 +26,11 @@ import nav_common as nc
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-DB_PATH = os.environ.get("GATEWAY_DB", "./gateway.db")
+# NO relative default (2026-07-30): "./gateway.db" under a service WorkingDirectory silently
+# MINTS a stray db (one appeared at /opt/liftlab-b3/cloud/gateway.db — no real tables — and a
+# tool that read it drew a confident fleet-wide wrong conclusion). The guard fires in _db(),
+# not at import, so apply-script smoke-imports (which never open the DB) keep working.
+DB_PATH = os.environ.get("GATEWAY_DB", "")
 GATEWAY_TOKENS = {g.split(":", 1)[0]: g.split(":", 1)[1]
                   for g in os.environ.get("GATEWAY_TOKENS", "site-A:devtoken").split(",") if ":" in g}
 ANALYSIS_TOKENS = {g.split(":", 1)[0]: g.split(":", 1)[1]
@@ -42,6 +46,10 @@ door_event_router = APIRouter()
 
 
 def _db():
+    if not DB_PATH or not os.path.isabs(DB_PATH):
+        raise RuntimeError(f"GATEWAY_DB must be an ABSOLUTE path (got {DB_PATH!r}) — a relative "
+                           "db path under a service WorkingDirectory mints a stray file; set the "
+                           "unit Environment (the live value is /var/lib/liftlab/gateway.db)")
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     db.execute("""CREATE TABLE IF NOT EXISTS gw_door_event (

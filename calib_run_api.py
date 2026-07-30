@@ -45,11 +45,38 @@ MAX_LINES = int(os.environ.get("CALIB_JOB_MAX_LINES", "4000"))
 
 # The interpreter that HAS cv2 (not this app's). Set DOOR_CALIB_PY in the unit if it is elsewhere.
 DOOR_CALIB_PY = os.environ.get("DOOR_CALIB_PY", "")
+# THE code-identity authority (2026-07-30): DOOR_CALIB_SCRIPT is REQUIRED. The old fallback list
+# didn't even contain /opt/liftlab-analysis — a deploy there was a silent no-op for the Build
+# button unless the env happened to be pinned. Guessing was only harmless while the pin existed;
+# an unset pin now ABORTS instead of quietly running whichever historical copy still exists.
 DOOR_CALIB_SCRIPT = os.environ.get("DOOR_CALIB_SCRIPT", "")
-_PY_GUESSES = ["/opt/liftlab-b3/calib/.venv/bin/python", "/opt/liftlab-b3/cloud/.venv/bin/python",
-               "/usr/bin/python3"]
-_SCRIPT_GUESSES = ["/opt/liftlab-b3/cloud/door_calib.py", "/opt/liftlab-b3/calib/door_calib.py",
-                   "/opt/liftlab-gpu/door_calib.py"]
+_PY_GUESSES = ["/opt/liftlab-analysis/.venv/bin/python", "/opt/liftlab-b3/calib/.venv/bin/python",
+               "/opt/liftlab-b3/cloud/.venv/bin/python", "/usr/bin/python3"]
+_SCRIPT_HISTORY = ["/opt/liftlab-analysis/door_calib.py", "/opt/liftlab-b3/cloud/door_calib.py",
+                   "/opt/liftlab-b3/calib/door_calib.py", "/opt/liftlab-gpu/door_calib.py"]
+
+
+def _md5(path):
+    import hashlib
+    try:
+        return hashlib.md5(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return "unreadable"
+
+
+def _resolve_script():
+    """(path, err). No fallback, no picking between copies: DOOR_CALIB_SCRIPT set and
+    existing, or refuse — listing every historical location that DOES hold a copy (with
+    md5s) so 'which one is real' is answered out loud, never by accident."""
+    if not DOOR_CALIB_SCRIPT:
+        present = [f"{p} (md5 {_md5(p)})" for p in _SCRIPT_HISTORY if os.path.exists(p)]
+        return None, ("DOOR_CALIB_SCRIPT is not set — refusing to guess which door_calib.py "
+                      f"is real. Copies found: {present or 'none'}. Pin the unit env to the "
+                      "one true copy.")
+    if not os.path.exists(DOOR_CALIB_SCRIPT):
+        return None, (f"DOOR_CALIB_SCRIPT={DOOR_CALIB_SCRIPT} does not exist — fix the unit "
+                      f"env (nothing else is searched: the pin is the authority)")
+    return DOOR_CALIB_SCRIPT, None
 
 # THE ALLOWLIST. A job name maps to a literal argv tail — nothing from the request is interpolated.
 JOBS = {
@@ -96,12 +123,12 @@ def _runner():
     """(python, script, reason). Resolved once per call so a fixed unit takes effect on restart
     without a code change."""
     py = DOOR_CALIB_PY or next((p for p in _PY_GUESSES if os.path.exists(p)), "")
-    sc = DOOR_CALIB_SCRIPT or next((p for p in _SCRIPT_GUESSES if os.path.exists(p)), "")
     if not py:
         return None, None, ("no python with cv2 found — set DOOR_CALIB_PY to the interpreter that "
                             "runs door_calib (this app's venv deliberately has no cv2)")
-    if not sc:
-        return None, None, ("door_calib.py not found — set DOOR_CALIB_SCRIPT to its path")
+    sc, err = _resolve_script()
+    if err:
+        return None, None, err
     bad = _unwritable()
     if bad:
         import getpass
@@ -212,7 +239,12 @@ def run_job(gw: str, cam: str, job: str):
     rec = {"job": job, "argv": argv, "started": time.time(), "ended": None, "running": True,
            "rc": None, "lines": deque(maxlen=MAX_LINES), "n": 0, "log": str(_logpath(gw, cam))}
     rec["lines"].append(f"[runner] $ GW={gw} CAM={cam} {' '.join(argv[1:])}")
-    rec["n"] += 1
+    # NON-NEGOTIABLE provenance line (three silent-authority bugs in one week — geometry
+    # space, label keys, file path): every run states WHICH file executed, by content.
+    rec["script_md5"] = _md5(script)
+    rec["lines"].append(f"[runner] executing {os.path.abspath(script)} md5={rec['script_md5']} "
+                        f"via {py}")
+    rec["n"] += 2
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, text=True, bufsize=1,

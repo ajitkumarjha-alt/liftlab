@@ -153,6 +153,26 @@ def _cells_space(gw=None, cam=None, cells_explicit=False):
     return None, "no recorded draw space", cur, cur_src
 
 
+def _gateway_db(db_path=None):
+    """The ingest DB path, with NO guessing: explicit param or $GATEWAY_DB, absolute, and
+    existing — or CalibError naming what was found. sudo strips the environment, and a
+    hardcoded default made the audit read a stray db and convict foldback fleet-wide on a
+    wrong file (2026-07-30). Run CLI as: sudo GATEWAY_DB=/var/lib/liftlab/gateway.db ..."""
+    dbp = db_path or os.environ.get("GATEWAY_DB", "")
+    if not dbp:
+        found = [p for p in ("/var/lib/liftlab/gateway.db", "/opt/liftlab-b3/cloud/gateway.db")
+                 if os.path.exists(p)]
+        raise CalibError("GATEWAY_DB is not set — refusing to guess the ingest DB (sudo strips "
+                         f"env; use `sudo GATEWAY_DB=<abs path> ...`). Candidates on disk: "
+                         f"{found or 'none'}")
+    if not os.path.isabs(dbp):
+        raise CalibError(f"GATEWAY_DB={dbp!r} is RELATIVE — a relative db path under a service "
+                         "WorkingDirectory is how the stray ./gateway.db was minted; absolute only")
+    if not os.path.exists(dbp):
+        raise CalibError(f"GATEWAY_DB={dbp} does not exist")
+    return dbp
+
+
 def _sha16(path):
     """First 16 hex chars of the file's sha256 — the content identity a label binds to."""
     import hashlib as _hl
@@ -718,7 +738,8 @@ def collect_crops(gw=None, cam=None, nframes=40, fresh=False, door_roi_frame=Non
     return _write_result(outdir, "_calib_collect.json", result)
 
 
-def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cell=None, align=None, out_path=None):
+def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cell=None, align=None,
+                     out_path=None, allow_glyph_loss=None):
     """Build templates.npz from collected crops + labels + fixed cells (from cells step / env / param).
     LABEL SOURCE: an explicit `labels` (comma-string/list, legacy 1:1 row-major) OR — when none is given —
     labels.json written by the /calib-label wizard, keyed by crop FILENAME (indices shift as crops append,
@@ -762,28 +783,41 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
     # stale-inherited: excluded, always, loudly. A label with NO bind entry is legacy: accepted and
     # counted, so established cams keep building until migrated (alphabet_audit --migrate-labels).
     # Governs the labels.json path only — explicit --labels is positional by declaration.
-    n_stale = n_unbound = 0
+    n_stale = n_unbound_ok = n_unbound_excl = 0
     if not labels:
         bind = _load_bind(outdir)
+        # Unbound (pre-binding) labels are accepted ONLY for cameras on the explicit
+        # allowlist — a global accept-with-warning is accept-and-ignore. Everyone else is
+        # held to content binding: migrate (alphabet_audit --migrate-labels) or relabel.
+        legacy_ok = cam in {x.strip() for x in
+                            os.environ.get("LABEL_BIND_LEGACY_CAMS", "").split(",") if x.strip()}
         checked = []
         for c, lab in kept:
             b = bind.get(Path(c).name)
             if b is None:
-                n_unbound += 1
-                checked.append((c, lab))
+                if legacy_ok:
+                    n_unbound_ok += 1
+                    checked.append((c, lab))
+                else:
+                    n_unbound_excl += 1
             elif _sha16(c) != b:
                 n_stale += 1
             else:
                 checked.append((c, lab))
-        if n_stale or n_unbound:
-            print(f"[build] label binding: {n_stale} STALE-INHERITED labels EXCLUDED (content "
-                  f"changed under the filename), {n_unbound} unbound legacy labels accepted; "
-                  f"{len(checked) - n_unbound}/{len(kept)} verified against content")
+        if n_stale or n_unbound_ok or n_unbound_excl:
+            pol = (f"{n_unbound_ok} unbound accepted ({cam} on LABEL_BIND_LEGACY_CAMS)"
+                   if legacy_ok else
+                   f"{n_unbound_excl} unbound EXCLUDED ({cam} not on LABEL_BIND_LEGACY_CAMS)")
+            print(f"[build] label binding: {n_stale} STALE-INHERITED excluded (content changed "
+                  f"under the filename); {pol}; "
+                  f"{len(checked) - n_unbound_ok}/{len(kept)} content-verified")
         kept = checked
         if not kept:
-            raise CalibError("every label failed the content-binding check — the crops changed "
-                             "since the labels were saved (re-Collect inheritance). Relabel at "
-                             f"/calib-label/{gw}/{cam} (saving re-binds automatically).")
+            raise CalibError("no labels survive the content-binding check "
+                             f"({n_stale} stale-inherited, {n_unbound_excl} unbound with "
+                             f"{cam!r} not on LABEL_BIND_LEGACY_CAMS). Relabel at "
+                             f"/calib-label/{gw}/{cam} (saving binds automatically), or migrate "
+                             f"healthy labels: alphabet_audit --migrate-labels.")
 
     dcells = _as_cells(digit_cells, "DIGIT_CELLS", gw, cam)
     acell = _as_cells(arrow_cell, "ARROW_CELL", gw, cam)
@@ -847,17 +881,34 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
         return out
     g_before, g_after = _glyphset(kept), _glyphset(dims_kept)
     lost = sorted(g for g in g_before if g_after.get(g, 0) == 0)
-    allow = {x.strip() for x in os.environ.get("ALLOW_GLYPH_LOSS", "").split(",") if x.strip()}
-    if lost and "*" not in allow and set(lost) - allow:
+    # Glyph loss ALWAYS aborts unless THIS invocation names the sacrifice on the CLI
+    # (--allow-glyph-loss M,E). Deliberately not an env/config constant: M and E sit at
+    # n=1 with foldback as their only growth path, and a standing pre-authorisation
+    # would make that blind spot permanent and invisible.
+    allow = ({x.strip() for x in allow_glyph_loss.split(",") if x.strip()}
+             if isinstance(allow_glyph_loss, str) else set(allow_glyph_loss or ()))
+    if lost and set(lost) - allow:
         raise CalibError(f"REFUSING BUILD: glyphs {sorted(set(lost) - allow)} drop to n=0 under "
                          f"the dims filter (had {[g_before[g] for g in lost]} crops in another "
-                         f"space). Set ALLOW_GLYPH_LOSS={','.join(lost)} to acknowledge, or "
-                         f"collect + label crops covering them first.")
+                         f"space). Acknowledge for THIS run only with "
+                         f"--allow-glyph-loss {','.join(lost)}, or collect + label crops "
+                         f"covering them first.")
+    if lost:
+        print(f"[build] glyph loss ACKNOWLEDGED this run: {lost} (had "
+              f"{[g_before[g] for g in lost]} crops in another space)")
 
     labeled = [(cv2.imread(c, cv2.IMREAD_GRAYSCALE), lab) for c, lab in dims_kept]
+    min_ex = int(os.environ.get("MIN_GLYPH_EXAMPLES", "3"))
     tpl, stats = gd.build_templates(labeled, dcells, acell[0], align=(align or os.environ.get("ALIGN", "right")),
-                                    min_examples=int(os.environ.get("MIN_GLYPH_EXAMPLES", "3")),
+                                    min_examples=min_ex,
                                     exemplars=int(os.environ.get("GLYPH_EXEMPLARS", "3")))
+    thin = sorted((g, n) for g, n in stats["glyphs"].items()
+                  if n <= min_ex and not g.startswith(gd.BLANK) and g not in gd.ARROWS)
+    if thin:
+        print(f"[build] THIN GLYPHS (n<=min_examples={min_ex}): "
+              + ", ".join(f"{g}={n}" for g, n in thin)
+              + " — their only growth path is foldback (/floorcheck reviews), which is "
+                "UNPROVEN until the floor_sample loop is verified end-to-end")
     outp = out_path or os.environ.get("TEMPLATES_OUT", os.path.join(TEMPLATES_DIR, gw, f"{cam}.npz"))
     os.makedirs(os.path.dirname(outp), exist_ok=True)
     gd.save_templates(tpl, outp)
@@ -892,9 +943,7 @@ def foldback(gw=None, cam=None, outdir=None, db_path=None):
     import numpy as np
     gwid = gw or GW; cam = cam or CAM
     outdir = outdir if outdir is not None else _calib_dir(gwid, cam)
-    dbp = db_path or os.environ.get("GATEWAY_DB", "/opt/liftlab-b3/cloud/gateway.db")
-    if not os.path.exists(dbp):
-        raise CalibError(f"gateway.db not found at {dbp} — set GATEWAY_DB to the cloud's ingest DB")
+    dbp = _gateway_db(db_path)
     folded_path = outdir / "_folded.json"
     folded = set()
     if folded_path.exists():
@@ -1166,9 +1215,7 @@ def readtest(gw=None, cam=None, db_path=None):
                          blank_lit_margin=float(os.environ.get("DOOR_BLANK_LIT_MARGIN", "0.15")),
                          confuse_band=float(os.environ.get("DOOR_CONFUSE_BAND", "0")),
                          disc_min=float(os.environ.get("DOOR_DISC_MIN", "0.10")))
-    dbp = db_path or os.environ.get("GATEWAY_DB", "/opt/liftlab-b3/cloud/gateway.db")
-    if not os.path.exists(dbp):
-        raise CalibError(f"gateway.db not found at {dbp} — set GATEWAY_DB")
+    dbp = _gateway_db(db_path)
     db = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True); db.row_factory = sqlite3.Row
     try:
         rows = db.execute("SELECT id,reviewed_label,floor,crop_jpeg FROM floor_sample WHERE gateway_id=? AND cam=? "
@@ -1226,6 +1273,9 @@ def main():
     ap.add_argument("--fitcells", action="store_true", help="AUTO-FIT per-cell geometry from labeled crops (ends anchor guessing)")
     ap.add_argument("--build", action="store_true", help="build templates.npz from collected crops + --labels")
     ap.add_argument("--labels", default="", help="row-major floor labels, e.g. '7^,8^,12^,...,P3v,6v'")
+    ap.add_argument("--allow-glyph-loss", default="", dest="allow_glyph_loss", metavar="G,G",
+                    help="acknowledge, for THIS build only, glyphs the dims filter starves to n=0 "
+                         "(e.g. 'M,E'); without it glyph loss always aborts")
     ap.add_argument("--fresh", action="store_true", help="clear accumulated crops before collecting (default = append)")
     a = ap.parse_args()
     try:
@@ -1259,7 +1309,7 @@ def main():
             propose_cells(anchors=a.anchors, anchor_crop=a.anchor_crop)   # prints + writes _calib_cells.json
             return
         if a.build:
-            r = build_from_crops(labels=a.labels)
+            r = build_from_crops(labels=a.labels, allow_glyph_loss=a.allow_glyph_loss)
             print(f"[build] {r['n_labeled']}/{r.get('n_crops','?')} crops labeled ({r['n_excluded']} excluded: no label or '-')")
             dr = r['stats'].get('dropped') or {}
             if dr:
