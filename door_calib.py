@@ -838,6 +838,18 @@ def build_from_crops(gw=None, cam=None, labels=None, digit_cells=None, arrow_cel
     #      labeled and trusted in labels.json; it is just uncuttable by the CURRENT cells, and
     #      becomes buildable again if that geometry is ever restored.
     drawn, drawn_src, cur_roi, cur_src = _cells_space(gw, cam, cells_explicit=bool(digit_cells))
+    # SIBLING-ARTIFACT SKEW (third instance of the class): _calib_fitcells.json /
+    # _calib_rois.json are ADVISORY outputs — nothing loads cells from them (runtime and
+    # build read roi.json, via the registry serializer and _as_cells respectively). But a
+    # human seeing a NEWER sibling can reasonably believe it landed; say the authority out
+    # loud whenever the mtimes disagree.
+    _roi_p = _calib_dir(gw, cam) / "roi.json"
+    for _sib in ("_calib_fitcells.json", "_calib_rois.json", "_calib_cells.json"):
+        _sp = _calib_dir(gw, cam) / _sib
+        if _roi_p.exists() and _sp.exists() and _sp.stat().st_mtime > _roi_p.stat().st_mtime:
+            print(f"[build] NOTE: {_sib} is NEWER than roi.json — artifacts do not feed this "
+                  f"build; roi.json cells are the authority (re-run the wizard Save if that "
+                  f"artifact was meant to land)")
     if drawn and cur_roi and (abs(drawn[0] - cur_roi[0]) > 1 or abs(drawn[1] - cur_roi[1]) > 1):
         raise CalibError(f"WRONG-SPACE CELLS: cells were drawn in {drawn[0]}x{drawn[1]} "
                          f"({drawn_src}) but the current panel0 ROI is {cur_roi[0]}x{cur_roi[1]} "

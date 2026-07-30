@@ -325,6 +325,17 @@ def _want_synth_d0(cam):
 async def _drawn(request, d, crop, cam):
     body = await request.json()
     panel_wh = _panel_wh(d, crop)
+    # SAVE-TIME SPACE GUARD (2026-07-30 06:25Z misfire): the wizard let cells be drawn on a
+    # STALE crop — panel_wh honestly recorded the crop's 110x170 while the live panel ROI
+    # was already 107x152, and the wrong-space cells sat as the file of record for hours.
+    # The drawing surface must be IN the current panel space, or this refuses before any
+    # derive/Save — the build-time guard alone lets a wrong Save lie in wait.
+    cur = (_load_roi(d).get("panel_rois") or [None])[0]
+    if cur and (abs(panel_wh[0] - int(cur[2])) > 1 or abs(panel_wh[1] - int(cur[3])) > 1):
+        raise HTTPException(409, f"drawing surface {crop} is {panel_wh[0]}x{panel_wh[1]} but the "
+                                 f"current panel0 ROI is {int(cur[2])}x{int(cur[3])} — that crop is "
+                                 f"from a DIFFERENT panel space (stale store or ROI changed since "
+                                 f"collect). Collect fresh crops, then draw on one of those.")
     tens = _rect(body.get("tens"), "TENS")
     units = _rect(body.get("units"), "UNITS")
     arrow = _rect(body.get("arrow"), "ARROW")
