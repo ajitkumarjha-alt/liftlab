@@ -86,6 +86,19 @@ def _db():
             db.execute(f"ALTER TABLE analyzer_status ADD COLUMN {col} {typ}")   # migrate pre-existing table
         except sqlite3.OperationalError:
             pass                                                                  # column already present
+    # WORKER TELEMETRY HISTORY (2026-07-30). analyzer_status is an UPSERT — current state
+    # only — which made today's wedge/restart forensics a journal hunt on a second box,
+    # left the load-drop bias hypothesis untestable against stored data, and gave the
+    # restart-proximity close_travel exclusion nothing to compute from. Same heartbeat,
+    # APPENDED (throttled + pruned): worker restarts recover as uptime_s resets;
+    # drop_frac/proc_ms become a time series a falsifier can regress against.
+    db.execute("""CREATE TABLE IF NOT EXISTS worker_telemetry (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT, ts REAL,
+      uptime_s REAL, proc_ms REAL, fetch_ms REAL, decode_ms REAL, track_ms REAL,
+      drop_frac REAL, drop_rate_hr REAL, seg_budget_ms REAL, analyze_fps REAL,
+      segments INTEGER, dropped INTEGER, posted INTEGER,
+      door_opens_since_transit INTEGER, s_since_transit_post REAL)""")
+    db.execute("CREATE INDEX IF NOT EXISTS ix_wtele ON worker_telemetry (gateway_id,cam,ts)")
     return db
 
 
@@ -245,6 +258,26 @@ async def analyzer_status_ingest(gw: str, request: Request, authorization: str =
          # worker still sends connect_ms — the metric must not vanish during the overlap
          d.get("headers_ms", d.get("connect_ms")), d.get("transfer_ms"), d.get("analyze_fps"),
          d.get("door_opens_since_transit"), d.get("s_since_transit_post")))
+    # append to history, throttled to one row per cam per WORKER_TELEMETRY_MIN_S so the
+    # per-segment heartbeat cadence cannot balloon the table (~10k rows/cam/week at 60s),
+    # pruned at WORKER_TELEMETRY_KEEP_DAYS. uptime_s resets ARE the restart log until the
+    # fleet posts reasons.
+    cam = str(d.get("cam", ""))
+    now = time.time()
+    last = db.execute("SELECT MAX(ts) FROM worker_telemetry WHERE gateway_id=? AND cam=?",
+                      (gw, cam)).fetchone()[0]
+    if last is None or now - last >= float(os.environ.get("WORKER_TELEMETRY_MIN_S", "60")):
+        db.execute("INSERT INTO worker_telemetry (gateway_id,cam,ts,uptime_s,proc_ms,fetch_ms,"
+                   "decode_ms,track_ms,drop_frac,drop_rate_hr,seg_budget_ms,analyze_fps,"
+                   "segments,dropped,posted,door_opens_since_transit,s_since_transit_post) "
+                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (gw, cam, now, d.get("uptime_s"), d.get("proc_ms"), d.get("fetch_ms"),
+                    d.get("decode_ms"), d.get("track_ms"), d.get("drop_frac"),
+                    d.get("drop_rate_hr"), d.get("seg_budget_ms"), d.get("analyze_fps"),
+                    d.get("segments"), d.get("dropped"), d.get("posted"),
+                    d.get("door_opens_since_transit"), d.get("s_since_transit_post")))
+        db.execute("DELETE FROM worker_telemetry WHERE ts < ?",
+                   (now - 86400.0 * float(os.environ.get("WORKER_TELEMETRY_KEEP_DAYS", "14")),))
     db.commit()
     db.close()
     return {"ok": True}
