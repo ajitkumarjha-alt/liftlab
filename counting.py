@@ -79,12 +79,25 @@ class YoloDetector:
         self.conf = conf
         self.tracker = tracker
         self.device = device
+        self.last_raw_n = 0                # boxes detected on the last frame, BEFORE the id gate
+        self.last_raw_hi = 0               # ...of which conf >= 0.5 (ByteTrack's first-association tier)
 
     def track(self, frame: np.ndarray) -> list[Detection]:
         kw = dict(classes=[0], persist=True, verbose=False, tracker=self.tracker, conf=self.conf)
         if self.device is not None:
             kw["device"] = self.device     # ensure INFERENCE runs on the GPU, not CPU (track() default is CPU)
         r = self.model.track(frame, **kw)[0]
+        # Raw counts BEFORE the id gate. ByteTrack can wedge (NaN-poisoned Kalman state after a
+        # corrupt frame) into emitting boxes with id=None forever — at the return value that is
+        # indistinguishable from an empty scene, which is how counting stops cold while door
+        # analysis flows (2026-07-29/30 wedges). last_raw_hi counts boxes confident enough that the
+        # tracker SHOULD have IDed them; callers use a long dets-without-ids streak as the tell.
+        self.last_raw_n = 0 if r.boxes is None else len(r.boxes)
+        try:
+            self.last_raw_hi = (0 if r.boxes is None or r.boxes.conf is None
+                                else int((r.boxes.conf >= 0.5).sum()))
+        except Exception:
+            self.last_raw_hi = self.last_raw_n
         if r.boxes is None or r.boxes.id is None:
             return []
         n = len(r.boxes.id)

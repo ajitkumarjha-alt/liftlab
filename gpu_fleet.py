@@ -50,6 +50,26 @@ WORKER_SCRIPT = os.environ.get("WORKER_SCRIPT", os.path.join(os.path.dirname(os.
 START_GRACE_S = float(os.environ.get("FLEET_START_GRACE_S", "20"))   # let a worker load its model
 RESTART_BACKOFF_S = float(os.environ.get("FLEET_RESTART_BACKOFF_S", "30"))
 LOOP_STALL_S = float(os.environ.get("FLEET_LOOP_STALL_S", "180"))
+# OUTPUT FLOOR (2026-07-30, second silent counting wedge in 24h, both mid-peak). The worker's own
+# detectors need door opens or learned history; this is the supervisor's crude backstop that needs
+# neither: a worker whose STREAM IS FRESH (its cursor file is advancing — segments are being
+# processed) but which has POSTED NOTHING for FLOOR_S gets restarted regardless of door state.
+# Evidence is two files the worker maintains in STATE_DIR: cursor_{cam} (mtime advances only when
+# segments flow through the loop) and transit_last_{cam} (touched on every successful transit POST).
+# Guards, each one load-bearing:
+#   - active hours only (IST): a quiet building at 3am is not a wedge; restart-looping every camera
+#     all night buries real journal signal. Default 07-22 covers both study peaks.
+#   - worker uptime must exceed FLOOR_S: a fresh restart starts with a stale transit_last, and
+#     without this guard the floor would restart-loop its own restarts forever.
+#   - zones must be configured: a camera with counting OFF will never post; restarting it is noise.
+#   - stream freshness: a starved stream is the relay watchdog's problem; a restart here cannot
+#     conjure segments and would mask the real (upstream) outage.
+# Crude by design — it converts a 4-hour data hole into a ~FLOOR_S one. 0 disables.
+FLOOR_S = float(os.environ.get("FLEET_TRANSIT_FLOOR_S", "900"))
+FLOOR_STREAM_FRESH_S = float(os.environ.get("FLEET_FLOOR_STREAM_FRESH_S", "120"))
+FLOOR_H0, FLOOR_H1 = (int(x) for x in os.environ.get("FLEET_FLOOR_HOURS_IST", "7,22").split(","))
+STATE_DIR = os.environ.get("STATE_DIR", "/var/lib/liftlab-gpu")
+IST_OFF_S = 5.5 * 3600.0
 
 
 def log(m):
@@ -83,8 +103,13 @@ def fetch_registry():
         cam = str(c.get("cam", ""))
         if cam:
             g = c.get("geometry") or {}
+            lv = c.get("door_levels") or {}
             out[cam] = {"enabled": bool(c.get("enabled")), "stride": int(c.get("stride") or 2),
                         "analyze_fps": float(c.get("analyze_fps") or 0),
+                        # per-camera DoorTracker levels (close_th recalibration). Values only; the
+                        # worker validates ranges — the registry already did on the way in.
+                        "door_levels": {k: float(v) for k, v in sorted(lv.items())
+                                        if isinstance(v, (int, float))},
                         # Door geometry AND counting zones travel with the camera, from roi.json via
                         # the registry, so a fleet-spawned worker needs no unit-file edits for either.
                         "geometry": {k: str(v) for k, v in sorted(g.items()) if k in
@@ -114,6 +139,17 @@ def start(cam, cfg):
             env.pop(envname, None)
     env["GPU_DOOR"] = "1" if (geom.get("door_roi_frame") and geom.get("panel_rois")
                               and geom.get("digit_cells") and geom.get("arrow_cell")) else "0"
+    # Per-camera DoorTracker levels from the registry (ch29's close_th recalibration). Same
+    # absent-means-UNSET rule as geometry: a level not set for THIS camera must fall back to the
+    # worker default, never inherit another camera's tuning from the fleet environment.
+    for key, envname in (("near_open", "DOOR_NEAR_OPEN"), ("close_th", "DOOR_CLOSE_TH"),
+                         ("close_start_th", "DOOR_CLOSE_START_TH"),
+                         ("close_debounce_s", "DOOR_CLOSE_DEBOUNCE_S")):
+        v = (cfg.get("door_levels") or {}).get(key)
+        if v is not None:
+            env[envname] = str(v)
+        else:
+            env.pop(envname, None)
     # ANALYZE_FPS is only SET when the registry asks for subsampling. Passing "0.0" is behaviourally
     # identical to unset (gpu_analyze treats <=0 as "every frame"), but it surfaces as a literal 0.0
     # on /ops next to workers showing "all(~25)", and two renderings of the same setting read as two
@@ -132,9 +168,11 @@ def start(cam, cfg):
                    "restarts": _procs.get(cam, {}).get("restarts", 0), "last_exit": None}
     zones = ("registry" if (geom.get("zone_landing") and geom.get("zone_cabin"))
              else ("builtin-ch29" if cam == "ch29" else "NONE — counting OFF (save zones into roi.json)"))
+    lv = cfg.get("door_levels") or {}
     log(f"{cam}: started pid={p.pid} stride={cfg['stride']} analyze_fps={cfg['analyze_fps']} "
         f"door={'ON' if env.get('GPU_DOOR') == '1' else 'off (geometry incomplete — draw it at /calib-roi)'} "
-        f"zones={zones}")
+        f"zones={zones}"
+        + (f" door_levels={lv} (NON-DEFAULT — this worker's door era moves)" if lv else ""))
 
 
 def stop(cam, why):
@@ -189,6 +227,46 @@ def reap():
                 _procs[cam]["restarts"] = rec["restarts"]
 
 
+def output_floor():
+    """Restart any worker that is demonstrably processing segments but has posted nothing for
+    FLOOR_S during active hours. See the FLOOR_S comment block for why each guard exists."""
+    if FLOOR_S <= 0:
+        return
+    hour_ist = int(((time.time() + IST_OFF_S) % 86400.0) // 3600.0)
+    if not (FLOOR_H0 <= hour_ist < FLOOR_H1):
+        return
+    now = time.time()
+    for cam in list(_procs):
+        rec = _procs[cam]
+        if rec["proc"].poll() is not None or now - rec["started"] < FLOOR_S:
+            continue                              # dead (reap's job) or too young to judge
+        geom = rec["cfg"].get("geometry") or {}
+        if not (geom.get("zone_landing") and geom.get("zone_cabin")) and cam != "ch29":
+            continue                              # counting OFF — this worker never posts transits
+        try:
+            cursor_age = now - os.path.getmtime(os.path.join(STATE_DIR, f"cursor_{cam}"))
+        except OSError:
+            continue                              # no cursor yet — nothing processed, nothing to judge
+        if cursor_age > FLOOR_STREAM_FRESH_S:
+            continue                              # stream not fresh — upstream problem, not a wedge
+        try:
+            transit_age = now - os.path.getmtime(os.path.join(STATE_DIR, f"transit_last_{cam}"))
+        except OSError:
+            transit_age = now - rec["started"]    # never posted since the file was introduced
+        transit_age = min(transit_age, now - rec["started"])   # never blame a previous worker's silence
+        if transit_age >= FLOOR_S:
+            cfg = rec["cfg"]
+            restarts = rec["restarts"]
+            log(f"{cam}: OUTPUT FLOOR — segments flowing (cursor {cursor_age:.0f}s old) but no transit "
+                f"posted in {transit_age:.0f}s (>= {FLOOR_S:.0f}s) during active hours "
+                f"({hour_ist:02d}h IST). Restarting the worker; if this recurs, read its journal for "
+                f"the wedge signature rather than trusting the restart.")
+            stop(cam, "output floor: no transits while segments flow")
+            start(cam, cfg)
+            if cam in _procs:
+                _procs[cam]["restarts"] = restarts + 1
+
+
 def watchdog(main_pid):
     """The supervisor's own liveness — same reasoning as relay_soak.sh. If the loop stops ticking it
     cannot fix itself, so die and let systemd restart. Workers are in the same cgroup and go too."""
@@ -214,6 +292,10 @@ def main():
     log(f"fleet up: {CLOUD}/api/gw/{GW}/cameras every {POLL_S:.0f}s; worker={WORKER_SCRIPT}")
     log("SAFETY: a failed or empty poll changes NOTHING — the running set is only ever altered by a "
         "registry that was read successfully and is non-empty.")
+    floor_desc = ("OFF" if FLOOR_S <= 0 else
+                  f"restart a zoned worker with fresh segments but no transit post for "
+                  f"{FLOOR_S:.0f}s, {FLOOR_H0:02d}-{FLOOR_H1:02d}h IST")
+    log(f"output floor: {floor_desc}")
 
     def _bye(signum, _f):
         log(f"signal {signum} — stopping {len(_procs)} worker(s)")
@@ -237,6 +319,7 @@ def main():
                 last_hash = reg["hash"]
             converge(reg)
         reap()
+        output_floor()
         alive = sorted(c for c, r in _procs.items() if r["proc"].poll() is None)
         if int(time.time()) % 300 < POLL_S:
             log(f"running: {alive or 'none'}")

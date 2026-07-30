@@ -122,10 +122,14 @@ DOOR_MIN_CLOSE_S = float(os.environ.get("DOOR_MIN_CLOSE_S", "0.3"))  # close bel
 DOOR_MAX_CLOSE_S = float(os.environ.get("DOOR_MAX_CLOSE_S", "30"))   # close above this -> withheld
 # h2 hysteresis + recalibration knobs (2026-07-29 flap fix; census: complete-close 43.6% on ch29 =
 # close_th too low for its edge contrast — these four make the levels tunable without a deploy).
-DOOR_NEAR_OPEN = float(os.environ.get("DOOR_NEAR_OPEN", "0.90"))     # fully-open level (open_full)
-DOOR_CLOSE_TH = float(os.environ.get("DOOR_CLOSE_TH", "0.10"))       # fully-closed level (close_full)
-DOOR_CLOSE_START_TH = float(os.environ.get("DOOR_CLOSE_START_TH", "0.75"))   # descent must REACH this to enter closing
-DOOR_CLOSE_DEBOUNCE_S = float(os.environ.get("DOOR_CLOSE_DEBOUNCE_S", "0.4"))  # ...and persist this long
+# Now per-camera via the registry (door_levels -> fleet env). DOOR_LEVEL_DEFAULTS is the single
+# source for "untuned": build_door_engine compares against it to decide whether the door era moves,
+# so editing a default here correctly re-eras every untuned camera.
+DOOR_LEVEL_DEFAULTS = (0.90, 0.10, 0.75, 0.4)     # near_open, close_th, close_start_th, debounce_s
+DOOR_NEAR_OPEN = float(os.environ.get("DOOR_NEAR_OPEN", str(DOOR_LEVEL_DEFAULTS[0])))     # fully-open level
+DOOR_CLOSE_TH = float(os.environ.get("DOOR_CLOSE_TH", str(DOOR_LEVEL_DEFAULTS[1])))       # fully-closed level
+DOOR_CLOSE_START_TH = float(os.environ.get("DOOR_CLOSE_START_TH", str(DOOR_LEVEL_DEFAULTS[2])))   # descent must REACH this to enter closing
+DOOR_CLOSE_DEBOUNCE_S = float(os.environ.get("DOOR_CLOSE_DEBOUNCE_S", str(DOOR_LEVEL_DEFAULTS[3])))  # ...and persist this long
 TEMPLATES_REFETCH_S = float(os.environ.get("TEMPLATES_REFETCH_S", "600"))  # re-pull npz; reload if hash changed
 # --- liveness: progress-based, because "active (running)" told us nothing during the 5h44m hang ---
 WD_STALL_S = float(os.environ.get("WD_STALL_S", "120"))    # no segment processed this long -> dump + exit
@@ -143,6 +147,37 @@ TRANSIT_STALL_OPENS = int(os.environ.get("TRANSIT_STALL_OPENS", "20"))  # ...whi
 # A raising det.track (the OTHER wedge mode) must be VISIBLE and self-heal, not silently propagate or
 # spin. Count consecutive failures; past this many, dump + exit.
 TRACK_FAIL_MAX = int(os.environ.get("TRACK_FAIL_MAX", "50"))
+# THE SILENT-[] MODE, finally attributable (2026-07-30): ByteTrack can wedge into emitting boxes
+# with id=None forever (NaN-poisoned Kalman state after a corrupt peak-load frame is the classic
+# cause) — counting.YoloDetector.track returns [] with no exception, doors flow, every liveness
+# check passes. counting.py now exposes last_raw_hi (confident boxes before the id gate): this many
+# CONSECUTIVE frames with confident detections but zero track ids = the tracker is convicted, not
+# suspected. First offence: rebuild the detector in place (~seconds, door pass unaffected). A
+# second within 10 minutes: dump stacks + exit — in-place healing did not stick, take the restart.
+TRACKER_IDLESS_MAX = int(os.environ.get("TRACKER_IDLESS_MAX", "600"))
+# DOOR-INDEPENDENT WEDGE DETECTOR (2026-07-30, second silent wedge in 24h). The output-attesting
+# check above needs door opens as its "lift in use" witness, so a camera with NO door calibration
+# (ch30/32/34) can wedge and never trip it — ch30 went quiet at 15:00 and nothing noticed for hours.
+# This detector attests against the camera's OWN HISTORY instead: segments flowing + zones present +
+# ZERO transits for TRANSIT_IDLE_STALL_S during an hour-of-day this camera historically posts in.
+# History is a per-hour-of-day (IST — the building's clock) EWMA of posted transits, persisted in
+# STATE_DIR so restarts keep what was learned. An hour whose EWMA sits below TRANSIT_HIST_MIN_RATE
+# never arms — nights and dead hours stay silent by construction, and a cold start (no history yet)
+# is silent until it has learned real hours. Wedged/partial hours are NOT folded into the EWMA
+# (segment coverage is required), so the detector cannot teach itself that a wedged camera is
+# "normally quiet". TRANSIT_IDLE_STALL_S=0 disables.
+TRANSIT_IDLE_STALL_S = float(os.environ.get("TRANSIT_IDLE_STALL_S", "2700"))
+TRANSIT_HIST_MIN_RATE = float(os.environ.get("TRANSIT_HIST_MIN_RATE", "3.0"))   # EWMA posts/hr to arm
+TRANSIT_HIST_ALPHA = float(os.environ.get("TRANSIT_HIST_ALPHA", "0.25"))        # fold-in weight per observed hour
+# Flow attestation: this many segments processed since the last transit proves the pipeline is
+# genuinely running (a starved stream must NOT fire this — upstream outages are the relay
+# watchdog's job, and a restart here cannot conjure segments).
+TRANSIT_IDLE_MIN_SEGS = int(os.environ.get("TRANSIT_IDLE_MIN_SEGS", "300"))
+IST_OFF_S = 5.5 * 3600.0                          # IST hour bucketing without a tz database
+
+
+def _ist_hour(ts):
+    return int(((ts + IST_OFF_S) % 86400.0) // 3600.0)
 # DISCONTINUITY GUARD (third instance of the pattern: relay ffmpeg, door pairing, now counting).
 # Persistent tracker + counter state must NOT survive a segment-clock gap it cannot account for. The
 # Thu-23 silence: the stream starved, segments arrived minutes apart, then recovered — and the
@@ -474,7 +509,14 @@ def build_door_engine(prefetched_tpl=None):
     # (before the '+'), so a DoorTracker logic change moves the comparability boundary exactly like
     # a template rebuild — the 5f1488a guards changed emissions without moving the era and poisoned
     # the pool for a week; the h2 deploy starts a fresh era by construction.
-    version = f"{eng.hash[:8]}{gd.TRACKER_LOGIC}+{geom_sig}"
+    # DOOR LEVELS ride the prefix too (2026-07-30 close_th recalibration): close_th decides whether
+    # a close ever COMPLETES, so two level sets are two instruments. DEFAULT levels contribute no
+    # tag — the format (and thus every live era) is unchanged until a camera is actually recalibrated.
+    levels_tag = ""
+    if (DOOR_NEAR_OPEN, DOOR_CLOSE_TH, DOOR_CLOSE_START_TH, DOOR_CLOSE_DEBOUNCE_S) != DOOR_LEVEL_DEFAULTS:
+        levels_tag = "L" + _hash8(f"{DOOR_NEAR_OPEN}|{DOOR_CLOSE_TH}|{DOOR_CLOSE_START_TH}|"
+                                  f"{DOOR_CLOSE_DEBOUNCE_S}")[:4]
+    version = f"{eng.hash[:8]}{gd.TRACKER_LOGIC}{levels_tag}+{geom_sig}"
     log(f"GPU_DOOR: {len(panels)} panel(s) [{mode}]; templates_hash={eng.hash[:12]}; door_version={version}")
     if FLOOR_ALPHABET:
         log(f"GPU_DOOR floor whitelist: {len(FLOOR_ALPHABET)} valid floors {FLOOR_ALPHABET[:6]}"
@@ -551,8 +593,26 @@ def main():
     door_opens_since_transit = 0                   # door-open transitions observed since that POST
     door_prev_state = None                         # for edge-detecting door opens
     track_fail_streak = 0                          # consecutive det.track exceptions
+    idless_streak = 0                              # consecutive frames: confident boxes, zero track ids
+    last_idless_rebuild = 0.0                      # wall clock of the last in-place tracker rebuild
     last_seg_wall = None                            # wall time of the last PROCESSED segment (gap guard)
     gap_resets = 0                                  # tracker/counter rebuilds on a discontinuity
+    # ── door-independent wedge history: per-IST-hour EWMA of posted transits ──────────────────────
+    hist_path = os.path.join(STATE_DIR, f"transit_hist_{CAM}.json")
+    transit_last_path = os.path.join(STATE_DIR, f"transit_last_{CAM}")   # mtime = last post (fleet floor)
+    hist_ewma = [None] * 24                        # posts/hr per hour-of-day; None = never observed
+    try:
+        _h = json.load(open(hist_path))
+        if isinstance(_h.get("ewma"), list) and len(_h["ewma"]) == 24:
+            hist_ewma = [(float(x) if x is not None else None) for x in _h["ewma"]]
+    except Exception:
+        pass
+    segs_since_transit = 0                         # segments PROCESSED since the last transit post (flow witness)
+    hour_id = int((time.time() + IST_OFF_S) // 3600.0)   # absolute IST hour bucket being accumulated
+    hour_posts = 0                                 # transits posted inside that bucket
+    hour_covered = False                           # True only when we WITNESSED this hour begin AND
+    hour_segs = 0                                  # ...segments flowed through it — partial/starved
+    #                                                hours must not fold a fake zero into the EWMA
     started = time.time()
     last_drop_log = time.time()
     last_idle_log = 0.0
@@ -591,6 +651,8 @@ def main():
     log(f"validation mode: {val_state}")
     log(f"output watchdog: restart if >= {TRANSIT_STALL_OPENS} door opens with no transit for "
         f"{TRANSIT_STALL_S:.0f}s (counting-path wedge); det.track self-heals after {TRACK_FAIL_MAX} fails")
+    log(f"door-independent wedge detector: {'OFF' if TRANSIT_IDLE_STALL_S <= 0 else 'restart on 0 transits for %.0fs across >= %d segments in an hour with EWMA >= %.1f/hr' % (TRANSIT_IDLE_STALL_S, TRANSIT_IDLE_MIN_SEGS, TRANSIT_HIST_MIN_RATE)}; "
+        f"silent-[] tracker heal after {TRACKER_IDLESS_MAX} idless frames")
 
     # GPU_DOOR state (all no-ops unless enabled). Separate stream; independent of counting.
     door_gd = None
@@ -639,6 +701,14 @@ def main():
                             # is the wedge; surfaced here so /ops shows it before the self-restart fires.
                             "door_opens_since_transit": door_opens_since_transit,
                             "s_since_transit_post": round(time.time() - last_transit_post_wall, 0),
+                            # door-independent wedge context: what THIS hour historically posts, and
+                            # how many segments have flowed since the last post — /ops turns these
+                            # into the rate-relative amber (a stale transit at 3am is normal; the
+                            # same staleness at 9am on a camera that posts 40/hr is the wedge).
+                            "hist_rate_hr": (round(hist_ewma[_ist_hour(time.time())], 1)
+                                             if hist_ewma[_ist_hour(time.time())] is not None else None),
+                            "segs_since_transit": segs_since_transit,
+                            "idless_streak": idless_streak,   # >0 sustained = silent-[] wedge building
                             "rej_disp": rej_disp, "rej_dwell": rej_dwell,
                             "rej_in": rej_in, "rej_out": rej_out,
                             "rej_hist": ",".join(str(x) for x in rej_hist),
@@ -829,6 +899,34 @@ def main():
                         os._exit(1)
                     dets = []
                 track_ms += (time.time() - tr_t0) * 1000     # YOLO inference — the cost that must fit the budget
+                # SILENT-[] WEDGE (see TRACKER_IDLESS_MAX): confident boxes, no ids, for a long
+                # unbroken streak. Heal in place first; a recurrence within 10min takes the restart.
+                if dets:
+                    idless_streak = 0
+                elif getattr(det, "last_raw_hi", 0) > 0:
+                    idless_streak += 1
+                    if idless_streak >= TRACKER_IDLESS_MAX:
+                        if time.time() - last_idless_rebuild < 600:
+                            log(f"TRACKER WEDGED AGAIN {time.time() - last_idless_rebuild:.0f}s after an "
+                                f"in-place rebuild — healing did not stick. Dumping stacks and exiting for restart.")
+                            import faulthandler as _fh
+                            _fh.dump_traceback(all_threads=True)
+                            os._exit(1)
+                        log(f"TRACKER WEDGED: {idless_streak} consecutive frames with confident detections "
+                            f"but ZERO track ids — ByteTrack state is poisoned (the silent-[] mode that "
+                            f"stopped counting cold on 07-29/30). Rebuilding detector + counter in place.")
+                        try:
+                            det = counting.YoloDetector(weights=MODEL, conf=CONF, tracker="bytetrack.yaml",
+                                                        device=DEVICE)
+                        except Exception as e:
+                            log(f"detector rebuild failed: {type(e).__name__}: {e} — keeping the old one")
+                        Hr, Wr = fr.shape[:2]
+                        ctr = make_counter(Wr, Hr)
+                        episode = None
+                        recent_dets.clear()
+                        idless_streak = 0
+                        last_idless_rebuild = time.time()
+                        continue
                 frame_off = seg_wall - ((rel[-1] - rel[i]) if rel else 0.0)   # REAL per-frame time (not 25fps assumed)
                 if val_state == "validating":                # DETECTION AUDIT: what did YOLO actually see?
                     ids = tuple(d.track_id for d in dets)
@@ -863,6 +961,13 @@ def main():
                         last_transit_ts = t.offset_s
                         last_transit_post_wall = time.time()   # OUTPUT attested — reset the wedge counters
                         door_opens_since_transit = 0
+                        segs_since_transit = 0
+                        hour_posts += 1
+                        try:                       # supervisor-visible attestation (gpu_fleet's output floor)
+                            with open(transit_last_path, "w") as f:
+                                f.write(str(time.time()))
+                        except Exception:
+                            pass
                     except Exception as e:
                         log(f"transit POST failed (no double-count on retry): {e}")
                     # EPISODE = the door-open record, built in BOTH modes. VALIDATING -> attach imagery +
@@ -925,6 +1030,39 @@ def main():
                 log(f"COUNTING WEDGED: {door_opens_since_transit} door opens and NO transit posted in "
                     f"{time.time() - last_transit_post_wall:.0f}s while segments flow — YOLO/tracker path "
                     f"is producing nothing. Dumping stacks and exiting for restart.")
+                import faulthandler as _fh
+                _fh.dump_traceback(all_threads=True)
+                os._exit(1)
+            # ── DOOR-INDEPENDENT WEDGE CHECK (see TRANSIT_IDLE_STALL_S). Runs only right here, after
+            # a fully-processed segment, for the same reason the liveness signal does: a starved or
+            # idle loop must never reach it. History arms it; flow attests it; zero output convicts.
+            segs_since_transit += 1
+            hour_segs += 1
+            now_hour = int((time.time() + IST_OFF_S) // 3600.0)
+            if now_hour != hour_id:
+                # fold the FINISHED hour into its hour-of-day EWMA — but only if we witnessed the
+                # whole hour with segments flowing; a partial (startup) or starved hour teaches nothing
+                if hour_covered and hour_segs > 0:
+                    h = _ist_hour((hour_id * 3600.0) - IST_OFF_S)
+                    prev = hist_ewma[h]
+                    hist_ewma[h] = (float(hour_posts) if prev is None
+                                    else TRANSIT_HIST_ALPHA * hour_posts + (1 - TRANSIT_HIST_ALPHA) * prev)
+                    try:
+                        with open(hist_path, "w") as f:
+                            json.dump({"ewma": hist_ewma, "updated": time.time()}, f)
+                    except Exception:
+                        pass
+                hour_id, hour_posts, hour_segs = now_hour, 0, 0
+                hour_covered = True               # from here we see this hour from its first minute
+            hist_rate = hist_ewma[_ist_hour(time.time())]
+            if (TRANSIT_IDLE_STALL_S > 0 and ctr is not None
+                    and hist_rate is not None and hist_rate >= TRANSIT_HIST_MIN_RATE
+                    and segs_since_transit >= TRANSIT_IDLE_MIN_SEGS
+                    and time.time() - last_transit_post_wall >= TRANSIT_IDLE_STALL_S):
+                log(f"COUNTING WEDGED (door-independent): NO transit posted in "
+                    f"{time.time() - last_transit_post_wall:.0f}s across {segs_since_transit} processed "
+                    f"segments, in an hour this camera historically posts {hist_rate:.1f}/hr. "
+                    f"Zones present, segments flowing, output silent. Dumping stacks and exiting for restart.")
                 import faulthandler as _fh
                 _fh.dump_traceback(all_threads=True)
                 os._exit(1)
