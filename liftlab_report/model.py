@@ -493,8 +493,10 @@ def demand_by_lift_hour(transits: list[dict], pi_cycles: list[dict],
         boarded: dict[str, list] = {}
         alighted: dict[str, list] = {}
         obs_days: dict[str, list] = {}
+        total_b: dict[str, list] = {}
+        total_a: dict[str, list] = {}
         for cam in cams:
-            b_row, a_row, d_row = [], [], []
+            b_row, a_row, d_row, tb_row, ta_row = [], [], [], [], []
             for h in hours:
                 day_keys = [(cam, ver, day.date().isoformat(), h) for day in days]
                 live = [k for k in day_keys if k in observed]
@@ -502,14 +504,23 @@ def demand_by_lift_hour(transits: list[dict], pi_cycles: list[dict],
                 if not live:
                     b_row.append(None)
                     a_row.append(None)
+                    tb_row.append(None)
+                    ta_row.append(None)
                     continue
                 b = sum(counts.get(k, {}).get("boarded", 0) for k in live)
                 a = sum(counts.get(k, {}).get("alighted", 0) for k in live)
+                # Totals are the raw observed counts; means divide by the days
+                # actually observed, which is what makes them comparable across
+                # lifts with different coverage.
+                tb_row.append(b)
+                ta_row.append(a)
                 b_row.append(b / len(live))
                 a_row.append(a / len(live))
             boarded[cam] = b_row
             alighted[cam] = a_row
             obs_days[cam] = d_row
+            total_b[cam] = tb_row
+            total_a[cam] = ta_row
 
         # Fleet: all 7 lifts serve ONE tower, so a fleet demand aggregate is a
         # statement about one population and is meaningful. It is an UNWEIGHTED
@@ -522,8 +533,17 @@ def demand_by_lift_hour(transits: list[dict], pi_cycles: list[dict],
             fleet_b.append(sum(boarded[c][h] for c in live) if live else None)
             fleet_a.append(sum(alighted[c][h] for c in live) if live else None)
 
+        fleet_tb, fleet_ta = [], []
+        for h in hours:
+            live = [c for c in cams if total_b[c][h] is not None]
+            fleet_tb.append(sum(total_b[c][h] for c in live) if live else None)
+            fleet_ta.append(sum(total_a[c][h] for c in live) if live else None)
+
         by_era[ver] = {
             "boarded": boarded, "alighted": alighted, "observed_days": obs_days,
+            "total_boarded_hr": total_b, "total_alighted_hr": total_a,
+            "fleet_total_boarded_hr": fleet_tb,
+            "fleet_total_alighted_hr": fleet_ta,
             "fleet_boarded": fleet_b, "fleet_alighted": fleet_a,
             "fleet_lifts_contributing": fleet_n,
             "peaks": _demand_peaks(cams, boarded, fleet_b),

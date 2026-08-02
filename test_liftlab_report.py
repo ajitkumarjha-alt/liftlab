@@ -631,20 +631,39 @@ def test_observed_days_matrix_matches_the_main_matrix(fixture_db):
     ws = cli.build_workbook(ctx)["DEMAND BY LIFT AND HOUR"]
     rows = [[c.value for c in r] for r in ws.iter_rows()]
 
-    def _block(title_text, offset):
+    def _block(title_text):
+        """The 24 hour-rows under a titled matrix. Located by finding the
+        'hour (IST)' header after the title, not by a hard-coded offset, so
+        adding a caption row does not silently shift the assertions."""
         i = next(k for k, r in enumerate(rows)
                  if any(c == title_text for c in r))
-        return rows[i + offset:i + offset + 24]
+        h = next(k for k in range(i, len(rows))
+                 if rows[k] and rows[k][0] == "hour (IST)")
+        start = h + 4                      # header + 3 provenance rows
+        return rows[start:start + 24]
 
-    main = _block("MEAN BOARDINGS PER HOUR OF DAY", 5)
-    days = _block("OBSERVED DAYS BEHIND EACH CELL ABOVE", 6)
-    assert len(main) == len(days) == 24
+    main = _block("MEAN BOARDINGS PER OBSERVED DAY, BY HOUR")
+    totals = _block("TOTAL OBSERVED BOARDINGS, BY HOUR")
+    days = _block("OBSERVED DAYS BEHIND EACH CELL ABOVE")
+    assert len(main) == len(totals) == len(days) == 24
     n_cams = len(ctx["cams"])
     for i in range(24):
-        assert main[i][0] == days[i][0], f"hour label mismatch on row {i}"
+        assert main[i][0] == days[i][0] == totals[i][0], (
+            f"hour label mismatch on row {i}")
         for j in range(1, n_cams + 1):
-            assert (main[i][j] == workbook.DARK) == (days[i][j] == 0), (
+            observed = days[i][j]
+            assert (main[i][j] == workbook.DARK) == (observed == 0), (
                 f"row {i} col {j}: '—' and 0-observed-days disagree")
+            # dark hours stay dark in the TOTALS matrix too
+            assert (totals[i][j] == workbook.DARK) == (observed == 0), (
+                f"row {i} col {j}: totals matrix disagrees with observed days")
+            if observed:
+                assert isinstance(totals[i][j], int), (
+                    f"row {i} col {j}: total is not a whole number of people")
+                assert totals[i][j] == pytest.approx(
+                    main[i][j] * observed, abs=0.01), (
+                    f"row {i} col {j}: total does not reconcile with "
+                    f"mean x observed days")
 
 
 def test_demand_never_pools_counting_eras(fixture_db):
@@ -1139,6 +1158,178 @@ def test_workbook_states_no_recommendation(fixture_db):
         low = text.lower()
         for b in banned:
             assert b not in low, f"[{sheet}] recommends: {b!r} in {text[:120]}"
+
+
+# ── 22. the tightened uninformative-interval rule ────────────────────────────
+
+def test_interval_rule_catches_the_half_to_full_width_band():
+    """The band the old rule admitted: CI width between 0.5x and 1.0x the
+    value. lift 3 / 260d4a0f sat here — value 2.75s, [1.52, 4.25], width 2.73."""
+    assert stats.MAX_CI_WIDTH_RATIO == 0.5
+    the_case = {"median": 2.75, "lo": 1.52, "hi": 4.25, "n": 91}
+    assert stats.interval_is_uninformative(the_case)
+
+    # explicitly across the band
+    for width, expected in ((0.40, False),   # 0.16x — firm
+                            (1.30, False),   # 0.52x ... just over? no: 0.52>0.5
+                            (1.37, True),    # 0.55x — suppressed
+                            (2.00, True),    # 0.80x — suppressed
+                            (2.60, True)):   # 1.04x — suppressed
+        ci = {"median": 2.50, "lo": 2.50 - width / 2, "hi": 2.50 + width / 2,
+              "n": 200}
+        got = stats.interval_is_uninformative(ci)
+        ratio = width / 2.50
+        assert got == (ratio > stats.MAX_CI_WIDTH_RATIO), (
+            f"width {width} (ratio {ratio:.2f}) -> {got}")
+
+    # the ratio is configurable
+    loose = {"median": 2.50, "lo": 2.00, "hi": 3.00, "n": 200}   # ratio 0.40
+    assert not stats.interval_is_uninformative(loose)
+    assert stats.interval_is_uninformative(loose, max_width_ratio=0.3)
+
+
+def test_newly_caught_pool_renders_the_suppression_text(fixture_db):
+    """Any pool the tightened rule catches must state why, not go silent."""
+    t0, t1 = _ts("2026-07-21T05:30:00"), _ts("2026-08-02T00:00:00")
+    ctx = cli.build_context(fixture_db, "site-A", t0, t1)
+    findings = narrative.build_findings(ctx, {})
+    caught = [(cam, era) for (cam, _i, era), a in ctx["aggs"].items()
+              if not a["close"]["suppressed"]
+              and stats.interval_is_uninformative(a["close"]["median_ci"])]
+    for cam, era in caught:
+        matching = [f for f in findings
+                    if era in f["sentence"] and "close-travel" in f["sentence"]]
+        assert matching, f"{cam}/{era} was suppressed but says nothing"
+        for f in matching:
+            assert "not enough data to state a close-travel value" in f["sentence"]
+            assert "takes a typical" not in f["sentence"]
+
+
+def test_suppression_text_describes_the_actual_rule(fixture_db):
+    """The wording must not claim the CI is wider than the value when the rule
+    is now half the value — that sentence would be false for the 0.5-1.0 band."""
+    t0, t1 = _ts("2026-07-21T05:30:00"), _ts("2026-08-02T00:00:00")
+    ctx = cli.build_context(fixture_db, "site-A", t0, t1)
+    for f in narrative.build_findings(ctx, {}):
+        s = f["sentence"]
+        if "not enough data to state a close-travel value" not in s:
+            continue
+        assert "wider than the value itself" not in s, (
+            f"stale wording from the 1.0x rule: {s[:170]}")
+        m = re.search(r"spans (\d+\.\d{2})s to (\d+\.\d{2})s — a spread of "
+                      r"(\d+\.\d{2})s", s)
+        if m:
+            lo, hi, spread = (float(m.group(i)) for i in (1, 2, 3))
+            assert spread == pytest.approx(hi - lo, abs=0.011), s[:170]
+
+
+# ── 23. finding 1 leads on the assumption gap ────────────────────────────────
+
+def test_finding_one_leads_on_the_assumption_gap(fixture_db):
+    """The study is about assumed-vs-observed. The compliance count may follow
+    as a consequence, but must not be the opening clause."""
+    t0, t1 = _ts("2026-07-21T05:30:00"), _ts("2026-08-02T00:00:00")
+    ctx = cli.build_context(fixture_db, "site-A", t0, t1)
+    first = narrative.build_findings(ctx, {})[0]
+    s = first["sentence"]
+    opening = s.split(". ")[0]          # ". " — not ".", which splits "2.00s"
+    assert "design sheet assumes" in opening, (
+        f"finding 1 does not open on the assumption: {opening}")
+    assert f"{eras.SHEET_CLOSE_S:.2f}s" in opening
+    # the compliance framing must come later, not first
+    cliff_pos = s.find("flips at")
+    assumed_pos = s.find("assumes")
+    if cliff_pos >= 0:
+        assert assumed_pos < cliff_pos, "compliance leads the assumption gap"
+    assert first["sheet"] and first["confidence"] and first["why"]
+
+
+def test_finding_one_states_the_observed_range_with_n(fixture_db):
+    t0, t1 = _ts("2026-07-21T05:30:00"), _ts("2026-08-02T00:00:00")
+    ctx = cli.build_context(fixture_db, "site-A", t0, t1)
+    s = narrative.build_findings(ctx, {})[0]["sentence"]
+    quotable = [a["close"] for a in ctx["aggs"].values()
+                if not a["close"]["suppressed"]
+                and not stats.interval_is_uninformative(a["close"]["median_ci"])
+                and a["close"]["median_ci"]["median"] is not None]
+    if not quotable:
+        pytest.skip("no quotable pool in this range")
+    meds = sorted(c["median_ci"]["median"] for c in quotable)
+    assert f"{meds[0]:.2f}s" in s and f"{meds[-1]:.2f}s" in s
+    assert f"n={sum(c['n'] for c in quotable):,}" in s
+    # and it says which side of the observed range the assumption falls on
+    assert any(w in s for w in ("BELOW everything measured",
+                                "ABOVE everything measured",
+                                "INSIDE the observed range"))
+
+
+def test_no_take_away_leads_on_compliance(fixture_db):
+    """Chart captions must lead on the assumption gap too."""
+    ctx = _demand_ctx(fixture_db)
+    wb = cli.build_workbook(ctx)
+    for sheet, text in _all_text(wb):
+        if not text.startswith("Take-away:"):
+            continue
+        head = text[:110].lower()
+        if "compliance" in head or "cliff" in head:
+            assert "assum" in head, (
+                f"[{sheet}] take-away leads on compliance: {text[:110]}")
+
+
+# ── 24. demand totals beside means ───────────────────────────────────────────
+
+def test_totals_matrix_is_whole_people_and_reconciles(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    d = ctx["demand"]
+    for ver, e in d["by_era"].items():
+        for cam in ctx["cams"]:
+            for h in d["hours"]:
+                tot, mean = e["total_boarded_hr"][cam][h], e["boarded"][cam][h]
+                days = e["observed_days"][cam][h]
+                assert (tot is None) == (mean is None)
+                if tot is None:
+                    assert days == 0
+                    continue
+                assert isinstance(tot, int)
+                assert tot == pytest.approx(mean * days, abs=1e-6)
+
+
+def test_demand_sheet_shows_both_matrices_with_the_coverage_caveat(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    wb = cli.build_workbook(ctx)
+    ws = wb["DEMAND BY LIFT AND HOUR"]
+    text = " ".join(str(c.value) for r in ws.iter_rows()
+                    for c in r if c.value is not None)
+    assert "MEAN BOARDINGS PER OBSERVED DAY, BY HOUR" in text
+    assert "TOTAL OBSERVED BOARDINGS, BY HOUR" in text
+    assert "MEAN ALIGHTINGS PER OBSERVED DAY, BY HOUR" in text
+    assert "TOTAL OBSERVED ALIGHTINGS, BY HOUR" in text
+    assert "NOT comparable" in text
+    assert "Compare lifts on the MEAN matrix" in text
+    # totals carry an integer format, means one decimal
+    fmts = {c.number_format for r in ws.iter_rows() for c in r
+            if isinstance(c.value, int)}
+    assert "#,##0" in fmts
+
+
+def test_glossary_distinguishes_mean_from_total(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    terms = {t for t, _m in narrative.GLOSSARY}
+    assert "mean per observed day, vs total observed" in terms
+    meaning = dict(narrative.GLOSSARY)["mean per observed day, vs total observed"]
+    assert "whole people" in meaning.lower()
+    assert "part of a person" in meaning.lower()
+
+
+def test_population_share_stays_blocked(fixture_db):
+    """v5 must not have introduced a share-of-population figure anywhere."""
+    ctx = _demand_ctx(fixture_db)
+    assert ctx.get("population") is None
+    wb = cli.build_workbook(ctx)
+    text = " ".join(v for s, v in _all_text(wb)
+                    if s == "DEMAND BY LIFT AND HOUR")
+    assert "BLOCKED — no population figure was supplied" in text
+    assert "as % of population" not in text
 
 
 def test_sheets_are_frozen_and_the_raw_sheet_filters(fixture_db):

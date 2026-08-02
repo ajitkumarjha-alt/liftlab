@@ -124,10 +124,11 @@ Two guards follow from it, both reported rather than applied silently:
 | Sheet | What it is |
 |---|---|
 | **READ THIS FIRST** | Sheet 1. Opens with WHY THIS STUDY EXISTS (the programme, the two questions, the benchmarking scope) and WHICH COEFFICIENTS ARE UNDER TEST (all eight, with per-export status). Written for a reader new to the project (MEP reviewer, manager). What this measures; one line per sheet; numbered findings each with **Evidence** (sheet + cell range + chart) and **Confidence** (HIGH / MEDIUM / TOO EARLY TO SAY, with the reason and the n that would move it); what we cannot say yet and what it would take; how much data this really is; a glossary; the colour legend. Every claim is **generated from the computed data** — no hardcoded prose about specific numbers — and a finding whose metric was suppressed says so. |
-| **SUMMARY** | Range, generated-at, eras present, gaps excluded; headline close-travel median/p85/n vs the 2.00 s assumption and % over the 2.31 s Bank C cliff, **per instrument era**; the stopping-rule chart (running mean ± 95 % CI vs 2.31 — the study ends when the band clears the line). |
+| **SUMMARY** | Range, generated-at, eras present, gaps excluded; **C27 door operating time** — observed close travel median / 95 % CI / p85 / n against the 2.00 s assumption, and % beyond the 2.31 s flip point, **per instrument era**; the widest disagreement between two lifts; the fleet comparison chart and the stopping-rule chart (running mean ± 95 % CI — the study ends when the band clears the line). Notes that C27 is one of eight coefficients, pointing at the scope table. |
 | **VS THE SHEET** | One row per MEP-02 v28 coefficient per era: C19, C26, C27, C17/C18, B24. Columns: assumption, observed, n, 95 % CI, decision threshold, verdict. Verdicts are mechanical (CI clears / straddles); unmeasurable coefficients say why. |
 | **PER-LIFT** | One block per channel: bank, counting_version, **precision beside every count**, per-era door-cycle stats (median/p85/min-max/histogram), dwell distribution, transits with per-hour rate (gap-excluded), coverage %. |
 | **FLEET** | **Unweighted sums**, labelled as such, with the per-lift precision range shown (never a silently-averaged precision). Grouped by bank; warns when the bank column is unpopulated. Fleet close-travel is `n/a — spans eras`. |
+| **DEMAND BY LIFT AND HOUR** | Per counting era (never pooled): **mean boardings/alightings per observed day, by hour** — the coverage-comparable figure — with the **total observed** counts beneath each as whole people. Totals are *not* comparable between lifts, because coverage ranges widely and a lift watched longer shows a bigger total regardless; the caption says so and points back at the means. Dark hours read `—` in every matrix, never 0. Then the observed-days matrix behind every cell, busiest hour per lift, peak 5-min demand vs the 8 % assumption (or an explicit BLOCKED without `--population`), and load balance. Carries the **canonical busiest hour** with its definition. |
 | **PEAK ANALYSIS** | Per day: worst 5-min boarding window (or the fixed window), peak:average ratio, peak-demand % when `--population` given; coefficients inside peak windows vs all-day, per era. |
 | **RAW** | Row-level era-tagged export — the audit trail. Every row carries instrument, counting_version, era, precision-at-time, and an in-declared-gap flag. |
 | **COVERAGE & ERAS** | Boundaries crossed with row counts each side, gap windows excluded, per-channel coverage % and row counts by era. A channel with zero rows is listed, not omitted. |
@@ -174,8 +175,14 @@ explicitly scoped.
   displaying as 2.31 against a 2.31 line reads *sits exactly ON the line*, never
   above or below.
 * **No point estimate in result language** where the interval cannot support one
-  — CI wider than the value itself, or n < 30. The sheet says "not enough data
-  to state a value (n=…; the range spans …, too wide to be useful)".
+  — CI wider than **half** the value (`stats.MAX_CI_WIDTH_RATIO`, default 0.5),
+  or n < 30. A median of 2.75 s with an interval of [1.52, 4.25] is consistent
+  both with a lift under the assumed value and one far over it, so no figure is
+  quoted; the sheet states the spread and why instead.
+* **Findings lead on the assumption gap**, not on a compliance count. Finding 1
+  opens with what the sheet assumes against the range actually observed (with
+  n); the compliance count follows as a consequence of that gap. Chart
+  take-aways follow the same rule.
 * **Load balance needs three lifts.** Across two points the coefficient of
   variation is degenerate (√2 whenever one is zero). Hours below the minimum get
   no row; if most hours fall below it the table is withheld with one line saying

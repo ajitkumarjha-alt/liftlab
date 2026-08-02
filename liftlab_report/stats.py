@@ -114,15 +114,24 @@ def compare_to_threshold(value: float | None, threshold: float,
     return AT
 
 
-def interval_is_uninformative(ci: dict, min_n: int = 30) -> bool:
+# An interval this wide relative to its own point estimate does not support
+# stating that estimate as a result. At 0.5, a 2.75s median with an interval of
+# [1.52, 4.25] (width 2.73, ratio 0.99) is suppressed: that range is consistent
+# both with a lift comfortably under the assumed value and one far over it, so
+# the midpoint is not a finding. The earlier 1.0 threshold admitted exactly that
+# case.
+MAX_CI_WIDTH_RATIO = 0.5
+
+
+def interval_is_uninformative(ci: dict, min_n: int = 30,
+                              max_width_ratio: float = MAX_CI_WIDTH_RATIO) -> bool:
     """True when a point estimate from this interval must NOT be stated as a
     result.
 
     Two ways an interval fails to support a value: too few observations, or a
-    width that exceeds the value itself — an interval of [0.88, 22.28] around
-    2.31 is consistent with almost any door, and printing '2.31s' from it in
-    the same sentence shape used for a well-measured lift invites the reader to
-    treat the two as comparable."""
+    width large relative to the value itself. Printing a midpoint drawn from a
+    wide interval in the same sentence shape used for a well-measured lift
+    invites the reader to treat the two as comparable when they are not."""
     n = ci.get("n") or 0
     if n < min_n:
         return True
@@ -131,7 +140,9 @@ def interval_is_uninformative(ci: dict, min_n: int = 30) -> bool:
         point = ci.get("mean")
     if lo is None or hi is None or point is None:
         return True
-    return (hi - lo) > abs(point)
+    if point == 0:
+        return True
+    return (hi - lo) > max_width_ratio * abs(point)
 
 
 def n_for_separation(ci: dict, threshold: float, value_key: str = "median"

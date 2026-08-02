@@ -418,11 +418,16 @@ def sheet_summary(wb, ctx, cd, anchors):
     if rows:
         cliff = sorted({a["close"]["cliff_s"] for a in ctx["aggs"].values()})[0]
         n_over = sum(1 for r in rows if r["over"])
+        assumed = eras.SHEET_CLOSE_S
+        n_slower = sum(1 for r in rows if r["median"] > assumed)
         row = caption(ws, row, (
-            f"Take-away: {n_over} of {len(rows)} lift-builds have a typical "
-            f"close time above the {cliff:.2f}s compliance line (red bars). "
-            f"Whiskers show the 95% range — where a whisker crosses the line, "
-            f"the measurement cannot yet say which side that lift is on."))
+            f"Take-away: the sheet assumes {assumed:.2f}s; {n_slower} of "
+            f"{len(rows)} measurable lift-builds close slower than that — the "
+            f"gap between assumed and observed is what this study is measuring. "
+            f"The red line marks {cliff:.2f}s, the point at which the "
+            f"tightest-margin bank's design case flips; {n_over} sit above it. "
+            f"Whiskers show the 95% range — where a whisker crosses a line, the "
+            f"measurement cannot yet say which side that lift is on."))
         ch = charts.fleet_comparison(cd, rows, cliff)
         if ch is not None:
             ws.add_chart(ch, f"A{row}")
@@ -669,11 +674,16 @@ def sheet_per_lift(wb, ctx, cd, anchors):
             spec = eras.DOOR_SPECS.get(cam, {})
             assumption = spec.get("sheet_close_s", eras.SHEET_CLOSE_S)
             pct_over = cl["over_cliff"]["pct"] or 0.0
+            vals = cl["values"]
+            pct_over_assumed = (100.0 * sum(1 for v in vals if v > assumption)
+                                / len(vals)) if vals else 0.0
             row = caption(ws, row, (
-                f"Take-away: {pct_over:.0f}% of this lift's closes land beyond "
-                f"the {cl['cliff_s']:.2f}s compliance line (red bars); the "
-                f"green bars are closes at or under the {assumption:.2f}s the "
-                f"design sheet assumed. n={cl['n']}."))
+                f"Take-away: {pct_over_assumed:.0f}% of this lift's closes take "
+                f"longer than the {assumption:.2f}s the design sheet assumes "
+                f"(amber and red bars); the green bars are the closes at or "
+                f"under it. Of the whole pool, {pct_over:.0f}% go beyond "
+                f"{cl['cliff_s']:.2f}s, where the tightest-margin bank's design "
+                f"case flips. n={cl['n']}."))
             ch = charts.close_histogram(
                 cd, f"{eras.lift_label(cam)} close travel — {instrument}/{era_id} "
                     f"(n={cl['n']})", cl["values"], stats.CLOSE_HIST_EDGES,
@@ -963,49 +973,71 @@ def sheet_demand(wb, ctx, cd, anchors):
                 rw += 1
             return rw
 
-        # ── BOARDINGS
-        row = section(ws, row, "MEAN BOARDINGS PER HOUR OF DAY")
-        row = _lift_headers(row, "hour (IST)")
-        b_first = row
-        for h in hours:
-            cell(ws, row, 1, f"{h:02d}:00", font=BODY_BOLD)
-            for i, cam in enumerate(cams, start=2):
-                v = e["boarded"][cam][h]
-                if v is None:
-                    cell(ws, row, i, DARK, fill=FILL_NA)
+        def _matrix(rw, heading, per_cam, fleet, fmt, note=None, heat=True):
+            """One hour x lift matrix. Dark hours read '—' in every matrix."""
+            rw = section(ws, rw, heading)
+            if note:
+                cell(ws, rw, 1, note, font=BODY_ITALIC, wrap=True)
+                ws.merge_cells(start_row=rw, start_column=1, end_row=rw,
+                               end_column=len(cams) + 2)
+                ws.row_dimensions[rw].height = 30
+                rw += 1
+            rw = _lift_headers(rw, "hour (IST)")
+            first = rw
+            for h in hours:
+                cell(ws, rw, 1, f"{h:02d}:00", font=BODY_BOLD)
+                for i, cam in enumerate(cams, start=2):
+                    v = per_cam[cam][h]
+                    if v is None:
+                        cell(ws, rw, i, DARK, fill=FILL_NA)
+                    else:
+                        cell(ws, rw, i, v, fmt)
+                fv = fleet[h]
+                if fv is None:
+                    cell(ws, rw, len(cams) + 2, DARK, fill=FILL_NA)
                 else:
-                    cell(ws, row, i, v, "0.0")
-            fv = e["fleet_boarded"][h]
-            if fv is None:
-                cell(ws, row, len(cams) + 2, DARK, fill=FILL_NA)
-            else:
-                cell(ws, row, len(cams) + 2, fv, "0.0", font=BODY_BOLD)
-            row += 1
-        b_last = row - 1
-        style.heatmap(ws, 2, len(cams) + 1, b_first, b_last)
+                    cell(ws, rw, len(cams) + 2, fv, fmt, font=BODY_BOLD)
+                rw += 1
+            if heat:
+                style.heatmap(ws, 2, len(cams) + 1, first, rw - 1)
+            return rw, first, rw - 1
+
+        covs = [ctx["coverage_pct"].get(c, 0.0) for c in cams]
+        totals_note = (
+            f"Whole people, as counted. These totals are NOT comparable "
+            f"between lifts: coverage ranges "
+            f"{min(covs):.0f}%–{max(covs):.0f}% across these lifts, so a lift "
+            f"watched for longer will show a bigger total whether or not it "
+            f"carried more. Compare lifts on the MEAN matrix above; use these "
+            f"totals to see the raw volume behind each mean."
+            if covs else "Whole people, as counted.")
+        mean_note = ("Averaged over the days each lift was actually observed in "
+                     "that hour, which is what makes these figures comparable "
+                     "between lifts of different coverage. A fraction of a "
+                     "person is an average across days, not a part-person.")
+
+        # ── BOARDINGS: mean, then the totals behind it
+        row, b_first, b_last = _matrix(
+            row, "MEAN BOARDINGS PER OBSERVED DAY, BY HOUR",
+            e["boarded"], e["fleet_boarded"], "0.0", note=mean_note)
         if first_matrix_range is None:
             first_matrix_range = _rng_cols(b_first, b_last, 1, len(cams) + 2)
         row += 1
+        row, _f, _l = _matrix(
+            row, "TOTAL OBSERVED BOARDINGS, BY HOUR",
+            e["total_boarded_hr"], e["fleet_total_boarded_hr"], F_INT,
+            note=totals_note, heat=False)
+        row += 1
 
-        # ── ALIGHTINGS
-        row = section(ws, row, "MEAN ALIGHTINGS PER HOUR OF DAY")
-        row = _lift_headers(row, "hour (IST)")
-        a_first = row
-        for h in hours:
-            cell(ws, row, 1, f"{h:02d}:00", font=BODY_BOLD)
-            for i, cam in enumerate(cams, start=2):
-                v = e["alighted"][cam][h]
-                if v is None:
-                    cell(ws, row, i, DARK, fill=FILL_NA)
-                else:
-                    cell(ws, row, i, v, "0.0")
-            fv = e["fleet_alighted"][h]
-            if fv is None:
-                cell(ws, row, len(cams) + 2, DARK, fill=FILL_NA)
-            else:
-                cell(ws, row, len(cams) + 2, fv, "0.0", font=BODY_BOLD)
-            row += 1
-        style.heatmap(ws, 2, len(cams) + 1, a_first, row - 1)
+        # ── ALIGHTINGS: mean, then the totals behind it
+        row, _f, _l = _matrix(
+            row, "MEAN ALIGHTINGS PER OBSERVED DAY, BY HOUR",
+            e["alighted"], e["fleet_alighted"], "0.0", note=mean_note)
+        row += 1
+        row, _f, _l = _matrix(
+            row, "TOTAL OBSERVED ALIGHTINGS, BY HOUR",
+            e["total_alighted_hr"], e["fleet_total_alighted_hr"], F_INT,
+            note=totals_note, heat=False)
         row += 1
 
         # ── OBSERVED DAYS

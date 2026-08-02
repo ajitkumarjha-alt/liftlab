@@ -210,19 +210,58 @@ def _f_compliance(ctx, anchors):
     cliffs = sorted({cl["cliff_s"] for _k, _a, cl in rows})
     cliff_txt = " / ".join(f"{c:.2f}s" for c in cliffs)
     sheet, rng = _anchor(anchors, "summary_headline", "SUMMARY")
+
+    # LEAD ON THE ASSUMPTION GAP. The study exists to check assumed
+    # coefficients against reality, so the first thing said about C27 is where
+    # the assumed value sits relative to what was measured. The compliance
+    # count follows as a CONSEQUENCE of that gap, not as the headline.
+    quotable = [(key, cl) for key, _a, cl in rows
+                if not cl["suppressed"]
+                and not stats.interval_is_uninformative(cl["median_ci"])
+                and cl["median_ci"]["median"] is not None]
+    assumed = eras.SHEET_CLOSE_S
+    if quotable:
+        meds = sorted(cl["median_ci"]["median"] for _k, cl in quotable)
+        n_q = sum(cl["n"] for _k, cl in quotable)
+        lo_v, hi_v = meds[0], meds[-1]
+        span = (f"is {lo_v:.2f}s" if len(meds) == 1
+                else f"spans {lo_v:.2f}s to {hi_v:.2f}s")
+        if assumed < lo_v:
+            where = ("BELOW everything measured here — every lift firm enough "
+                     "to quote closes slower than the sheet assumes")
+        elif assumed > hi_v:
+            where = ("ABOVE everything measured here — every lift firm enough "
+                     "to quote closes faster than the sheet assumes")
+        else:
+            where = ("INSIDE the observed range — some lifts are faster than "
+                     "the sheet assumes and some slower")
+        first = (f"The design sheet assumes doors close in {assumed:.2f}s. "
+                 f"Across the {len(quotable)} lift-build(s) measured firmly "
+                 f"enough to quote, the observed typical close travel {span} "
+                 f"(n={n_q:,} closes), so the assumed value sits {where}.")
+    else:
+        first = (f"The design sheet assumes doors close in {assumed:.2f}s. No "
+                 f"lift-build in this range was measured firmly enough to put "
+                 f"an observed value beside it — see the per-lift findings for "
+                 f"what each is short of.")
+
     parts = []
     if over:
-        parts.append(f"{len(over)} measured ABOVE it — "
+        parts.append(f"{len(over)} above it — "
                      + ", ".join(eras.lift_label(c) for c in sorted(set(over))))
     if under:
-        parts.append(f"{len(under)} measured below it — "
+        parts.append(f"{len(under)} below it — "
                      + ", ".join(eras.lift_label(c) for c in sorted(set(under))))
     if straddle:
-        parts.append(f"{len(straddle)} too close to call at the data collected "
-                     f"so far")
-    sentence = (f"Of the {len(rows)} lift-and-build combinations with door "
-                f"data, measured against the compliance line of {cliff_txt}: "
-                + "; ".join(parts) + ".")
+        parts.append(f"{len(straddle)} not yet placeable on either side")
+    second = (f"Because the design sheet multiplies door-close time by the "
+              f"number of stops a car makes, a gap of this kind propagates "
+              f"into round-trip time — and banks differ in how much slack they "
+              f"have to absorb it. On the tightest-margin bank the design case "
+              f"flips at {cliff_txt}; measured against that line, of the "
+              f"{len(rows)} lift-build combinations with door data: "
+              + "; ".join(parts) + ".")
+    sentence = first + " " + second
     lvl = (HIGH if (over or under) and not straddle and n_tot >= N_HIGH
            else MEDIUM if n_tot >= N_MEDIUM else TOO_EARLY)
     why = (f"{n_tot} door closes across all lifts; "
@@ -252,9 +291,15 @@ def _f_compliance(ctx, anchors):
             # No point estimate in result language — the interval does not
             # support one, and a number in this sentence shape would be read as
             # a measurement of the same standing as a well-sampled lift's.
+            # Describe the SPREAD, not the midpoint — restating the midpoint
+            # inside a "not measurable" sentence is how a suppressed number
+            # ends up quoted anyway.
             span = (f"the range consistent with this data spans "
-                    f"{mc['lo']:.2f}s to {mc['hi']:.2f}s, which is wider than "
-                    f"the value itself and too wide to be useful"
+                    f"{mc['lo']:.2f}s to {mc['hi']:.2f}s — a spread of "
+                    f"{mc['hi'] - mc['lo']:.2f}s, more than "
+                    f"{stats.MAX_CI_WIDTH_RATIO:g}x the value it is meant to "
+                    f"pin down, and consistent both with a lift under the "
+                    f"assumed {eras.SHEET_CLOSE_S:.2f}s and one well over it"
                     if mc["lo"] is not None else
                     "there are too few closes to put any range around it")
             sentence = (f"{eras.lift_label(cam)} on "
@@ -785,6 +830,15 @@ GLOSSARY = [
      "transit going in; an alighting is one going out."),
     ("boarding",
      "One person entering the lift car. Peak demand is counted in boardings."),
+    ("mean per observed day, vs total observed",
+     "A TOTAL is the raw number of people counted — whole people. A MEAN PER "
+     "OBSERVED DAY divides that total by the number of days the lift was "
+     "actually being watched in that hour. Totals cannot be compared between "
+     "lifts here, because the lifts were watched for very different amounts of "
+     "time and a lift watched longer will show a bigger total regardless of how "
+     "busy it was; the means can. A mean of 12.3 people does not mean part of a "
+     "person boarded — it means that across the days observed, that hour "
+     "averaged 12.3 people, the same way a household can average 2.4 children."),
     ("p85",
      "The 85th percentile: the value that 85% of the measurements fall below. "
      "Useful because a typical (median) figure hides the slow tail, and lift "
