@@ -27,8 +27,8 @@ bash -n /tmp/relay_soak.sh || { say "relay_soak.sh syntax error — aborting"; e
 # /tmp copy from a previous attempt all look like a successful deploy. Print the md5 of every
 # artifact and, where an expected value is supplied, REFUSE to continue on a mismatch.
 # Set RELAY_MD5 / UNIT_MD5 to enforce (from `md5sum` on the file you intend to ship).
-for _pair in "relay_soak.sh:${RELAY_MD5:-}" "liftlab-relay.service:${UNIT_MD5:-}"; do
-  _f=${_pair%%:*}; _want=${_pair#*:}
+for _pair in "relay_soak.sh:RELAY_MD5:${RELAY_MD5:-}" "liftlab-relay.service:UNIT_MD5:${UNIT_MD5:-}"; do
+  _f=${_pair%%:*}; _rest=${_pair#*:}; _var=${_rest%%:*}; _want=${_rest#*:}
   _got=$(md5sum "/tmp/$_f" | cut -d' ' -f1)
   if [ -n "$_want" ]; then
     if [ "$_got" != "$_want" ]; then
@@ -36,9 +36,9 @@ for _pair in "relay_soak.sh:${RELAY_MD5:-}" "liftlab-relay.service:${UNIT_MD5:-}
       say "  Re-fetch it: curl -fsSL -o /tmp/$_f https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts/$_f"
       exit 1
     fi
-    say "md5 $_f: $_got (matches expected)"
+    say "md5 $_f: $_got (matches expected — verified)"
   else
-    say "md5 $_f: $_got  (set ${_f%%.*}_MD5= to enforce; unenforced here)"
+    say "md5 $_f: $_got  (UNENFORCED — pass ${_var}=${_got} to make this a gate)"
   fi
 done
 
