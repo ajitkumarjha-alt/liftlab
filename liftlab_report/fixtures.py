@@ -155,7 +155,8 @@ def add_quantized_gpu_cycles(db, cam: str, start: datetime, n: int,
                       door_version=door_version)
 
 
-def make_fixture(path: str, *, with_pi=True, with_gpu=True) -> str:
+def make_fixture(path: str, *, with_pi=True, with_gpu=True,
+                 floor_ranges: dict | None = None) -> str:
     """A small but era-complete gateway DB:
     * pi_watch cycles 2026-07-15 and 2026-07-18 (both pi sub-eras)
     * gpu_engine cycles + transits 2026-07-22..23 and 2026-07-30
@@ -167,6 +168,10 @@ def make_fixture(path: str, *, with_pi=True, with_gpu=True) -> str:
     * ch34: a channel that goes silent for a whole day between live days, for
       the suspected-gap detector
     * validation rows for all 7 cams under 2026-07-28-registry-zones
+
+    floor_ranges: {cam: "1-30"} written into camera_registry.floor_range. The
+    LIVE gateway has this field EMPTY on every channel, which is the default
+    here — bank derivation must be exercised against both states.
     """
     db = sqlite3.connect(path)
     _ddl(db)
@@ -180,9 +185,10 @@ def make_fixture(path: str, *, with_pi=True, with_gpu=True) -> str:
              _ist(2026, 7, 29, 12, 0).timestamp(),
              _ist(2026, 7, 29, 12, 0).timestamp(), "2026-07-28-registry-zones"))
         db.execute(
-            "INSERT INTO camera_registry (gateway_id,cam,enabled,note,updated_at)"
-            " VALUES (?,?,1,?,?)",
-            (GW, f"ch{ch}", f"fixture lift {ch}", time.time()))
+            "INSERT INTO camera_registry (gateway_id,cam,enabled,note,"
+            "updated_at,floor_range) VALUES (?,?,1,?,?,?)",
+            (GW, f"ch{ch}", f"fixture lift {ch}", time.time(),
+             (floor_ranges or {}).get(f"ch{ch}", "")))
         db.execute(
             "INSERT INTO analyzer_status (gateway_id,cam,ts,counting_version)"
             " VALUES (?,?,?,?)",
@@ -249,11 +255,17 @@ def make_fixture(path: str, *, with_pi=True, with_gpu=True) -> str:
         # ch34 — live on Jul 25 and Jul 28, silent through Jul 26 and Jul 27.
         # Jul 26 is NOT declared, so the detector must flag it; Jul 27 IS
         # declared, so the detector must stay quiet about it.
+        #
+        # Its closes cluster tightly around 1.5s against ch32's ~2.4s on the
+        # same day, with enough cycles for a confidence interval — two lifts in
+        # one tower whose intervals do not overlap. That is the shape the
+        # unresolved-divergence finding exists to raise, so the fixture has to
+        # contain it or the test for it proves nothing.
         for day in (25, 28):
             add_quantized_gpu_cycles(
-                db, "ch34", _ist(2026, 7, day, 10, 0), 8,
-                close_s=lambda k: 2.0 + 0.08 * (k % 4), open_s=2.4,
-                door_version="ee55ff66+7788aa99")
+                db, "ch34", _ist(2026, 7, day, 10, 0), 40,
+                close_s=lambda k: 1.44 + 0.08 * (k % 3), open_s=2.4,
+                door_version="ee55ff66+7788aa99", step_min=5)
     db.commit()
     db.close()
     return path

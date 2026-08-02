@@ -8,7 +8,7 @@ on READ THIS FIRST, generated from the same constants.
 
 from __future__ import annotations
 
-from openpyxl.formatting.rule import FormulaRule
+from openpyxl.formatting.rule import ColorScaleRule, FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -197,6 +197,23 @@ def autofilter(ws, header_row_idx: int, n_cols: int, last_row: int):
         return
     ws.auto_filter.ref = (f"A{header_row_idx}:"
                           f"{get_column_letter(n_cols)}{last_row}")
+
+
+def heatmap(ws, first_col: int, last_col: int, first_row: int, last_row: int):
+    """Colour-scale a numeric matrix.
+
+    The NUMBER stays visible in every cell — colour is a second channel, not
+    the only one, so the matrix is still readable printed in greyscale or by a
+    colour-blind reader. Light-to-dark on a single hue for the same reason: it
+    survives desaturation, which a red-green scale does not."""
+    if last_row < first_row or last_col < first_col:
+        return
+    ref = (f"{get_column_letter(first_col)}{first_row}:"
+           f"{get_column_letter(last_col)}{last_row}")
+    ws.conditional_formatting.add(ref, ColorScaleRule(
+        start_type="min", start_color="FFFFFF",
+        mid_type="percentile", mid_value=50, mid_color="9DC3E6",
+        end_type="max", end_color="1F4E79"))
 
 
 def verdict_conditional_formatting(ws, col: int, first_row: int, last_row: int):

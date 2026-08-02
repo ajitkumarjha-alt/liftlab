@@ -35,12 +35,19 @@ N_MEDIUM = 30
 
 # Finding order is by weight on the design decision, not by sheet order.
 P_COMPLIANCE = 10          # does the fleet clear the compliance cliff
+P_UNRESOLVED = 15          # an open question that blocks quoting other figures
 P_WORST = 20               # which lift is worst, and by how much
 P_MEASURE_BLOCKED = 30     # a headline coefficient that cannot be measured
 P_DATA_QUALITY = 40        # filters and artifacts that move the headline
+P_DEMAND = 45              # when the building uses its lifts, and how evenly
 P_TRANSFER = 50            # secondary coefficients
 P_PEAK = 60
 P_COVERAGE = 70
+
+# Two lifts in the SAME tower differing by more than this in typical close
+# travel is not ordinary unit-to-unit variation and gets raised as an open
+# question rather than reported as a result.
+DIVERGENCE_S = 0.5
 
 
 def _era_label(instrument: str, era_id: str) -> str:
@@ -105,8 +112,12 @@ def build_findings(ctx: dict, anchors: dict) -> list[dict]:
     number being quoted."""
     out: list[dict] = []
     out += _f_compliance(ctx, anchors)
+    out += _f_divergence(ctx, anchors)
     out += _f_open_travel(ctx, anchors)
     out += _f_floor_filter(ctx, anchors)
+    out += _f_demand(ctx, anchors)
+    out += _f_load_balance(ctx, anchors)
+    out += _f_per_floor_blocked(ctx, anchors)
     out += _f_transfer(ctx, anchors)
     out += _f_peak(ctx, anchors)
     out += _f_coverage(ctx, anchors)
@@ -210,6 +221,178 @@ def _f_compliance(ctx, anchors):
                     "close-travel histogram")[1],
             lvl, why, n=cl["n"]))
     return out
+
+
+def _f_divergence(ctx, anchors):
+    """Two lifts in the SAME tower whose close travel differs materially, with
+    non-overlapping intervals.
+
+    This is deliberately NOT resolved here. Both explanations — genuine
+    mechanical difference, or a measurement artifact of camera geometry or the
+    door-detection build — are consistent with the evidence in this workbook,
+    and nothing in the data separates them. Picking one would be inventing a
+    conclusion; the honest output is a named open question that blocks per-lift
+    figures from being quoted for design."""
+    pools = []
+    for (cam, instrument, era_id), a in sorted(ctx["aggs"].items()):
+        cl, mc = a["close"], a["close"]["median_ci"]
+        if cl["suppressed"] or mc["median"] is None or mc["lo"] is None:
+            continue
+        if cl["n"] < N_MEDIUM:
+            continue
+        pools.append((cam, instrument, era_id, cl, mc))
+    if len(pools) < 2:
+        return []
+    lo_p = min(pools, key=lambda p: p[4]["median"])
+    hi_p = max(pools, key=lambda p: p[4]["median"])
+    if lo_p[0] == hi_p[0]:
+        return []
+    gap = hi_p[4]["median"] - lo_p[4]["median"]
+    disjoint = hi_p[4]["lo"] > lo_p[4]["hi"]
+    if gap < DIVERGENCE_S or not disjoint:
+        return []
+
+    hi_cam, _hi_i, hi_era, hi_cl, hi_mc = hi_p
+    lo_cam, _lo_i, lo_era, lo_cl, lo_mc = lo_p
+    sheet, rng = _anchor(anchors, "summary_headline", "SUMMARY")
+    same_build = hi_era == lo_era
+    sentence = (
+        f"{eras.lift_label(hi_cam).capitalize()} takes "
+        f"{hi_mc['median']:.2f}s to close and "
+        f"{eras.lift_label(lo_cam)} takes {lo_mc['median']:.2f}s — a "
+        f"{gap:.2f}s difference between two lifts in the same tower, and the "
+        f"two ranges do not overlap ([{hi_mc['lo']:.2f}, {hi_mc['hi']:.2f}] "
+        f"against [{lo_mc['lo']:.2f}, {lo_mc['hi']:.2f}]), so this is not "
+        f"measurement noise. Identical door hardware should not differ this "
+        f"much. THE CAUSE IS UNRESOLVED: it is either a real mechanical "
+        f"difference between the two units — which would be a maintenance "
+        f"finding — or an artifact of how these two cameras see their doors "
+        f"({'both lifts were measured by different door-detection builds'
+            if not same_build else 'both were measured by the same '
+            'door-detection build, which makes camera geometry the more likely '
+            'of the two'}). Nothing in this data separates the two "
+        f"explanations, and this workbook does not choose between them.")
+    return [_finding(
+        P_UNRESOLVED,
+        f"OPEN QUESTION — {eras.lift_label(hi_cam)} and {eras.lift_label(lo_cam)} "
+        f"disagree by {gap:.2f}s and nothing here says why",
+        sentence, sheet, rng,
+        _anchor(anchors, "fleet_compare_chart", sheet,
+                "fleet comparison chart")[1],
+        TOO_EARLY,
+        f"both pools are individually well-sampled (n={hi_cl['n']} and "
+        f"n={lo_cl['n']}) and their intervals are disjoint, so the DIFFERENCE "
+        f"is solid; what is unresolved is its CAUSE, which no amount of the "
+        f"same measurement will settle",
+        n=min(hi_cl["n"], lo_cl["n"]),
+        extra=[
+            "This blocks per-lift close-travel figures from being quoted for "
+            "design: until the cause is known, a per-lift number cannot be "
+            "attributed to the lift rather than to its camera.",
+            "To resolve: physically time the doors on both lifts with a "
+            "stopwatch and compare against these figures; and/or re-measure "
+            "both under the same door-detection build with checked camera "
+            "geometry. One afternoon of manual timing separates the two "
+            "explanations outright."])]
+
+
+def _f_demand(ctx, anchors):
+    """When the building actually uses its lifts."""
+    demand = ctx.get("demand") or {}
+    by_era = demand.get("by_era") or {}
+    if not by_era:
+        return []
+    # the counting era carrying the most data speaks for the building
+    ver = max(by_era, key=lambda v: by_era[v]["total_boarded"])
+    e = by_era[ver]
+    pk = e["peaks"]["__fleet__"]
+    if pk["hour"] is None:
+        return []
+    sheet, rng = _anchor(anchors, "demand_peaks", "DEMAND BY LIFT AND HOUR")
+    ranked = sorted(
+        ((h, v) for h, v in enumerate(e["fleet_boarded"]) if v is not None),
+        key=lambda hv: -hv[1])[:3]
+    busy = ", ".join(f"{h:02d}:00" for h, _v in ranked)
+    sentence = (
+        f"The tower's busiest hour is "
+        f"{pk['hour']:02d}:00–{pk['hour'] + 1:02d}:00, carrying about "
+        f"{pk['value']:.0f} boardings against a typical hour's "
+        f"{pk['mean']:.0f} — {pk['ratio']:.1f} times the average hour. The "
+        f"three busiest hours of the day are {busy}. All seven lifts serve one "
+        f"tower, so this describes a single population.")
+    lvl, why = (MEDIUM, f"{e['total_boarded']:,} boardings under counting build "
+                        f"{ver}; hours a lift was not observed are excluded "
+                        f"rather than counted as zero")
+    return [_finding(P_DEMAND, "When the building uses its lifts", sentence,
+                     sheet, rng,
+                     _anchor(anchors, ("demand_chart", ver), sheet,
+                             "mean boardings by hour and lift")[1],
+                     lvl, why, n=e["total_boarded"])]
+
+
+def _f_load_balance(ctx, anchors):
+    """Whether the load sits evenly across the lifts — heavily caveated,
+    because uneven coverage looks exactly like uneven load."""
+    demand = ctx.get("demand") or {}
+    by_era = demand.get("by_era") or {}
+    if not by_era:
+        return []
+    ver = max(by_era, key=lambda v: by_era[v]["total_boarded"])
+    e = by_era[ver]
+    cvs = [(h, c) for h, c in enumerate(e["cv"]) if c is not None]
+    if not cvs:
+        return []
+    covs = [ctx["coverage_pct"].get(c, 0.0) for c in ctx["cams"]]
+    spread = (max(covs) - min(covs)) if covs else 0.0
+    mean_cv = sum(c for _h, c in cvs) / len(cvs)
+    worst_h, worst_cv = max(cvs, key=lambda hc: hc[1])
+    sheet, rng = _anchor(anchors, "demand_matrix", "DEMAND BY LIFT AND HOUR")
+    reading = ("evenly shared" if mean_cv < 0.25
+               else "moderately uneven" if mean_cv < 0.6
+               else "concentrated on some lifts")
+    sentence = (
+        f"Across the hours where at least two lifts were observed, boardings "
+        f"are {reading} between lifts (average spread {mean_cv:.2f}, worst at "
+        f"{worst_h:02d}:00 at {worst_cv:.2f}). THIS FIGURE MUST BE READ WITH "
+        f"CARE: per-lift coverage in this range spans "
+        f"{min(covs):.0f}%–{max(covs):.0f}%, a {spread:.0f}-point spread, and "
+        f"a lift that was watched less will show less load whether or not it "
+        f"carried less. At this coverage spread the comparison is not safe "
+        f"across all seven lifts.")
+    lvl = TOO_EARLY if spread > 20 else MEDIUM
+    why = (f"coverage spread of {spread:.0f} points across lifts; load balance "
+           f"is only interpretable across lifts of similar coverage, and these "
+           f"lifts are not")
+    return [_finding(P_DEMAND + 1, "Is the load balanced across the lifts?",
+                     sentence, sheet, rng, None, lvl, why, n=len(cvs),
+                     extra=["To make this readable: level up coverage across "
+                            "the lifts, then re-export. Comparing demand "
+                            "between a 57%-covered lift and a 17%-covered one "
+                            "mostly measures the cameras, not the traffic."])]
+
+
+def _f_per_floor_blocked(ctx, anchors):
+    """What demand analysis still cannot reach, and why."""
+    fs = ctx.get("floor_status") or {}
+    rows = sum(d.get("rows", 0) for d in fs.values())
+    confident = sum(d.get("confident", 0) for d in fs.values())
+    if not rows or confident:
+        return []
+    sheet, rng = _anchor(anchors, "tier2_table", "TIER-2 BLOCKED")
+    sentence = (
+        f"Demand PER FLOOR — where people get on and off — cannot be reported "
+        f"at all. Not one of the {rows:,} door observations in this range "
+        f"produced a confident floor reading, so there is no way to say which "
+        f"floor a boarding happened at. Demand per lift and per hour, which "
+        f"does not need the floor, is reported in full.")
+    return [_finding(
+        P_DEMAND + 2, "Per-floor demand is unavailable", sentence, sheet, rng,
+        None, TOO_EARLY,
+        f"0 confident floor reads out of {rows:,} door observations",
+        n=0,
+        extra=["This is the same blocker behind the C21/C22 speed factors and "
+               "the C17/C18 probable-stops coefficients. Fixing the "
+               "floor-indicator reading unblocks all of them together."])]
 
 
 def _f_open_travel(ctx, anchors):

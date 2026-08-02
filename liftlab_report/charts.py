@@ -41,7 +41,11 @@ CLR_LINE = "ED7D31"
 # One standard chart footprint, so anchors can be computed instead of guessed.
 CH_H, CH_W = 9.0, 18.0
 CM_PER_ROW = 0.529         # a default-height Excel row
-MAX_LABELLED_BINS = 12     # above this, data labels stop being legible
+
+# Above this many categories the labels collide with their neighbours no matter
+# how the chart is sized, so they are dropped and the value axis carries the
+# numbers instead. An unreadable label is worse than no label.
+MAX_LABELLED_CATS = 8
 
 
 def rows_for(height_cm: float = CH_H, pad: int = 3) -> int:
@@ -98,6 +102,36 @@ def _axis(ch, x_title, y_title, x_fmt, y_fmt, y_min=0.0, y_max=None,
         ch.y_axis.scaling.min = y_min
     if y_max is not None:
         ch.y_axis.scaling.max = y_max
+    return ch
+
+
+def _data_labels(ch, n_cats: int, num_fmt: str = "#,##0", pos: str | None = "inEnd"):
+    """Attach value-only data labels, or none at all.
+
+    openpyxl OMITS unset DataLabelList attributes from the XML, and Excel then
+    applies its OWN defaults — which print "series name, category name, value"
+    against every point. Setting showVal=True alone is therefore not enough:
+    every other flag must be written explicitly as False. That omission is what
+    made the v2 charts unreadable, and on a stacked histogram it also printed a
+    label for each of the two zero-height segments in every bin.
+
+    Labels are attached ONLY where they can be read. Past MAX_LABELLED_CATS
+    categories they are dropped and the value axis carries the numbers.
+    """
+    if n_cats > MAX_LABELLED_CATS:
+        ch.dataLabels = None
+        return ch
+    ch.dataLabels = DataLabelList()
+    ch.dataLabels.showVal = True
+    # Explicit False on every one of these — never left None.
+    ch.dataLabels.showSerName = False
+    ch.dataLabels.showCatName = False
+    ch.dataLabels.showLegendKey = False
+    ch.dataLabels.showPercent = False
+    ch.dataLabels.showBubbleSize = False
+    ch.dataLabels.numFmt = num_fmt
+    if pos:
+        ch.dataLabels.dLblPos = pos
     return ch
 
 
@@ -167,18 +201,17 @@ def close_histogram(cd: ChartData, title: str, values: list[float],
     ch.type = "col"
     ch.grouping = "stacked"                # one value per bin, so bars align
     ch.overlap = 100
+    ch.gapWidth = 40                       # wide bars, readable at this bin count
     ch.title = title
     ch.add_data(cd.ref(c0 + 1, c1, 1, nr), titles_from_data=True)
     ch.set_categories(cd.ref(c0, c0, 2, nr))
     for s, rgb in zip(ch.series, (CLR_GOOD, CLR_WARN, CLR_BAD)):
         _colour(s, rgb)
     _axis(ch, "close travel (s)", "number of closes", None, "#,##0")
-    if len(labels) <= MAX_LABELLED_BINS:
-        ch.dataLabels = DataLabelList()
-        ch.dataLabels.showVal = True
-        ch.dataLabels.numFmt = "#,##0"
+    # 12 bins: past the labelling limit, so the value axis carries the numbers.
+    _data_labels(ch, len(labels))
     _legend(ch, 3)
-    return _size(ch)
+    return _size(ch, h=10.0, w=15.0)
 
 
 # ── stopping rule ────────────────────────────────────────────────────────────
@@ -262,9 +295,8 @@ def fleet_comparison(cd: ChartData, rows: list[dict], cliff_s: float):
         dp.graphicalProperties = GraphicalProperties(
             solidFill=CLR_BAD if r["over"] else CLR_GOOD)
         series.data_points.append(dp)
-    bar.dataLabels = DataLabelList()
-    bar.dataLabels.showVal = True
-    bar.dataLabels.numFmt = "0.00"
+    bar.gapWidth = 40
+    _data_labels(bar, len(rows), num_fmt="0.00", pos="inEnd")
     _axis(bar, "lift", "close travel (s)", None, "0.00")
 
     line = LineChart()
@@ -280,21 +312,24 @@ def fleet_comparison(cd: ChartData, rows: list[dict], cliff_s: float):
 # ── generic bar / line ───────────────────────────────────────────────────────
 
 def bar_chart(cd: ChartData, title, cats_ref, data_ref, n_series, n_cats,
-              x_title, y_title, y_fmt="#,##0", colour=CLR_NEUTRAL):
+              x_title, y_title, y_fmt="#,##0", colour=CLR_NEUTRAL,
+              h=CH_H, w=CH_W, grouping=None):
     ch = BarChart()
     ch.type = "col"
+    if grouping:
+        ch.grouping = grouping
+    ch.gapWidth = 40
     ch.title = title
     ch.add_data(data_ref, titles_from_data=True)
     ch.set_categories(cats_ref)
     if n_series == 1:
         _colour(ch.series[0], colour)
     _axis(ch, x_title, y_title, None, y_fmt)
-    if n_cats <= MAX_LABELLED_BINS:
-        ch.dataLabels = DataLabelList()
-        ch.dataLabels.showVal = True
-        ch.dataLabels.numFmt = y_fmt
+    # Labels only survive when BOTH the category count and the series count
+    # leave room: k series over n categories means k*n label boxes.
+    _data_labels(ch, n_cats * max(1, n_series), num_fmt=y_fmt)
     _legend(ch, n_series)
-    return _size(ch)
+    return _size(ch, h=h, w=w)
 
 
 def line_chart(cd: ChartData, title, cats_ref, data_ref, n_series,
@@ -306,9 +341,65 @@ def line_chart(cd: ChartData, title, cats_ref, data_ref, n_series,
     for s in ch.series:
         s.marker = Marker(symbol="circle", size=5)
         s.smooth = False
+    ch.dataLabels = None            # explicit: a 24-point line cannot carry them
     _axis(ch, x_title, y_title, None, y_fmt, y_min=y_min, y_max=y_max)
     _legend(ch, n_series, position="r")
     return _size(ch)
+
+
+def demand_by_hour_grouped(cd: ChartData, hours: list[str], by_lift: dict,
+                           title: str):
+    """Grouped columns, hour x lift. A lift that was DARK in an hour carries
+    None, not 0 — an unobserved hour must not draw a zero-height bar that reads
+    as 'this lift carried nobody'."""
+    cols = [["hour (IST)"] + hours]
+    for label, vals in by_lift.items():
+        cols.append([label] + [None if v is None else round(v, 2) for v in vals])
+    wsd, c0, c1, nr = cd.block(cols)
+    ch = BarChart()
+    ch.type = "col"
+    ch.grouping = "clustered"
+    ch.gapWidth = 60
+    ch.overlap = -10
+    ch.title = title
+    ch.add_data(cd.ref(c0 + 1, c1, 1, nr), titles_from_data=True)
+    ch.set_categories(cd.ref(c0, c0, 2, nr))
+    ch.dataLabels = None               # 24 hours x n lifts — never labellable
+    _axis(ch, "hour of the day (IST)", "mean boardings per hour", None, "0.0")
+    _legend(ch, len(by_lift), position="b")
+    return _size(ch, h=10.0, w=24.0)
+
+
+def fleet_demand_line(cd: ChartData, hours: list[str], fleet: list,
+                      peak_hour: int | None, title: str):
+    """Fleet total by hour, with the peak hour marked by a second series that
+    is non-null only at the peak — so the mark cannot drift from the data."""
+    peak_series = [None] * len(hours)
+    if peak_hour is not None and 0 <= peak_hour < len(hours):
+        peak_series[peak_hour] = fleet[peak_hour]
+    cols = [["hour (IST)"] + hours,
+            ["fleet total (sum of per-lift means)"]
+            + [None if v is None else round(v, 2) for v in fleet],
+            ["busiest hour"]
+            + [None if v is None else round(v, 2) for v in peak_series]]
+    wsd, c0, c1, nr = cd.block(cols)
+    ch = LineChart()
+    ch.title = title
+    ch.add_data(cd.ref(c0 + 1, c1, 1, nr), titles_from_data=True)
+    ch.set_categories(cd.ref(c0, c0, 2, nr))
+    _colour(ch.series[0], CLR_NEUTRAL, line_only=True)
+    ch.series[0].marker = Marker(symbol="circle", size=5)
+    ch.series[0].smooth = False
+    # the peak marker: a big dot, no connecting line
+    ch.series[1].marker = Marker(symbol="diamond", size=11)
+    gp = GraphicalProperties()
+    gp.line = LineProperties(noFill=True)
+    ch.series[1].graphicalProperties = gp
+    ch.series[1].smooth = False
+    ch.dataLabels = None
+    _axis(ch, "hour of the day (IST)", "mean boardings per hour", None, "0.0")
+    _legend(ch, 2, position="b")
+    return _size(ch, h=9.0, w=22.0)
 
 
 def coverage_timeline(cd: ChartData, days: list[str], by_cam: dict,
@@ -332,6 +423,7 @@ def coverage_timeline(cd: ChartData, days: list[str], by_cam: dict,
     bar.add_data(cd.ref(c0 + 1, c0 + 1, 1, nr), titles_from_data=True)
     bar.set_categories(cd.ref(c0, c0, 2, nr))
     _colour(bar.series[0], CLR_GREY)
+    bar.dataLabels = None
     _axis(bar, "day (IST)", "share of the day", None, "0%", y_min=0, y_max=1.0)
 
     line = LineChart()
@@ -339,6 +431,7 @@ def coverage_timeline(cd: ChartData, days: list[str], by_cam: dict,
     for s in line.series:
         s.marker = Marker(symbol="circle", size=5)
         s.smooth = False
+    line.dataLabels = None
     bar += line
     _legend(bar, 1 + len(cams), position="r")
     return _size(bar, h=10.0, w=22.0)

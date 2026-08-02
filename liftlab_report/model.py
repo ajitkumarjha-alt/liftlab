@@ -412,6 +412,212 @@ def vs_sheet_rows(aggs: dict[tuple, dict], cam: str) -> list[dict]:
     return rows
 
 
+# ── demand by lift and hour ──────────────────────────────────────────────────
+# Floor attribution is blocked (no confident reads), so per-floor origin/
+# destination demand is unavailable. Per-lift, per-hour demand is NOT blocked.
+#
+# The unit is (cam, counting_version, hour-of-day). counting_version is part of
+# the key because counts made by different counting builds are different
+# measurements — pooling them to get a tidier matrix would be the same mistake
+# the instrument split guards against.
+
+def demand_by_lift_hour(transits: list[dict], pi_cycles: list[dict],
+                        cov_buckets: dict, bucket_s: int, stamps: dict,
+                        cams: list[str], t0: float, t1: float) -> dict:
+    """Mean boardings/alightings per hour-of-day, per lift, per counting era.
+
+    A cell is the mean over the DAYS THAT LIFT HAD DATA IN THAT HOUR, so a lift
+    that was dark does not drag its own average down. A cell with no observed
+    days is None — rendered '—', never 0. A dark lift is not an idle lift, and
+    a zero there would be read as 'this lift carried nobody'.
+
+    Returns {'versions': [...], 'hours': [0..23], 'by_era': {version: {...}}}.
+    """
+    hours = list(range(24))
+    day0 = datetime.fromtimestamp(t0, eras.IST).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    days = []
+    d = day0
+    while d.timestamp() < t1:
+        days.append(d)
+        d += timedelta(days=1)
+
+    # (cam, version, day, hour) -> counts, and which of those windows were live
+    counts: dict[tuple, dict] = {}
+    observed: set[tuple] = set()
+    versions: set[str] = set()
+
+    for cam in cams:
+        buckets = cov_buckets.get(cam) or set()
+        for day in days:
+            for h in hours:
+                w0 = (day + timedelta(hours=h)).timestamp()
+                w1 = w0 + 3600.0
+                if w1 <= t0 or w0 >= t1:
+                    continue
+                lo, hi = max(w0, t0), min(w1, t1)
+                # live = at least one coverage bucket with data, and the window
+                # is not wholly inside a declared outage
+                b0 = int((lo - t0) // bucket_s)
+                b1 = int((hi - t0 - 1e-9) // bucket_s)
+                has_rows = any(b in buckets for b in range(b0, b1 + 1))
+                fully_gapped = eras.gap_overlap_s(cam, lo, hi) >= (hi - lo) - 1.0
+                ver = eras.counting_version_at(cam, (lo + hi) / 2.0, stamps)
+                versions.add(ver)
+                if has_rows and not fully_gapped:
+                    observed.add((cam, ver, day.date().isoformat(), h))
+
+    def _bump(cam, ts, boarded, alighted):
+        if eras.in_gap(cam, ts):
+            return
+        dt = datetime.fromtimestamp(ts, eras.IST)
+        ver = eras.counting_version_at(cam, ts, stamps)
+        key = (cam, ver, dt.date().isoformat(), dt.hour)
+        c = counts.setdefault(key, {"boarded": 0, "alighted": 0})
+        c["boarded"] += boarded
+        c["alighted"] += alighted
+
+    for t in transits:
+        if not (t0 <= t["ts"] < t1):
+            continue
+        _bump(t["cam"], t["ts"], 1 if t["direction"] == "in" else 0,
+              1 if t["direction"] != "in" else 0)
+    for c in pi_cycles:
+        if not (t0 <= c["ts"] < t1):
+            continue
+        _bump(c["cam"], c["ts"], int(c.get("boarded") or 0),
+              int(c.get("alighted") or 0))
+
+    by_era: dict[str, dict] = {}
+    for ver in sorted(versions):
+        boarded: dict[str, list] = {}
+        alighted: dict[str, list] = {}
+        obs_days: dict[str, list] = {}
+        for cam in cams:
+            b_row, a_row, d_row = [], [], []
+            for h in hours:
+                day_keys = [(cam, ver, day.date().isoformat(), h) for day in days]
+                live = [k for k in day_keys if k in observed]
+                d_row.append(len(live))
+                if not live:
+                    b_row.append(None)
+                    a_row.append(None)
+                    continue
+                b = sum(counts.get(k, {}).get("boarded", 0) for k in live)
+                a = sum(counts.get(k, {}).get("alighted", 0) for k in live)
+                b_row.append(b / len(live))
+                a_row.append(a / len(live))
+            boarded[cam] = b_row
+            alighted[cam] = a_row
+            obs_days[cam] = d_row
+
+        # Fleet: all 7 lifts serve ONE tower, so a fleet demand aggregate is a
+        # statement about one population and is meaningful. It is an UNWEIGHTED
+        # SUM of the per-lift hourly means, labelled as such, over the lifts
+        # that were actually observed in that hour.
+        fleet_b, fleet_a, fleet_n = [], [], []
+        for h in hours:
+            live = [c for c in cams if boarded[c][h] is not None]
+            fleet_n.append(len(live))
+            fleet_b.append(sum(boarded[c][h] for c in live) if live else None)
+            fleet_a.append(sum(alighted[c][h] for c in live) if live else None)
+
+        by_era[ver] = {
+            "boarded": boarded, "alighted": alighted, "observed_days": obs_days,
+            "fleet_boarded": fleet_b, "fleet_alighted": fleet_a,
+            "fleet_lifts_contributing": fleet_n,
+            "peaks": _demand_peaks(cams, boarded, fleet_b),
+            "cv": _load_balance_cv(cams, boarded),
+            "n_transits": sum(
+                v["boarded"] + v["alighted"]
+                for k, v in counts.items() if k[1] == ver),
+            # raw totals — the reconciliation handle against PEAK ANALYSIS
+            "total_boarded": sum(v["boarded"] for k, v in counts.items()
+                                 if k[1] == ver),
+            "total_alighted": sum(v["alighted"] for k, v in counts.items()
+                                  if k[1] == ver),
+        }
+    return {"hours": hours, "versions": sorted(versions), "by_era": by_era,
+            "n_days_in_range": len(days)}
+
+
+def peak_5min_by_cam(transits, pi_cycles, cams, t0, t1) -> dict:
+    """Busiest 5 minutes per lift over the whole range, and for the fleet.
+
+    Same sliding window and same gap-excluded boarding stream as
+    peak_by_day(), so the two sheets cannot disagree about what a boarding is.
+    {cam: {'boardings', 'w0'}} plus '__fleet__'."""
+    ev = _boarding_events(transits, pi_cycles)
+    out = {}
+    for cam in list(cams) + ["__fleet__"]:
+        sub = sorted((ts, n) for ts, n, c in ev
+                     if (cam == "__fleet__" or c == cam) and t0 <= ts < t1)
+        best = {"boardings": 0, "w0": None}
+        if sub:
+            j = 0
+            run = 0
+            for i, (ts, n) in enumerate(sub):
+                run += n
+                while sub[j][0] <= ts - 300.0:
+                    run -= sub[j][1]
+                    j += 1
+                if run > best["boardings"]:
+                    best = {"boardings": run, "w0": sub[j][0]}
+        out[cam] = best
+    return out
+
+
+def demand_totals(demand: dict) -> dict:
+    """{version: total boardings} — the figure that must reconcile against the
+    day-boardings column on PEAK ANALYSIS, since both come from the same
+    gap-excluded boarding stream."""
+    return {ver: e["total_boarded"] for ver, e in demand["by_era"].items()}
+
+
+def _demand_peaks(cams, boarded, fleet_b) -> dict:
+    """Busiest hour, its value, the all-day mean hourly, and peak:mean — per
+    lift and for the fleet. Means are over OBSERVED hours only."""
+    out = {}
+
+    def _one(vals):
+        live = [(h, v) for h, v in enumerate(vals) if v is not None]
+        if not live or all(v == 0 for _h, v in live):
+            return {"hour": None, "value": None, "mean": None, "ratio": None,
+                    "n_hours": len(live)}
+        h_peak, v_peak = max(live, key=lambda hv: hv[1])
+        mean = sum(v for _h, v in live) / len(live)
+        return {"hour": h_peak, "value": v_peak, "mean": mean,
+                "ratio": (v_peak / mean) if mean else None,
+                "n_hours": len(live)}
+
+    for cam in cams:
+        out[cam] = _one(boarded[cam])
+    out["__fleet__"] = _one(fleet_b)
+    return out
+
+
+def _load_balance_cv(cams, boarded) -> list:
+    """Coefficient of variation of boardings ACROSS lifts, per hour.
+
+    0 means every observed lift carried the same load that hour; higher means
+    the load sat on some lifts more than others. Computed only over lifts
+    observed in that hour, and None below 2 such lifts — a spread across one
+    lift is not a spread."""
+    out = []
+    for h in range(24):
+        vals = [boarded[c][h] for c in cams if boarded[c][h] is not None]
+        if len(vals) < 2:
+            out.append(None)
+            continue
+        m = sum(vals) / len(vals)
+        if m <= 0:
+            out.append(None)
+            continue
+        sd = (sum((v - m) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
+        out.append(sd / m)
+    return out
+
+
 # ── suspected (undeclared) gap detection ─────────────────────────────────────
 
 SUSPECT_WINDOW_S = 6 * 3600          # the shortest silence worth flagging

@@ -234,3 +234,81 @@ def load_banks(path: str | Path | None = None) -> dict[str, str]:
 
 def lift_label(cam: str) -> str:
     return f"lift {cam.removeprefix('ch')}"
+
+
+# ── Bank derivation from the registry ────────────────────────────────────────
+# All lifts here serve ONE tower, but a tall tower is normally ZONED and MEP-02
+# treats each bank as a separate design case — so which lifts share a bank is a
+# real question, not bookkeeping.
+#
+# The only evidence the DB holds is camera_registry.floor_range, an
+# operator-entered fact. Lifts serving the SAME floor range are one bank. Where
+# the field is blank the lift stays UNKNOWN: a bank is never inferred from
+# channel number, from observed floors (floor attribution is unreliable — see
+# TIER-2 BLOCKED), or from anything else. Guessing a bank would silently merge
+# two design cases.
+
+def normalise_floor_range(raw: str | None) -> str:
+    """Canonical form of a floor_range string, so '1-30' and ' 1 - 30 ' agree.
+    Returns '' for anything blank or unparseable — never a guess."""
+    if not raw:
+        return ""
+    s = " ".join(str(raw).split()).strip().strip(",;")
+    if not s:
+        return ""
+    return s.replace(" - ", "-").replace(" -", "-").replace("- ", "-").upper()
+
+
+def derive_banks(registry: dict, cams: list[str] | None = None) -> tuple[dict, dict]:
+    """(banks, evidence) from camera_registry.floor_range.
+
+    banks:    {cam: bank_name or ''}  — '' means UNKNOWN, and stays UNKNOWN.
+    evidence: {cam: {'floor_range', 'source', 'shared_with'}} so COVERAGE & ERAS
+              can show WHY a lift was placed in a bank, or why it was not.
+
+    Banks are named after the floor range they serve ("floors 1-30"), because a
+    bank letter is not in the DB and inventing one would imply knowledge that
+    does not exist."""
+    cams = list(cams or registry.keys())
+    by_range: dict[str, list[str]] = {}
+    for cam in cams:
+        fr = normalise_floor_range((registry.get(cam) or {}).get("floor_range"))
+        if fr:
+            by_range.setdefault(fr, []).append(cam)
+    banks, evidence = {}, {}
+    for cam in cams:
+        fr = normalise_floor_range((registry.get(cam) or {}).get("floor_range"))
+        if fr:
+            shared = sorted(c for c in by_range[fr] if c != cam)
+            banks[cam] = f"floors {fr}"
+            evidence[cam] = {
+                "floor_range": fr,
+                "source": "camera_registry.floor_range (operator-entered)",
+                "shared_with": shared}
+        else:
+            banks[cam] = ""
+            evidence[cam] = {
+                "floor_range": "",
+                "source": "camera_registry.floor_range is EMPTY — bank not "
+                          "derivable; never guessed",
+                "shared_with": []}
+    return banks, evidence
+
+
+def load_banks_with_derivation(registry: dict, cams: list[str],
+                               path: str | Path | None = None
+                               ) -> tuple[dict, dict]:
+    """Sidecar first (an operator's explicit statement outranks a derivation),
+    then fill the blanks from the registry. Evidence records which won."""
+    sidecar = load_banks(path)
+    derived, evidence = derive_banks(registry, cams)
+    banks = {}
+    for cam in cams:
+        if sidecar.get(cam):
+            banks[cam] = sidecar[cam]
+            evidence[cam] = dict(evidence.get(cam, {}),
+                                 source="lift_banks.json (explicit operator "
+                                        "assignment; overrides derivation)")
+        else:
+            banks[cam] = derived.get(cam, "")
+    return banks, evidence

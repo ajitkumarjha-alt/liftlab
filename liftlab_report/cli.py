@@ -124,7 +124,12 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
                 f"analyzer_status reports {live!r} — update COUNTING_EPOCHS "
                 f"in eras.py before trusting counting-era splits for this camera")
 
-    banks = eras.load_banks(banks_path)
+    banks, bank_evidence = eras.load_banks_with_derivation(
+        registry, cams, banks_path)
+
+    demand = model.demand_by_lift_hour(
+        transits, pi_cycles, cov_buckets, reader.BUCKET_S, stamps,
+        cams, t0, t1)
 
     # Fleet-wide sampling resolution, for the plain-English sheet: the eras
     # agree in practice, but say so from the data rather than assume it.
@@ -199,6 +204,8 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         "cv_attribution": cv_attribution,
         "stamps": stamps,
         "min_close_s": floor_s,
+        "bank_evidence": bank_evidence,
+        "demand": demand,
         "suspected_gaps": suspected_gaps,
         "era_quanta": era_quanta,
         "fleet_quantum_s": fleet_quantum,
@@ -219,6 +226,7 @@ def build_workbook(ctx):
     workbook.sheet_vs_sheet(wb, ctx, cd, anchors)
     workbook.sheet_per_lift(wb, ctx, cd, anchors)
     workbook.sheet_fleet(wb, ctx, cd, anchors)
+    workbook.sheet_demand(wb, ctx, cd, anchors)
     workbook.sheet_peak(wb, ctx, cd, anchors)
     workbook.sheet_raw(wb, ctx, anchors)
     workbook.sheet_coverage(wb, ctx, cd, anchors)

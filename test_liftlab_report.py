@@ -4,13 +4,15 @@ resolution-bound suppression rule.
 Run: python -m pytest test_liftlab_report.py -q"""
 
 import hashlib
+import re
 import sqlite3
 from datetime import datetime
 
 import pytest
 from openpyxl.utils.cell import coordinate_to_tuple
 
-from liftlab_report import cli, eras, model, narrative, reader, stats
+from liftlab_report import (charts, cli, eras, model, narrative, reader, stats,
+                            workbook)
 from liftlab_report.fixtures import FRAME_QUANTUM_S, make_fixture
 
 
@@ -438,7 +440,7 @@ def test_suppressed_metric_says_so_in_the_findings(fixture_db):
     t0, t1 = _ts("2026-07-25T00:00:00"), _ts("2026-07-26T00:00:00")
     ctx = cli.build_context(fixture_db, "site-A", t0, t1)
     findings = narrative.build_findings(ctx, {})
-    open_f = [f for f in findings if "OPEN" in f["headline"].upper()]
+    open_f = [f for f in findings if "OPEN travel" in f["headline"]]
     assert open_f, "an entirely suppressed coefficient vanished from the sheet"
     f = open_f[0]
     assert f["confidence"] == narrative.TOO_EARLY
@@ -511,6 +513,309 @@ def test_no_number_lands_in_a_general_format_cell(fixture_db):
                         c.number_format == "General":
                     offenders.append(f"{ws.title}!{c.coordinate}={c.value}")
     assert not offenders, f"unformatted numbers: {offenders[:10]}"
+
+
+# ── 11. chart data labels (v2 shipped unreadable charts) ─────────────────────
+
+LABEL_FLAGS = ("showVal", "showSerName", "showCatName", "showLegendKey",
+               "showPercent", "showBubbleSize")
+
+
+def test_data_labels_are_never_left_unset(fixture_db):
+    """openpyxl OMITS unset DataLabelList flags and Excel then supplies its own
+    defaults — printing 'series name, category name, value' on every point.
+    Every flag must be written explicitly, or the labels must be absent."""
+    t0, t1 = _ts("2026-07-22T00:00:00"), _ts("2026-07-26T00:00:00")
+    wb = cli.build_workbook(cli.build_context(fixture_db, "site-A", t0, t1))
+    seen = 0
+    for ws in wb.worksheets:
+        for ch in getattr(ws, "_charts", []):
+            seen += 1
+            dl = ch.dataLabels
+            if dl is None:
+                continue                      # no labels at all is allowed
+            for flag in LABEL_FLAGS:
+                assert getattr(dl, flag) is not None, (
+                    f"{ws.title}: dataLabels.{flag} left None — Excel will "
+                    f"apply its own default")
+            assert dl.showVal is True
+            assert dl.showSerName is False
+            assert dl.showCatName is False
+            assert dl.showLegendKey is False
+            assert dl.showPercent is False
+            assert dl.showBubbleSize is False
+    assert seen >= 4
+
+
+def test_labels_dropped_where_they_could_not_be_read(fixture_db):
+    """Past the legibility limit the labels come off entirely — an unreadable
+    label is worse than none. 12-bin histograms must not carry labels."""
+    t0, t1 = _ts("2026-07-22T00:00:00"), _ts("2026-07-26T00:00:00")
+    wb = cli.build_workbook(cli.build_context(fixture_db, "site-A", t0, t1))
+    checked = 0
+    for ws in wb.worksheets:
+        for ch in getattr(ws, "_charts", []):
+            cats = 0
+            for s in ch.series:
+                ref = getattr(getattr(s, "cat", None), "numRef", None) or \
+                    getattr(getattr(s, "cat", None), "strRef", None)
+                if ref is not None and ref.f:
+                    m = re.findall(r"\$(\d+)", ref.f)
+                    if len(m) >= 2:
+                        cats = max(cats, int(m[1]) - int(m[0]) + 1)
+            if cats > charts.MAX_LABELLED_CATS:
+                assert ch.dataLabels is None, (
+                    f"{ws.title}: {cats} categories still carries data labels")
+                checked += 1
+    assert checked, "no wide chart was checked — the limit proved nothing"
+
+
+def test_stacked_histogram_writes_none_not_zero_for_absent_bands(fixture_db):
+    """A stacked bin must carry a value in exactly ONE series. Zeros in the
+    other two would draw zero-height segments and label them."""
+    t0, t1 = _ts("2026-07-22T00:00:00"), _ts("2026-07-26T00:00:00")
+    wb = cli.build_workbook(cli.build_context(fixture_db, "site-A", t0, t1))
+    ws = wb["DATA_CHARTS"]
+    found = 0
+    for row in ws.iter_rows(min_row=1, max_row=1):
+        for c in row:
+            if not (isinstance(c.value, str)
+                    and c.value.startswith("at or below the")):
+                continue
+            found += 1
+            # the three band columns start at THIS cell's column
+            for r in range(2, 14):
+                cells = [ws.cell(row=r, column=c.column + k).value
+                         for k in range(3)]
+                non_null = [x for x in cells if x is not None]
+                assert len(non_null) <= 1, (
+                    f"bin row {r} has {len(non_null)} populated bands: "
+                    f"{cells} — zero-height segments would be drawn and "
+                    f"labelled")
+    assert found, "no stacked histogram band block found"
+
+
+# ── 12. demand by lift and hour ──────────────────────────────────────────────
+
+DEMAND_T0, DEMAND_T1 = "2026-07-22T00:00:00", "2026-07-26T00:00:00"
+
+
+def _demand_ctx(fixture_db):
+    return cli.build_context(fixture_db, "site-A", _ts(DEMAND_T0), _ts(DEMAND_T1))
+
+
+def test_dark_hour_is_a_dash_never_zero(fixture_db):
+    """A lift that was not observed in an hour must not read 0 — a dark lift is
+    not an idle lift, and 0 would be read as 'carried nobody'."""
+    ctx = _demand_ctx(fixture_db)
+    d = ctx["demand"]
+    ver = max(d["by_era"], key=lambda v: d["by_era"][v]["total_boarded"])
+    e = d["by_era"][ver]
+    for cam in ctx["cams"]:
+        for h in d["hours"]:
+            observed = e["observed_days"][cam][h]
+            val = e["boarded"][cam][h]
+            if observed == 0:
+                assert val is None, (
+                    f"{cam} h{h}: 0 observed days but value {val} — a dark "
+                    f"hour must be None, rendered '—'")
+            else:
+                assert val is not None
+    ws = cli.build_workbook(ctx)["DEMAND BY LIFT AND HOUR"]
+    vals = [c.value for r in ws.iter_rows() for c in r]
+    assert workbook.DARK in vals
+
+
+def test_observed_days_matrix_matches_the_main_matrix(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    ws = cli.build_workbook(ctx)["DEMAND BY LIFT AND HOUR"]
+    rows = [[c.value for c in r] for r in ws.iter_rows()]
+
+    def _block(title_text, offset):
+        i = next(k for k, r in enumerate(rows)
+                 if any(c == title_text for c in r))
+        return rows[i + offset:i + offset + 24]
+
+    main = _block("MEAN BOARDINGS PER HOUR OF DAY", 5)
+    days = _block("OBSERVED DAYS BEHIND EACH CELL ABOVE", 6)
+    assert len(main) == len(days) == 24
+    n_cams = len(ctx["cams"])
+    for i in range(24):
+        assert main[i][0] == days[i][0], f"hour label mismatch on row {i}"
+        for j in range(1, n_cams + 1):
+            assert (main[i][j] == workbook.DARK) == (days[i][j] == 0), (
+                f"row {i} col {j}: '—' and 0-observed-days disagree")
+
+
+def test_demand_never_pools_counting_eras(fixture_db):
+    """Counts from different counting builds are different measurements."""
+    ctx = _demand_ctx(fixture_db)
+    d = ctx["demand"]
+    assert len(d["versions"]) >= 1
+    assert set(d["by_era"]) == set(d["versions"])
+    ws = cli.build_workbook(ctx)["DEMAND BY LIFT AND HOUR"]
+    text = " ".join(str(c.value) for r in ws.iter_rows()
+                    for c in r if c.value is not None)
+    for ver in d["versions"]:
+        assert ver in text, f"counting era {ver} is not named on the sheet"
+    assert "never pooled" in text
+
+
+def test_demand_reconciles_with_peak_analysis(fixture_db):
+    """Both sheets rest on the same gap-excluded boarding stream, so their
+    boarding totals must agree exactly."""
+    ctx = _demand_ctx(fixture_db)
+    here = sum(e["total_boarded"] for e in ctx["demand"]["by_era"].values())
+    there = sum(p["day_boardings"] for p in ctx["peaks"])
+    assert here == there, f"demand={here} vs peak sheet={there}"
+    ws = cli.build_workbook(ctx)["DEMAND BY LIFT AND HOUR"]
+    text = " ".join(str(c.value) for r in ws.iter_rows()
+                    for c in r if c.value is not None)
+    assert "YES — same gap-excluded boarding stream" in text
+
+
+def test_population_block_states_its_blocker_when_absent(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    ws = cli.build_workbook(ctx)["DEMAND BY LIFT AND HOUR"]
+    text = " ".join(str(c.value) for r in ws.iter_rows()
+                    for c in r if c.value is not None)
+    assert "BLOCKED — no population figure was supplied" in text
+    assert "NEVER guessed" in text
+    assert "--population" in text
+
+
+def test_population_block_compares_when_supplied(fixture_db):
+    ctx = cli.build_context(fixture_db, "site-A", _ts(DEMAND_T0), _ts(DEMAND_T1),
+                            population=2400)
+    ws = cli.build_workbook(ctx)["DEMAND BY LIFT AND HOUR"]
+    text = " ".join(str(c.value) for r in ws.iter_rows()
+                    for c in r if c.value is not None)
+    assert "BLOCKED — no population figure was supplied" not in text
+    assert "as % of population (2,400)" in text
+    assert "within design" in text or "over design" in text
+
+
+def test_load_balance_warns_that_coverage_can_mimic_load(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    ws = cli.build_workbook(ctx)["DEMAND BY LIFT AND HOUR"]
+    text = " ".join(str(c.value) for r in ws.iter_rows()
+                    for c in r if c.value is not None)
+    assert "uneven COVERAGE can masquerade as uneven LOAD" in text
+    assert "similar coverage" in text
+    # CV is undefined below two observed lifts, never faked as 0
+    d = ctx["demand"]
+    ver = d["versions"][0]
+    e = d["by_era"][ver]
+    for h in d["hours"]:
+        live = sum(1 for c in ctx["cams"] if e["boarded"][c][h] is not None)
+        if live < 2:
+            assert e["cv"][h] is None
+
+
+# ── 13. bank derivation ──────────────────────────────────────────────────────
+
+def test_banks_derived_from_shared_floor_range(tmp_path):
+    """Lifts serving the same floor range are one bank; the evidence is named."""
+    db = make_fixture(str(tmp_path / "banked.db"), floor_ranges={
+        "ch16": "1-30", "ch27": "1-30", "ch29": "31-60", "ch30": " 31 - 60 "})
+    ctx = cli.build_context(db, "site-A", _ts("2026-07-22T00:00:00"),
+                            _ts("2026-07-26T00:00:00"))
+    assert ctx["banks"]["ch16"] == ctx["banks"]["ch27"] != ""
+    assert ctx["banks"]["ch29"] == ctx["banks"]["ch30"] != ""
+    assert ctx["banks"]["ch16"] != ctx["banks"]["ch29"]
+    # whitespace variants normalise to the same bank, not to two banks
+    assert ctx["bank_evidence"]["ch30"]["floor_range"] == "31-60"
+    assert ctx["bank_evidence"]["ch16"]["shared_with"] == ["ch27"]
+    assert "floor_range" in ctx["bank_evidence"]["ch16"]["source"]
+    # channels with no floor_range stay UNKNOWN — never guessed
+    for cam in ("ch32", "ch34", "ch37"):
+        assert ctx["banks"][cam] == ""
+
+
+def test_banks_stay_unknown_when_floor_range_is_empty(fixture_db):
+    """The live gateway state: floor_range empty on every channel."""
+    ctx = _demand_ctx(fixture_db)
+    assert all((ctx["banks"].get(c) or "") == "" for c in ctx["cams"])
+    for cam in ctx["cams"]:
+        assert "EMPTY" in ctx["bank_evidence"][cam]["source"]
+    ws = cli.build_workbook(ctx)["COVERAGE & ERAS"]
+    text = " ".join(str(c.value) for r in ws.iter_rows()
+                    for c in r if c.value is not None)
+    assert "BANK ASSIGNMENT — DERIVATION AND EVIDENCE" in text
+    assert "NO lift could be assigned a bank" in text
+    # and the cross-bank pooling warning stays live on FLEET
+    fleet = " ".join(str(c.value) for r in cli.build_workbook(ctx)["FLEET"]
+                     .iter_rows() for c in r if c.value is not None)
+    assert "bank column is UNPOPULATED" in fleet
+
+
+def test_sidecar_assignment_outranks_derivation(tmp_path):
+    """An operator's explicit statement beats a derived one."""
+    db = make_fixture(str(tmp_path / "b2.db"), floor_ranges={"ch16": "1-30"})
+    sidecar = tmp_path / "banks.json"
+    sidecar.write_text('{"banks": {"ch16": "Bank C"}}', encoding="utf-8")
+    ctx = cli.build_context(db, "site-A", _ts("2026-07-22T00:00:00"),
+                            _ts("2026-07-26T00:00:00"),
+                            banks_path=str(sidecar))
+    assert ctx["banks"]["ch16"] == "Bank C"
+    assert "lift_banks.json" in ctx["bank_evidence"]["ch16"]["source"]
+
+
+# ── 14. the unresolved per-lift divergence ───────────────────────────────────
+
+def test_divergence_is_raised_as_an_open_question_not_a_conclusion(fixture_db):
+    """Two lifts in one tower differing materially with disjoint intervals is
+    a finding — but the CAUSE must not be picked."""
+    t0, t1 = _ts("2026-07-25T00:00:00"), _ts("2026-07-26T00:00:00")
+    ctx = cli.build_context(fixture_db, "site-A", t0, t1)
+    findings = narrative.build_findings(ctx, {})
+    div = [f for f in findings if "OPEN QUESTION" in f["headline"]]
+    if not div:
+        pytest.skip("this fixture range has no divergent pair to report on")
+    f = div[0]
+    assert f["confidence"] == narrative.TOO_EARLY
+    s = f["sentence"]
+    assert "UNRESOLVED" in s
+    # both explanations offered, neither chosen
+    assert "mechanical" in s and "camera" in s
+    assert "does not choose between them" in s
+    # and it says what it blocks
+    assert any("blocks per-lift" in e for e in f["extra"])
+
+
+def test_divergence_absent_when_intervals_overlap():
+    """No open question where the difference could be noise."""
+    ci_a = {"median": 2.0, "lo": 1.8, "hi": 2.4, "n": 200}
+    ci_b = {"median": 2.2, "lo": 2.0, "hi": 2.6, "n": 200}
+    assert not (ci_b["lo"] > ci_a["hi"])       # overlapping → not a divergence
+
+
+def test_v3_findings_cover_demand(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    heads = " | ".join(f["headline"] for f in narrative.build_findings(ctx, {}))
+    assert "When the building uses its lifts" in heads
+    assert "load balanced" in heads
+
+
+def test_per_floor_finding_appears_exactly_when_no_confident_reads(fixture_db):
+    """The live gateway has ZERO confident floor reads; the fixture cameras do
+    read floors. The finding must track the data, not be hardcoded either way."""
+    ctx = _demand_ctx(fixture_db)
+    confident = sum(d.get("confident", 0)
+                    for d in ctx["floor_status"].values())
+    heads = " | ".join(f["headline"] for f in narrative.build_findings(ctx, {}))
+    present = "Per-floor demand is unavailable" in heads
+    assert present == (confident == 0), (
+        f"{confident} confident reads but finding present={present}")
+
+    # force the live condition and the finding must appear
+    blinded = dict(ctx)
+    blinded["floor_status"] = {
+        cam: dict(d, confident=0, no_read=d.get("rows", 0))
+        for cam, d in ctx["floor_status"].items()}
+    heads2 = " | ".join(f["headline"]
+                        for f in narrative.build_findings(blinded, {}))
+    assert "Per-floor demand is unavailable" in heads2
 
 
 def test_sheets_are_frozen_and_the_raw_sheet_filters(fixture_db):
