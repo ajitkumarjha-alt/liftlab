@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# liftlab-report — era-hygienic Excel export from the gateway DB (read-only).
+# Installed by symlinking into PATH, e.g.:
+#   sudo ln -s /opt/liftlab/pi-scripts/liftlab-report /usr/local/bin/liftlab-report
+# Requires: python3 + openpyxl (pip install openpyxl) and GATEWAY_DB set (or --db).
+set -euo pipefail
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export PYTHONPATH="${DIR}${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m liftlab_report "$@"

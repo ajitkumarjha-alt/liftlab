@@ -1,0 +1,12 @@
+{
+  "_comment": "Bank assignment sidecar for liftlab-report. Aj populates the values; blank = UNKNOWN. The workbook NEVER guesses banks — fleet sheets warn when this is unpopulated because cross-bank pooling may mix design cases.",
+  "banks": {
+    "ch16": "",
+    "ch27": "",
+    "ch29": "",
+    "ch30": "",
+    "ch32": "",
+    "ch34": "",
+    "ch37": ""
+  }
+}
