@@ -125,12 +125,47 @@ def add_transit(db, cam: str, dt: datetime, direction="in", track_id=1):
         (GW, cam, ts, int(ts // 2), direction, track_id, ts))
 
 
+# The live gateway samples at 12.5 fps, so every travel value it can produce is
+# a multiple of this. The fixture reproduces that so the quantum detector and
+# the floor/suppression rules are exercised against realistic shapes rather
+# than against clean synthetic numbers they would never meet.
+FRAME_QUANTUM_S = 0.08
+
+
+def _quantized(seconds: float, jitter_ms: int = 0) -> float:
+    """Snap to the frame grid, optionally with the ±1 ms jitter the live rows
+    carry (values are written to 3 dp by the analyzer)."""
+    k = max(1, round(seconds / FRAME_QUANTUM_S))
+    return round(k * FRAME_QUANTUM_S + jitter_ms / 1000.0, 3)
+
+
+def add_quantized_gpu_cycles(db, cam: str, start: datetime, n: int,
+                             close_s, open_s, door_version=DOOR_VERSION,
+                             step_min: int = 5):
+    """n GPU cycles whose travels sit on the frame grid. close_s/open_s may be
+    a float or a callable(k) so a caller can mix one-frame artifacts into an
+    otherwise plausible pool."""
+    for k in range(n):
+        ct = close_s(k) if callable(close_s) else close_s
+        ot = open_s(k) if callable(open_s) else open_s
+        add_gpu_cycle(db, cam, start + timedelta(minutes=step_min * k),
+                      close_travel=_quantized(ct, (k % 3) - 1),
+                      open_travel=_quantized(ot, (k % 3) - 1),
+                      dwell=6.0 + (k % 4), floor=str(10 + k % 5),
+                      door_version=door_version)
+
+
 def make_fixture(path: str, *, with_pi=True, with_gpu=True) -> str:
     """A small but era-complete gateway DB:
     * pi_watch cycles 2026-07-15 and 2026-07-18 (both pi sub-eras)
     * gpu_engine cycles + transits 2026-07-22..23 and 2026-07-30
       (both counting eras), incl. one reopen and one withheld-quality pi row
     * a cycle inside the Jul-31 outage gap (must be excluded from rates)
+    * ch32: a frame-quantized pool on 2026-07-25 mixing one-frame close
+      artifacts with real closes, and open travels mostly pinned at one frame —
+      the shapes the floor filter and the suppression rule exist to catch
+    * ch34: a channel that goes silent for a whole day between live days, for
+      the suspected-gap detector
     * validation rows for all 7 cams under 2026-07-28-registry-zones
     """
     db = sqlite3.connect(path)
@@ -186,6 +221,39 @@ def make_fixture(path: str, *, with_pi=True, with_gpu=True) -> str:
         # inside the Jul-31 full-outage gap window — must be rate-excluded
         add_gpu_cycle(db, "ch16", _ist(2026, 7, 31, 13, 0), close_travel=2.4)
         add_transit(db, "ch16", _ist(2026, 7, 31, 13, 1), "in", track_id=999)
+
+        # ch32 — the quantization story, on the frame grid. Three populations,
+        # because two DIFFERENT guards are involved and a test that cannot tell
+        # them apart proves nothing:
+        #   k%5==0  one frame (0.08s) — already implausible under PLAUS_LO=0.3,
+        #           so it must never reach a close pool by either route
+        #   k%5==1  4-6 frames (0.32-0.48s) — PLAUSIBLE by the old bound but
+        #           still far too short to be a real close: this is the band
+        #           MIN_PLAUSIBLE_CLOSE_S exists for, and the band the live
+        #           gateway actually loses cycles in
+        #   else    real closes straddling the 2.31s cliff
+        # Open travel is pinned at one frame for 3 of every 4 cycles — which is
+        # what makes open travel unmeasurable rather than fast.
+        add_quantized_gpu_cycles(
+            db, "ch32", _ist(2026, 7, 25, 9, 0), 60,
+            close_s=lambda k: (FRAME_QUANTUM_S if k % 5 == 0
+                               else 4 * FRAME_QUANTUM_S + FRAME_QUANTUM_S * (k % 3)
+                               if k % 5 == 1
+                               else 1.8 + 0.24 * (k % 6)),
+            open_s=lambda k: (FRAME_QUANTUM_S if k % 4 else 2.4),
+            door_version="aa11bb22+cc33dd44")
+        for k in range(20):
+            add_transit(db, "ch32", _ist(2026, 7, 25, 9, 2) + timedelta(minutes=15 * k),
+                        "in", track_id=400 + k)
+
+        # ch34 — live on Jul 25 and Jul 28, silent through Jul 26 and Jul 27.
+        # Jul 26 is NOT declared, so the detector must flag it; Jul 27 IS
+        # declared, so the detector must stay quiet about it.
+        for day in (25, 28):
+            add_quantized_gpu_cycles(
+                db, "ch34", _ist(2026, 7, day, 10, 0), 8,
+                close_s=lambda k: 2.0 + 0.08 * (k % 4), open_s=2.4,
+                door_version="ee55ff66+7788aa99")
     db.commit()
     db.close()
     return path

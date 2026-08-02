@@ -2,6 +2,7 @@
 
   liftlab-report --from <ISO ts> --to <ISO ts> [--out <path>]
                  [--peak-window auto|HH:MM-HH:MM] [--population N]
+                 [--min-close 0.5]
                  [--db <sqlite path>] [--gateway site-A] [--banks <json>]
 
 Naive (offset-less) --from/--to are interpreted as IST (+05:30), the
@@ -45,7 +46,8 @@ def default_out_dir() -> Path:
 
 def build_context(db_path: str, gw: str, t0: float, t1: float,
                   peak_window: str = "auto", population: int | None = None,
-                  banks_path: str | None = None) -> dict:
+                  banks_path: str | None = None,
+                  min_close_s: float | None = None) -> dict:
     """Everything the workbook needs, precomputed. Read-only throughout."""
     if t1 <= t0:
         raise ReportError("--to must be after --from")
@@ -64,8 +66,11 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
     finally:
         db.close()
 
+    floor_s = (eras.MIN_PLAUSIBLE_CLOSE_S if min_close_s is None
+               else float(min_close_s))
     all_cycles = pi_cycles + gpu_cycles
-    aggs = model.aggregate_cycles(all_cycles, t0, t1)
+    aggs = model.aggregate_cycles(all_cycles, t0, t1, min_close_s=floor_s)
+    suspected_gaps = model.detect_suspected_gaps(all_cycles, transits, cams, t0, t1)
     transit_aggs = model.aggregate_transits(transits, stamps, t0, t1)
     profile = model.hourly_profile(transits, pi_cycles)
     fixed = model.parse_peak_window(peak_window)
@@ -121,6 +126,15 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
 
     banks = eras.load_banks(banks_path)
 
+    # Fleet-wide sampling resolution, for the plain-English sheet: the eras
+    # agree in practice, but say so from the data rather than assume it.
+    era_quanta = {k: a["quantum_s"] for k, a in aggs.items()
+                  if a["quantum_s"] is not None}
+    fleet_quantum = None
+    if era_quanta:
+        vals = sorted(era_quanta.values())
+        fleet_quantum = vals[len(vals) // 2]
+
     # raw rows
     raw_rows = []
     for c in all_cycles:
@@ -139,6 +153,9 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
                               or (datetime.fromtimestamp(c["close_ts"], eras.IST).isoformat()
                                   if c.get("close_ts") else None)),
             "close_travel_s": c.get("close_travel_s"),
+            "below_floor": ("YES" if (c.get("close_travel_s") is not None
+                                      and float(c["close_travel_s"]) < floor_s)
+                            else ""),
             "cycle_class": c.get("cycle_class"),
             "boarded": c.get("boarded"), "alighted": c.get("alighted"),
             "floor": c.get("floor"), "floor_source": c.get("floor_source"),
@@ -155,7 +172,7 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
             "instrument": t["instrument"], "counting_version": ver,
             "era_id": f"counting:{ver}", "event_type": "transit",
             "door_open_ts": None, "door_close_ts": None, "close_travel_s": None,
-            "cycle_class": None,
+            "below_floor": "", "cycle_class": None,
             "boarded": 1 if t["direction"] == "in" else None,
             "alighted": 1 if t["direction"] == "out" else None,
             "floor": None, "floor_source": None,
@@ -181,21 +198,33 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         "version_mismatches": version_mismatches,
         "cv_attribution": cv_attribution,
         "stamps": stamps,
+        "min_close_s": floor_s,
+        "suspected_gaps": suspected_gaps,
+        "era_quanta": era_quanta,
+        "fleet_quantum_s": fleet_quantum,
+        "transits": transits,
     }
 
 
 def build_workbook(ctx):
+    """Data sheets first — they record WHERE they put each figure in `anchors`.
+    READ THIS FIRST is built last from those anchors, so every 'Evidence:' line
+    on it names a cell range that really holds the number it quotes, then it is
+    moved to the front where a first-time reader will meet it."""
     from openpyxl import Workbook
     wb = Workbook()
     cd = workbook.ChartData(wb)
-    workbook.sheet_summary(wb, ctx, cd)
-    workbook.sheet_vs_sheet(wb, ctx, cd)
-    workbook.sheet_per_lift(wb, ctx, cd)
-    workbook.sheet_fleet(wb, ctx, cd)
-    workbook.sheet_peak(wb, ctx, cd)
-    workbook.sheet_raw(wb, ctx)
-    workbook.sheet_coverage(wb, ctx, cd)
-    workbook.sheet_tier2(wb, ctx)
+    anchors: dict = {}
+    workbook.sheet_summary(wb, ctx, cd, anchors)
+    workbook.sheet_vs_sheet(wb, ctx, cd, anchors)
+    workbook.sheet_per_lift(wb, ctx, cd, anchors)
+    workbook.sheet_fleet(wb, ctx, cd, anchors)
+    workbook.sheet_peak(wb, ctx, cd, anchors)
+    workbook.sheet_raw(wb, ctx, anchors)
+    workbook.sheet_coverage(wb, ctx, cd, anchors)
+    workbook.sheet_tier2(wb, ctx, anchors)
+    workbook.sheet_read_this_first(wb, ctx, anchors)
+    wb.move_sheet("READ THIS FIRST", offset=-(len(wb.sheetnames) - 1))
     # keep DATA_CHARTS last in the tab order
     wb.move_sheet("DATA_CHARTS", offset=len(wb.sheetnames))
     return wb
@@ -215,6 +244,12 @@ def run(argv=None) -> Path:
                     help="'auto' (worst 5-min window per day) or fixed HH:MM-HH:MM")
     ap.add_argument("--population", type=int, default=None,
                     help="tower population for peak-demand %% vs the 8%% HC assumption")
+    ap.add_argument("--min-close", dest="min_close", type=float,
+                    default=eras.MIN_PLAUSIBLE_CLOSE_S,
+                    help="one-frame quantization floor in seconds: closes below "
+                         "this are door-state flip artifacts and are rejected "
+                         f"from every close-travel statistic "
+                         f"(default {eras.MIN_PLAUSIBLE_CLOSE_S})")
     ap.add_argument("--db", default=os.environ.get("GATEWAY_DB",
                                                    "/var/lib/liftlab/gateway.db"),
                     help="gateway sqlite DB path (default: $GATEWAY_DB)")
@@ -226,9 +261,12 @@ def run(argv=None) -> Path:
     t0, t1 = parse_ts(args.from_ts), parse_ts(args.to_ts)
     if not Path(args.db).exists():
         raise ReportError(f"DB not found: {args.db}")
+    if args.min_close < 0:
+        raise ReportError("--min-close must be >= 0")
     ctx = build_context(args.db, args.gateway, t0, t1,
                         peak_window=args.peak_window,
-                        population=args.population, banks_path=args.banks)
+                        population=args.population, banks_path=args.banks,
+                        min_close_s=args.min_close)
     wb = build_workbook(ctx)
     if args.out:
         out = Path(args.out)

@@ -2,32 +2,30 @@
 from model.py; this file NEVER computes a cross-era number — if a cell would
 need one it prints 'n/a — spans eras'.
 
-Number formats are set explicitly; durations use 0.00 (never scientific).
-Every figure row carries its n. Charts are native Excel charts fed from the
-hidden DATA_CHARTS sheet.
+Formatting and chart configuration live in style.py and charts.py so that a
+number can never land in a cell as a bare float and a chart can never ship
+without readable axes.
+
+Sheet builders record where they put things in an `anchors` dict. READ THIS
+FIRST is built LAST, from those anchors, and then moved to the front — that is
+what lets every "Evidence:" line on it name a cell range that really holds the
+number it is quoting.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from openpyxl import Workbook
-from openpyxl.chart import BarChart, LineChart, Reference
-from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from . import eras, stats
+from . import charts, eras, narrative, stats, style
+from .charts import ChartData  # re-exported: cli builds one and passes it in
 from .eras import GPU_ENGINE, PI_WATCH
 from .reader import precision_str
-
-F_DUR = "0.00"
-F_INT = "#,##0"
-F_PCT = "0.0"
-BOLD = Font(bold=True)
-H1 = Font(bold=True, size=14)
-WARN_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-ERA_FILL = PatternFill(start_color="FCE4EC", end_color="FCE4EC", fill_type="solid")
-WRAP = Alignment(wrap_text=True, vertical="top")
+from .style import (BODY, BODY_BOLD, BODY_ITALIC, F_INT, F_PCT, F_RATE, F_SEC,
+                    F_SEC_PLAIN, F_TS, FILL_ERA, FILL_NA, FILL_WARN, H1, H2,
+                    banner, caption, cell, freeze_below, header_row, section,
+                    title)
 
 NA_SPANS = "n/a — spans eras"
 
@@ -38,21 +36,21 @@ def _fmt_ts(epoch: float | None) -> str:
     return datetime.fromtimestamp(epoch, eras.IST).strftime("%Y-%m-%d %H:%M:%S%z")
 
 
+def _dt(epoch: float | None):
+    """A real datetime so the cell can carry a date number format."""
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(epoch, eras.IST).replace(tzinfo=None)
+
+
 def _ci_str(lo, hi) -> str:
     if lo is None or hi is None:
         return "n too small"
     return f"[{lo:.2f}, {hi:.2f}]"
 
 
-def _set(ws, row, col, value, fmt=None, font=None, fill=None):
-    c = ws.cell(row=row, column=col, value=value)
-    if fmt:
-        c.number_format = fmt
-    if font:
-        c.font = font
-    if fill:
-        c.fill = fill
-    return c
+def _rng(first_row, last_row, n_cols) -> str:
+    return f"A{first_row}:{get_column_letter(n_cols)}{last_row}"
 
 
 def _era_banner(ws, row, boundaries) -> int:
@@ -61,73 +59,179 @@ def _era_banner(ws, row, boundaries) -> int:
     msg = ("⚠ RANGE CROSSES ERA BOUNDARIES — every aggregate on this sheet is "
            "PER ERA; pi_watch and gpu_engine figures are different instruments "
            "and are never pooled. See COVERAGE & ERAS.")
-    c = _set(ws, row, 1, msg, font=Font(bold=True, color="9C0006"), fill=ERA_FILL)
-    c.alignment = WRAP
-    ws.row_dimensions[row].height = 30
-    return row + 2
-
-
-def _header_row(ws, row, headers):
-    for i, h in enumerate(headers, start=1):
-        _set(ws, row, i, h, font=BOLD)
+    row = banner(ws, row, msg, fill=FILL_ERA, font=style.ERA_FONT)
     return row + 1
 
 
-# ── DATA_CHARTS helpers ──────────────────────────────────────────────────────
-
-class ChartData:
-    """Sequential column blocks on a hidden sheet; returns openpyxl Reference
-    ranges for chart series."""
-
-    def __init__(self, wb):
-        self.ws = wb.create_sheet("DATA_CHARTS")
-        self.ws.sheet_state = "hidden"
-        self.col = 1
-
-    def block(self, title_rows: list[list]) -> tuple:
-        """Write columns; title_rows[i] = [header, v1, v2, ...]. Returns
-        (ws, first_col, last_col, n_rows)."""
-        c0 = self.col
-        nrows = 0
-        for j, colvals in enumerate(title_rows):
-            for i, v in enumerate(colvals):
-                self.ws.cell(row=i + 1, column=c0 + j, value=v)
-            nrows = max(nrows, len(colvals))
-        self.col = c0 + len(title_rows) + 1
-        return self.ws, c0, c0 + len(title_rows) - 1, nrows
+def _floor_banner(ws, row, ctx) -> int:
+    """Amber banner naming every pool that lost more than the warn share to the
+    one-frame floor — the reader must not meet a moved median unexplained."""
+    warned = [(k, a) for k, a in sorted(ctx["aggs"].items())
+              if a["close"]["floor_reject_warn"]]
+    if not warned:
+        return row
+    bits = []
+    for (cam, _inst, era_id), a in warned:
+        cl = a["close"]
+        bits.append(f"{eras.lift_label(cam)}/{era_id} "
+                    f"{100 * cl['floor_reject_frac']:.0f}% "
+                    f"({cl['n_floor_rejected']} of {cl['n_prefilter']})")
+    msg = (f"⚠ ONE-FRAME QUANTIZATION FLOOR — closes shorter than "
+           f"{ctx['min_close_s']:.2f}s are door-state flicker, not closes, and "
+           f"are rejected from every close-travel figure. Pools losing more "
+           f"than {100 * eras.FLOOR_REJECT_WARN_FRAC:.0f}% to the floor: "
+           + "; ".join(bits) + ". Pre- and post-filter figures are both shown "
+           "on PER-LIFT.")
+    return banner(ws, row, msg, height=44) + 1
 
 
-def _bar_chart(title, cats_ref, data_ref, y_title="count"):
-    ch = BarChart()
-    ch.type = "col"
-    ch.title = title
-    ch.y_axis.title = y_title
-    ch.x_axis.title = "bin (s)"
-    ch.add_data(data_ref, titles_from_data=True)
-    ch.set_categories(cats_ref)
-    ch.height, ch.width = 8, 16
-    return ch
+def _suppression_banner(ws, row, ctx) -> int:
+    sup = [k for k, a in sorted(ctx["aggs"].items())
+           if a["open_travel"]["suppressed"] or a["close"]["suppressed"]]
+    if not sup:
+        return row
+    q = ctx.get("fleet_quantum_s")
+    q_txt = f"{q:.2f}s" if q else "the detected frame quantum"
+    msg = (f"⚠ NOT MEASURABLE — {len(sup)} lift-build pool(s) have more than "
+           f"{100 * eras.QUANTUM_SUPPRESS_FRAC:.0f}% of their values pinned at "
+           f"the sampling-resolution floor ({q_txt}, one video frame). No "
+           f"verdict is issued for those measurements; the reason is printed "
+           f"in place of the verdict on VS THE SHEET.")
+    return banner(ws, row, msg, fill=FILL_NA, height=44) + 1
 
 
-def _line_chart(title, cats_ref, data_ref, y_title="", x_title=""):
-    ch = LineChart()
-    ch.title = title
-    ch.y_axis.title = y_title
-    ch.x_axis.title = x_title
-    ch.add_data(data_ref, titles_from_data=True)
-    ch.set_categories(cats_ref)
-    ch.height, ch.width = 8, 20
-    return ch
+# ── READ THIS FIRST ──────────────────────────────────────────────────────────
+
+def sheet_read_this_first(wb, ctx, anchors):
+    """Built LAST (so anchors are populated), moved to the front by the caller."""
+    ws = wb.create_sheet("READ THIS FIRST")
+    ws.sheet_view.showGridLines = False
+    row = title(ws, "LIFTLAB — what we measured, what we found, and what we "
+                    "cannot say yet")
+    row += 1
+    cell(ws, row, 1, f"Covering {ctx['from_iso'][:16]} to {ctx['to_iso'][:16]} "
+                     f"(building local time). Generated {ctx['generated_at']}.",
+         font=BODY_ITALIC)
+    row += 2
+
+    # ── what this measures
+    row = section(ws, row, "WHAT THIS MEASURES")
+    for para in narrative.what_this_measures(ctx):
+        c = cell(ws, row, 1, para, wrap=True)
+        ws.row_dimensions[row].height = 28
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
+        row += 1
+    row += 1
+
+    # ── how to read the workbook
+    row = section(ws, row, "HOW TO READ THIS WORKBOOK")
+    hdr = row
+    row = header_row(ws, row, ["sheet", "the question it answers"])
+    for name, question in narrative.sheet_guide():
+        cell(ws, row, 1, name, font=BODY_BOLD)
+        cell(ws, row, 2, question, wrap=True)
+        row += 1
+    style.wrap_column(ws, 2, hdr + 1, row - 1, width=90)
+    row += 1
+
+    # ── colour convention
+    row = section(ws, row, "COLOUR CONVENTION USED THROUGHOUT")
+    for name, meaning, tag in narrative.COLOUR_LEGEND:
+        fill = {"green": style.FILL_GOOD, "red": style.FILL_BAD,
+                "amber": style.FILL_WARN, "grey": style.FILL_NA}[name]
+        cell(ws, row, 1, tag, font=BODY_BOLD, fill=fill)
+        cell(ws, row, 2, meaning, wrap=True)
+        row += 1
+    row += 1
+
+    # ── findings
+    row = section(ws, row, "WHAT WE FOUND")
+    cell(ws, row, 1, "Ordered by how much each matters to the design decision, "
+                     "not by where it appears in the workbook. Every figure "
+                     "below can be checked at the sheet and cells named against "
+                     "it.", font=BODY_ITALIC, wrap=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
+    row += 2
+    findings = narrative.build_findings(ctx, anchors)
+    if not findings:
+        row = banner(ws, row, "No findings — this range produced no measurable "
+                              "door or transit data. See COVERAGE & ERAS.")
+    for f in findings:
+        cell(ws, row, 1, f"{f['number']}.", font=BODY_BOLD)
+        c = cell(ws, row, 2, f["sentence"], font=BODY_BOLD, wrap=True)
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=9)
+        ws.row_dimensions[row].height = 44
+        row += 1
+        ev = f"Evidence: sheet {f['sheet']}, cells {f['range']}"
+        if f.get("chart"):
+            ev += f"; chart: {f['chart']}"
+        cell(ws, row, 2, ev, font=BODY_ITALIC)
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=9)
+        row += 1
+        cell(ws, row, 2, "Confidence:", font=BODY_BOLD)
+        cell(ws, row, 3, f["confidence"], font=BODY_BOLD,
+             fill=style.confidence_fill(f["confidence"]))
+        cell(ws, row, 4, f["why"], wrap=True)
+        ws.merge_cells(start_row=row, start_column=4, end_row=row, end_column=9)
+        ws.row_dimensions[row].height = 28
+        row += 1
+        for extra in f.get("extra") or []:
+            cell(ws, row, 2, extra, font=BODY_ITALIC, wrap=True)
+            ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=9)
+            row += 1
+        row += 1
+
+    # ── what we cannot say
+    row = section(ws, row, "WHAT WE CANNOT SAY YET — AND WHAT IT WOULD TAKE")
+    hdr = row
+    row = header_row(ws, row, ["what we cannot say", "why not",
+                               "what would make it sayable"])
+    for item in narrative.cannot_say_yet(ctx):
+        cell(ws, row, 1, item["what"], font=BODY_BOLD, wrap=True)
+        cell(ws, row, 2, item["why"], wrap=True)
+        cell(ws, row, 3, item["to_fix"], wrap=True)
+        ws.row_dimensions[row].height = 60
+        row += 1
+    for col in (1, 2, 3):
+        style.wrap_column(ws, col, hdr + 1, row - 1, width=48)
+    row += 1
+
+    # ── how much data
+    row = section(ws, row, "HOW MUCH DATA THIS IS")
+    for s in narrative.data_scale_sentences(ctx):
+        cell(ws, row, 1, s, wrap=True)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
+        ws.row_dimensions[row].height = 28
+        row += 1
+    row += 1
+
+    # ── glossary
+    row = section(ws, row, "GLOSSARY")
+    hdr = row
+    row = header_row(ws, row, ["term", "what it means"])
+    for term, meaning in narrative.GLOSSARY:
+        cell(ws, row, 1, term, font=BODY_BOLD)
+        cell(ws, row, 2, meaning, wrap=True)
+        ws.row_dimensions[row].height = 42
+        row += 1
+    style.wrap_column(ws, 2, hdr + 1, row - 1, width=95)
+
+    style.set_widths(ws, {1: 26, 2: 40, 3: 22, 4: 40})
+    style.print_setup(ws, landscape=False)
+    return ws
 
 
-# ── sheet builders ───────────────────────────────────────────────────────────
+# ── SUMMARY ──────────────────────────────────────────────────────────────────
 
-def sheet_summary(wb, ctx, cd):
+def sheet_summary(wb, ctx, cd, anchors):
     ws = wb.active
     ws.title = "SUMMARY"
-    _set(ws, 1, 1, f"LIFTLAB report — {ctx['from_iso']} → {ctx['to_iso']}", font=H1)
-    row = 3
+    row = title(ws, f"LIFTLAB report — {ctx['from_iso']} → {ctx['to_iso']}")
+    row += 1
     row = _era_banner(ws, row, ctx["boundaries"])
+    row = _floor_banner(ws, row, ctx)
+    row = _suppression_banner(ws, row, ctx)
+
     meta = [
         ("Generated at", ctx["generated_at"]),
         ("Gateway", ctx["gw"]),
@@ -136,170 +240,295 @@ def sheet_summary(wb, ctx, cd):
         ("Total raw rows exported", ctx["n_raw_rows"]),
         ("Eras present", ", ".join(sorted({f"{k[1]}/{k[2]}" for k in ctx["aggs"]}))
          or "none (no door cycles in range)"),
+        ("Sampling resolution detected",
+         (f"{ctx['fleet_quantum_s']:.2f}s per frame — the shortest duration the "
+          f"cameras can express" if ctx.get("fleet_quantum_s")
+          else "not determinable from this range")),
+        ("Implausibly-short close filter",
+         f"closes below {ctx['min_close_s']:.2f}s rejected (--min-close)"),
         ("Gap windows excluded", len([g for g in eras.DATA_GAPS
                                       if g["start_epoch"] < ctx["t1"]
                                       and g["end_epoch"] > ctx["t0"]])),
+        ("Suspected undeclared gaps flagged", len(ctx.get("suspected_gaps") or [])),
     ]
     for k, v in meta:
-        _set(ws, row, 1, k, font=BOLD)
-        _set(ws, row, 2, v)
+        cell(ws, row, 1, k, font=BODY_BOLD)
+        cell(ws, row, 2, v, fmt=F_INT if isinstance(v, int) else None)
         row += 1
     row += 1
-    _set(ws, row, 1, "HEADLINE — observed door-close travel vs the sheet, "
-                     "PER INSTRUMENT ERA (never pooled)", font=BOLD)
-    row += 1
-    row = _header_row(ws, row, [
-        "lift", "instrument", "era", "n (clean closes)", "median s", "p85 s",
-        f"sheet assumption s", "% > cliff", "cliff s", "95% CI of %>cliff",
-        "verdict vs cliff (on median CI)"])
+
+    row = section(ws, row, "HEADLINE — observed door-close travel vs the sheet, "
+                           "PER INSTRUMENT ERA (never pooled)")
+    headers = ["lift", "instrument", "era", "n (clean closes)", "median s",
+               "p85 s", "sheet assumption s", "% > cliff", "cliff s",
+               "95% CI of % > cliff", "verdict vs cliff (on median CI)"]
+    hdr_row = row
+    row = header_row(ws, row, headers)
+    first_data = row
     for (cam, instrument, era_id), a in sorted(ctx["aggs"].items()):
         cl = a["close"]
         spec = eras.DOOR_SPECS.get(cam, {})
         mc = cl["median_ci"]
-        _set(ws, row, 1, eras.lift_label(cam))
-        _set(ws, row, 2, instrument)
-        _set(ws, row, 3, era_id)
-        _set(ws, row, 4, cl["n"], F_INT)
-        _set(ws, row, 5, mc["median"], F_DUR)
-        _set(ws, row, 6, cl["p85"], F_DUR)
-        _set(ws, row, 7, spec.get("sheet_close_s", eras.SHEET_CLOSE_S), F_DUR)
-        _set(ws, row, 8, cl["over_cliff"]["pct"], F_PCT)
-        _set(ws, row, 9, cl["cliff_s"], F_DUR)
-        _set(ws, row, 10, _ci_str(cl["over_cliff"]["lo"], cl["over_cliff"]["hi"]))
-        _set(ws, row, 11, stats.verdict_vs_threshold(mc, cl["cliff_s"]))
+        verdict = (cl["suppression_reason"] if cl["suppressed"]
+                   else stats.verdict_vs_threshold(mc, cl["cliff_s"]))
+        cell(ws, row, 1, eras.lift_label(cam))
+        cell(ws, row, 2, instrument)
+        cell(ws, row, 3, era_id)
+        cell(ws, row, 4, cl["n"], F_INT)
+        cell(ws, row, 5, mc["median"], F_SEC)
+        cell(ws, row, 6, cl["p85"], F_SEC)
+        cell(ws, row, 7, spec.get("sheet_close_s", eras.SHEET_CLOSE_S), F_SEC)
+        cell(ws, row, 8, (cl["over_cliff"]["pct"] / 100.0
+                          if cl["over_cliff"]["pct"] is not None else None), F_PCT)
+        cell(ws, row, 9, cl["cliff_s"], F_SEC)
+        cell(ws, row, 10, _ci_str(cl["over_cliff"]["lo"], cl["over_cliff"]["hi"]))
+        cell(ws, row, 11, verdict, wrap=True,
+             fill=style.verdict_fill(verdict, cl["suppressed"]))
         row += 1
     if not ctx["aggs"]:
-        _set(ws, row, 1, "No door cycles in range — see COVERAGE & ERAS.")
+        cell(ws, row, 1, "No door cycles in range — see COVERAGE & ERAS.",
+             fill=FILL_WARN)
         row += 1
+    last_data = row - 1
+    anchors["summary_headline"] = ("SUMMARY", _rng(first_data, max(first_data,
+                                                                  last_data),
+                                                   len(headers)))
+    style.verdict_conditional_formatting(ws, 11, first_data, last_data)
+    style.autofit(ws, max_row=last_data, wrap_cols=(11,))
+    style.set_widths(ws, {3: 22, 11: 46})
+    freeze_below(ws, hdr_row)
+    style.print_setup(ws, repeat_row=hdr_row)
+    row += 2
 
-    # Stopping-rule chart: running mean + 95% CI band vs the 2.31s line, for
-    # each spec'd camera's largest clean-era pool.
-    for cam in eras.DOOR_SPECS:
-        best = None
-        for key, a in ctx["aggs"].items():
-            if key[0] == cam and a["close"]["n"] >= 2:
-                if best is None or a["close"]["n"] > best[1]["close"]["n"]:
-                    best = (key, a)
-        if not best:
+    # ── fleet comparison chart — the design reviewer's chart
+    rows = []
+    for (cam, instrument, era_id), a in sorted(ctx["aggs"].items()):
+        cl, mc = a["close"], a["close"]["median_ci"]
+        if cl["n"] == 0 or mc["median"] is None or cl["suppressed"]:
             continue
-        (cam_, instrument, era_id), a = best
-        vals = a["close"]["values"]
-        run_mean, lo_b, hi_b, cliff_line, idx = [], [], [], [], []
-        s = s2 = 0.0
-        for i, v in enumerate(vals, start=1):
-            s += v
-            s2 += v * v
-            m = s / i
-            sd = (max(0.0, s2 - i * m * m) / (i - 1)) ** 0.5 if i > 1 else None
-            half = (stats.Z95 * sd / (i ** 0.5)) if sd is not None else None
-            run_mean.append(round(m, 3))
-            lo_b.append(round(m - half, 3) if half is not None else None)
-            hi_b.append(round(m + half, 3) if half is not None else None)
-            cliff_line.append(a["close"]["cliff_s"])
-            idx.append(i)
-        wsd, c0, c1, nr = cd.block([
-            ["n"] + idx, ["running mean"] + run_mean, ["CI lo"] + lo_b,
-            ["CI hi"] + hi_b, [f"cliff {a['close']['cliff_s']}s"] + cliff_line])
-        cats = Reference(wsd, min_col=c0, min_row=2, max_row=nr)
-        data = Reference(wsd, min_col=c0 + 1, max_col=c1, min_row=1, max_row=nr)
-        ch = _line_chart(
-            f"{eras.lift_label(cam)} stopping rule — running mean close-travel "
-            f"± 95% CI vs {a['close']['cliff_s']}s ({instrument}/{era_id}, "
-            f"n={a['close']['n']})", cats, data,
-            y_title="close travel s", x_title="cycles (chronological)")
-        ws.add_chart(ch, f"A{row + 2}")
-        row += 20
+        lo = mc["lo"] if mc["lo"] is not None else mc["median"]
+        hi = mc["hi"] if mc["hi"] is not None else mc["median"]
+        rows.append({"label": f"{eras.lift_label(cam)} {era_id}",
+                     "median": mc["median"],
+                     "err_lo": max(0.0, mc["median"] - lo),
+                     "err_hi": max(0.0, hi - mc["median"]),
+                     "n": cl["n"], "over": mc["median"] > cl["cliff_s"]})
+    if rows:
+        cliff = sorted({a["close"]["cliff_s"] for a in ctx["aggs"].values()})[0]
+        n_over = sum(1 for r in rows if r["over"])
+        row = caption(ws, row, (
+            f"Take-away: {n_over} of {len(rows)} lift-builds have a typical "
+            f"close time above the {cliff:.2f}s compliance line (red bars). "
+            f"Whiskers show the 95% range — where a whisker crosses the line, "
+            f"the measurement cannot yet say which side that lift is on."))
+        ch = charts.fleet_comparison(cd, rows, cliff)
+        if ch is not None:
+            ws.add_chart(ch, f"A{row}")
+            anchors["fleet_compare_chart"] = (
+                "SUMMARY", f"'Typical door-close travel by lift' at A{row}")
+            row += charts.rows_for(10.0)
+
+    # ── stopping rule for the BEST-SAMPLED pool
+    best = None
+    for key, a in ctx["aggs"].items():
+        if a["close"]["n"] >= 2 and not a["close"]["suppressed"]:
+            if best is None or a["close"]["n"] > best[1]["close"]["n"]:
+                best = (key, a)
+    if best:
+        (cam, instrument, era_id), a = best
+        cl = a["close"]
+        row = caption(ws, row, (
+            f"Take-away: this is the best-sampled pool ({eras.lift_label(cam)}, "
+            f"n={cl['n']}). The study can stop for this lift when the dashed "
+            f"95% band sits wholly below the red line and stays there; while "
+            f"the band still touches the line, more closes are needed. "
+            f"Per-lift versions of this chart are on PER-LIFT."))
+        ch = charts.stopping_rule(
+            cd, f"{eras.lift_label(cam)} — is the measurement settled yet? "
+                f"({instrument}/{era_id}, n={cl['n']})",
+            cl["values"], cl["cliff_s"])
+        ws.add_chart(ch, f"A{row}")
+        anchors["stopping_rule_chart"] = (
+            "SUMMARY", f"'is the measurement settled yet' at A{row}")
+        row += charts.rows_for()
     return ws
 
 
-def sheet_vs_sheet(wb, ctx, cd):
+# ── VS THE SHEET ─────────────────────────────────────────────────────────────
+
+def sheet_vs_sheet(wb, ctx, cd, anchors):
+    from .model import vs_sheet_rows
     ws = wb.create_sheet("VS THE SHEET")
-    _set(ws, 1, 1, f"Observed coefficients vs {eras.SHEET_NAME} assumptions", font=H1)
-    row = 3
+    row = title(ws, f"Observed coefficients vs {eras.SHEET_NAME} assumptions")
+    row += 1
     row = _era_banner(ws, row, ctx["boundaries"])
-    _set(ws, row, 1, "Verdicts are mechanical: CI vs decision threshold. "
-                     "No further interpretation is offered.", font=BOLD)
+    row = _suppression_banner(ws, row, ctx)
+    cell(ws, row, 1, "Verdicts are mechanical: the confidence interval against "
+                     "the decision threshold. No further interpretation is "
+                     "offered. Where a measurement is bound by the camera's "
+                     "sampling resolution, the reason is printed in place of a "
+                     "verdict — a resolution-bound number is not a result.",
+         font=BODY_ITALIC, wrap=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+    ws.row_dimensions[row].height = 30
     row += 2
+
+    headers = ["coefficient", "instrument / era", "sheet assumption",
+               "observed value", "n", "95% CI", "decision threshold", "verdict"]
+    first_hdr = None
     for cam in ctx["cams"]:
         if cam not in {k[0] for k in ctx["aggs"]} and cam not in eras.DOOR_SPECS:
             continue
-        _set(ws, row, 1, f"{eras.lift_label(cam)} ({cam})"
-             + (f" — bank {ctx['banks'].get(cam) or 'UNKNOWN'}"), font=BOLD)
+        cell(ws, row, 1, f"{eras.lift_label(cam)} ({cam})"
+             f" — bank {ctx['banks'].get(cam) or 'UNKNOWN'}", font=H2)
         row += 1
-        row = _header_row(ws, row, [
-            "coefficient", "instrument / era", "sheet assumption",
-            "observed value", "n", "95% CI", "decision threshold", "verdict"])
-        from .model import vs_sheet_rows
+        hdr_row = row
+        first_hdr = first_hdr or hdr_row
+        row = header_row(ws, row, headers)
+        cam_first = row
         for r in vs_sheet_rows(ctx["aggs"], cam):
-            _set(ws, row, 1, r["coefficient"])
-            _set(ws, row, 2, r["era"])
-            _set(ws, row, 3, r["assumption"] if isinstance(r["assumption"], str)
-                 else r["assumption"], F_DUR if not isinstance(r["assumption"], str) else None)
-            _set(ws, row, 4, r["observed"], F_DUR)
-            _set(ws, row, 5, r["n"], F_INT)
-            _set(ws, row, 6, _ci_str(*r["ci"]))
-            _set(ws, row, 7, r["threshold"], F_DUR)
-            _set(ws, row, 8, r["verdict"])
+            cell(ws, row, 1, r["coefficient"])
+            cell(ws, row, 2, r["era"])
+            if isinstance(r["assumption"], str):
+                cell(ws, row, 3, r["assumption"], wrap=True)
+            else:
+                cell(ws, row, 3, r["assumption"], F_SEC)
+            cell(ws, row, 4, r["observed"], F_SEC)
+            cell(ws, row, 5, r["n"], F_INT)
+            cell(ws, row, 6, _ci_str(*r["ci"]))
+            cell(ws, row, 7, r["threshold"], F_SEC)
+            cell(ws, row, 8, r["verdict"], wrap=True,
+                 fill=style.verdict_fill(r["verdict"], r.get("suppressed")))
+            if "open travel" in r["coefficient"] and r.get("suppressed"):
+                anchors.setdefault("vs_sheet_open",
+                                   ("VS THE SHEET", f"A{row}:H{row}"))
             row += 1
+        anchors[("vs_sheet", cam)] = ("VS THE SHEET", _rng(cam_first, row - 1,
+                                                           len(headers)))
+        style.verdict_conditional_formatting(ws, 8, cam_first, row - 1)
         row += 1
+    anchors.setdefault("vs_sheet_open", ("VS THE SHEET", "—"))
+    style.autofit(ws, wrap_cols=(1, 3, 8))
+    style.set_widths(ws, {1: 42, 2: 26, 8: 60})
+    if first_hdr:
+        freeze_below(ws, first_hdr)
+        style.print_setup(ws, repeat_row=first_hdr)
     return ws
 
 
-def sheet_per_lift(wb, ctx, cd):
+# ── PER-LIFT ─────────────────────────────────────────────────────────────────
+
+def sheet_per_lift(wb, ctx, cd, anchors):
     ws = wb.create_sheet("PER-LIFT")
-    _set(ws, 1, 1, "Per-lift analysis (one block per channel; every count has "
-                   "its precision beside it)", font=H1)
-    row = 3
+    row = title(ws, "Per-lift analysis (one block per channel; every count has "
+                    "its precision beside it)")
+    row += 1
     row = _era_banner(ws, row, ctx["boundaries"])
-    hist_labels = stats.hist_labels(stats.CLOSE_HIST_EDGES)
-    dwell_labels = stats.hist_labels(stats.DWELL_HIST_EDGES)
+    row = _floor_banner(ws, row, ctx)
+    first_hdr = None
+
     for cam in ctx["cams"]:
         v = ctx["validation"].get(cam, {})
         cur_ver = (ctx["analyzer_versions"].get(cam)
                    or v.get("counting_version") or "unknown")
         prec = precision_str(ctx["validation"], cam, cur_ver)
-        _set(ws, row, 1, eras.lift_label(cam), font=H1)
-        _set(ws, row, 3, f"bank: {ctx['banks'].get(cam) or 'UNKNOWN'}")
-        _set(ws, row, 4, f"counting_version: {cur_ver}")
-        _set(ws, row, 5, f"precision: {prec}"
-             + (f", validated {_fmt_ts(v['confirmed_at'])}" if v.get("confirmed_at") else ""))
-        _set(ws, row, 7, f"coverage after gap exclusion: "
-             f"{ctx['coverage_pct'].get(cam, 0.0):.1f}%")
+        cell(ws, row, 1, eras.lift_label(cam), font=H1)
+        cell(ws, row, 3, f"bank: {ctx['banks'].get(cam) or 'UNKNOWN'}")
+        cell(ws, row, 4, f"counting_version: {cur_ver}")
+        cell(ws, row, 5, f"precision: {prec}"
+             + (f", validated {_fmt_ts(v['confirmed_at'])}"
+                if v.get("confirmed_at") else ""))
+        cell(ws, row, 7, f"coverage after gap exclusion: "
+                         f"{ctx['coverage_pct'].get(cam, 0.0):.1f}%")
         row += 2
 
         cam_aggs = {k: a for k, a in ctx["aggs"].items() if k[0] == cam}
         if not cam_aggs:
-            _set(ws, row, 1, "No door cycles in this range for this channel — "
-                             "see COVERAGE & ERAS.", fill=WARN_FILL)
-            row += 2
-        row = _header_row(ws, row, [
-            "instrument", "era", "cycles n", "clean closes n", "close median s",
-            "close p85 s", "close min s", "close max s",
-            "excluded (flap/reopen/implausible/gap)", "dwell n",
-            "dwell median s", "dwell p85 s", "cycles/hr (gap-excl)"])
+            row = banner(ws, row, "No door cycles in this range for this "
+                                  "channel — see COVERAGE & ERAS.", height=18)
+            row += 1
+
+        headers = ["instrument", "era", "cycles n",
+                   "clean closes n (before floor filter)",
+                   "close median s (before)", "close p85 s (before)",
+                   "floor applied s",
+                   "clean closes n (after floor filter)",
+                   "close median s (after)", "close median 95% CI lo s",
+                   "close median 95% CI hi s", "close p85 s (after)",
+                   "compliance cliff s", "% of closes over the cliff",
+                   "rejected at floor", "% of pool rejected",
+                   "close min s", "close max s",
+                   "excluded (flap/reopen/implausible/gap)", "dwell n",
+                   "dwell median s", "dwell p85 s", "cycles/hr (gap-excl)"]
+        hdr_row = row
+        first_hdr = first_hdr or hdr_row
+        row = header_row(ws, row, headers)
+        block_first = row
         for (c_, instrument, era_id), a in sorted(cam_aggs.items()):
+            cl = a["close"]
             f = ctx["funnels"].get((cam, era_id), {})
             excl = (f"{f.get('n_flap', 0)}/{f.get('n_reopened', 0)}/"
                     f"{f.get('n_implausible', 0)}/{a['n_in_gap_excluded']}"
                     if instrument == GPU_ENGINE else
                     f"withheld={a['n_closes_excluded']}, gap={a['n_in_gap_excluded']}")
-            _set(ws, row, 1, instrument)
-            _set(ws, row, 2, era_id)
-            _set(ws, row, 3, a["n_cycles"], F_INT)
-            _set(ws, row, 4, a["close"]["n"], F_INT)
-            _set(ws, row, 5, a["close"]["median_ci"]["median"], F_DUR)
-            _set(ws, row, 6, a["close"]["p85"], F_DUR)
-            _set(ws, row, 7, a["close"]["min"], F_DUR)
-            _set(ws, row, 8, a["close"]["max"], F_DUR)
-            _set(ws, row, 9, excl)
-            _set(ws, row, 10, a["dwell"]["n"], F_INT)
-            _set(ws, row, 11, a["dwell"]["median_ci"]["median"], F_DUR)
-            _set(ws, row, 12, a["dwell"]["p85"], F_DUR)
-            _set(ws, row, 13, a["cycles_per_hr"], F_DUR)
+            cell(ws, row, 1, instrument)
+            cell(ws, row, 2, era_id)
+            cell(ws, row, 3, a["n_cycles"], F_INT)
+            cell(ws, row, 4, cl["n_prefilter"], F_INT)
+            cell(ws, row, 5, cl["median_prefilter"], F_SEC)
+            cell(ws, row, 6, cl["p85_prefilter"], F_SEC)
+            cell(ws, row, 7, cl["floor_s"], F_SEC)
+            cell(ws, row, 8, cl["n"], F_INT)
+            cell(ws, row, 9, cl["median_ci"]["median"], F_SEC)
+            cell(ws, row, 10, cl["median_ci"]["lo"], F_SEC)
+            cell(ws, row, 11, cl["median_ci"]["hi"], F_SEC)
+            cell(ws, row, 12, cl["p85"], F_SEC)
+            cell(ws, row, 13, cl["cliff_s"], F_SEC)
+            cell(ws, row, 14, (cl["over_cliff"]["pct"] / 100.0
+                               if cl["over_cliff"]["pct"] is not None else None),
+                 F_PCT)
+            cell(ws, row, 15, cl["n_floor_rejected"], F_INT)
+            cell(ws, row, 16, cl["floor_reject_frac"], F_PCT,
+                 fill=FILL_WARN if cl["floor_reject_warn"] else None)
+            cell(ws, row, 17, cl["min"], F_SEC)
+            cell(ws, row, 18, cl["max"], F_SEC)
+            cell(ws, row, 19, excl)
+            cell(ws, row, 20, a["dwell"]["n"], F_INT)
+            cell(ws, row, 21, a["dwell"]["median_ci"]["median"], F_SEC)
+            cell(ws, row, 22, a["dwell"]["p85"], F_SEC)
+            cell(ws, row, 23, a["cycles_per_hr"], F_RATE)
+            anchors[("per_lift_close", cam, instrument, era_id)] = (
+                "PER-LIFT", f"A{row}:{get_column_letter(len(headers))}{row}")
             row += 1
         row += 1
+
+        # open travel: state the suppression rather than print a false figure
+        ot_hdr = row
+        row = header_row(ws, row, ["instrument", "era", "open-travel n",
+                                   "open-travel median s",
+                                   "at the one-frame floor",
+                                   "status against the sheet's open assumption"])
+        for (c_, instrument, era_id), a in sorted(cam_aggs.items()):
+            ot = a["open_travel"]
+            cell(ws, row, 1, instrument)
+            cell(ws, row, 2, era_id)
+            cell(ws, row, 3, ot["n"], F_INT)
+            if ot["suppressed"]:
+                cell(ws, row, 4, "not measurable", fill=FILL_NA)
+            else:
+                cell(ws, row, 4, ot["median_ci"]["median"], F_SEC)
+            cell(ws, row, 5, ot["at_quantum"]["frac"], F_PCT,
+                 fill=FILL_NA if ot["suppressed"] else None)
+            cell(ws, row, 6, ot["suppression_reason"] or
+                 stats.verdict_vs_threshold(ot["median_ci"], eras.SHEET_OPEN_S),
+                 wrap=True,
+                 fill=style.verdict_fill(None, ot["suppressed"]))
+            row += 1
+        style.wrap_column(ws, 6, ot_hdr + 1, row - 1, width=60)
+        row += 1
+
         # transits — precision ADJACENT to every count
-        row = _header_row(ws, row, [
+        row = header_row(ws, row, [
             "counting era", "boarded", "precision (boarded)", "alighted",
             "precision (alighted)", "riders/hr (gap-excl)", "gap-excluded n",
             "first", "last"])
@@ -308,85 +537,124 @@ def sheet_per_lift(wb, ctx, cd):
                       if k[1] == PI_WATCH and a["n_counted_cycles"]]
         for (c_, ver), d in sorted(t_aggs.items()):
             p = precision_str(ctx["validation"], cam, ver)
-            _set(ws, row, 1, ver)
-            _set(ws, row, 2, d["boarded"], F_INT)
-            _set(ws, row, 3, p)
-            _set(ws, row, 4, d["alighted"], F_INT)
-            _set(ws, row, 5, p)
-            _set(ws, row, 6, d["per_hr"], F_DUR)
-            _set(ws, row, 7, d["n_in_gap_excluded"], F_INT)
-            _set(ws, row, 8, _fmt_ts(d["first_ts"]))
-            _set(ws, row, 9, _fmt_ts(d["last_ts"]))
+            cell(ws, row, 1, ver)
+            cell(ws, row, 2, d["boarded"], F_INT)
+            cell(ws, row, 3, p)
+            cell(ws, row, 4, d["alighted"], F_INT)
+            cell(ws, row, 5, p)
+            cell(ws, row, 6, d["per_hr"], F_RATE)
+            cell(ws, row, 7, d["n_in_gap_excluded"], F_INT)
+            cell(ws, row, 8, _dt(d["first_ts"]), F_TS)
+            cell(ws, row, 9, _dt(d["last_ts"]), F_TS)
             row += 1
         for (c_, instrument, era_id), a in pi_counted:
-            _set(ws, row, 1, f"{era_id} (Pi on-device counter)")
-            _set(ws, row, 2, a["boarded"], F_INT)
-            _set(ws, row, 3, "unvalidated (Pi counter was never precision-scored)")
-            _set(ws, row, 4, a["alighted"], F_INT)
-            _set(ws, row, 5, "unvalidated (Pi counter was never precision-scored)")
+            cell(ws, row, 1, f"{era_id} (Pi on-device counter)")
+            cell(ws, row, 2, a["boarded"], F_INT)
+            cell(ws, row, 3, "unvalidated (Pi counter was never precision-scored)")
+            cell(ws, row, 4, a["alighted"], F_INT)
+            cell(ws, row, 5, "unvalidated (Pi counter was never precision-scored)")
             row += 1
         if not t_aggs and not pi_counted:
-            _set(ws, row, 1, "no transits in range")
+            cell(ws, row, 1, "no transits in range")
             row += 1
-        row += 1
-        # histograms + dwell distribution charts per era with data
+        row += 2
+
+        # charts per era with data
         for (c_, instrument, era_id), a in sorted(cam_aggs.items()):
-            if a["close"]["n"] == 0:
+            cl = a["close"]
+            if cl["n"] == 0:
                 continue
-            wsd, c0, c1, nr = cd.block([
-                ["bin"] + hist_labels,
-                [f"{cam} {instrument}/{era_id} closes (n={a['close']['n']})"]
-                + a["close"]["hist"]])
-            cats = Reference(wsd, min_col=c0, min_row=2, max_row=nr)
-            data = Reference(wsd, min_col=c1, min_row=1, max_row=nr)
-            ch = _bar_chart(
-                f"{eras.lift_label(cam)} close-travel — {instrument}/{era_id} "
-                f"(n={a['close']['n']}; 2.00 assumption and "
-                f"{a['close']['cliff_s']} cliff are bin edges)", cats, data)
+            spec = eras.DOOR_SPECS.get(cam, {})
+            assumption = spec.get("sheet_close_s", eras.SHEET_CLOSE_S)
+            pct_over = cl["over_cliff"]["pct"] or 0.0
+            row = caption(ws, row, (
+                f"Take-away: {pct_over:.0f}% of this lift's closes land beyond "
+                f"the {cl['cliff_s']:.2f}s compliance line (red bars); the "
+                f"green bars are closes at or under the {assumption:.2f}s the "
+                f"design sheet assumed. n={cl['n']}."))
+            ch = charts.close_histogram(
+                cd, f"{eras.lift_label(cam)} close travel — {instrument}/{era_id} "
+                    f"(n={cl['n']})", cl["values"], stats.CLOSE_HIST_EDGES,
+                assumption, cl["cliff_s"])
             ws.add_chart(ch, f"A{row}")
+            anchors[("close_hist", cam, instrument, era_id)] = (
+                "PER-LIFT", f"'{eras.lift_label(cam)} close travel' at A{row}")
+
             if a["dwell"]["n"]:
-                wsd2, d0, d1, nr2 = cd.block([
-                    ["bin"] + dwell_labels,
+                caption(ws, row - 1, (
+                    f"Take-away: how long the doors stand open on "
+                    f"{eras.lift_label(cam)} — the loading time, separate from "
+                    f"the closing time. n={a['dwell']['n']}."), col=11)
+                wsd, d0, d1, nr2 = cd.block([
+                    ["dwell band (s)"] + stats.hist_labels(stats.DWELL_HIST_EDGES),
                     [f"{cam} {instrument}/{era_id} dwell (n={a['dwell']['n']})"]
                     + a["dwell"]["hist"]])
-                cats2 = Reference(wsd2, min_col=d0, min_row=2, max_row=nr2)
-                data2 = Reference(wsd2, min_col=d1, min_row=1, max_row=nr2)
-                ch2 = _bar_chart(
-                    f"{eras.lift_label(cam)} dwell distribution — "
-                    f"{instrument}/{era_id} (n={a['dwell']['n']})", cats2, data2)
-                ws.add_chart(ch2, f"J{row}")
-            row += 17
+                ch2 = charts.bar_chart(
+                    cd, f"{eras.lift_label(cam)} dwell distribution — "
+                        f"{instrument}/{era_id} (n={a['dwell']['n']})",
+                    cd.ref(d0, d0, 2, nr2), cd.ref(d1, d1, 1, nr2),
+                    n_series=1, n_cats=nr2 - 1,
+                    x_title="dwell (s)", y_title="number of cycles")
+                ws.add_chart(ch2, f"K{row}")
+            row += charts.rows_for()
+
+            # stopping rule for every pool with enough data to judge
+            if cl["n"] >= narrative.N_MEDIUM:
+                row = caption(ws, row, (
+                    f"Take-away: whether {eras.lift_label(cam)}'s close-travel "
+                    f"measurement has settled. When the dashed 95% band sits "
+                    f"wholly clear of the red compliance line, collecting more "
+                    f"closes for this lift stops changing the answer."))
+                ch3 = charts.stopping_rule(
+                    cd, f"{eras.lift_label(cam)} — is the measurement settled "
+                        f"yet? ({instrument}/{era_id}, n={cl['n']})",
+                    cl["values"], cl["cliff_s"])
+                ws.add_chart(ch3, f"A{row}")
+                row += charts.rows_for()
         row += 2
+
+    style.set_widths(ws, {1: 14, 2: 16, 3: 10, 4: 16, 5: 14, 6: 14, 7: 12,
+                          8: 16, 9: 14, 10: 14, 11: 14, 12: 14, 13: 12, 14: 14,
+                          15: 12, 16: 14, 19: 30, 23: 14})
+    if first_hdr:
+        freeze_below(ws, first_hdr)
+        style.autofilter(ws, first_hdr, 23, first_hdr + 40)
+        style.print_setup(ws, repeat_row=first_hdr)
     return ws
 
 
-def sheet_fleet(wb, ctx, cd):
+# ── FLEET ────────────────────────────────────────────────────────────────────
+
+def sheet_fleet(wb, ctx, cd, anchors):
     ws = wb.create_sheet("FLEET")
-    _set(ws, 1, 1, "Fleet roll-up — UNWEIGHTED SUMS", font=H1)
-    row = 3
+    row = title(ws, "Fleet roll-up — UNWEIGHTED SUMS")
+    row += 1
     row = _era_banner(ws, row, ctx["boundaries"])
     precs = [v["precision_pct"] for v in ctx["validation"].values()
              if v.get("precision_pct") is not None]
     prec_note = (f"precision {min(precs):.0f}%–{max(precs):.0f}% across "
                  f"contributing lifts — totals are NOT precision-weighted"
                  if precs else "no validated precision on any contributing lift")
-    _set(ws, row, 1, f"Fleet totals are unweighted sums; {prec_note}.",
-         font=BOLD, fill=WARN_FILL)
-    row += 1
+    row = banner(ws, row, f"Fleet totals are unweighted sums; {prec_note}.",
+                 height=18)
     banks_present = {b for b in ctx["banks"].values() if b}
     if not banks_present:
-        _set(ws, row, 1, "⚠ bank column is UNPOPULATED (all UNKNOWN) — fleet "
-                         "figures below pool across banks and may mix design "
-                         "cases. Populate lift_banks.json.", fill=WARN_FILL)
-        row += 1
+        row = banner(ws, row, "⚠ bank column is UNPOPULATED (all UNKNOWN) — "
+                              "fleet figures below pool across banks and may "
+                              "mix design cases. Populate lift_banks.json.",
+                     height=30)
     row += 1
+
     groups: dict[str, list[str]] = {}
     for cam in ctx["cams"]:
         groups.setdefault(ctx["banks"].get(cam) or "UNKNOWN", []).append(cam)
+    first_hdr = None
     for bank, cams in sorted(groups.items()):
-        _set(ws, row, 1, f"Bank: {bank} ({', '.join(cams)})", font=BOLD)
+        cell(ws, row, 1, f"Bank: {bank} ({', '.join(cams)})", font=H2)
         row += 1
-        row = _header_row(ws, row, [
+        hdr_row = row
+        first_hdr = first_hdr or hdr_row
+        row = header_row(ws, row, [
             "counting era", "boarded (sum)", "alighted (sum)",
             "lifts contributing", "precision range", "riders/hr (sum, gap-excl)",
             "close-travel"])
@@ -402,14 +670,15 @@ def sheet_fleet(wb, ctx, cd):
         for ver, g in sorted(by_ver.items()):
             ps = [ctx["validation"][c]["precision_pct"] for c in g["cams"]
                   if ctx["validation"].get(c, {}).get("precision_pct") is not None]
-            _set(ws, row, 1, ver)
-            _set(ws, row, 2, g["b"], F_INT)
-            _set(ws, row, 3, g["a"], F_INT)
-            _set(ws, row, 4, ", ".join(sorted(g["cams"])))
-            _set(ws, row, 5, (f"{min(ps):.0f}%–{max(ps):.0f}%" if ps
+            cell(ws, row, 1, ver)
+            cell(ws, row, 2, g["b"], F_INT)
+            cell(ws, row, 3, g["a"], F_INT)
+            cell(ws, row, 4, ", ".join(sorted(g["cams"])))
+            cell(ws, row, 5, (f"{min(ps):.0f}%–{max(ps):.0f}%" if ps
                               else "unvalidated"))
-            _set(ws, row, 6, g["rate"], F_DUR)
-            _set(ws, row, 7, NA_SPANS + " (per-camera door instruments)")
+            cell(ws, row, 6, g["rate"], F_RATE)
+            cell(ws, row, 7, NA_SPANS + " (per-camera door instruments)",
+                 fill=FILL_NA)
             row += 1
         pi_b = sum(a["boarded"] for k, a in ctx["aggs"].items()
                    if k[0] in cams and k[1] == PI_WATCH and a["n_counted_cycles"])
@@ -418,78 +687,112 @@ def sheet_fleet(wb, ctx, cd):
         pi_n = sum(1 for k, a in ctx["aggs"].items()
                    if k[0] in cams and k[1] == PI_WATCH and a["n_counted_cycles"])
         if pi_n:
-            _set(ws, row, 1, "pi_watch on-device counter (pre-2026-07-21)")
-            _set(ws, row, 2, pi_b, F_INT)
-            _set(ws, row, 3, pi_a, F_INT)
-            _set(ws, row, 4, f"{pi_n} lift-eras")
-            _set(ws, row, 5, "unvalidated")
-            _set(ws, row, 7, NA_SPANS)
+            cell(ws, row, 1, "pi_watch on-device counter (pre-2026-07-21)")
+            cell(ws, row, 2, pi_b, F_INT)
+            cell(ws, row, 3, pi_a, F_INT)
+            cell(ws, row, 4, f"{pi_n} lift-eras")
+            cell(ws, row, 5, "unvalidated")
+            cell(ws, row, 7, NA_SPANS, fill=FILL_NA)
             row += 1
         if not by_ver and not pi_n:
-            _set(ws, row, 1, "no transits in range for this bank")
+            cell(ws, row, 1, "no transits in range")
             row += 1
         row += 1
-    # hourly profile chart — fleet + per-lift boardings by IST hour
+
+    # hourly profile chart
     hours = list(range(24))
     cols = [["IST hour"] + hours]
     fleet_b = [0] * 24
     fleet_a = [0] * 24
     for cam in ctx["cams"]:
         p = ctx["profile"].get(cam, {})
-        col = [f"{cam} boarded"] + [p.get(h, {}).get("boarded", 0) for h in hours]
-        cols.append(col)
+        cols.append([f"{cam} boarded"] + [p.get(h, {}).get("boarded", 0)
+                                          for h in hours])
         for h in hours:
             fleet_b[h] += p.get(h, {}).get("boarded", 0)
             fleet_a[h] += p.get(h, {}).get("alighted", 0)
     cols.append(["fleet boarded (unweighted sum)"] + fleet_b)
     cols.append(["fleet alighted (unweighted sum)"] + fleet_a)
     wsd, c0, c1, nr = cd.block(cols)
-    cats = Reference(wsd, min_col=c0, min_row=2, max_row=nr)
-    data = Reference(wsd, min_col=c0 + 1, max_col=c1, min_row=1, max_row=nr)
-    ch = _line_chart("Hourly boarding/alighting profile (IST, gap-excluded; "
-                     "pi_watch counts + gpu transits shown as people counts)",
-                     cats, data, y_title="people", x_title="IST hour")
-    ws.add_chart(ch, f"A{row + 1}")
+    peak_hour = max(hours, key=lambda h: fleet_b[h]) if any(fleet_b) else None
+    row = caption(ws, row, (
+        f"Take-away: when the building actually uses its lifts. The busiest "
+        f"hour observed is {peak_hour:02d}:00–{peak_hour + 1:02d}:00 with "
+        f"{fleet_b[peak_hour]:,} boardings across the fleet."
+        if peak_hour is not None else
+        "Take-away: no boardings were recorded in this range."))
+    ch = charts.line_chart(
+        cd, "Hourly boarding profile (building local time, outages excluded)",
+        cd.ref(c0, c0, 2, nr), cd.ref(c0 + 1, c1, 1, nr),
+        n_series=len(cols) - 1, x_title="hour of the day",
+        y_title="people", y_fmt="#,##0")
+    ws.add_chart(ch, f"A{row}")
+    anchors["profile_chart"] = ("FLEET", f"'Hourly boarding profile' at A{row}")
+    style.autofit(ws, max_row=row - 2, wrap_cols=(7,))
+    style.set_widths(ws, {1: 34, 7: 44})
+    if first_hdr:
+        freeze_below(ws, first_hdr)
+        style.print_setup(ws, repeat_row=first_hdr)
     return ws
 
 
-def sheet_peak(wb, ctx, cd):
+# ── PEAK ANALYSIS ────────────────────────────────────────────────────────────
+
+def sheet_peak(wb, ctx, cd, anchors):
+    from .model import aggregate_cycles
     ws = wb.create_sheet("PEAK ANALYSIS")
-    _set(ws, 1, 1, "Peak analysis — worst 5-min boarding window per day"
-         + (f" (fixed window {ctx['peak_window_spec']})"
-            if ctx["peak_window_spec"] not in (None, "", "auto") else ""), font=H1)
-    row = 3
+    row = title(ws, "Peak analysis — worst 5-min boarding window per day"
+                + (f" (fixed window {ctx['peak_window_spec']})"
+                   if ctx["peak_window_spec"] not in (None, "", "auto") else ""))
+    row += 1
     row = _era_banner(ws, row, ctx["boundaries"])
+    if ctx.get("suspected_gaps"):
+        row = banner(ws, row, (
+            f"⚠ {len(ctx['suspected_gaps'])} suspected undeclared quiet "
+            f"window(s) are NOT excluded from the averages below. A quiet "
+            f"period counted as live time deflates the average and inflates "
+            f"every peak:average ratio on this sheet. See COVERAGE & ERAS."),
+            height=44)
+        row += 1
     pop = ctx.get("population")
-    row = _header_row(ws, row, [
-        "day (IST)", "peak window", "boardings in window", "day boardings",
-        "avg 5-min boardings (gap-excl)", "peak : average",
-        "peak demand % of population" + ("" if pop else " (population not supplied)"),
-        f"vs {eras.HC_PEAK_DESIGN_PCT}% HC design"])
+    headers = ["day (IST)", "peak window", "boardings in window", "day boardings",
+               "avg 5-min boardings (gap-excl)", "peak : average",
+               "peak demand % of population"
+               + ("" if pop else " (population not supplied)"),
+               f"vs {eras.HC_PEAK_DESIGN_PCT:.0f}% HC design"]
+    hdr_row = row
+    row = header_row(ws, row, headers)
+    first_data = row
     for p in ctx["peaks"]:
         pk = p["peak"]
-        _set(ws, row, 1, p["day"])
-        _set(ws, row, 2, (f"{_fmt_ts(pk['w0'])[11:16]}–{_fmt_ts(pk['w1'])[11:16]}"
+        cell(ws, row, 1, p["day"])
+        cell(ws, row, 2, (f"{_fmt_ts(pk['w0'])[11:16]}–{_fmt_ts(pk['w1'])[11:16]}"
                           if pk else "no boardings"))
-        _set(ws, row, 3, pk["boardings"] if pk else 0, F_INT)
-        _set(ws, row, 4, p["day_boardings"], F_INT)
-        _set(ws, row, 5, p["avg_5min"], F_DUR)
-        _set(ws, row, 6, p["peak_to_avg"], F_DUR)
+        cell(ws, row, 3, pk["boardings"] if pk else 0, F_INT)
+        cell(ws, row, 4, p["day_boardings"], F_INT)
+        cell(ws, row, 5, p["avg_5min"], F_RATE)
+        cell(ws, row, 6, p["peak_to_avg"], F_RATE)
         if pop and pk:
-            pct = 100.0 * pk["boardings"] / pop
-            _set(ws, row, 7, pct, F_PCT)
-            _set(ws, row, 8, "over design" if pct > eras.HC_PEAK_DESIGN_PCT
-                 else "within design")
+            frac = pk["boardings"] / pop
+            over = 100.0 * frac > eras.HC_PEAK_DESIGN_PCT
+            cell(ws, row, 7, frac, F_PCT)
+            cell(ws, row, 8, "over design" if over else "within design",
+                 fill=style.FILL_BAD if over else style.FILL_GOOD)
         else:
-            _set(ws, row, 7, "" if pk else "")
-            _set(ws, row, 8, "population not supplied — % left blank" if pk else "")
+            cell(ws, row, 7, None)
+            cell(ws, row, 8, "population not supplied — % left blank" if pk else "",
+                 fill=FILL_NA if pk else None)
         row += 1
+    anchors["peak_table"] = ("PEAK ANALYSIS",
+                             _rng(first_data, max(first_data, row - 1),
+                                  len(headers)))
+    freeze_below(ws, hdr_row)
     row += 1
-    _set(ws, row, 1, "Coefficients INSIDE daily peak windows vs ALL-DAY, per "
-                     "instrument era (peak-window cycles pooled across days "
-                     "within one era only):", font=BOLD)
-    row += 1
-    row = _header_row(ws, row, [
+
+    row = section(ws, row, "Coefficients INSIDE daily peak windows vs ALL-DAY, "
+                           "per instrument era (peak-window cycles pooled "
+                           "across days within one era only)")
+    row = header_row(ws, row, [
         "lift", "instrument", "era", "scope", "clean closes n", "close median s",
         "dwell n", "dwell median s"])
     windows = [(p["peak"]["w0"], p["peak"]["w1"]) for p in ctx["peaks"] if p["peak"]]
@@ -497,191 +800,301 @@ def sheet_peak(wb, ctx, cd):
     def _in_peak(ts):
         return any(w0 <= ts < w1 for w0, w1 in windows)
 
-    from .model import aggregate_cycles
     peak_cycles = [c for c in ctx["all_cycles"] if _in_peak(c["ts"])]
-    peak_aggs = aggregate_cycles(peak_cycles, ctx["t0"], ctx["t1"])
+    peak_aggs = aggregate_cycles(peak_cycles, ctx["t0"], ctx["t1"],
+                                 min_close_s=ctx["min_close_s"])
     for (cam, instrument, era_id), a in sorted(ctx["aggs"].items()):
         pa = peak_aggs.get((cam, instrument, era_id))
         for scope, src in (("peak windows", pa), ("all-day", a)):
             if src is None:
                 continue
-            _set(ws, row, 1, eras.lift_label(cam))
-            _set(ws, row, 2, instrument)
-            _set(ws, row, 3, era_id)
-            _set(ws, row, 4, scope)
-            _set(ws, row, 5, src["close"]["n"], F_INT)
-            _set(ws, row, 6, src["close"]["median_ci"]["median"], F_DUR)
-            _set(ws, row, 7, src["dwell"]["n"], F_INT)
-            _set(ws, row, 8, src["dwell"]["median_ci"]["median"], F_DUR)
+            cell(ws, row, 1, eras.lift_label(cam))
+            cell(ws, row, 2, instrument)
+            cell(ws, row, 3, era_id)
+            cell(ws, row, 4, scope)
+            cell(ws, row, 5, src["close"]["n"], F_INT)
+            cell(ws, row, 6, src["close"]["median_ci"]["median"], F_SEC)
+            cell(ws, row, 7, src["dwell"]["n"], F_INT)
+            cell(ws, row, 8, src["dwell"]["median_ci"]["median"], F_SEC)
             row += 1
+    style.autofit(ws, wrap_cols=(8,))
+    style.set_widths(ws, {1: 16, 2: 18, 3: 22, 7: 26, 8: 26})
+    style.print_setup(ws, repeat_row=hdr_row)
     return ws
 
 
-def sheet_raw(wb, ctx):
+# ── RAW ──────────────────────────────────────────────────────────────────────
+
+def sheet_raw(wb, ctx, anchors):
     ws = wb.create_sheet("RAW")
-    _set(ws, 1, 1, "Raw era-tagged export — the audit trail. No aggregation.", font=H1)
-    row = 3
+    row = title(ws, "Raw era-tagged export — the audit trail. No aggregation.")
+    row += 1
     row = _era_banner(ws, row, ctx["boundaries"])
     headers = ["ts (IST)", "ts_epoch", "channel", "lift_label", "bank",
                "instrument", "counting_version", "era_id", "event_type",
                "door_open_ts", "door_close_ts", "close_travel_s",
                "cycle_class/quality", "boarded", "alighted", "floor",
-               "floor_source", "precision_at_time", "in_declared_gap"]
-    row = _header_row(ws, row, headers)
+               "floor_source", "precision_at_time", "in_declared_gap",
+               "below_min_close_floor"]
+    hdr_row = row
+    row = header_row(ws, row, headers)
+    first_data = row
+    keys = ("ts_ist", "ts_epoch", "channel", "lift_label", "bank", "instrument",
+            "counting_version", "era_id", "event_type", "door_open_ts",
+            "door_close_ts", "close_travel_s", "cycle_class", "boarded",
+            "alighted", "floor", "floor_source", "precision_at_time", "in_gap",
+            "below_floor")
+    fmts = {"close_travel_s": F_SEC, "ts_epoch": "0.000",
+            "boarded": F_INT, "alighted": F_INT}
     for r in ctx["raw_rows"]:
-        for i, key in enumerate(("ts_ist", "ts_epoch", "channel", "lift_label",
-                                 "bank", "instrument", "counting_version",
-                                 "era_id", "event_type", "door_open_ts",
-                                 "door_close_ts", "close_travel_s",
-                                 "cycle_class", "boarded", "alighted", "floor",
-                                 "floor_source", "precision_at_time",
-                                 "in_gap"), start=1):
-            fmt = F_DUR if key in ("close_travel_s",) else None
-            _set(ws, row, i, r.get(key), fmt)
+        for i, key in enumerate(keys, start=1):
+            cell(ws, row, i, r.get(key), fmts.get(key))
         row += 1
-    for col in range(1, len(headers) + 1):
-        ws.column_dimensions[get_column_letter(col)].width = 16
+    last = row - 1
+    anchors["raw_table"] = ("RAW", _rng(first_data, max(first_data, last),
+                                        len(headers)))
+    style.set_widths(ws, {i: 18 for i in range(1, len(headers) + 1)})
+    style.set_widths(ws, {1: 22, 7: 30, 18: 34, 10: 26, 11: 26})
+    freeze_below(ws, hdr_row, col=4)
+    style.autofilter(ws, hdr_row, len(headers), last)
+    style.print_setup(ws, repeat_row=hdr_row)
     return ws
 
 
-def sheet_coverage(wb, ctx, cd):
+# ── COVERAGE & ERAS ──────────────────────────────────────────────────────────
+
+def sheet_coverage(wb, ctx, cd, anchors):
     ws = wb.create_sheet("COVERAGE & ERAS")
-    _set(ws, 1, 1, "Coverage, era boundaries, and excluded gap windows", font=H1)
-    row = 3
-    _set(ws, row, 1, "ERA BOUNDARIES CROSSED BY THIS RANGE", font=BOLD)
+    row = title(ws, "Coverage, era boundaries, and excluded gap windows")
     row += 1
+
+    row = section(ws, row, "ERA BOUNDARIES CROSSED BY THIS RANGE")
     if ctx["boundaries"]:
-        row = _header_row(ws, row, ["boundary (ts)", "what changed",
-                                    "rows before", "rows after"])
+        row = header_row(ws, row, ["boundary (ts)", "what changed",
+                                   "rows before", "rows after"])
         for b in ctx["boundaries"]:
-            _set(ws, row, 1, b["boundary"])
-            c = _set(ws, row, 2, b["kind"])
-            c.alignment = WRAP
-            _set(ws, row, 3, b["rows_before"], F_INT)
-            _set(ws, row, 4, b["rows_after"], F_INT)
+            cell(ws, row, 1, b["boundary"])
+            cell(ws, row, 2, b["kind"], wrap=True)
+            cell(ws, row, 3, b["rows_before"], F_INT)
+            cell(ws, row, 4, b["rows_after"], F_INT)
+            ws.row_dimensions[row].height = 40
             row += 1
     else:
-        _set(ws, row, 1, "none — the whole range lies inside single eras")
+        cell(ws, row, 1, "none — the whole range lies inside single eras")
         row += 1
     row += 1
-    _set(ws, row, 1, "DECLARED DATA GAPS OVERLAPPING THIS RANGE (excluded from "
-                     "all rate/duration statistics)", font=BOLD)
-    row += 1
-    row = _header_row(ws, row, ["start", "end", "channels affected", "reason"])
+
+    row = section(ws, row, "DECLARED DATA GAPS OVERLAPPING THIS RANGE "
+                           "(excluded from all rate/duration statistics)")
+    row = header_row(ws, row, ["start", "end", "channels affected", "reason"])
     n_gaps = 0
     for g in eras.DATA_GAPS:
         if g["start_epoch"] < ctx["t1"] and g["end_epoch"] > ctx["t0"]:
-            _set(ws, row, 1, g["start"])
-            _set(ws, row, 2, g["end"])
-            _set(ws, row, 3, ", ".join(g["cams"]) if g["cams"] else "ALL")
-            c = _set(ws, row, 4, g["reason"])
-            c.alignment = WRAP
+            cell(ws, row, 1, g["start"])
+            cell(ws, row, 2, g["end"])
+            cell(ws, row, 3, ", ".join(g["cams"]) if g["cams"] else "ALL")
+            cell(ws, row, 4, g["reason"], wrap=True)
+            ws.row_dimensions[row].height = 40
             row += 1
             n_gaps += 1
     if not n_gaps:
-        _set(ws, row, 1, "none")
+        cell(ws, row, 1, "none")
         row += 1
     row += 1
-    _set(ws, row, 1, "PER-CHANNEL COVERAGE (15-min buckets with ≥1 row, over "
-                     "non-gap time) AND ROW COUNTS BY ERA", font=BOLD)
+
+    # ── auto-detected suspects: flagged, never auto-excluded
+    row = section(ws, row, "AUTO-DETECTED SUSPECTED GAPS — FLAGGED ONLY, "
+                           "NOT EXCLUDED")
+    row = banner(ws, row, (
+        "These windows were found automatically: a channel went silent while it "
+        "was producing data on both sides. They are NOT excluded from any "
+        "statistic. Declaring a gap stays a human decision — check the "
+        "operations record, then append confirmed outages to "
+        "eras.py::DATA_GAPS and re-export."), height=44)
+    susp = ctx.get("suspected_gaps") or []
+    if susp:
+        row = header_row(ws, row, ["channel", "kind", "start", "end",
+                                   "hours silent", "hours already declared",
+                                   "hours unexplained", "detail"])
+        for g in susp:
+            cell(ws, row, 1, g["cam"])
+            cell(ws, row, 2, g["kind"])
+            cell(ws, row, 3, _dt(g["start"]), F_TS)
+            cell(ws, row, 4, _dt(g["end"]), F_TS)
+            cell(ws, row, 5, g["span_s"] / 3600.0, F_RATE)
+            cell(ws, row, 6, g["declared_s"] / 3600.0, F_RATE)
+            cell(ws, row, 7, g["undeclared_s"] / 3600.0, F_RATE,
+                 fill=FILL_WARN if g["undeclared_s"] > 3600 else None)
+            cell(ws, row, 8, g["detail"], wrap=True)
+            row += 1
+    else:
+        cell(ws, row, 1, "none detected in this range")
+        row += 1
     row += 1
-    row = _header_row(ws, row, [
-        "channel", "coverage % (gap-adjusted)", "instrument", "era",
-        "door cycles", "clean closes", "transits", "first row", "last row",
-        "counting_version attribution"])
+
+    # ── floor rejection per channel/era
+    row = section(ws, row, "CYCLES REJECTED AT THE ONE-FRAME QUANTIZATION FLOOR")
+    cell(ws, row, 1, (f"Closes shorter than {ctx['min_close_s']:.2f}s are "
+                      f"rejected from every close-travel statistic: a lift door "
+                      f"cannot close in one video frame, so a value that short "
+                      f"is the door state flickering between frames. The "
+                      f"sampling resolution is detected from the data on every "
+                      f"run, never assumed."), font=BODY_ITALIC, wrap=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
+    ws.row_dimensions[row].height = 30
+    row += 1
+    hdr = row
+    row = header_row(ws, row, [
+        "channel", "instrument", "era", "detected frame quantum s",
+        "quantum source", "clean closes before filter", "rejected at floor",
+        "% of pool rejected", "close values at the quantum",
+        "open values at the quantum"])
+    for (cam, instrument, era_id), a in sorted(ctx["aggs"].items()):
+        cl, ot = a["close"], a["open_travel"]
+        cell(ws, row, 1, cam)
+        cell(ws, row, 2, instrument)
+        cell(ws, row, 3, era_id)
+        cell(ws, row, 4, a["quantum_s"], F_SEC_PLAIN)
+        cell(ws, row, 5, a["quantum_source"], wrap=True)
+        cell(ws, row, 6, cl["n_prefilter"], F_INT)
+        cell(ws, row, 7, cl["n_floor_rejected"], F_INT)
+        cell(ws, row, 8, cl["floor_reject_frac"], F_PCT,
+             fill=FILL_WARN if cl["floor_reject_warn"] else None)
+        cell(ws, row, 9, cl["at_quantum"]["frac"], F_PCT,
+             fill=FILL_NA if cl["suppressed"] else None)
+        cell(ws, row, 10, ot["at_quantum"]["frac"], F_PCT,
+             fill=FILL_NA if ot["suppressed"] else None)
+        row += 1
+    style.wrap_column(ws, 5, hdr + 1, row - 1, width=32)
+    row += 1
+
+    row = section(ws, row, "PER-CHANNEL COVERAGE (15-min buckets with ≥1 row, "
+                           "over non-gap time) AND ROW COUNTS BY ERA")
+    cov_hdr = row
+    headers = ["channel", "coverage % (gap-adjusted)", "instrument", "era",
+               "door cycles", "clean closes", "transits", "first row",
+               "last row", "counting_version attribution"]
+    row = header_row(ws, row, headers)
+    cov_first = row
     for cam in ctx["cams"]:
         cam_aggs = sorted((k, a) for k, a in ctx["aggs"].items() if k[0] == cam)
         t_by_ver = sorted((k, d) for k, d in ctx["transit_aggs"].items()
                           if k[0] == cam)
-        cov = ctx["coverage_pct"].get(cam, 0.0)
+        cov = ctx["coverage_pct"].get(cam, 0.0) / 100.0
         attribution = ctx["cv_attribution"].get(cam, "declared epochs")
         if not cam_aggs and not t_by_ver:
-            _set(ws, row, 1, cam)
-            _set(ws, row, 2, cov, F_PCT)
-            _set(ws, row, 3, "—")
-            _set(ws, row, 4, "ZERO ROWS in this range", fill=WARN_FILL)
-            _set(ws, row, 10, attribution)
+            cell(ws, row, 1, cam)
+            cell(ws, row, 2, cov, F_PCT)
+            cell(ws, row, 3, "—")
+            cell(ws, row, 4, "ZERO ROWS in this range", fill=FILL_WARN)
+            cell(ws, row, 10, attribution)
             row += 1
             continue
         for (c_, instrument, era_id), a in cam_aggs:
-            _set(ws, row, 1, cam)
-            _set(ws, row, 2, cov, F_PCT)
-            _set(ws, row, 3, instrument)
-            _set(ws, row, 4, era_id)
-            _set(ws, row, 5, a["n_cycles"], F_INT)
-            _set(ws, row, 6, a["close"]["n"], F_INT)
-            _set(ws, row, 8, _fmt_ts(a["first_ts"]))
-            _set(ws, row, 9, _fmt_ts(a["last_ts"]))
-            _set(ws, row, 10, attribution)
+            cell(ws, row, 1, cam)
+            cell(ws, row, 2, cov, F_PCT)
+            cell(ws, row, 3, instrument)
+            cell(ws, row, 4, era_id)
+            cell(ws, row, 5, a["n_cycles"], F_INT)
+            cell(ws, row, 6, a["close"]["n"], F_INT)
+            cell(ws, row, 8, _dt(a["first_ts"]), F_TS)
+            cell(ws, row, 9, _dt(a["last_ts"]), F_TS)
+            cell(ws, row, 10, attribution)
             row += 1
         for (c_, ver), d in t_by_ver:
-            _set(ws, row, 1, cam)
-            _set(ws, row, 2, cov, F_PCT)
-            _set(ws, row, 3, "gpu_engine (counting)")
-            _set(ws, row, 4, f"counting: {ver}")
-            _set(ws, row, 7, d["n"], F_INT)
-            _set(ws, row, 8, _fmt_ts(d["first_ts"]))
-            _set(ws, row, 9, _fmt_ts(d["last_ts"]))
-            _set(ws, row, 10, attribution)
+            cell(ws, row, 1, cam)
+            cell(ws, row, 2, cov, F_PCT)
+            cell(ws, row, 3, "gpu_engine (counting)")
+            cell(ws, row, 4, f"counting: {ver}")
+            cell(ws, row, 7, d["n"], F_INT)
+            cell(ws, row, 8, _dt(d["first_ts"]), F_TS)
+            cell(ws, row, 9, _dt(d["last_ts"]), F_TS)
+            cell(ws, row, 10, attribution)
             row += 1
+    anchors["coverage_table"] = ("COVERAGE & ERAS",
+                                 _rng(cov_first, max(cov_first, row - 1),
+                                      len(headers)))
     row += 1
     if ctx["version_mismatches"]:
-        _set(ws, row, 1, "⚠ COUNTING-VERSION CROSS-CHECK MISMATCHES (declared "
-                         "epoch vs live analyzer_status/camera_validation):",
-             font=BOLD, fill=WARN_FILL)
-        row += 1
+        row = banner(ws, row, "⚠ COUNTING-VERSION CROSS-CHECK MISMATCHES "
+                              "(declared epoch vs live analyzer_status / "
+                              "camera_validation):", height=18)
         for m in ctx["version_mismatches"]:
-            _set(ws, row, 1, m)
+            cell(ws, row, 1, m, wrap=True)
+            ws.row_dimensions[row].height = 40
             row += 1
         row += 1
-    # coverage timeline chart: daily coverage % per channel
+
+    # ── coverage timeline, with declared outages shaded distinctly
     days = ctx["coverage_daily"]["days"]
-    cols = [["day"] + days]
-    for cam in ctx["cams"]:
-        cols.append([cam] + ctx["coverage_daily"]["by_cam"].get(cam, [0] * len(days)))
     if days:
-        wsd, c0, c1, nr = cd.block(cols)
-        cats = Reference(wsd, min_col=c0, min_row=2, max_row=nr)
-        data = Reference(wsd, min_col=c0 + 1, max_col=c1, min_row=1, max_row=nr)
-        ch = _line_chart("Coverage timeline — daily % of 15-min buckets with "
-                         "data, per channel (gaps show as dips; era boundaries "
-                         "listed above)", cats, data,
-                         y_title="% buckets with data", x_title="day (IST)")
-        ws.add_chart(ch, f"A{row + 1}")
+        gap_share = []
+        for d_label in days:
+            d0 = datetime.fromisoformat(d_label).replace(tzinfo=eras.IST)
+            s = max(d0.timestamp(), ctx["t0"])
+            e = min((d0 + timedelta(days=1)).timestamp(), ctx["t1"])
+            span = max(1.0, e - s)
+            # fleet-wide declared outage share of the day
+            share = min(1.0, eras.gap_overlap_s(ctx["cams"][0], s, e) / span)
+            gap_share.append(round(share, 4))
+        row = caption(ws, row, (
+            "Take-away: where a line dips, that channel stopped producing data. "
+            "Grey bars mark time already DECLARED as an outage — a dip over a "
+            "grey bar is explained; a dip with no grey bar under it is not, and "
+            "should be checked against the suspected-gaps table above."))
+        ch = charts.coverage_timeline(cd, days,
+                                      ctx["coverage_daily"]["by_cam"], gap_share)
+        ws.add_chart(ch, f"A{row}")
+        anchors["coverage_chart"] = ("COVERAGE & ERAS",
+                                     f"'Daily coverage by channel' at A{row}")
+    style.autofit(ws, max_row=cov_hdr, wrap_cols=(2, 4, 5))
+    style.set_widths(ws, {1: 14, 2: 24, 3: 22, 4: 30, 5: 30, 8: 20, 9: 20,
+                          10: 30})
+    style.print_setup(ws)
     return ws
 
 
-def sheet_tier2(wb, ctx):
+# ── TIER-2 BLOCKED ───────────────────────────────────────────────────────────
+
+def sheet_tier2(wb, ctx, anchors):
     ws = wb.create_sheet("TIER-2 BLOCKED")
-    _set(ws, 1, 1, "Floor attribution status — why C21/C22 (and C17/C18 trip "
-                   "segmentation) are unavailable", font=H1)
-    row = 3
-    row = _header_row(ws, row, [
+    row = title(ws, "Floor attribution status — why C21/C22 (and C17/C18 trip "
+                    "segmentation) are unavailable")
+    row += 1
+    hdr_row = row
+    row = header_row(ws, row, [
         "channel", "door rows in range", "confident reads", "no_read",
         "ambiguous", "invalid_label", "other", "glyphs seen (alphabet state)"])
+    first = row
     for cam in ctx["cams"]:
         d = ctx["floor_status"].get(cam)
-        _set(ws, row, 1, cam)
+        cell(ws, row, 1, cam)
         if not d:
-            _set(ws, row, 2, 0, F_INT)
-            _set(ws, row, 8, "no gw_door_event rows in range")
+            cell(ws, row, 2, 0, F_INT)
+            cell(ws, row, 8, "no gw_door_event rows in range", fill=FILL_NA)
             row += 1
             continue
-        _set(ws, row, 2, d["rows"], F_INT)
-        _set(ws, row, 3, d["confident"], F_INT)
-        _set(ws, row, 4, d["no_read"], F_INT)
-        _set(ws, row, 5, d["ambiguous"], F_INT)
-        _set(ws, row, 6, d["invalid"], F_INT)
-        _set(ws, row, 7, d["other"], F_INT)
-        c = _set(ws, row, 8, ", ".join(d["glyphs"][:40])
-                 + (" …" if len(d["glyphs"]) > 40 else ""))
-        c.alignment = WRAP
+        cell(ws, row, 2, d["rows"], F_INT)
+        cell(ws, row, 3, d["confident"], F_INT,
+             fill=FILL_NA if not d["confident"] else None)
+        cell(ws, row, 4, d["no_read"], F_INT)
+        cell(ws, row, 5, d["ambiguous"], F_INT)
+        cell(ws, row, 6, d["invalid"], F_INT)
+        cell(ws, row, 7, d["other"], F_INT)
+        cell(ws, row, 8, ", ".join(d["glyphs"][:40])
+             + (" …" if len(d["glyphs"]) > 40 else ""), wrap=True)
         row += 1
+    anchors["tier2_table"] = ("TIER-2 BLOCKED", _rng(first, max(first, row - 1), 8))
     row += 1
-    _set(ws, row, 1, "C21/C22 speed factors need per-stop floor attribution "
-                     "(confident reads on consecutive stops). C17/C18 need "
-                     "trip segmentation on top of that. Until the confident-"
-                     "read rate supports it, these stay blocked — the gap is "
-                     "documented here rather than absent.", font=BOLD)
-    ws.cell(row=row, column=1).alignment = WRAP
+    cell(ws, row, 1, "C21/C22 speed factors need per-stop floor attribution "
+                     "(confident reads on consecutive stops). C17/C18 need trip "
+                     "segmentation on top of that. Until the confident-read rate "
+                     "supports it, these stay blocked — the gap is documented "
+                     "here rather than absent.", font=BODY_BOLD, wrap=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+    ws.row_dimensions[row].height = 44
+    style.set_widths(ws, {1: 12, 2: 20, 3: 18, 4: 14, 5: 14, 6: 16, 7: 12,
+                          8: 50})
+    freeze_below(ws, hdr_row)
+    style.print_setup(ws, repeat_row=hdr_row)
     return ws

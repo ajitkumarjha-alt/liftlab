@@ -58,6 +58,24 @@ PLAUS_LO, PLAUS_HI = 0.3, 30.0
 MIN_OPEN_DWELL_S = float(os.environ.get("DASH_MIN_OPEN_DWELL_S", "1.5"))
 FLAP_GAP_S = float(os.environ.get("DASH_FLAP_GAP_S", "1.0"))
 
+# ── One-frame quantization floor ─────────────────────────────────────────────
+# Door travel is measured by frame sampling, so every value is a multiple of the
+# frame interval (~0.08 s at 12.5 fps on the live gateway — detected at run time,
+# never assumed: see stats.detect_quantum). A lift door does not close in one
+# frame; a one-frame "close" is a door-state flip artifact, not a close.
+#
+# MIN_PLAUSIBLE_CLOSE_S is a SECOND, higher floor sitting above the dashboard's
+# PLAUS_LO=0.3 plausibility bound. Cycles below it are rejected from every
+# close-travel statistic and counted on COVERAGE & ERAS.
+MIN_PLAUSIBLE_CLOSE_S = float(os.environ.get("LIFTLAB_MIN_CLOSE_S", "0.5"))
+
+# A pool losing more than this share to the floor gets a visible SUMMARY warning.
+FLOOR_REJECT_WARN_FRAC = 0.05
+
+# When more than this share of a pool's values sit AT the one-frame quantum, the
+# measurement is resolution-bound: emit no verdict, emit the reason instead.
+QUANTUM_SUPPRESS_FRAC = 0.20
+
 # ── The sheet (MEP-02 v28) ───────────────────────────────────────────────────
 SHEET_NAME = "MEP-02 v28"
 DOOR_SPECS = {
@@ -97,6 +115,20 @@ DATA_GAPS = [
     {"start": "2026-08-01T23:16:00+05:30", "end": "2026-08-01T23:18:00+05:30",
      "cams": [c for c in ALL_CAMS if c != "ch16"],
      "reason": "all except ch16 dark"},
+    # Surfaced by the auto-detector on the first live run and DECLARED here by
+    # hand (the detector only ever flags; declaring stays a human decision).
+    # Left live, these two days counted as covered time with no boardings —
+    # deflating the 5-min average and inflating every peak:average ratio.
+    {"start": "2026-07-24T00:00:00+05:30", "end": "2026-07-25T00:00:00+05:30",
+     "cams": None,
+     "reason": "undeclared — no rows; cause unknown. Whole IST day: 0 transits "
+               "fleet-wide and 94 gw_door_event rows on ch16 only, against a "
+               "12-13k/day neighbour baseline."},
+    {"start": "2026-07-27T00:00:00+05:30", "end": "2026-07-28T00:00:00+05:30",
+     "cams": None,
+     "reason": "undeclared — no rows; cause unknown. Whole IST day: 1 transit "
+               "fleet-wide and 65 gw_door_event rows on ch16 only, against a "
+               "4-13k/day neighbour baseline."},
 ]
 for _g in DATA_GAPS:
     _g["start_epoch"] = datetime.fromisoformat(_g["start"]).timestamp()

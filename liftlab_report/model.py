@@ -18,10 +18,19 @@ def _era_key(c) -> tuple:
     return (c["cam"], c["instrument"], c["era_id"])
 
 
-def aggregate_cycles(cycles: list[dict], t0: float, t1: float) -> dict[tuple, dict]:
+def aggregate_cycles(cycles: list[dict], t0: float, t1: float,
+                     min_close_s: float | None = None) -> dict[tuple, dict]:
     """{(cam, instrument, era_id): agg}. Gap-time cycles are excluded from
     rate denominators upstream; here they are excluded from duration pools
-    entirely (a close inside a declared gap window is suspect data)."""
+    entirely (a close inside a declared gap window is suspect data).
+
+    min_close_s is the one-frame quantization floor (eras.MIN_PLAUSIBLE_CLOSE_S
+    by default): closes below it are door-state flip artifacts, not closes, and
+    are rejected from every close-travel statistic. The pre-filter pool is kept
+    alongside so the effect of the floor is auditable on PER-LIFT rather than
+    invisible."""
+    floor = (eras.MIN_PLAUSIBLE_CLOSE_S if min_close_s is None
+             else float(min_close_s))
     pools: dict[tuple, dict] = {}
     for c in cycles:
         if eras.in_gap(c["cam"], c["ts"]):
@@ -33,8 +42,20 @@ def aggregate_cycles(cycles: list[dict], t0: float, t1: float) -> dict[tuple, di
         p["n_cycles"] += 1
         p["first_ts"] = min(p["first_ts"], c["ts"]) if p["first_ts"] else c["ts"]
         p["last_ts"] = max(p["last_ts"], c["ts"]) if p["last_ts"] else c["ts"]
+        # Every measured travel value, quotable or not — the quantum is a
+        # property of the SAMPLING, so it is detected from the widest pool
+        # available for the era, not from the post-filter survivors.
+        if c.get("close_travel_s") is not None:
+            p["all_travel"].append(float(c["close_travel_s"]))
+        if c.get("open_travel_s") is not None and c["open_travel_s"] > 0:
+            p["all_travel"].append(float(c["open_travel_s"]))
         if c.get("clean_close") and c.get("close_travel_s") is not None:
-            p["closes"].append(float(c["close_travel_s"]))
+            v = float(c["close_travel_s"])
+            p["closes_prefilter"].append(v)
+            if v < floor:
+                p["n_floor_rejected"] += 1
+            else:
+                p["closes"].append(v)
         else:
             p["n_closes_excluded"] += 1
         if c.get("dwell_s") is not None and c["dwell_s"] > 0:
@@ -51,34 +72,79 @@ def aggregate_cycles(cycles: list[dict], t0: float, t1: float) -> dict[tuple, di
         if load > 0 and c.get("dwell_s") and c["dwell_s"] > 0:
             p["transfer_pp"].append(c["dwell_s"] / load)
             p["lost_time"].append(c["dwell_s"] - eras.SHEET_TRANSFER_S_PP * load)
+    # The frame quantum is a property of the SAMPLING, not of one era's pool.
+    # Detect per era first, then use the MEDIAN of the successful detections as
+    # the fallback for eras whose own pool was inconclusive. Pooling the raw
+    # values fleet-wide would let one camera whose travels drift off-grid mask
+    # the quantum for every other camera — and an era with no quantum silently
+    # dodges the suppression rule, which is exactly the failure this guards.
+    per_era = {key: stats.detect_quantum(p["all_travel"])
+               for key, p in pools.items()}
+    found = sorted(q for q in per_era.values() if q is not None)
+    fleet_q = found[len(found) // 2] if found else None
     out = {}
     for key, p in pools.items():
-        out[key] = _finalise(key, p, t0, t1)
+        out[key] = _finalise(key, p, t0, t1, floor, per_era[key], fleet_q)
     return out
 
 
 def _empty_pool() -> dict:
-    return {"n_cycles": 0, "closes": [], "dwells": [], "opens": [],
+    return {"n_cycles": 0, "closes": [], "closes_prefilter": [], "dwells": [],
+            "opens": [], "all_travel": [],
             "transfer_pp": [], "lost_time": [], "pax_per_trip": [],
             "boarded": 0, "alighted": 0, "n_counted_cycles": 0,
             "n_closes_excluded": 0, "n_in_gap_excluded": 0,
+            "n_floor_rejected": 0,
             "first_ts": None, "last_ts": None}
 
 
-def _finalise(key, p, t0, t1) -> dict:
+def _finalise(key, p, t0, t1, floor, own_q=None, fleet_q=None) -> dict:
     cam, instrument, era_id = key
     closes = sorted(p["closes"])
+    closes_pre = sorted(p["closes_prefilter"])
+    opens = sorted(p["opens"])
     n = len(closes)
     spec = eras.DOOR_SPECS.get(cam)
     cliff = (spec or {}).get("compliance_s", eras.COMPLIANCE_CLIFF_S)
     over = sum(1 for v in closes if v > cliff)
     covered_s = max(0.0, (t1 - t0) - eras.gap_overlap_s(cam, t0, t1))
+
+    # Sampling resolution for this era, detected from every travel value it
+    # produced (opens included — they are the same clock), falling back to the
+    # fleet-wide detection. A per-era value within jitter of the fleet value is
+    # snapped to it so ±1 ms noise does not present as two different quanta.
+    quantum, quantum_source = own_q, "detected in this era"
+    if quantum is None:
+        quantum = fleet_q
+        quantum_source = ("median of the other eras' detections "
+                          "(this era's own pool was inconclusive)"
+                          if fleet_q is not None else "undetermined")
+    elif fleet_q is not None and abs(quantum - fleet_q) <= stats.grid_tol(fleet_q):
+        quantum = fleet_q
+    close_floor_share = stats.floor_share(closes_pre, quantum)
+    open_floor_share = stats.floor_share(opens, quantum)
+    n_pre = len(closes_pre)
+    reject_frac = (p["n_floor_rejected"] / n_pre) if n_pre else None
+
+    # Suppression: a pool with too much mass pinned at one quantum is
+    # resolution-bound and gets a reason instead of a verdict.
+    def _suppress(fs, kind, remedy):
+        if fs["frac"] is not None and fs["frac"] > eras.QUANTUM_SUPPRESS_FRAC:
+            return True, stats.floor_suppression_note(kind, fs, remedy)
+        return False, None
+
+    open_sup, open_why = _suppress(open_floor_share, "open-travel",
+                                   stats.OPEN_TRAVEL_REMEDY)
+    close_sup, close_why = _suppress(close_floor_share, "close-travel",
+                                     stats.CLOSE_TRAVEL_REMEDY)
     return {
         "cam": cam, "instrument": instrument, "era_id": era_id,
         "first_ts": p["first_ts"], "last_ts": p["last_ts"],
         "n_cycles": p["n_cycles"],
         "n_in_gap_excluded": p["n_in_gap_excluded"],
         "n_closes_excluded": p["n_closes_excluded"],
+        "quantum_s": quantum,
+        "quantum_source": quantum_source,
         "close": {
             "n": n,
             "median_ci": stats.median_ci(closes),
@@ -90,6 +156,18 @@ def _finalise(key, p, t0, t1) -> dict:
             "over_cliff": stats.wilson_ci(over, n),
             "cliff_s": cliff,
             "values": closes,
+            # pre-floor-filter twins, so the filter's effect is auditable
+            "n_prefilter": n_pre,
+            "median_prefilter": stats.pctl(closes_pre, 0.5),
+            "p85_prefilter": stats.pctl(closes_pre, 0.85),
+            "floor_s": floor,
+            "n_floor_rejected": p["n_floor_rejected"],
+            "floor_reject_frac": reject_frac,
+            "floor_reject_warn": (reject_frac is not None
+                                  and reject_frac > eras.FLOOR_REJECT_WARN_FRAC),
+            "at_quantum": close_floor_share,
+            "suppressed": close_sup,
+            "suppression_reason": close_why,
         },
         "dwell": {
             "n": len(p["dwells"]),
@@ -98,8 +176,11 @@ def _finalise(key, p, t0, t1) -> dict:
             "hist": stats.hist(p["dwells"], stats.DWELL_HIST_EDGES),
         },
         "open_travel": {
-            "n": len(p["opens"]),
-            "median_ci": stats.median_ci(sorted(p["opens"])),
+            "n": len(opens),
+            "median_ci": stats.median_ci(opens),
+            "at_quantum": open_floor_share,
+            "suppressed": open_sup,
+            "suppression_reason": open_why,
         },
         "transfer_pp": stats.mean_ci(p["transfer_pp"]),
         "lost_time": stats.mean_ci(p["lost_time"]),
@@ -264,20 +345,26 @@ def vs_sheet_rows(aggs: dict[tuple, dict], cam: str) -> list[dict]:
     for (c_, instrument, era_id), a in sorted(cam_aggs.items()):
         tag = f"{instrument} / {era_id}"
         mc = a["close"]["median_ci"]
+        cl = a["close"]
         rows.append({
             "coefficient": "C27 door close travel (s)", "era": tag,
             "assumption": sheet_close, "threshold": cliff,
             "observed": mc["median"], "n": mc["n"],
             "ci": (mc["lo"], mc["hi"]),
-            "verdict": stats.verdict_vs_threshold(mc, cliff),
+            "verdict": (cl["suppression_reason"] if cl["suppressed"]
+                        else stats.verdict_vs_threshold(mc, cliff)),
+            "suppressed": cl["suppressed"],
         })
-        oc = a["open_travel"]["median_ci"]
+        ot = a["open_travel"]
+        oc = ot["median_ci"]
         rows.append({
             "coefficient": "C27 door open travel (s)", "era": tag,
             "assumption": sheet_open, "threshold": sheet_open,
             "observed": oc["median"], "n": oc["n"],
             "ci": (oc["lo"], oc["hi"]),
-            "verdict": stats.verdict_vs_threshold(oc, sheet_open),
+            "verdict": (ot["suppression_reason"] if ot["suppressed"]
+                        else stats.verdict_vs_threshold(oc, sheet_open)),
+            "suppressed": ot["suppressed"],
         })
         xc = a["transfer_pp"]
         rows.append({
@@ -320,7 +407,93 @@ def vs_sheet_rows(aggs: dict[tuple, dict], cam: str) -> list[dict]:
             "threshold": None, "observed": None, "n": 0, "ci": (None, None),
             "verdict": f"not measurable — {why}; see TIER-2 BLOCKED",
         })
+    for r in rows:
+        r.setdefault("suppressed", False)
     return rows
+
+
+# ── suspected (undeclared) gap detection ─────────────────────────────────────
+
+SUSPECT_WINDOW_S = 6 * 3600          # the shortest silence worth flagging
+
+
+def detect_suspected_gaps(all_cycles: list[dict], transits: list[dict],
+                          cams: list[str], t0: float, t1: float) -> list[dict]:
+    """Windows a channel went silent while it was demonstrably alive on both
+    sides — i.e. candidate gaps that nobody has DECLARED.
+
+    Two detectors, both requiring rows before AND after the silence so a
+    channel's first/last day is never mistaken for an outage:
+      * whole IST days with zero rows on a channel that has rows on other days;
+      * any silence of >= SUSPECT_WINDOW_S between consecutive rows.
+
+    FLAGS ONLY. Nothing here is excluded from any statistic — declaring a gap
+    stays a human decision, made by appending to eras.DATA_GAPS."""
+    rows_by_cam: dict[str, list[float]] = {c: [] for c in cams}
+    for r in list(all_cycles) + list(transits):
+        if r["cam"] in rows_by_cam and t0 <= r["ts"] < t1:
+            rows_by_cam[r["cam"]].append(r["ts"])
+
+    day0 = datetime.fromtimestamp(t0, eras.IST).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    days = []
+    d = day0
+    while d.timestamp() < t1:
+        days.append((d.date().isoformat(), max(d.timestamp(), t0),
+                     min((d + timedelta(days=1)).timestamp(), t1)))
+        d += timedelta(days=1)
+
+    out = []
+    for cam in cams:
+        ts_list = sorted(rows_by_cam[cam])
+        if not ts_list:
+            continue                      # zero rows everywhere: already on COVERAGE
+        first, last = ts_list[0], ts_list[-1]
+        # (a) silent whole days, bracketed by live days
+        silent_days = []
+        for label, d0, d1 in days:
+            if d1 <= first or d0 >= last:
+                continue                  # outside the channel's own live span
+            if any(d0 <= ts < d1 for ts in ts_list):
+                continue
+            silent_days.append((d0, d1))
+            if _fully_declared(cam, d0, d1):
+                continue
+            out.append(_suspect(cam, d0, d1, "silent day",
+                                f"{label}: zero rows, but this channel has "
+                                f"rows before and after"))
+        # (b) long silences inside the live span, not already told as a day
+        for a, b in zip(ts_list, ts_list[1:]):
+            if b - a < SUSPECT_WINDOW_S:
+                continue
+            if _fully_declared(cam, a, b):
+                continue
+            covered = sum(max(0.0, min(b, d1) - max(a, d0))
+                          for d0, d1 in silent_days)
+            if covered >= 0.5 * (b - a):
+                continue                  # already reported as silent day(s)
+            out.append(_suspect(cam, a, b, "long silence",
+                                f"{(b - a) / 3600.0:.1f} h with no rows, between "
+                                f"rows on both sides"))
+    out.sort(key=lambda g: (g["start"], g["cam"]))
+    return out
+
+
+def _suspect(cam: str, t0: float, t1: float, kind: str, detail: str) -> dict:
+    """A flagged window, with the share already covered by DECLARED gaps so the
+    reader can see how much of it is genuinely unexplained."""
+    declared = eras.gap_overlap_s(cam, t0, t1)
+    span = max(0.0, t1 - t0)
+    return {"cam": cam, "start": t0, "end": t1, "kind": kind, "detail": detail,
+            "span_s": span, "declared_s": declared,
+            "undeclared_s": max(0.0, span - declared)}
+
+
+def _fully_declared(cam: str, t0: float, t1: float) -> bool:
+    """True when [t0,t1) is already inside declared gap windows for cam."""
+    if t1 <= t0:
+        return True
+    return eras.gap_overlap_s(cam, t0, t1) >= (t1 - t0) - 1.0
 
 
 # ── era boundary detection for a range ───────────────────────────────────────
