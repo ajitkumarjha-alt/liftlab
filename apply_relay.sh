@@ -21,6 +21,33 @@ say "REV=dumb-streamer-3  (real-ffmpeg parse gate; probed rtsp timeout; MERGES u
 [ -d "$PIAG" ] || { echo "pi-agent dir $PIAG not found"; exit 2; }
 
 bash -n /tmp/relay_soak.sh || { say "relay_soak.sh syntax error — aborting"; exit 1; }
+
+# ---------- MD5 GATE: prove the file we are about to install is the file we fetched ----------
+# Deploy is curl-from-GitHub, so a truncated download, a proxy-cached older revision, or a stale
+# /tmp copy from a previous attempt all look like a successful deploy. Print the md5 of every
+# artifact and, where an expected value is supplied, REFUSE to continue on a mismatch.
+# Set RELAY_MD5 / UNIT_MD5 to enforce (from `md5sum` on the file you intend to ship).
+for _pair in "relay_soak.sh:${RELAY_MD5:-}" "liftlab-relay.service:${UNIT_MD5:-}"; do
+  _f=${_pair%%:*}; _want=${_pair#*:}
+  _got=$(md5sum "/tmp/$_f" | cut -d' ' -f1)
+  if [ -n "$_want" ]; then
+    if [ "$_got" != "$_want" ]; then
+      say "ABORT: /tmp/$_f md5 $_got != expected $_want — refusing to install a file I cannot vouch for."
+      say "  Re-fetch it: curl -fsSL -o /tmp/$_f https://raw.githubusercontent.com/ajitkumarjha-alt/liftlab/pi-scripts/$_f"
+      exit 1
+    fi
+    say "md5 $_f: $_got (matches expected)"
+  else
+    say "md5 $_f: $_got  (set ${_f%%.*}_MD5= to enforce; unenforced here)"
+  fi
+done
+
+# The builtin channel list is the 2026-08-01 defect. It must not come back via a stale /tmp copy.
+if grep -nE '^[^#]*CSRC="builtin"' /tmp/relay_soak.sh; then
+  say "ABORT: /tmp/relay_soak.sh still has the builtin channel fallback (line above) — stale copy?"
+  say "  That list streamed the wrong seven cameras for 17 minutes on 2026-08-01."
+  exit 1
+fi
 # The new relay must not contain a single executable reference to the watch. Assert it, so a stale
 # /tmp copy can never quietly reinstate the thing that cost 22h.
 if grep -nE '^[^#]*(watch_local|door_fps\(|GUARD_TRIP)' /tmp/relay_soak.sh; then
@@ -139,9 +166,28 @@ if grep -qE '^RELAY_RW_TIMEOUT_US=0' /etc/liftlab-agent.env 2>/dev/null \
 fi
 systemctl daemon-reload
 systemctl enable liftlab-relay >/dev/null 2>&1 || true
+# PID-MUST-CHANGE GATE. `systemctl restart` returning 0 does not prove the service restarted: a
+# unit that fails to stop, or one systemd considers already-correct, can leave the OLD process
+# running with the OLD script. Capture MainPID before, and require a different, non-zero one after.
+PID_BEFORE=$(systemctl show -p MainPID --value liftlab-relay 2>/dev/null || echo 0)
+say "MainPID before restart: ${PID_BEFORE:-0}"
 systemctl restart liftlab-relay
-sleep 8
-AC=$(systemctl is-active liftlab-relay)
+# POLL, DO NOT SLEEP. A fixed `sleep 8` is both too slow when it works and too fast when the box is
+# loaded — and it reports whatever happens to be true at second 8. Poll until the service is active
+# with a NEW pid, or give up with the reason.
+PID_AFTER=0; AC=inactive
+for _i in $(seq 1 40); do          # up to ~20s at 0.5s
+  AC=$(systemctl is-active liftlab-relay 2>/dev/null || echo inactive)
+  PID_AFTER=$(systemctl show -p MainPID --value liftlab-relay 2>/dev/null || echo 0)
+  [ "$AC" = active ] && [ "${PID_AFTER:-0}" != 0 ] && [ "$PID_AFTER" != "$PID_BEFORE" ] && break
+  sleep 0.5
+done
+say "MainPID after restart:  ${PID_AFTER:-0}  (active=${AC}, polled)"
+if [ "${PID_AFTER:-0}" = 0 ] || [ "$PID_AFTER" = "$PID_BEFORE" ]; then
+  say "RESULT: FAIL — MainPID did not change (${PID_BEFORE} -> ${PID_AFTER}). The old process is still"
+  say "  running the OLD script; nothing you just installed is in effect. journalctl -u liftlab-relay -n 40"
+  exit 1
+fi
 say "liftlab-relay = $AC | liftlab-watch = $(systemctl is-active liftlab-watch 2>/dev/null || echo inactive)"
 if [ "$AC" != active ]; then
   say "RESULT: CHECK — relay not active. journalctl -u liftlab-relay -n 40"; exit 1

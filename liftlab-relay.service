@@ -20,10 +20,25 @@ Environment=RELAY_INTERVAL=30
 # regardless of what its process status or bitrate says; two strikes at INTERVAL=30 restarts it
 # ~60-90s in. RELAY_LOOP_STALL_S guards the SUPERVISOR itself — a dumb streamer still needs dumb
 # babysitting, so the loop has to prove it is turning.
-Environment=RELAY_SEG_STALL_S=60
+# Segment age is now only a LOG signal: delivered-bytes advancing is the ground truth for whether a
+# stream is alive, because segment age is read from the VM and its reporting lag alone can exceed a
+# stall threshold on a healthy stream. Kept generous so the log line stays meaningful.
+Environment=RELAY_SEG_STALL_S=180
+# Grace floor. Measured fleet recovery latency (29 events, relay_status): p50 160s, p90 350s,
+# p95 376s, max 972s. The old 120s sat BELOW THE MEDIAN, so more than half of all recoveries were
+# killed before the stream could establish — that was the 2026-08-01 restart loop. The relay also
+# derives grace from measured first-segment latency at run time; this is the floor under it.
+Environment=RELAY_GRACE_FLOOR_S=420
+Environment=RELAY_STALL_STRIKES=3
 Environment=RELAY_LOOP_STALL_S=120
 Environment=RELAY_CALL_TIMEOUT=10
 ExecStart=/bin/bash /home/askjitk/liftlab-b3/pi-agent/relay_soak.sh
+# Stopping must not hang: the supervisor traps TERM and kills 7 ffmpeg children. Give it a bounded
+# window, then SIGKILL the whole cgroup. Without this a wedged child can hold the restart open long
+# enough for the deploy's PID gate to read a stale MainPID.
+TimeoutStopSec=5
+KillMode=mixed
+KillSignal=SIGTERM
 # ALWAYS restart. There is no longer any exit this service can make that should leave it dead: the
 # door guard's deliberate exit-0 (which cost 22h + 25min of pipeline data) is gone, so every exit is
 # now a fault. (Rate limiter is disabled in [Unit] above.)
