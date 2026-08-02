@@ -91,6 +91,49 @@ def verdict_vs_threshold(ci: dict, threshold: float) -> str:
     return "CI straddles threshold — keep collecting"
 
 
+BELOW, AT, ABOVE = "below", "at", "above"
+
+
+def compare_to_threshold(value: float | None, threshold: float,
+                         decimals: int = 2) -> str | None:
+    """Three-way comparison AT THE PRECISION THE READER SEES.
+
+    A median of 2.3149 displayed as "2.31" against a 2.31 threshold is not
+    above it — reporting it as above is a claim the displayed digits do not
+    support. Comparing rounded-to-displayed values makes the sentence agree
+    with the number printed beside it.
+
+    Returns 'below' | 'at' | 'above', or None when there is no value."""
+    if value is None:
+        return None
+    v, t = round(float(value), decimals), round(float(threshold), decimals)
+    if v < t:
+        return BELOW
+    if v > t:
+        return ABOVE
+    return AT
+
+
+def interval_is_uninformative(ci: dict, min_n: int = 30) -> bool:
+    """True when a point estimate from this interval must NOT be stated as a
+    result.
+
+    Two ways an interval fails to support a value: too few observations, or a
+    width that exceeds the value itself — an interval of [0.88, 22.28] around
+    2.31 is consistent with almost any door, and printing '2.31s' from it in
+    the same sentence shape used for a well-measured lift invites the reader to
+    treat the two as comparable."""
+    n = ci.get("n") or 0
+    if n < min_n:
+        return True
+    lo, hi, point = ci.get("lo"), ci.get("hi"), ci.get("median")
+    if point is None:
+        point = ci.get("mean")
+    if lo is None or hi is None or point is None:
+        return True
+    return (hi - lo) > abs(point)
+
+
 def n_for_separation(ci: dict, threshold: float, value_key: str = "median"
                      ) -> int | None:
     """How many observations would be needed for this CI to clear `threshold`.

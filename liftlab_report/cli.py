@@ -54,6 +54,10 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
     db = reader.open_ro(db_path)
     try:
         cams = [c for c in reader.fetch_cams(db, gw)]
+        # Install the building's own lift names before ANYTHING renders a
+        # label. Unconditional, so a run never inherits the previous run's.
+        channel_labels = reader.fetch_channel_labels(db, gw)
+        eras.set_display_labels(channel_labels)
         validation = reader.fetch_validation(db, gw)
         stamps = reader.validation_stamps(validation)
         registry = reader.fetch_registry(db, gw)
@@ -204,6 +208,9 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         "cv_attribution": cv_attribution,
         "stamps": stamps,
         "min_close_s": floor_s,
+        "canonical": model.canonical_figures(demand, peaks, aggs, coverage_pct),
+        "channel_labels": channel_labels,
+        "unlabelled_cams": [c for c in cams if not eras.has_display_label(c)],
         "bank_evidence": bank_evidence,
         "demand": demand,
         "suspected_gaps": suspected_gaps,

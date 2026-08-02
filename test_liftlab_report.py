@@ -818,6 +818,329 @@ def test_per_floor_finding_appears_exactly_when_no_confident_reads(fixture_db):
     assert "Per-floor demand is unavailable" in heads2
 
 
+# ── 15. one figure, one computation ──────────────────────────────────────────
+
+def _all_text(wb, skip=("DATA_CHARTS",)):
+    out = []
+    for ws in wb.worksheets:
+        if ws.title in skip:
+            continue
+        for r in ws.iter_rows():
+            for c in r:
+                if isinstance(c.value, str):
+                    out.append((ws.title, c.value))
+    return out
+
+
+def test_every_rendered_busiest_hour_resolves_to_the_canonical_value(fixture_db):
+    """v3 stated three different fleet busiest hours. Every statement of one
+    must now resolve to the single canonical figure, or explicitly name a
+    different definition."""
+    ctx = _demand_ctx(fixture_db)
+    canon = ctx["canonical"]["fleet_busiest_hour"]
+    assert canon["hour"] is not None
+    canonical_txt = f"{canon['hour']:02d}:00"
+    wb = cli.build_workbook(ctx)
+    offenders = []
+    for sheet, text in _all_text(wb):
+        # An UNQUALIFIED claim about the busiest hour must be the canonical one.
+        for m in re.finditer(r"busiest hour is (\d{2}):00", text):
+            if f"{m.group(1)}:00" != canonical_txt:
+                offenders.append((sheet, "unqualified", text[:140]))
+    assert not offenders, f"non-canonical busiest hour stated: {offenders}"
+
+    # Any OTHER hour that appears as a peak must be explicitly scoped — naming
+    # its counting era and saying it is not the canonical figure. Rewording
+    # alone must not be enough to pass this test.
+    for sheet, text in _all_text(wb):
+        for m in re.finditer(r"peaks at (\d{2}):00", text):
+            if f"{m.group(1)}:00" == canonical_txt:
+                continue
+            assert "counting era" in text and "canonical" in text, (
+                f"[{sheet}] states a peak of {m.group(1)}:00 without scoping "
+                f"it against the canonical figure: {text[:160]}")
+
+
+def test_a_sheet_using_another_definition_must_declare_it(fixture_db):
+    """FLEET plots raw pooled totals — a different definition. It is allowed,
+    but only if it says so and defers to the canonical figure."""
+    ctx = _demand_ctx(fixture_db)
+    wb = cli.build_workbook(ctx)
+    fleet = " ".join(v for s, v in _all_text(wb) if s == "FLEET")
+    assert "NOTE THE DEFINITION" in fleet
+    assert "canonical busiest hour" in fleet
+    demand = " ".join(v for s, v in _all_text(wb)
+                      if s == "DEMAND BY LIFT AND HOUR")
+    assert "THE CANONICAL BUSIEST HOUR" in demand
+    assert ctx["canonical"]["fleet_busiest_hour"]["definition"] in demand
+
+
+def test_cross_sheet_figures_come_from_one_computation(fixture_db):
+    """Boarding totals and coverage range are quoted on several sheets."""
+    ctx = _demand_ctx(fixture_db)
+    canon = ctx["canonical"]
+    assert canon["total_boardings"]["value"] == sum(
+        p["day_boardings"] for p in ctx["peaks"])
+    assert canon["n_clean_closes"]["value"] == sum(
+        a["close"]["n"] for a in ctx["aggs"].values())
+    live = [v for v in ctx["coverage_pct"].values() if v > 0]
+    assert canon["coverage_range"]["lo"] == pytest.approx(min(live))
+    assert canon["coverage_range"]["hi"] == pytest.approx(max(live))
+
+
+# ── 16. boundary comparison ──────────────────────────────────────────────────
+
+def test_equality_is_never_reported_as_exceedance():
+    assert stats.compare_to_threshold(2.31, 2.31) == stats.AT
+    assert stats.compare_to_threshold(2.3149, 2.31) == stats.AT   # displays 2.31
+    assert stats.compare_to_threshold(2.3151, 2.31) == stats.ABOVE
+    assert stats.compare_to_threshold(2.3049, 2.31) == stats.BELOW
+    assert stats.compare_to_threshold(None, 2.31) is None
+
+
+def test_a_median_on_the_line_reads_as_on_the_line(fixture_db):
+    """The v3 defect: 'takes a typical 2.31s to close — above the 2.31s line'."""
+    t0, t1 = _ts("2026-07-21T05:30:00"), _ts("2026-08-02T00:00:00")
+    ctx = cli.build_context(fixture_db, "site-A", t0, t1)
+    for f in narrative.build_findings(ctx, {}):
+        s = f["sentence"]
+        for m in re.finditer(r"typical (\d+\.\d{2})s to close.*?is (above|below) "
+                             r"the (\d+\.\d{2})s line", s):
+            val, rel, thr = float(m.group(1)), m.group(2), float(m.group(3))
+            assert val != thr, (
+                f"{val}s reported as {rel} the identical {thr}s line: {s[:150]}")
+    # and the AT wording exists as an option at all
+    assert "sits exactly ON" in narrative._relation(2.31, 2.31)
+
+
+# ── 17. weak intervals must not be rendered as results ───────────────────────
+
+def test_no_point_estimate_where_the_interval_is_useless(fixture_db):
+    """A CI wider than the value itself, or n<30, cannot support a stated
+    value in result language."""
+    assert stats.interval_is_uninformative(
+        {"median": 2.31, "lo": 0.88, "hi": 22.28, "n": 15})
+    assert stats.interval_is_uninformative(
+        {"median": 2.31, "lo": 2.2, "hi": 2.4, "n": 12})       # n too small
+    assert not stats.interval_is_uninformative(
+        {"median": 3.16, "lo": 2.99, "hi": 3.35, "n": 1244})
+
+    t0, t1 = _ts("2026-07-21T05:30:00"), _ts("2026-08-02T00:00:00")
+    ctx = cli.build_context(fixture_db, "site-A", t0, t1)
+    for (cam, inst, era), a in ctx["aggs"].items():
+        cl, mc = a["close"], a["close"]["median_ci"]
+        if not stats.interval_is_uninformative(mc) or cl["suppressed"]:
+            continue
+        sent = [f["sentence"] for f in narrative.build_findings(ctx, {})
+                if era in f["sentence"] and eras.lift_label(cam) in f["sentence"]
+                and "close-travel" in f["sentence"]]
+        for s in sent:
+            assert "not enough data to state a value" in s or \
+                   "not enough data to state a close-travel value" in s, s[:160]
+            assert "takes a typical" not in s
+
+
+# ── 18. load balance ─────────────────────────────────────────────────────────
+
+def test_load_balance_needs_three_lifts(fixture_db):
+    """CoV across two points is degenerate — sqrt(2) whenever one is zero."""
+    ctx = _demand_ctx(fixture_db)
+    for ver, e in ctx["demand"]["by_era"].items():
+        for h in ctx["demand"]["hours"]:
+            live = sum(1 for c in ctx["cams"] if e["boarded"][c][h] is not None)
+            if live < model.LOAD_BALANCE_MIN_LIFTS:
+                assert e["cv"][h] is None, (
+                    f"{ver} h{h}: CoV computed across only {live} lift(s)")
+
+
+def test_load_balance_table_withheld_when_mostly_uncomputable(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    wb = cli.build_workbook(ctx)
+    text = " ".join(v for s, v in _all_text(wb)
+                    if s == "DEMAND BY LIFT AND HOUR")
+    for ver, e in ctx["demand"]["by_era"].items():
+        if not model.load_balance_reportable(e["cv"]):
+            assert "NOT REPORTED" in text
+            assert "degenerate" in text
+    # sqrt(2) must never appear as a computed CoV *value* — only, at most, in
+    # the prose explaining why such a value would be meaningless
+    ws = wb["DEMAND BY LIFT AND HOUR"]
+    for r in ws.iter_rows():
+        for c in r:
+            if isinstance(c.value, float):
+                assert abs(c.value - 2 ** 0.5) > 1e-3, (
+                    f"{c.coordinate}: degenerate two-lift CoV rendered as a "
+                    f"load-balance value")
+
+
+# ── 19. narrative is grammatical ─────────────────────────────────────────────
+
+def test_finding_sentences_are_not_garbled(fixture_db):
+    """The v3 defect: 'boardings are concentrated on some lifts between lifts'.
+    Catches duplicated clause fragments, unsubstituted placeholders and doubled
+    prepositions to the extent those are testable."""
+    t0, t1 = _ts("2026-07-21T05:30:00"), _ts("2026-08-02T00:00:00")
+    ctx = cli.build_context(fixture_db, "site-A", t0, t1)
+    findings = narrative.build_findings(ctx, {})
+    assert findings
+    bad_patterns = [
+        (r"\{[a-z_]+\}", "unsubstituted placeholder"),
+        (r"\b(\w+)\s+\1\b", "doubled word"),
+        (r"\b(?:of|in|to|on|at|between|from|with|by)\s+"
+         r"(?:of|in|to|on|at|between|from|with|by)\b", "doubled preposition"),
+        (r"\bbetween lifts\b.*\bbetween lifts\b", "duplicated clause"),
+        (r"\bNone\b", "None leaked into prose"),
+        (r"\s,|\s\.", "space before punctuation"),
+        (r"\(\s*\)", "empty parentheses"),
+        (r"—\s*—", "doubled dash"),
+    ]
+    for f in findings:
+        for field in ("headline", "sentence", "why"):
+            text = f.get(field) or ""
+            for pat, why in bad_patterns:
+                m = re.search(pat, text)
+                assert not m, (
+                    f"finding {f['number']} {field}: {why} "
+                    f"({m.group(0)!r}) in: {text[:170]}")
+            assert text.strip() == text.strip().replace("  ", " ") or \
+                "  " not in text, f"double space in {field}: {text[:120]}"
+
+
+def test_lift_names_are_not_mangled_by_capitalisation():
+    eras.set_display_labels({"ch16": "Service Lift"})
+    try:
+        assert narrative._sentence_start(eras.lift_label("ch16")) == "Service Lift"
+    finally:
+        eras.set_display_labels({})
+
+
+# ── 20. lift naming ──────────────────────────────────────────────────────────
+
+def test_display_labels_come_from_channel_map(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    assert ctx["channel_labels"], "channel_map labels were not read"
+    for cam, label in ctx["channel_labels"].items():
+        assert eras.lift_label(cam) == label
+    assert not ctx["unlabelled_cams"]
+
+
+def test_no_channel_derived_label_where_a_real_one_exists(fixture_db):
+    """'lift 16' must not appear anywhere when channel_map calls it 'lift 1'."""
+    ctx = _demand_ctx(fixture_db)
+    wb = cli.build_workbook(ctx)
+    real = set(ctx["channel_labels"].values())
+    forbidden = {f"lift {c.removeprefix('ch')}" for c in ctx["cams"]} - real
+    offenders = []
+    for sheet, text in _all_text(wb):
+        for bad in forbidden:
+            if re.search(rf"\b{re.escape(bad)}\b(?!\s*\()", text):
+                offenders.append((sheet, bad, text[:100]))
+    assert not offenders, f"channel-derived labels rendered: {offenders[:5]}"
+
+
+def test_unnamed_lift_is_marked_not_invented():
+    eras.set_display_labels({})
+    try:
+        lab = eras.lift_label("ch16")
+        assert eras.UNLABELLED_SUFFIX in lab
+    finally:
+        eras.set_display_labels({})
+
+
+def test_channel_shown_on_first_mention_then_dropped(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    findings = narrative.build_findings(ctx, {})
+    blob = " ".join(f["headline"] + " " + f["sentence"] for f in findings)
+    for cam in ctx["cams"]:
+        label = eras.lift_label(cam)
+        if label not in blob:
+            continue
+        assert blob.count(f"{label} ({cam})") == 1, (
+            f"{cam}: channel should be shown exactly once, on first mention")
+
+
+# ── 21. study framing ────────────────────────────────────────────────────────
+
+def test_study_purpose_is_not_framed_as_door_close_or_compliance(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    wb = cli.build_workbook(ctx)
+    banned = [
+        "whole reason this study exists",
+        "the main thing this study measures",
+        "which is why this study measures close travel",
+    ]
+    for sheet, text in _all_text(wb):
+        low = text.lower()
+        for b in banned:
+            assert b not in low, f"[{sheet}] still frames the study as {b!r}"
+
+
+def test_opening_block_states_the_two_study_questions(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    wb = cli.build_workbook(ctx)
+    text = " ".join(v for s, v in _all_text(wb) if s == "READ THIS FIRST")
+    assert "WHY THIS STUDY EXISTS" in text
+    for q in eras.STUDY_QUESTIONS:
+        assert q in text, f"study question missing: {q[:60]}"
+    assert "BENCHMARKING" in text
+    assert "not a verdict on this building" in text
+
+
+def test_coefficient_scope_table_covers_all_eight_with_status(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    scope = narrative.coefficient_scope(ctx)
+    assert {c["id"] for c in scope} == {c["id"] for c in eras.COEFFICIENTS}
+    assert len(scope) == 8
+    valid = {"MEASURED", "PARTLY MEASURED", "NOT MEASURED", "BLOCKED"}
+    for c in scope:
+        assert c["status"] in valid
+        assert c["status_why"], f"{c['id']} has a status with no reason"
+    wb = cli.build_workbook(ctx)
+    text = " ".join(v for s, v in _all_text(wb) if s == "READ THIS FIRST")
+    assert "WHICH COEFFICIENTS ARE UNDER TEST" in text
+    for c in eras.COEFFICIENTS:
+        assert c["id"] in text
+
+
+def test_scope_status_tracks_the_data_not_a_hardcoded_table(fixture_db):
+    """Floor-dependent coefficients are BLOCKED only while floor reads are."""
+    ctx = _demand_ctx(fixture_db)
+    blinded = dict(ctx)
+    blinded["floor_status"] = {c: dict(d, confident=0)
+                               for c, d in ctx["floor_status"].items()}
+    scope = {c["id"]: c for c in narrative.coefficient_scope(blinded)}
+    for cid in ("C17", "C18", "C21", "C22"):
+        assert scope[cid]["status"] == "BLOCKED"
+        assert "0 confident reads" in scope[cid]["status_why"]
+    # C27 tracks whether closes were actually measured
+    empty = dict(ctx, aggs={})
+    assert {c["id"]: c for c in narrative.coefficient_scope(empty)
+            }["C27"]["status"] == "NOT MEASURED"
+
+
+def test_demand_assumption_is_tracked_and_names_its_blocker(fixture_db):
+    ctx = _demand_ctx(fixture_db)
+    row = narrative.demand_assumption_row(ctx)
+    assert row["status"] == "BLOCKED"
+    assert "--population" in row["status_why"]
+    assert "never guessed" in row["status_why"]
+    with_pop = narrative.demand_assumption_row(dict(ctx, population=2400))
+    assert with_pop["status"] == "MEASURED"
+
+
+def test_workbook_states_no_recommendation(fixture_db):
+    """The machine emits facts. It must not advise a design change."""
+    ctx = _demand_ctx(fixture_db)
+    wb = cli.build_workbook(ctx)
+    banned = ["we recommend", "should be increased", "should be reduced",
+              "you should add", "must be redesigned", "add another lift",
+              "is compliant", "is non-compliant"]
+    for sheet, text in _all_text(wb):
+        low = text.lower()
+        for b in banned:
+            assert b not in low, f"[{sheet}] recommends: {b!r} in {text[:120]}"
+
+
 def test_sheets_are_frozen_and_the_raw_sheet_filters(fixture_db):
     t0, t1 = _ts("2026-07-22T00:00:00"), _ts("2026-07-26T00:00:00")
     wb = cli.build_workbook(cli.build_context(fixture_db, "site-A", t0, t1))

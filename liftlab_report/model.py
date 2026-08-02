@@ -541,6 +541,68 @@ def demand_by_lift_hour(transits: list[dict], pi_cycles: list[dict],
             "n_days_in_range": len(days)}
 
 
+# ── canonical figures ────────────────────────────────────────────────────────
+# A figure stated on more than one sheet must come from ONE computation. The
+# v3 workbook stated three different fleet busiest-hours — a raw pooled sum on
+# FLEET, a per-era mean on READ THIS FIRST, and a different era's per-era mean
+# on DEMAND — because three places each computed their own. A reader met the
+# document contradicting itself on its most quotable number.
+#
+# canonical_figures() is now the single source. Anything rendering a canonical
+# figure reads it from here. A sheet that genuinely needs a DIFFERENT
+# definition must say so and say how it differs; `definition` is the sentence
+# it has to print.
+
+def canonical_figures(demand: dict, peaks: list, aggs: dict,
+                      coverage_pct: dict) -> dict:
+    """{name: {value, definition, ...}} — every figure quoted on more than one
+    sheet, computed once."""
+    out: dict = {}
+
+    by_era = (demand or {}).get("by_era") or {}
+    if by_era:
+        # The counting era carrying the most boardings speaks for the building:
+        # counts from different counting builds are different measurements, so
+        # a fleet figure has to belong to ONE of them rather than pool them.
+        ver = max(by_era, key=lambda v: by_era[v]["total_boarded"])
+        e = by_era[ver]
+        pk = e["peaks"]["__fleet__"]
+        out["fleet_busiest_hour"] = {
+            "era": ver,
+            "hour": pk["hour"],
+            "value": pk["value"],
+            "all_day_mean": pk["mean"],
+            "ratio": pk["ratio"],
+            "definition": (
+                "mean boardings per observed hour-of-day, summed across lifts, "
+                f"within counting era {ver}; hours in which a lift was not "
+                "observed are excluded rather than counted as zero"),
+        }
+
+    out["total_boardings"] = {
+        "value": sum(e["total_boarded"] for e in by_era.values()),
+        "definition": ("every boarding in range, outages excluded, summed "
+                       "across all counting eras"),
+    }
+    out["n_clean_closes"] = {
+        "value": sum(a["close"]["n"] for a in (aggs or {}).values()),
+        "definition": ("door closes surviving flap/reopen/implausible "
+                       "classification and the one-frame floor, summed across "
+                       "lift-eras"),
+    }
+    live = {c: v for c, v in (coverage_pct or {}).items() if v > 0}
+    out["coverage_range"] = {
+        "lo": min(live.values()) if live else 0.0,
+        "hi": max(live.values()) if live else 0.0,
+        "definition": ("share of 15-minute blocks holding at least one row, "
+                       "over non-outage time, per channel"),
+    }
+    return out
+
+
+
+
+
 def peak_5min_by_cam(transits, pi_cycles, cams, t0, t1) -> dict:
     """Busiest 5 minutes per lift over the whole range, and for the fleet.
 
@@ -596,17 +658,23 @@ def _demand_peaks(cams, boarded, fleet_b) -> dict:
     return out
 
 
+# A spread needs something to spread across. With two lifts the coefficient of
+# variation is degenerate — one lift at zero and any other value gives sqrt(2)
+# = 1.414 regardless of the numbers, which reads as a dramatic imbalance and
+# means nothing. Three observed lifts is the floor for saying anything.
+LOAD_BALANCE_MIN_LIFTS = 3
+
+
 def _load_balance_cv(cams, boarded) -> list:
     """Coefficient of variation of boardings ACROSS lifts, per hour.
 
     0 means every observed lift carried the same load that hour; higher means
-    the load sat on some lifts more than others. Computed only over lifts
-    observed in that hour, and None below 2 such lifts — a spread across one
-    lift is not a spread."""
+    the load sat on some lifts more than others. None below
+    LOAD_BALANCE_MIN_LIFTS observed lifts — see the constant."""
     out = []
     for h in range(24):
         vals = [boarded[c][h] for c in cams if boarded[c][h] is not None]
-        if len(vals) < 2:
+        if len(vals) < LOAD_BALANCE_MIN_LIFTS:
             out.append(None)
             continue
         m = sum(vals) / len(vals)
@@ -616,6 +684,16 @@ def _load_balance_cv(cams, boarded) -> list:
         sd = (sum((v - m) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
         out.append(sd / m)
     return out
+
+
+def load_balance_reportable(cv: list) -> bool:
+    """Whether the per-hour load-balance table is worth printing at all.
+
+    If most hours could not be computed, the table is mostly blanks and the few
+    rows that survive are not representative of the day — one line saying so is
+    more honest than 24 rows of mostly nothing."""
+    usable = sum(1 for c in cv if c is not None)
+    return usable > len(cv) / 2
 
 
 # ── suspected (undeclared) gap detection ─────────────────────────────────────

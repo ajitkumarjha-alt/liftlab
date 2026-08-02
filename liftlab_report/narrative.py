@@ -22,6 +22,7 @@ Confidence is mechanical, never editorial:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from . import eras, stats
@@ -98,6 +99,46 @@ def _how_much_more(n: int, ci: dict, threshold: float) -> str:
     return f"; about n={need:,} would be needed to separate them"
 
 
+def _annotate_first_mentions(findings: list[dict], cams: list[str]) -> None:
+    """Append the camera channel to each lift's FIRST mention, in RENDER order.
+
+    Done after sorting, not during construction: findings are built by rule and
+    then reordered by priority, so 'first built' is not 'first read'. Matching
+    is word-bounded so 'lift 1' does not claim the first mention of 'lift 10'."""
+    seen: set[str] = set()
+    by_label = sorted(((eras.lift_label(c), c) for c in cams),
+                      key=lambda p: -len(p[0]))
+    for f in findings:
+        for field in ("headline", "sentence"):
+            text = f.get(field) or ""
+            for label, cam in by_label:
+                if cam in seen or not label:
+                    continue
+                m = re.search(rf"{re.escape(label)}(?!\s*\()(?![\w])", text)
+                if not m:
+                    continue
+                text = (text[:m.start()] + eras.lift_label_with_channel(cam)
+                        + text[m.end():])
+                seen.add(cam)
+            f[field] = text
+
+
+def _sentence_start(text: str) -> str:
+    """Upper-case the first character only. str.capitalize() would lower-case
+    the rest, mangling a building label like 'Service Lift' into 'Service
+    lift' — these names come from the building, not from us."""
+    return text[:1].upper() + text[1:] if text else text
+
+
+def _relation(value, threshold, decimals: int = 2) -> str:
+    """'above the 2.31s line' / 'below …' / 'exactly ON …' — never 'above' for
+    a value that displays as equal to the threshold."""
+    rel = stats.compare_to_threshold(value, threshold, decimals)
+    if rel == stats.AT:
+        return f"sits exactly ON the {threshold:.{decimals}f}s line"
+    return f"is {rel} the {threshold:.{decimals}f}s line"
+
+
 def _finding(priority, headline, sentence, sheet, cell_range, chart,
              confidence, why, n=None, extra=None) -> dict:
     return {"priority": priority, "headline": headline, "sentence": sentence,
@@ -122,6 +163,7 @@ def build_findings(ctx: dict, anchors: dict) -> list[dict]:
     out += _f_peak(ctx, anchors)
     out += _f_coverage(ctx, anchors)
     out.sort(key=lambda f: (f["priority"], -(f["n"] or 0)))
+    _annotate_first_mentions(out, ctx.get("cams") or [])
     for i, f in enumerate(out, start=1):
         f["number"] = i
     return out
@@ -170,16 +212,17 @@ def _f_compliance(ctx, anchors):
     sheet, rng = _anchor(anchors, "summary_headline", "SUMMARY")
     parts = []
     if over:
-        parts.append(f"{len(over)} ({', '.join(eras.lift_label(c) for c in sorted(set(over)))}) "
-                     f"measured ABOVE it")
+        parts.append(f"{len(over)} measured ABOVE it — "
+                     + ", ".join(eras.lift_label(c) for c in sorted(set(over))))
     if under:
-        parts.append(f"{len(under)} ({', '.join(eras.lift_label(c) for c in sorted(set(under)))}) "
-                     f"measured below it")
+        parts.append(f"{len(under)} measured below it — "
+                     + ", ".join(eras.lift_label(c) for c in sorted(set(under))))
     if straddle:
-        parts.append(f"{len(straddle)} too close to call at the data collected so far")
-    sentence = (f"Of the {len(rows)} lift-and-build combinations with door data, "
-                + "; ".join(parts) +
-                f" — measured against the compliance line of {cliff_txt}.")
+        parts.append(f"{len(straddle)} too close to call at the data collected "
+                     f"so far")
+    sentence = (f"Of the {len(rows)} lift-and-build combinations with door "
+                f"data, measured against the compliance line of {cliff_txt}: "
+                + "; ".join(parts) + ".")
     lvl = (HIGH if (over or under) and not straddle and n_tot >= N_HIGH
            else MEDIUM if n_tot >= N_MEDIUM else TOO_EARLY)
     why = (f"{n_tot} door closes across all lifts; "
@@ -187,7 +230,8 @@ def _f_compliance(ctx, anchors):
               if not straddle else
               f"{len(straddle)} lift(s) still have intervals crossing the line"))
     out.append(_finding(
-        P_COMPLIANCE, "Does door-close travel clear the compliance line?",
+        P_COMPLIANCE,
+        "C27 door operating time — observed close travel vs the assumed value",
         sentence, sheet, rng,
         _anchor(anchors, "fleet_compare_chart", sheet, "fleet comparison chart")[1],
         lvl, why, n=n_tot))
@@ -199,23 +243,35 @@ def _f_compliance(ctx, anchors):
         lvl, why = _confidence(cl["n"], mc, cliff, cl["suppressed"])
         sheet, rng = _anchor(anchors, ("per_lift_close", cam, instrument, era_id),
                              "PER-LIFT")
+        headline = f"{eras.lift_label(cam)} — close travel"
         if cl["suppressed"]:
-            sentence = (f"{eras.lift_label(cam).capitalize()} on "
+            sentence = (f"{eras.lift_label(cam)} on "
                         f"{_era_label(instrument, era_id)}: no close-travel figure "
                         f"is quoted — {cl['suppression_reason']}")
+        elif stats.interval_is_uninformative(mc):
+            # No point estimate in result language — the interval does not
+            # support one, and a number in this sentence shape would be read as
+            # a measurement of the same standing as a well-sampled lift's.
+            span = (f"the range consistent with this data spans "
+                    f"{mc['lo']:.2f}s to {mc['hi']:.2f}s, which is wider than "
+                    f"the value itself and too wide to be useful"
+                    if mc["lo"] is not None else
+                    "there are too few closes to put any range around it")
+            sentence = (f"{eras.lift_label(cam)} on "
+                        f"{_era_label(instrument, era_id)}: not enough data to "
+                        f"state a close-travel value (n={cl['n']}; {span}). No "
+                        f"figure is quoted for this lift-build.")
         else:
-            rel = ("above" if (mc["median"] or 0) > cliff else "below")
-            ci_txt = (f"(the true value is very likely between {mc['lo']:.2f}s and "
-                      f"{mc['hi']:.2f}s)" if mc["lo"] is not None
-                      else "(too few closes to put a range around it)")
+            ci_txt = (f"(the true value is very likely between {mc['lo']:.2f}s "
+                      f"and {mc['hi']:.2f}s)")
             pct = cl["over_cliff"]["pct"]
-            sentence = (f"{eras.lift_label(cam).capitalize()} on "
+            sentence = (f"{eras.lift_label(cam)} on "
                         f"{_era_label(instrument, era_id)} takes a typical "
-                        f"{mc['median']:.2f}s to close {ci_txt} — {rel} the "
-                        f"{cliff:.2f}s line, with {pct:.0f}% of its closes over "
-                        f"that line, from n={cl['n']} closes.")
+                        f"{mc['median']:.2f}s to close {ci_txt} — this "
+                        f"{_relation(mc['median'], cliff)}, with {pct:.0f}% of "
+                        f"its closes over that line, from n={cl['n']} closes.")
         out.append(_finding(
-            P_WORST, f"{eras.lift_label(cam)} — close travel", sentence,
+            P_WORST, headline, sentence,
             sheet, rng,
             _anchor(anchors, ("close_hist", cam, instrument, era_id), sheet,
                     "close-travel histogram")[1],
@@ -257,7 +313,7 @@ def _f_divergence(ctx, anchors):
     sheet, rng = _anchor(anchors, "summary_headline", "SUMMARY")
     same_build = hi_era == lo_era
     sentence = (
-        f"{eras.lift_label(hi_cam).capitalize()} takes "
+        f"{_sentence_start(eras.lift_label(hi_cam))} takes "
         f"{hi_mc['median']:.2f}s to close and "
         f"{eras.lift_label(lo_cam)} takes {lo_mc['median']:.2f}s — a "
         f"{gap:.2f}s difference between two lifts in the same tower, and the "
@@ -298,28 +354,30 @@ def _f_divergence(ctx, anchors):
 
 def _f_demand(ctx, anchors):
     """When the building actually uses its lifts."""
-    demand = ctx.get("demand") or {}
-    by_era = demand.get("by_era") or {}
-    if not by_era:
+    # Read the CANONICAL figure — never recompute one here, or this finding
+    # becomes the third different busiest hour in the document.
+    canon = (ctx.get("canonical") or {}).get("fleet_busiest_hour")
+    if not canon or canon.get("hour") is None:
         return []
-    # the counting era carrying the most data speaks for the building
-    ver = max(by_era, key=lambda v: by_era[v]["total_boarded"])
-    e = by_era[ver]
-    pk = e["peaks"]["__fleet__"]
-    if pk["hour"] is None:
+    ver = canon["era"]
+    e = ((ctx.get("demand") or {}).get("by_era") or {}).get(ver)
+    if not e:
         return []
-    sheet, rng = _anchor(anchors, "demand_peaks", "DEMAND BY LIFT AND HOUR")
+    sheet, rng = _anchor(anchors, "canonical_busiest_hour",
+                         "DEMAND BY LIFT AND HOUR")
     ranked = sorted(
         ((h, v) for h, v in enumerate(e["fleet_boarded"]) if v is not None),
         key=lambda hv: -hv[1])[:3]
     busy = ", ".join(f"{h:02d}:00" for h, _v in ranked)
+    n_lifts = len(ctx["cams"])
     sentence = (
         f"The tower's busiest hour is "
-        f"{pk['hour']:02d}:00–{pk['hour'] + 1:02d}:00, carrying about "
-        f"{pk['value']:.0f} boardings against a typical hour's "
-        f"{pk['mean']:.0f} — {pk['ratio']:.1f} times the average hour. The "
-        f"three busiest hours of the day are {busy}. All seven lifts serve one "
-        f"tower, so this describes a single population.")
+        f"{canon['hour']:02d}:00–{canon['hour'] + 1:02d}:00, carrying about "
+        f"{canon['value']:.0f} boardings against a typical hour's "
+        f"{canon['all_day_mean']:.0f} — {canon['ratio']:.1f} times the average "
+        f"hour. The three busiest hours of the day are {busy}. All {n_lifts} "
+        f"lifts serve one tower, so this describes a single population. "
+        f"Definition: {canon['definition']}.")
     lvl, why = (MEDIUM, f"{e['total_boarded']:,} boardings under counting build "
                         f"{ver}; hours a lift was not observed are excluded "
                         f"rather than counted as zero")
@@ -339,36 +397,57 @@ def _f_load_balance(ctx, anchors):
         return []
     ver = max(by_era, key=lambda v: by_era[v]["total_boarded"])
     e = by_era[ver]
+    from .model import LOAD_BALANCE_MIN_LIFTS, load_balance_reportable
     cvs = [(h, c) for h, c in enumerate(e["cv"]) if c is not None]
-    if not cvs:
-        return []
     covs = [ctx["coverage_pct"].get(c, 0.0) for c in ctx["cams"]]
     spread = (max(covs) - min(covs)) if covs else 0.0
+    sheet, rng = _anchor(anchors, "demand_matrix", "DEMAND BY LIFT AND HOUR")
+    n_lifts = len(ctx["cams"])
+    coverage_caveat = (
+        f"Per-lift coverage in this range spans {min(covs):.0f}%–"
+        f"{max(covs):.0f}%, a {spread:.0f}-point spread, and a lift that was "
+        f"watched less will show less load whether or not it carried less — so "
+        f"uneven coverage can masquerade as uneven load."
+        if covs else "")
+
+    if not cvs or not load_balance_reportable(e["cv"]):
+        sentence = (
+            f"Whether the load is shared evenly between lifts cannot be stated "
+            f"from this range. Fewer than {LOAD_BALANCE_MIN_LIFTS} lifts were "
+            f"observed together in most hours of the day, and a spread measured "
+            f"across one or two lifts is not a spread. {coverage_caveat}")
+        return [_finding(
+            P_DEMAND + 1, "Is the load balanced across the lifts?", sentence,
+            sheet, rng, None, TOO_EARLY,
+            f"only {len(cvs)} of 24 hours had at least "
+            f"{LOAD_BALANCE_MIN_LIFTS} lifts observed together",
+            n=len(cvs),
+            extra=["To make this answerable: get the lifts observed over the "
+                   "same hours, then re-export."])]
+
     mean_cv = sum(c for _h, c in cvs) / len(cvs)
     worst_h, worst_cv = max(cvs, key=lambda hc: hc[1])
-    sheet, rng = _anchor(anchors, "demand_matrix", "DEMAND BY LIFT AND HOUR")
-    reading = ("evenly shared" if mean_cv < 0.25
-               else "moderately uneven" if mean_cv < 0.6
-               else "concentrated on some lifts")
+    reading = ("shared fairly evenly between lifts" if mean_cv < 0.25
+               else "moderately uneven between lifts" if mean_cv < 0.6
+               else "concentrated on some lifts rather than shared")
     sentence = (
-        f"Across the hours where at least two lifts were observed, boardings "
-        f"are {reading} between lifts (average spread {mean_cv:.2f}, worst at "
-        f"{worst_h:02d}:00 at {worst_cv:.2f}). THIS FIGURE MUST BE READ WITH "
-        f"CARE: per-lift coverage in this range spans "
-        f"{min(covs):.0f}%–{max(covs):.0f}%, a {spread:.0f}-point spread, and "
-        f"a lift that was watched less will show less load whether or not it "
-        f"carried less. At this coverage spread the comparison is not safe "
-        f"across all seven lifts.")
+        f"Across the {len(cvs)} hours where at least {LOAD_BALANCE_MIN_LIFTS} "
+        f"lifts were observed together, boardings are {reading} (average "
+        f"spread {mean_cv:.2f}, widest at {worst_h:02d}:00 at "
+        f"{worst_cv:.2f}). THIS MUST BE READ WITH CARE: {coverage_caveat} At "
+        f"this coverage spread the comparison is not safe across all "
+        f"{n_lifts} lifts.")
     lvl = TOO_EARLY if spread > 20 else MEDIUM
     why = (f"coverage spread of {spread:.0f} points across lifts; load balance "
            f"is only interpretable across lifts of similar coverage, and these "
            f"lifts are not")
     return [_finding(P_DEMAND + 1, "Is the load balanced across the lifts?",
                      sentence, sheet, rng, None, lvl, why, n=len(cvs),
-                     extra=["To make this readable: level up coverage across "
-                            "the lifts, then re-export. Comparing demand "
-                            "between a 57%-covered lift and a 17%-covered one "
-                            "mostly measures the cameras, not the traffic."])]
+                     extra=[f"To make this readable: level up coverage across "
+                            f"the lifts, then re-export. Comparing demand "
+                            f"between a {max(covs):.0f}%-covered lift and a "
+                            f"{min(covs):.0f}%-covered one mostly measures the "
+                            f"cameras, not the traffic."])]
 
 
 def _f_per_floor_blocked(ctx, anchors):
@@ -448,7 +527,7 @@ def _f_floor_filter(ctx, anchors):
         shift = ("" if pre is None or post is None else
                  f", which moved the typical close from {pre:.2f}s to {post:.2f}s")
         sentence = (
-            f"{eras.lift_label(cam).capitalize()} on "
+            f"{_sentence_start(eras.lift_label(cam))} on "
             f"{_era_label(instrument, era_id)} lost "
             f"{cl['n_floor_rejected']} of {cl['n_prefilter']} recorded closes "
             f"({100 * cl['floor_reject_frac']:.0f}%) to the implausibly-short "
@@ -480,7 +559,7 @@ def _f_transfer(ctx, anchors):
         sheet, rng = _anchor(anchors, ("vs_sheet", cam), "VS THE SHEET")
         rel = "longer than" if (xc["mean"] or 0) > thr else "shorter than"
         sentence = (
-            f"{eras.lift_label(cam).capitalize()} takes about "
+            f"{_sentence_start(eras.lift_label(cam))} takes about "
             f"{xc['mean']:.2f}s per person to load and unload, {rel} the "
             f"sheet's {thr:.2f}s allowance, from n={xc['n']} cycles where the "
             f"people count could be joined to the door timing.")
@@ -687,8 +766,17 @@ def data_scale_sentences(ctx: dict) -> list[str]:
 GLOSSARY = [
     ("close travel",
      "How long the doors take to go from starting to close to fully shut, in "
-     "seconds. This is the number the lift design sheet makes an assumption "
-     "about, and the main thing this study measures."),
+     "seconds. It is ONE of the eight assumed coefficients this study is "
+     "validating, and the most leveraged of them: the design sheet multiplies "
+     "it by the number of stops a car makes, so a small error per cycle "
+     "compounds into the round-trip time that sets how many lifts a tower "
+     "needs."),
+    ("lift 1, ch16",
+     "'Lift 1' is the building's own name for the lift, taken from the channel "
+     "map. 'ch16' is the camera channel watching it. They refer to the same "
+     "lift; the channel is shown on first mention on each sheet so the two can "
+     "be tied together. Where the building has not named a lift, the workbook "
+     "says so rather than inventing a name."),
     ("dwell",
      "How long the doors stay fully open while people get in and out, in "
      "seconds. Separate from close travel."),
@@ -710,10 +798,14 @@ GLOSSARY = [
      "The number of measurements a figure is computed from. Every figure in "
      "this workbook carries its n; a figure without one is a defect."),
     ("the compliance cliff",
-     "The close-travel value above which the bank stops meeting its design "
-     "case. It sits just above the sheet's own assumed close time, so a small "
-     "overshoot in door closing is the difference between compliant and not — "
-     "which is why this study measures close travel to two decimal places."),
+     "A worked example of coefficient sensitivity, not a target anyone is "
+     "aiming at. Each bank has slack in its round-trip time. Where that slack "
+     "is generous, a door-close time above the assumed value changes nothing. "
+     "Where it is tight — a few seconds — the same overshoot is enough to flip "
+     "that bank's design case. The 'cliff' is the close-travel value at which "
+     "that flip happens for the tightest-margin bank. It illustrates why the "
+     "accuracy of an assumed coefficient decides lift count and speed; it is a "
+     "result of this study, not its purpose."),
     ("different instruments",
      "Door timings here come from two different measuring systems that ran at "
      "different times: an on-camera Pi door-watch, retired partway through, and "
@@ -750,49 +842,175 @@ COLOUR_LEGEND = [
 def sheet_guide() -> list[tuple[str, str]]:
     """(sheet, the question it answers) — plain terms, no jargon."""
     return [
-        ("SUMMARY", "How do the lifts' door-close times compare to what the "
-                    "design sheet assumed, and are we collecting enough data "
-                    "to stop?"),
-        ("VS THE SHEET", "Coefficient by coefficient: what did the design sheet "
-                         "assume, what did we actually measure, and does the "
-                         "measurement clear the threshold?"),
-        ("PER-LIFT", "For one lift at a time: how fast do its doors close, how "
-                     "long do they stay open, how many people use it, and how "
-                     "much of the time were we watching it?"),
-        ("FLEET", "The lifts added up — and an explicit statement of what that "
-                  "addition does and does not mean."),
-        ("PEAK ANALYSIS", "How busy is the busiest five minutes of each day, "
-                          "and how does that compare to the average?"),
+        ("SUMMARY", "Which assumed coefficients this site could measure, how "
+                    "far the measurements sit from the assumptions, and "
+                    "whether enough has been collected to stop measuring."),
+        ("VS THE SHEET", "Coefficient by coefficient: what the design sheet "
+                         "assumes, what this site actually did, and whether "
+                         "the measurement is firm enough to revise the "
+                         "assumption with."),
+        ("PER-LIFT", "One lift at a time: its door timings, how long it stands "
+                     "open, how many people it carried, and how much of the "
+                     "period it was observed — the per-unit evidence behind "
+                     "every fleet figure."),
+        ("FLEET", "The lifts added together, for the figures where adding them "
+                  "is valid — and an explicit statement of what that addition "
+                  "does and does not mean."),
+        ("DEMAND BY LIFT AND HOUR", "How the building actually uses its lifts "
+                                    "through the day. This feeds the demand "
+                                    "assumption, which needs no floor "
+                                    "attribution and is the study's "
+                                    "highest-value output."),
+        ("PEAK ANALYSIS", "The busiest five minutes of each day, which is the "
+                          "window the handling-capacity assumption is written "
+                          "against."),
         ("RAW", "Every individual recorded event, so any number in this "
                 "workbook can be traced back to the observations behind it."),
-        ("COVERAGE & ERAS", "When were we actually watching, when did the "
-                            "measuring setup change, and which quiet periods "
-                            "are outages we know about versus ones we don't?"),
-        ("TIER-2 BLOCKED", "Which design coefficients we still cannot measure "
-                           "at all, and exactly what is stopping us."),
+        ("COVERAGE & ERAS", "When the cameras were actually watching, when the "
+                            "measuring setup changed, and which quiet periods "
+                            "are outages we know about versus ones we don't — "
+                            "how much weight the measurements can bear."),
+        ("TIER-2 BLOCKED", "Which assumed coefficients this site could not "
+                           "measure at all, and exactly what is stopping "
+                           "each one."),
+    ]
+
+
+def why_this_study_exists(ctx: dict) -> list[str]:
+    """The opening block. Explains the PROGRAMME this workbook belongs to,
+    before any measurement is shown."""
+    n_coef = len(eras.COEFFICIENTS)
+    return [
+        f"When a new tower is designed, the lift traffic calculation is driven "
+        f"by a table of assumed coefficients — how long doors take, how many "
+        f"people a car carries, how many floors it stops at. Those assumptions "
+        f"come from the {eras.SHEET_NAME} standards table. They have never "
+        f"been checked against a real, occupied building.",
+        f"This study measures what actually happens. Cameras in the lift cars "
+        f"of handed-over, occupied residential towers record boardings, "
+        f"alightings, door timings, dwell and stops. Those measurements go "
+        f"back into the design sheet as corrected factors.",
+        f"It answers two questions: (1) {eras.STUDY_QUESTIONS[0]} "
+        f"(2) {eras.STUDY_QUESTIONS[1]}",
+        f"Scope: {eras.STUDY_SCOPE} It is a BENCHMARKING study across a "
+        f"portfolio, not a compliance audit of any one building.",
+        f"This workbook reports ONE site's measurements toward that programme, "
+        f"covering {ctx['from_iso'][:16]} to {ctx['to_iso'][:16]}. It is not a "
+        f"verdict on this building. It reports observations beside the "
+        f"assumptions they test, with the number of observations against every "
+        f"figure, and says so explicitly wherever the data does not support a "
+        f"conclusion. There are {n_coef} assumed coefficients under test in "
+        f"total; the table below shows how much of that this export reaches.",
     ]
 
 
 def what_this_measures(ctx: dict) -> list[str]:
-    """Opening paragraph. Numbers come from the declared sheet values."""
-    cliffs = sorted({a["close"]["cliff_s"] for a in ctx["aggs"].values()}) or \
-        [eras.COMPLIANCE_CLIFF_S]
-    cliff = cliffs[0]
+    """What the cameras record, and what it feeds."""
     assumed = eras.SHEET_CLOSE_S
-    margin = cliff - assumed
     return [
-        f"Cameras inside the lift cars watch the doors. From that video this "
-        f"study times how long the doors take to close, how long they stay "
-        f"open, and how many people get in and out.",
-        f"The {eras.SHEET_NAME} design sheet assumes the doors close in "
-        f"{assumed:.2f} seconds. The bank stops meeting its design case above "
-        f"{cliff:.2f} seconds.",
-        f"That {margin:.2f}-second margin is the whole reason this study exists: "
-        f"the difference between a compliant lift bank and a non-compliant one "
-        f"is smaller than the eye can judge, so it has to be measured rather "
-        f"than estimated.",
-        f"This workbook reports what the cameras actually recorded between "
-        f"{ctx['from_iso'][:16]} and {ctx['to_iso'][:16]}, with the number of "
-        f"observations beside every figure and an explicit statement wherever "
-        f"the data does not support a conclusion.",
+        f"Cameras inside the lift cars record, for every door cycle: when the "
+        f"doors start and finish opening, how long they stand open, how long "
+        f"they take to close, and how many people cross the threshold in each "
+        f"direction. From those, this workbook derives door operating time, "
+        f"passenger transfer time, passengers per trip, lost time per stop, "
+        f"and demand by hour.",
+        f"Each of those is an assumed coefficient in the {eras.SHEET_NAME} "
+        f"design sheet. Every figure here is placed beside the assumption it "
+        f"tests, so the gap between assumed and observed is readable directly.",
+        f"Door-close time carries more weight than the others because the "
+        f"design sheet multiplies it by the number of stops a car makes — "
+        f"currently around 15 down-stops — so an error of a fraction of a "
+        f"second per door cycle compounds into the round-trip time that decides "
+        f"how many lifts a tower needs and how fast they must run. The sheet "
+        f"assumes {assumed:.2f} seconds.",
+        f"The highest-value measurement in this study is NOT in the round-trip "
+        f"calculation at all. The {eras.HC_PEAK_DESIGN_PCT:.0f}% "
+        f"handling-capacity figure is a DEMAND assumption — "
+        f"{eras.HC_ASSUMPTION_NOTE}. Cameras measure that directly and it needs "
+        f"no floor attribution. If actual demand is well below the assumption, "
+        f"the portfolio is being over-designed; if well above it, there is a "
+        f"service problem nobody has diagnosed. Either outcome outweighs the "
+        f"whole coefficient exercise.",
     ]
+
+
+def coefficient_scope(ctx: dict) -> list[dict]:
+    """The full scope of what is under test, with THIS export's status per
+    coefficient computed from the data — so the reader sees what the measured
+    part is a fraction OF.
+
+    Status is derived, never declared: a table that says 'measured' while the
+    data says otherwise is worse than no table."""
+    aggs = ctx.get("aggs") or {}
+    fs = ctx.get("floor_status") or {}
+    confident = sum(d.get("confident", 0) for d in fs.values())
+
+    def _any(key_fn):
+        return any(key_fn(a) for a in aggs.values())
+
+    n_close = sum(a["close"]["n"] for a in aggs.values())
+    open_suppressed = aggs and all(a["open_travel"]["suppressed"]
+                                   for a in aggs.values())
+    n_xfer = sum(a["transfer_pp"]["n"] for a in aggs.values())
+    n_pax = sum(a["pax_per_trip"]["n"] for a in aggs.values())
+    n_lost = sum(a["lost_time"]["n"] for a in aggs.values())
+
+    status: dict[str, tuple[str, str]] = {}
+    if n_close and not open_suppressed:
+        status["C27"] = ("PARTLY MEASURED",
+                         f"close travel measured (n={n_close:,}); open travel "
+                         f"also measured")
+    elif n_close:
+        status["C27"] = ("PARTLY MEASURED",
+                         f"close travel measured (n={n_close:,}); open travel "
+                         f"NOT measurable — pinned at the camera's frame "
+                         f"quantum")
+    else:
+        status["C27"] = ("NOT MEASURED", "no clean door cycles in this range")
+    status["C26"] = (("MEASURED", f"n={n_xfer:,} cycles with counts joined to "
+                                  f"dwell") if n_xfer else
+                     ("NOT MEASURED", "no per-cycle passenger counts joined to "
+                                      "dwell in this range"))
+    status["C19"] = (("PARTLY MEASURED",
+                      f"observed loading recorded (n={n_pax:,}) but the car's "
+                      f"rated capacity is not in this database, so it cannot "
+                      f"be expressed as a share of capacity") if n_pax else
+                     ("NOT MEASURED", "no per-cycle passenger counts in range"))
+    status["B24"] = (("MEASURED", f"n={n_lost:,} stops") if n_lost else
+                     ("NOT MEASURED", "needs dwell measured against passenger "
+                                      "load"))
+    blocked = ("BLOCKED", f"floor attribution produced {confident:,} confident "
+                          f"reads in this range — without the floor of "
+                          f"consecutive stops this cannot be computed")
+    for cid in ("C17", "C18", "C21", "C22"):
+        status[cid] = blocked
+
+    out = []
+    for c in eras.COEFFICIENTS:
+        st, why = status.get(c["id"], ("NOT MEASURED", ""))
+        out.append({**c, "status": st, "status_why": why})
+    return out
+
+
+def demand_assumption_row(ctx: dict) -> dict:
+    """The handling-capacity assumption, tracked separately from the RTT
+    coefficients because it is a demand figure and the study's highest-value
+    output."""
+    pop = ctx.get("population")
+    peaks = [p for p in ctx["peaks"] if p["peak"]]
+    best = max((p["peak"]["boardings"] for p in peaks), default=0)
+    if pop:
+        st = "MEASURED"
+        why = (f"busiest five minutes observed carried {best} boardings, "
+               f"{100.0 * best / pop:.1f}% of the {pop:,} population supplied")
+    else:
+        st = "BLOCKED"
+        why = (f"busiest five minutes observed carried {best} boardings, but no "
+               f"population figure was supplied to this export, so it cannot be "
+               f"expressed as a share of the population. Re-run with "
+               f"--population N. The population is never guessed.")
+    return {"id": f"{eras.HC_PEAK_DESIGN_PCT:.0f}% HC",
+            "name": "handling capacity (peak 5-minute demand)",
+            "assumes": eras.HC_ASSUMPTION_NOTE,
+            "needs": "boarding counts and the building's population",
+            "status": st, "status_why": why}

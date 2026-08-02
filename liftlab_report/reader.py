@@ -102,6 +102,24 @@ def fetch_cams(db, gw: str) -> list[str]:
     return list(eras.ALL_CAMS)
 
 
+def fetch_channel_labels(db, gw: str) -> dict[str, str]:
+    """{cam: the building's own name for this lift} from channel_map.label.
+
+    This is what the lift is called in the building — "lift 1" — as distinct
+    from ch16, which is the camera channel watching it. The workbook is an
+    external artifact read by people who know the building, not the wiring, so
+    the building's name is the one to show. Channels with no label are absent
+    from the mapping and the caller must mark the fallback rather than quietly
+    invent a name from the channel number."""
+    out = {}
+    for r in _q(db, "SELECT channel, label FROM channel_map "
+                    "WHERE gateway_id=? AND is_lift=1", (gw,)):
+        label = (r["label"] or "").strip()
+        if label:
+            out[f"ch{int(r['channel'])}"] = label
+    return out
+
+
 # ── Pi door-watch (gw_event) — the retired instrument ────────────────────────
 
 def fetch_pi_cycles(db, gw: str, t0: float, t1: float) -> list[dict]:

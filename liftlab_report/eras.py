@@ -76,8 +76,66 @@ FLOOR_REJECT_WARN_FRAC = 0.05
 # measurement is resolution-bound: emit no verdict, emit the reason instead.
 QUANTUM_SUPPRESS_FRAC = 0.20
 
+# ── The study ────────────────────────────────────────────────────────────────
+# What this is: empirical calibration of lift DESIGN FACTORS, measured from
+# cabin CCTV in handed-over, occupied residential towers. Lift traffic analysis
+# for new towers uses assumed coefficients from a standards table that has
+# never been validated against a real occupied building. This measures what
+# actually happens and feeds corrected factors back into the design sheet.
+#
+# It is a BENCHMARKING STUDY across a portfolio, not a compliance audit of one
+# building, and this workbook is one site's measurements toward that.
+STUDY_QUESTIONS = [
+    "Was the lift selection correct for this project — the number of lifts, "
+    "their speed and capacity — given how the building is actually used?",
+    "Can the same assumed coefficients be reused for future projects, or do "
+    "they need revising, and by how much?",
+]
+STUDY_SCOPE = ("5 projects across different categories, analysed one at a "
+               "time, roughly a week of footage each.")
+
 # ── The sheet (MEP-02 v28) ───────────────────────────────────────────────────
 SHEET_NAME = "MEP-02 v28"
+
+# The eight assumed coefficients under test. `measurable` says what it would
+# take to measure each here; the STATUS is computed per run from the data, never
+# declared, so the table cannot drift from what the export actually contains.
+COEFFICIENTS = [
+    {"id": "C17", "name": "probable stops, up peak",
+     "assumes": "how many floors a car stops at on an up trip",
+     "needs": "trip segmentation, which needs floor attribution"},
+    {"id": "C18", "name": "probable stops, down peak",
+     "assumes": "how many floors a car stops at on a down trip",
+     "needs": "trip segmentation, which needs floor attribution"},
+    {"id": "C19", "name": "average passengers per trip",
+     "assumes": "car loading as a share of rated capacity",
+     "needs": "per-cycle passenger counts joined to trips, plus the car's "
+              "rated capacity (not held in this database)"},
+    {"id": "C21", "name": "speed factor, up",
+     "assumes": "how much of rated speed is achieved between stops",
+     "needs": "floor attribution on consecutive stops"},
+    {"id": "C22", "name": "speed factor, down",
+     "assumes": "how much of rated speed is achieved between stops",
+     "needs": "floor attribution on consecutive stops"},
+    {"id": "C26", "name": "passenger transfer time",
+     "assumes": "seconds per person to board or alight",
+     "needs": "per-cycle passenger counts joined to door dwell"},
+    {"id": "C27", "name": "door operating time",
+     "assumes": "seconds for the doors to close, and to open",
+     "needs": "door timing from cabin video at sufficient frame rate"},
+    {"id": "B24", "name": "lost time per stop",
+     "assumes": "seconds lost per stop beyond transfer and door time",
+     "needs": "dwell measured against passenger load"},
+]
+
+# The handling-capacity assumption is a DEMAND figure, not an RTT coefficient:
+# the share of the building's population wanting to move in the peak 5 minutes.
+# Cameras measure it directly and it needs no floor attribution, which is why
+# it is the highest-value output of the study and is tracked separately from
+# the coefficient table above.
+HC_ASSUMPTION_NOTE = (
+    "the share of the building's population that wants to move in the busiest "
+    "five minutes")
 DOOR_SPECS = {
     "ch29": {"sheet_close_s": 2.00, "compliance_s": 2.31, "bank": "C",
              "transfer_sheet_s": 1.50, "sheet_open_s": 3.00},
@@ -232,8 +290,50 @@ def load_banks(path: str | Path | None = None) -> dict[str, str]:
     return banks
 
 
+# ── Display names ────────────────────────────────────────────────────────────
+# The building calls it "lift 1"; the gateway calls it ch16. Those are two
+# different things and a reader handed both without explanation would infer
+# twice as many lifts as exist. The workbook shows the BUILDING's name, because
+# the workbook is read by people who know the building.
+#
+# The mapping comes from channel_map.label and is installed once per run by
+# build_context. It is process state rather than a threaded-through argument
+# because lift_label() is called from every module and every sheet; the setter
+# is called unconditionally at the top of every build so a run can never
+# inherit the previous run's names.
+_DISPLAY_LABELS: dict[str, str] = {}
+
+# Marks a name the workbook had to invent because channel_map had none.
+UNLABELLED_SUFFIX = " (unnamed — no channel_map label)"
+
+
+def set_display_labels(labels: dict | None) -> None:
+    """Install this run's {cam: building name}. Always called, even when empty."""
+    _DISPLAY_LABELS.clear()
+    for cam, label in (labels or {}).items():
+        if label and str(label).strip():
+            _DISPLAY_LABELS[cam] = str(label).strip()
+
+
+def has_display_label(cam: str) -> bool:
+    return cam in _DISPLAY_LABELS
+
+
 def lift_label(cam: str) -> str:
-    return f"lift {cam.removeprefix('ch')}"
+    """The building's name for this lift, e.g. 'lift 1'.
+
+    Falls back to the channel number ONLY when the building has not named it,
+    and says so visibly — an invented name that looks like a real one is worse
+    than an obvious placeholder."""
+    if cam in _DISPLAY_LABELS:
+        return _DISPLAY_LABELS[cam]
+    return f"lift {cam.removeprefix('ch')}{UNLABELLED_SUFFIX}"
+
+
+def lift_label_with_channel(cam: str) -> str:
+    """'lift 1 (ch16)' — for the first mention on a sheet, so the reader can
+    tie the building's name to the camera channel used everywhere else."""
+    return f"{lift_label(cam)} ({cam})"
 
 
 # ── Bank derivation from the registry ────────────────────────────────────────

@@ -54,7 +54,8 @@ def _ddl(db):
         door_levels TEXT DEFAULT '', floor_range TEXT DEFAULT '',
         PRIMARY KEY (gateway_id, cam));
     CREATE TABLE IF NOT EXISTS channel_map (
-        gateway_id TEXT, channel INTEGER, is_lift INTEGER);
+        gateway_id TEXT, channel INTEGER, is_lift INTEGER, label TEXT,
+        marked_at REAL);
     CREATE TABLE IF NOT EXISTS analyzer_status (
         gateway_id TEXT, cam TEXT, ts REAL, counting_version TEXT,
         PRIMARY KEY (gateway_id, cam));
@@ -176,7 +177,10 @@ def make_fixture(path: str, *, with_pi=True, with_gpu=True,
     db = sqlite3.connect(path)
     _ddl(db)
     for i, ch in enumerate(eras.CHANNELS):
-        db.execute("INSERT INTO channel_map VALUES (?,?,1)", (GW, ch))
+        # The building names its lifts 1..7; the gateway knows them as ch16,
+        # ch27, ... Live data carries both, so the fixture must too.
+        db.execute("INSERT INTO channel_map VALUES (?,?,1,?,?)",
+                   (GW, ch, f"lift {i + 1}", time.time()))
         exact, n = PRECISIONS[f"ch{ch}"]
         db.execute(
             "INSERT INTO camera_validation (gateway_id,cam,state,n_reviewed,"

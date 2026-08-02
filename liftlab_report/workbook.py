@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 
 from openpyxl.utils import get_column_letter
 
-from . import charts, eras, narrative, stats, style
+from . import charts, eras, model, narrative, stats, style
 from .charts import ChartData  # re-exported: cli builds one and passes it in
 from .eras import GPU_ENGINE, PI_WATCH
 from .reader import precision_str
@@ -51,6 +51,20 @@ def _ci_str(lo, hi) -> str:
 
 def _rng(first_row, last_row, n_cols) -> str:
     return f"A{first_row}:{get_column_letter(n_cols)}{last_row}"
+
+
+def _lbl(ws, cam: str) -> str:
+    """The building's name for a lift, with the camera channel appended on this
+    SHEET's first mention — so a reader can tie 'lift 1' to 'ch16' once, then
+    read clean names afterwards."""
+    seen = getattr(ws, "_liftlab_named", None)
+    if seen is None:
+        seen = set()
+        ws._liftlab_named = seen
+    if cam in seen:
+        return eras.lift_label(cam)
+    seen.add(cam)
+    return eras.lift_label_with_channel(cam)
 
 
 def _era_banner(ws, row, boundaries) -> int:
@@ -114,13 +128,55 @@ def sheet_read_this_first(wb, ctx, anchors):
          font=BODY_ITALIC)
     row += 2
 
+    # ── why the study exists (the programme, before any measurement)
+    row = section(ws, row, "WHY THIS STUDY EXISTS")
+    for para in narrative.why_this_study_exists(ctx):
+        cell(ws, row, 1, para, wrap=True)
+        ws.row_dimensions[row].height = 44
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
+        row += 1
+    row += 1
+
     # ── what this measures
     row = section(ws, row, "WHAT THIS MEASURES")
     for para in narrative.what_this_measures(ctx):
         c = cell(ws, row, 1, para, wrap=True)
-        ws.row_dimensions[row].height = 28
+        ws.row_dimensions[row].height = 44
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
         row += 1
+    row += 1
+
+    # ── the whole scope of what is under test, and how much this export reaches
+    row = section(ws, row, "WHICH COEFFICIENTS ARE UNDER TEST")
+    scope = narrative.coefficient_scope(ctx)
+    n_done = sum(1 for c in scope if c["status"] == "MEASURED")
+    n_part = sum(1 for c in scope if c["status"] == "PARTLY MEASURED")
+    cell(ws, row, 1,
+         f"The design sheet rests on {len(scope)} assumed coefficients. This "
+         f"export fully measures {n_done} and partly measures {n_part}; the "
+         f"rest are listed with what is blocking them. This table is what the "
+         f"measured part is a fraction OF.", font=BODY_ITALIC, wrap=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
+    ws.row_dimensions[row].height = 30
+    row += 1
+    hdr = row
+    row = header_row(ws, row, ["coefficient", "what it assumes",
+                               "what measuring it needs",
+                               "status in this export", "why"])
+    _STATUS_FILL = {"MEASURED": style.FILL_GOOD,
+                    "PARTLY MEASURED": style.FILL_WARN,
+                    "NOT MEASURED": FILL_NA, "BLOCKED": FILL_NA}
+    for c in scope + [narrative.demand_assumption_row(ctx)]:
+        cell(ws, row, 1, f"{c['id']} — {c['name']}", font=BODY_BOLD, wrap=True)
+        cell(ws, row, 2, c["assumes"], wrap=True)
+        cell(ws, row, 3, c["needs"], wrap=True)
+        cell(ws, row, 4, c["status"], font=BODY_BOLD,
+             fill=_STATUS_FILL.get(c["status"]))
+        cell(ws, row, 5, c["status_why"], wrap=True)
+        ws.row_dimensions[row].height = 42
+        row += 1
+    for col, w in ((1, 30), (2, 34), (3, 34), (4, 20), (5, 46)):
+        style.wrap_column(ws, col, hdr + 1, row - 1, width=w)
     row += 1
 
     # ── how to read the workbook
@@ -262,8 +318,20 @@ def sheet_summary(wb, ctx, cd, anchors):
         row += 1
     row += 1
 
-    row = section(ws, row, "HEADLINE — observed door-close travel vs the sheet, "
-                           "PER INSTRUMENT ERA (never pooled)")
+    row = section(ws, row, "C27 DOOR OPERATING TIME — observed close travel vs "
+                           "the assumed value, PER INSTRUMENT ERA (never "
+                           "pooled)")
+    cell(ws, row, 1,
+         f"C27 is one of the {len(eras.COEFFICIENTS)} assumed coefficients "
+         f"under test, and the most leveraged: the design sheet multiplies it "
+         f"by the number of stops a car makes. It is not the purpose of the "
+         f"study — see WHICH COEFFICIENTS ARE UNDER TEST on READ THIS FIRST "
+         f"for the full scope and what this export reaches. Verdicts below are "
+         f"mechanical statements about the measurement, not recommendations.",
+         font=BODY_ITALIC, wrap=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=13)
+    ws.row_dimensions[row].height = 44
+    row += 1
     headers = ["lift", "instrument", "era", "n (clean closes)", "median s",
                "median 95% CI lo s", "median 95% CI hi s",
                "p85 s", "sheet assumption s", "% > cliff", "cliff s",
@@ -277,7 +345,7 @@ def sheet_summary(wb, ctx, cd, anchors):
         mc = cl["median_ci"]
         verdict = (cl["suppression_reason"] if cl["suppressed"]
                    else stats.verdict_vs_threshold(mc, cl["cliff_s"]))
-        cell(ws, row, 1, eras.lift_label(cam))
+        cell(ws, row, 1, _lbl(ws, cam))
         cell(ws, row, 2, instrument)
         cell(ws, row, 3, era_id)
         cell(ws, row, 4, cl["n"], F_INT)
@@ -313,7 +381,7 @@ def sheet_summary(wb, ctx, cd, anchors):
         gap = hi_p[2]["median"] - lo_p[2]["median"]
         disjoint = hi_p[2]["lo"] > lo_p[2]["hi"]
         cell(ws, row, 1, "Widest disagreement between two lifts", font=BODY_BOLD)
-        cell(ws, row, 2, f"{eras.lift_label(hi_p[0])} vs {eras.lift_label(lo_p[0])}")
+        cell(ws, row, 2, f"{_lbl(ws, hi_p[0])} vs {_lbl(ws, lo_p[0])}")
         cell(ws, row, 5, gap, F_SEC, font=BODY_BOLD,
              fill=FILL_WARN if disjoint and gap >= narrative.DIVERGENCE_S
              else None)
@@ -342,7 +410,7 @@ def sheet_summary(wb, ctx, cd, anchors):
             continue
         lo = mc["lo"] if mc["lo"] is not None else mc["median"]
         hi = mc["hi"] if mc["hi"] is not None else mc["median"]
-        rows.append({"label": f"{eras.lift_label(cam)} {era_id}",
+        rows.append({"label": f"{eras.lift_label_with_channel(cam)} {era_id}",
                      "median": mc["median"],
                      "err_lo": max(0.0, mc["median"] - lo),
                      "err_hi": max(0.0, hi - mc["median"]),
@@ -413,7 +481,7 @@ def sheet_vs_sheet(wb, ctx, cd, anchors):
     for cam in ctx["cams"]:
         if cam not in {k[0] for k in ctx["aggs"]} and cam not in eras.DOOR_SPECS:
             continue
-        cell(ws, row, 1, f"{eras.lift_label(cam)} ({cam})"
+        cell(ws, row, 1, f"{_lbl(ws, cam)}"
              f" — bank {ctx['banks'].get(cam) or 'UNKNOWN'}", font=H2)
         row += 1
         hdr_row = row
@@ -466,7 +534,7 @@ def sheet_per_lift(wb, ctx, cd, anchors):
         cur_ver = (ctx["analyzer_versions"].get(cam)
                    or v.get("counting_version") or "unknown")
         prec = precision_str(ctx["validation"], cam, cur_ver)
-        cell(ws, row, 1, eras.lift_label(cam), font=H1)
+        cell(ws, row, 1, _lbl(ws, cam), font=H1)
         cell(ws, row, 3, f"bank: {ctx['banks'].get(cam) or 'UNKNOWN'}")
         cell(ws, row, 4, f"counting_version: {cur_ver}")
         cell(ws, row, 5, f"precision: {prec}"
@@ -748,15 +816,27 @@ def sheet_fleet(wb, ctx, cd, anchors):
     cols.append(["fleet boarded (unweighted sum)"] + fleet_b)
     cols.append(["fleet alighted (unweighted sum)"] + fleet_a)
     wsd, c0, c1, nr = cd.block(cols)
-    peak_hour = max(hours, key=lambda h: fleet_b[h]) if any(fleet_b) else None
-    row = caption(ws, row, (
-        f"Take-away: when the building actually uses its lifts. The busiest "
-        f"hour observed is {peak_hour:02d}:00–{peak_hour + 1:02d}:00 with "
-        f"{fleet_b[peak_hour]:,} boardings across the fleet."
-        if peak_hour is not None else
-        "Take-away: no boardings were recorded in this range."))
+    # This chart plots RAW TOTALS pooled across counting builds — a different
+    # definition from the canonical busiest hour. It therefore names its own
+    # definition and defers to the canonical figure rather than stating a
+    # competing "busiest hour" of its own.
+    canon = (ctx.get("canonical") or {}).get("fleet_busiest_hour")
+    if canon and canon.get("hour") is not None:
+        row = caption(ws, row, (
+            f"Take-away: when the building actually uses its lifts. NOTE THE "
+            f"DEFINITION — this chart plots RAW TOTAL boardings per hour summed "
+            f"over every day and pooled across counting builds, which is not "
+            f"the workbook's headline busiest-hour figure. The canonical "
+            f"busiest hour is {canon['hour']:02d}:00–{canon['hour'] + 1:02d}:00 "
+            f"({canon['value']:.0f} boardings), defined as {canon['definition']} "
+            f"— see DEMAND BY LIFT AND HOUR. Raw totals favour whichever hours "
+            f"had most days observed, which is why the two differ."))
+    else:
+        row = caption(ws, row, "Take-away: no boardings were recorded in this "
+                               "range.")
     ch = charts.line_chart(
-        cd, "Hourly boarding profile (building local time, outages excluded)",
+        cd, "Hourly boarding profile — RAW TOTALS, pooled across counting "
+            "builds (not the canonical busiest-hour figure)",
         cd.ref(c0, c0, 2, nr), cd.ref(c0 + 1, c1, 1, nr),
         n_series=len(cols) - 1, x_title="hour of the day",
         y_title="people", y_fmt="#,##0")
@@ -800,6 +880,41 @@ def sheet_demand(wb, ctx, cd, anchors):
     cams = ctx["cams"]
     hours = demand["hours"]
     pop = ctx.get("population")
+
+    # The canonical busiest hour, stated ONCE, at the top, with its definition —
+    # every other statement of it in this workbook resolves to this value.
+    canon = (ctx.get("canonical") or {}).get("fleet_busiest_hour")
+    row = section(ws, row, "THE CANONICAL BUSIEST HOUR")
+    if canon and canon.get("hour") is not None:
+        cell(ws, row, 1, "busiest hour (fleet)", font=BODY_BOLD)
+        cell(ws, row, 2, f"{canon['hour']:02d}:00–{canon['hour'] + 1:02d}:00")
+        cell(ws, row, 4, "mean boardings in it", font=BODY_BOLD)
+        cell(ws, row, 5, canon["value"], "0.0")
+        row += 1
+        cell(ws, row, 1, "typical hour, all day", font=BODY_BOLD)
+        cell(ws, row, 2, canon["all_day_mean"], "0.0")
+        cell(ws, row, 4, "peak : typical", font=BODY_BOLD)
+        cell(ws, row, 5, canon["ratio"], "0.00")
+        row += 1
+        cell(ws, row, 1, "definition", font=BODY_BOLD)
+        cell(ws, row, 2, canon["definition"], wrap=True)
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=10)
+        ws.row_dimensions[row].height = 32
+        row += 1
+        cell(ws, row, 1,
+             "This is the figure this workbook quotes wherever a fleet busiest "
+             "hour is stated. Any sheet showing a different hour is using a "
+             "different definition and says so where it does.",
+             font=BODY_ITALIC, wrap=True)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=10)
+        ws.row_dimensions[row].height = 28
+        row += 1
+    else:
+        cell(ws, row, 1, "No boardings in range — no busiest hour to state.")
+        row += 1
+    anchors["canonical_busiest_hour"] = ("DEMAND BY LIFT AND HOUR",
+                                         _rng(row - 4, row - 1, 10))
+    row += 1
     p5 = peak_5min_by_cam(ctx["transits"], ctx["all_cycles"], cams,
                           ctx["t0"], ctx["t1"])
 
@@ -821,7 +936,7 @@ def sheet_demand(wb, ctx, cd, anchors):
                  wrap=True)
             ws.cell(row=rw, column=1).font = style.HEADER_FONT
             for i, cam in enumerate(cams, start=2):
-                c = cell(ws, rw, i, eras.lift_label(cam), font=style.HEADER_FONT,
+                c = cell(ws, rw, i, _lbl(ws, cam), font=style.HEADER_FONT,
                          fill=style.FILL_HEADER, wrap=True)
                 c.alignment = style.WRAP_CENTRE
             c = cell(ws, rw, len(cams) + 2, "FLEET TOTAL\n(unweighted sum of "
@@ -916,6 +1031,20 @@ def sheet_demand(wb, ctx, cd, anchors):
 
         # ── PEAK ROW
         row = section(ws, row, "BUSIEST HOUR PER LIFT")
+        is_canonical_era = bool(canon) and canon.get("era") == ver
+        cell(ws, row, 1,
+             ("The FLEET row here is the canonical busiest hour stated at the "
+              "top of this sheet — same definition, same value."
+              if is_canonical_era else
+              f"NOTE — this block covers counting era {ver}, which is NOT the "
+              f"era the canonical busiest hour is drawn from (that is "
+              f"{canon['era'] if canon else 'n/a'}, the era carrying the most "
+              f"boardings). The FLEET row below is this era's busiest hour on "
+              f"the same definition, and will differ."),
+             font=BODY_ITALIC, wrap=True)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        ws.row_dimensions[row].height = 30
+        row += 1
         hdr = row
         row = header_row(ws, row, [
             "lift", "busiest hour (IST)", "mean boardings in it",
@@ -925,7 +1054,7 @@ def sheet_demand(wb, ctx, cd, anchors):
             pk = e["peaks"][cam]
             is_fleet = cam == "__fleet__"
             cell(ws, row, 1, "FLEET (all lifts, one tower)" if is_fleet
-                 else eras.lift_label(cam), font=BODY_BOLD if is_fleet else BODY)
+                 else _lbl(ws, cam), font=BODY_BOLD if is_fleet else BODY)
             cell(ws, row, 2, f"{pk['hour']:02d}:00" if pk["hour"] is not None
                  else DARK)
             cell(ws, row, 3, pk["value"], "0.0")
@@ -966,7 +1095,7 @@ def sheet_demand(wb, ctx, cd, anchors):
             best = p5[cam]
             is_fleet = cam == "__fleet__"
             cell(ws, row, 1, "FLEET (all lifts, one tower)" if is_fleet
-                 else eras.lift_label(cam), font=BODY_BOLD if is_fleet else BODY)
+                 else _lbl(ws, cam), font=BODY_BOLD if is_fleet else BODY)
             cell(ws, row, 2, best["boardings"], F_INT)
             cell(ws, row, 3, _fmt_ts(best["w0"])[:16] if best["w0"] else DARK)
             if pop:
@@ -1001,28 +1130,47 @@ def sheet_demand(wb, ctx, cd, anchors):
                 f"{max(covs):.0f}% — a {max(covs) - min(covs):.0f}-point spread. "
                 f"The load-balance figures below are NOT safely comparable "
                 f"across lifts at this spread."), height=32)
-        hdr = row
-        row = header_row(ws, row, ["hour (IST)",
-                                   "lifts observed", "coefficient of variation",
-                                   "reading"])
-        for h in hours:
-            cv = e["cv"][h]
-            n_live = sum(1 for c in cams if e["boarded"][c][h] is not None)
-            cell(ws, row, 1, f"{h:02d}:00", font=BODY_BOLD)
-            cell(ws, row, 2, n_live, F_INT)
-            if cv is None:
-                cell(ws, row, 3, DARK, fill=FILL_NA)
-                cell(ws, row, 4, "fewer than two observed lifts", fill=FILL_NA)
-            else:
+        if not model.load_balance_reportable(e["cv"]):
+            usable = sum(1 for c in e["cv"] if c is not None)
+            row = banner(ws, row, (
+                f"NOT REPORTED — a load-balance figure needs at least "
+                f"{model.LOAD_BALANCE_MIN_LIFTS} lifts observed in the same "
+                f"hour, and only {usable} of 24 hours meet that in this "
+                f"counting era. Below that, the measure is degenerate: with "
+                f"two lifts where one carried nobody it returns 1.41 whatever "
+                f"the numbers are, which reads as a dramatic imbalance and "
+                f"means nothing. The per-hour table is therefore withheld."),
+                fill=FILL_NA, height=58)
+            row += 1
+        else:
+            hdr = row
+            row = header_row(ws, row, [
+                "hour (IST)", "lifts observed", "coefficient of variation",
+                "reading"])
+            for h in hours:
+                cv = e["cv"][h]
+                if cv is None:
+                    continue            # below the minimum: no row at all
+                n_live = sum(1 for c in cams if e["boarded"][c][h] is not None)
+                cell(ws, row, 1, f"{h:02d}:00", font=BODY_BOLD)
+                cell(ws, row, 2, n_live, F_INT)
                 cell(ws, row, 3, cv, "0.00")
-                cell(ws, row, 4, ("evenly shared" if cv < 0.25
+                cell(ws, row, 4, ("shared fairly evenly" if cv < 0.25
                                   else "moderately uneven" if cv < 0.6
                                   else "concentrated on some lifts"))
+                row += 1
+            cell(ws, row, 1, f"Hours with fewer than "
+                             f"{model.LOAD_BALANCE_MIN_LIFTS} lifts observed "
+                             f"together are omitted rather than shown as a "
+                             f"number — the measure is not meaningful there.",
+                 font=BODY_ITALIC, wrap=True)
+            ws.merge_cells(start_row=row, start_column=1, end_row=row,
+                           end_column=8)
             row += 1
         row += 2
 
         # ── charts for this era
-        by_lift = {eras.lift_label(c): e["boarded"][c] for c in cams}
+        by_lift = {eras.lift_label_with_channel(c): e["boarded"][c] for c in cams}
         row = caption(ws, row, (
             "Take-away: the shape of the day — which hours carry the load, and "
             "whether the lifts rise and fall together. Gaps in a lift's bars "
@@ -1036,13 +1184,27 @@ def sheet_demand(wb, ctx, cd, anchors):
         row += charts.rows_for(10.0)
 
         pk = e["peaks"]["__fleet__"]
-        row = caption(ws, row, (
-            f"Take-away: the tower's busiest hour is "
-            f"{pk['hour']:02d}:00–{pk['hour'] + 1:02d}:00, carrying "
-            f"{pk['value']:.0f} boardings against an all-day mean of "
-            f"{pk['mean']:.0f} — {pk['ratio']:.1f}x the typical hour."
-            if pk["hour"] is not None else
-            "Take-away: no hour in this counting era carried boardings."))
+        if pk["hour"] is None:
+            cap = "Take-away: no hour in this counting era carried boardings."
+        elif is_canonical_era:
+            cap = (f"Take-away: the busiest hour is "
+                   f"{pk['hour']:02d}:00–{pk['hour'] + 1:02d}:00, carrying "
+                   f"{pk['value']:.0f} boardings against an all-day mean of "
+                   f"{pk['mean']:.0f} — {pk['ratio']:.1f}x the typical hour. "
+                   f"This is the canonical figure stated at the top of this "
+                   f"sheet.")
+        else:
+            # Deliberately NOT phrased as "the busiest hour is": this era taken
+            # alone is a narrower view, and only the canonical figure gets to
+            # make the unqualified claim.
+            cap = (f"Take-away: counting era {ver} TAKEN ALONE peaks at "
+                   f"{pk['hour']:02d}:00–{pk['hour'] + 1:02d}:00 with "
+                   f"{pk['value']:.0f} boardings ({pk['ratio']:.1f}x its own "
+                   f"all-day mean). This era is not the one the canonical "
+                   f"busiest hour is drawn from — it carries less data — so "
+                   f"this is a view of one build, not the workbook's "
+                   f"busiest-hour figure.")
+        row = caption(ws, row, cap)
         ws.add_chart(charts.fleet_demand_line(
             cd, [f"{h:02d}:00" for h in hours], e["fleet_boarded"],
             pk["hour"], f"Fleet boardings by hour — {ver}"), f"A{row}")
@@ -1175,7 +1337,7 @@ def sheet_peak(wb, ctx, cd, anchors):
         for scope, src in (("peak windows", pa), ("all-day", a)):
             if src is None:
                 continue
-            cell(ws, row, 1, eras.lift_label(cam))
+            cell(ws, row, 1, _lbl(ws, cam))
             cell(ws, row, 2, instrument)
             cell(ws, row, 3, era_id)
             cell(ws, row, 4, scope)
