@@ -18,10 +18,12 @@ Every panel carries its own timestamp.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1023,7 +1025,15 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
             end_ts = None
             floor_src = r if (r["floor"] is not None and r["reason"] in DOOR_OK_REASONS
                               and (alphabet is None or str(r["floor"]) in alphabet)) else None
-            for nxt in rows[idx + 1:]:
+            # islice, NOT rows[idx+1:]. The slice built a fresh copy of the whole remaining list on
+            # every door-open transition — and because the loop below breaks after a handful of rows
+            # (DOOR_OPEN_MAX_S, or the 'closed' that ends the cycle), that copy was pure waste. With
+            # ~60k era rows per camera and thousands of cycles in them, it made this function
+            # quadratic in ALLOCATION while staying linear in work: gigabytes of list churn per
+            # camera, seven cameras per request. That is what put /dash at 180s+ and what stacked
+            # into the 1.48 GB OOM. islice iterates the same rows in the same order and honours the
+            # same breaks — identical results, no copy.
+            for nxt in itertools.islice(rows, idx + 1, None):
                 if (nxt["ts"] or 0) - (r["ts"] or 0) > DOOR_OPEN_MAX_S:
                     break
                 # A confident read from INSIDE the cycle is the best floor evidence: the car is
@@ -1157,20 +1167,27 @@ def _transits_for_join(db, gw):
 
 
 def _transit_by_cam(db, gw):
+    """Per-camera boarded/alighted totals + today's counts, AGGREGATED IN SQL.
+
+    This used to SELECT every transit row for the gateway and tally them in Python — 22k+ row
+    objects materialised on every /dash load to produce five numbers per camera. The counting rule
+    is preserved exactly: 'in' is a boarding and ANYTHING ELSE is an alighting (so a NULL or
+    unrecognised direction still lands where it always did), and last_ts still ignores rows with
+    no timestamp. Only the arithmetic moved; no reported number changes.
+    """
     today = _ist_today_epoch()
-    rows = _q(db, "SELECT cam, direction, ts FROM transit_event WHERE gateway_id=?", (gw,))
-    by = {}
-    for r in rows:
-        d = by.setdefault(r["cam"], {"bt": 0, "at": 0, "b": 0, "a": 0, "last": None})
-        ins = r["direction"] == "in"
-        d["b" if ins else "a"] += 1
-        if r["ts"] and r["ts"] >= today:
-            d["bt" if ins else "at"] += 1
-        if r["ts"] and (d["last"] is None or r["ts"] > d["last"]):
-            d["last"] = r["ts"]
-    return {cam: {"boarded_today": d["bt"], "alighted_today": d["at"],
-                  "boarded_total": d["b"], "alighted_total": d["a"], "last_ts": d["last"]}
-            for cam, d in by.items()}
+    rows = _q(db, "SELECT cam, "
+                  "SUM(direction='in') b, "
+                  "SUM(direction IS NULL OR direction<>'in') a, "
+                  "SUM(direction='in' AND ts IS NOT NULL AND ts>=?) bt, "
+                  "SUM((direction IS NULL OR direction<>'in') AND ts IS NOT NULL AND ts>=?) at, "
+                  "MAX(NULLIF(ts, 0)) last_ts "     # NULLIF: the Python version tested `if r['ts']`,
+                                                    # which skipped ts=0 as falsy. MAX would not.
+                  "FROM transit_event WHERE gateway_id=? GROUP BY cam", (today, today, gw))
+    return {r["cam"]: {"boarded_today": r["bt"] or 0, "alighted_today": r["at"] or 0,
+                       "boarded_total": r["b"] or 0, "alighted_total": r["a"] or 0,
+                       "last_ts": r["last_ts"]}
+            for r in rows}
 
 
 def _analyzers(db, gw):
@@ -1197,20 +1214,78 @@ def _latest(db, table, gw):
     return dict(rows[0]) if rows else None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# HISTORICAL HALF OF /dash, COMPUTED OFF THE REFRESH PATH
+#
+# Measured cost of one /dash/{gw}/data with 428k gw_door_event rows (2026-08-03):
+#     _tier2 (7 cams)     > 20 min      <- three near-full reads per camera
+#     _door_gpu_by_cam      10.5 s
+#     _transits_for_join     0.54 s
+#     _transit_by_cam        0.54 s
+#     _door_by_cam           0.23 s
+#     everything else      < 0.01 s
+# The page auto-refreshes. With a computation that long, refreshes overlap, each holding its own
+# copy of the row set, and on 2026-08-03 that stacked to 1.48 GB RSS on a 1.97 GB box until the
+# kernel OOM-killed the gateway — taking the segment ingest down with it.
+#
+# These are aggregates over DAYS of history. Recomputing them per refresh buys nothing: the numbers
+# cannot meaningfully change between two refreshes seconds apart. So they are computed at most once
+# per _HEAVY_TTL and shared. Two properties matter more than the speed:
+#
+#   1. The computation runs INSIDE the lock. Concurrent requests wait for one result instead of each
+#      building their own — that, not the TTL, is what makes the memory stacking impossible.
+#   2. Nothing here is a live signal. Heartbeat ages, analyser state, relay/watch status and snapshot
+#      staleness are all recomputed per request BELOW, unaffected by this cache, because those are
+#      exactly the fields an operator reads to decide whether something is broken right now.
+#
+# The response carries heavy_computed_at/heavy_age_s so the page can state the age of the historical
+# panels rather than implying they are live.
+_HEAVY_TTL = float(os.environ.get("DASH_HEAVY_TTL_S", "90"))
+_heavy_lock = threading.Lock()
+_heavy_cache = {}                                  # (gw, era) -> {"t": epoch, "v": {...}}
+
+
+def _dash_heavy(db, gw, cams, era):
+    """The history-walking half of dash_data, memoised per (gw, era). Returns (values, computed_at)."""
+    key = (gw, era)
+    with _heavy_lock:
+        hit = _heavy_cache.get(key)
+        if hit and (time.time() - hit["t"]) < _HEAVY_TTL:
+            return hit["v"], hit["t"]
+        # Recompute under the lock. A second caller that arrived while this ran will find the fresh
+        # entry on its own pass through the check above, so it never starts a duplicate walk.
+        tj = _transits_for_join(db, gw)
+        v = {
+            "door": _door_by_cam(db, gw),                                  # Pi-era (gw_event), RETIRED
+            "door_gpu": _door_gpu_by_cam(db, gw, [c["cam"] for c in cams]),  # GPU-era, LIVE
+            "trans": _transit_by_cam(db, gw),
+            "xfer": _transfer_by_cam(db, gw),
+            "floor_cov": _floor_coverage(db, gw),
+            "tier2": {k: val for k, val in
+                      ((c["cam"], _tier2(db, gw, c["cam"], tj.get(c["cam"], []), era_override=era))
+                       for c in cams) if val},
+        }
+        t = time.time()
+        _heavy_cache[key] = {"t": t, "v": v}
+        # `era` is a REQUEST parameter, so the key space is caller-controlled: without a bound, a
+        # crawler walking ?era=... would pin one full aggregate per distinct value in memory. Keep
+        # the newest few and drop the rest — a dropped entry costs a recompute, never a wrong answer.
+        if len(_heavy_cache) > 8:
+            for k, _ in sorted(_heavy_cache.items(), key=lambda kv: kv[1]["t"])[:-8]:
+                _heavy_cache.pop(k, None)
+        return v, t
+
+
 @dash_router.get("/dash/{gw}/data")
 def dash_data(gw: str, era: str = ""):
     db = _db()
     now = time.time()
     cams = _cameras(db, gw)
-    door = _door_by_cam(db, gw)                      # Pi-era (gw_event), RETIRED instrument
-    door_gpu = _door_gpu_by_cam(db, gw, [c["cam"] for c in cams])   # GPU-era (gw_door_event), LIVE
-    trans = _transit_by_cam(db, gw)
-    xfer = _transfer_by_cam(db, gw)
-    floor_cov = _floor_coverage(db, gw)
+    heavy, heavy_t = _dash_heavy(db, gw, cams, era)
+    door, door_gpu = heavy["door"], heavy["door_gpu"]
+    trans, xfer = heavy["trans"], heavy["xfer"]
+    floor_cov, tier2 = heavy["floor_cov"], heavy["tier2"]
     registry = _registry(db, gw)
-    tj = _transits_for_join(db, gw)
-    tier2 = {c["cam"]: _tier2(db, gw, c["cam"], tj.get(c["cam"], []), era_override=era) for c in cams}
-    tier2 = {k: v for k, v in tier2.items() if v}
     ana = _analyzers(db, gw)
     val = _validations(db, gw)
     w = _latest(db, "watch_status", gw)
@@ -1308,6 +1383,12 @@ def dash_data(gw: str, era: str = ""):
                        "unlock": "floor OCR (template-match the LED digits + direction arrow)"}
 
     return JSONResponse({"t": now, "gw": gw, "ist_today": _ist_today_str(),
+                         # age of the HISTORICAL panels (headline/tier2/door_gpu/transit totals).
+                         # The live strip — pi, relay, gpu, analyzer ages, snapshots — is always
+                         # computed fresh on this request and is NOT covered by these fields.
+                         "heavy_computed_at": heavy_t,
+                         "heavy_age_s": round(now - heavy_t, 1),
+                         "heavy_ttl_s": _HEAVY_TTL,
                          "pi": pi, "relay": relay, "gpu": gpu,
                          "cameras": out_cams, "headline": headline, "registry": registry,
                          "floor_coverage": floor_cov, "tier2": tier2, "unavailable": unavailable,
