@@ -195,6 +195,56 @@ grep -q 'LOOP_STALL_S="\${RELAY_LOOP_STALL_S:-120}"' "$SRC" && ok "LOOP_STALL_S 
 grep -q 'supervisor_watchdog \$\$ &' "$SRC" && ok "supervisor watchdog still armed" \
                                             || bad "supervisor watchdog no longer armed"
 
+echo
+echo "== 7. escalation survives a supervisor restart (the 2026-08-04 defect) =="
+# The watchdog fired every ~6 min for two hours and ran stage 1/3 EVERY time. Stage 1 does not
+# restart the supervisor — it restarts the ffmpeg children — but its seven kill+launch cycles over
+# a wedged NIC push one loop iteration past RELAY_LOOP_STALL_S, so the supervisor SELF-watchdog
+# SIGKILLs it and systemd restarts it with FLEET_STAGE=0. The stage must therefore live on disk.
+STATE_DIR=$(mktemp -d)
+run_state(){  # $1=script body evaluated after loading the state helpers
+  ( set +u
+    IFACE=lo; say(){ :; }
+    RELAY_STATE_DIR="$STATE_DIR"
+    FLEET_STATE_DIR="$RELAY_STATE_DIR"; mkdir -p "$FLEET_STATE_DIR"
+    FLEET_STATE="$FLEET_STATE_DIR/fleet_escalation"
+    FLEET_STATE_TTL="${TTL_OVERRIDE:-1800}"
+    FLEET_STAGE=0; FLEET_ZERO_SINCE=0; FLEET_DOWN=0; FLEET_LAST_REBOOT=0
+    eval "$(extract fleet_state_save fleet_state_load)"
+    eval "$1" ) }
+
+# a supervisor reaches stage 2, then dies and comes back
+run_state 'FLEET_STAGE=2; FLEET_ZERO_SINCE=$(( $(date +%s) - 400 )); fleet_state_save'
+GOT=$(run_state 'fleet_state_load; echo "$FLEET_STAGE"')
+chk "stage survives a supervisor restart" "$GOT" "2"
+GOT=$(run_state 'fleet_state_load; echo "$FLEET_DOWN"')
+chk "fleet-down flag restored with it" "$GOT" "1"
+
+# ...and the ORIGINAL down-since is kept, so the reboot gate sees the true outage length
+GOT=$(run_state 'fleet_state_load; now=$(date +%s); [ $(( now - FLEET_ZERO_SINCE )) -ge 400 ] && echo yes || echo no')
+chk "down-since is the real one, not reset by the restart" "$GOT" "yes"
+
+# a stale state from an old incident must NOT send a later blip straight to reboot
+TTL_OVERRIDE=1 run_state 'sleep 2; fleet_state_load; echo "$FLEET_STAGE"' > /tmp/_r7 2>/dev/null
+chk "stale state expires rather than pre-escalating" "$(cat /tmp/_r7)" "0"
+
+# the reboot timestamp must OUTLIVE the expiry — the cooldown is about the machine, not the incident
+run_state 'FLEET_STAGE=3; FLEET_ZERO_SINCE=1; FLEET_LAST_REBOOT=1234567; fleet_state_save'
+GOT=$(TTL_OVERRIDE=1 run_state 'sleep 2; fleet_state_load; echo "$FLEET_LAST_REBOOT"')
+chk "reboot timestamp survives state expiry" "$GOT" "1234567"
+rm -rf "$STATE_DIR" /tmp/_r7
+
+echo
+echo "== 8. the ladder is restart -> driver reload -> gated reboot =="
+grep -q 'modprobe -r' "$SRC" && ok "stage 2 reloads the NIC driver" || bad "no driver reload"
+grep -q 'FLEET_REBOOT_MIN_DOWN_S:-900' "$SRC" && ok "reboot gated on 15 min down"                                               || bad "reboot not gated on downtime"
+grep -q 'FLEET_REBOOT_COOLDOWN_S:-3600' "$SRC" && ok "reboot gated on a 1h cooldown"                                                || bad "reboot has no cooldown"
+grep -q 'fleet_state_save                                  # RECORD BEFORE REBOOTING' "$SRC"   && ok "cooldown is recorded BEFORE the reboot (or it is lost)"   || bad "reboot timestamp not persisted before rebooting"
+# the link bounce must no longer gate stage 2 — it cannot work on a wedged PHY
+grep -q 'iface_bounce || true' "$SRC" && ok "link bounce no longer gates escalation"                                       || bad "link bounce still gates a stage"
+# tx_packets is the ONLY signal: dmesg is silent on this fault
+grep -q 'statistics/tx_packets' "$SRC" && ok "tx_packets is read as the recovery test"                                        || bad "no tx_packets check"
+
 rm -f /tmp/_r1 /tmp/_r1b /tmp/_r2 /tmp/_r4
 echo
 echo "== $PASS passed, $FAIL failed =="

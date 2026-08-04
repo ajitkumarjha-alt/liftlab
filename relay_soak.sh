@@ -55,7 +55,12 @@ GRACE_CAP_S="${RELAY_GRACE_CAP_S:-1200}"       # never wait longer than this to 
 # independent check on the SUM.
 FLEET_DOWN_S="${RELAY_FLEET_DOWN_S:-300}"      # total delivery ~0 this long = fleet down
 FLEET_MIN_KBPS="${RELAY_FLEET_MIN_KBPS:-20}"   # fleet-wide sum below this counts as zero
-FLEET_IFACE_BOUNCE="${RELAY_FLEET_IFACE_BOUNCE:-1}"   # 0 disables the link-bounce escalation
+FLEET_IFACE_BOUNCE="${RELAY_FLEET_IFACE_BOUNCE:-1}"   # 0 disables the (ineffective) link bounce
+NIC_MODULE="${RELAY_NIC_MODULE:-bcmgenet}"           # onboard Pi ethernet driver — the thing that wedges
+NIC_RELOAD_WAIT_S="${RELAY_NIC_RELOAD_WAIT_S:-20}"   # link + DHCP settle time after a driver reload
+FLEET_REBOOT="${RELAY_FLEET_REBOOT:-1}"              # 0 disables the stage-3 reboot entirely
+FLEET_REBOOT_MIN_DOWN_S="${RELAY_FLEET_REBOOT_MIN_DOWN_S:-900}"    # only reboot after 15 min down
+FLEET_REBOOT_COOLDOWN_S="${RELAY_FLEET_REBOOT_COOLDOWN_S:-3600}"   # and not twice within the hour
 FLEET_NAG_S="${RELAY_FLEET_NAG_S:-60}"         # once down and un-recovered, shout this often
 # How often to re-resolve the channel list from channel_map while running, so a
 # registry change is picked up without a restart.
@@ -424,29 +429,139 @@ restart_stream(){   # $1=slot $2=reason
 }
 
 # ---------- fleet delivery watchdog state ----------
+# PERSISTED ACROSS SUPERVISOR RESTARTS. This is the 2026-08-04 defect: the watchdog fired correctly
+# every ~6 min for two hours and ran stage 1/3 EVERY TIME, never escalating.
+#
+# The cause was not that stage 1 restarts the supervisor — it does not, it only restarts the ffmpeg
+# children. It is that stage 1's work (seven kill+launch cycles, each shelling out over a wedged
+# NIC) makes one loop iteration exceed RELAY_LOOP_STALL_S, so the supervisor SELF-watchdog above
+# declares the loop wedged and SIGKILLs it. systemd restarts it 15s later with FLEET_STAGE=0, and
+# the ladder starts from the bottom again. Observed supervisor PIDs: 1018884 -> 1020675 -> 1022463
+# -> 1024258 -> 1026086.
+#
+# So the stage cannot live only in memory. It is written to disk on every change and re-read at
+# startup, which works regardless of WHY the supervisor died. FLEET_ZERO_SINCE is persisted with it
+# because the reboot gate needs to know how long the fleet has really been down, not how long since
+# the last restart — otherwise a loop of restarts makes the outage look permanently fresh and the
+# reboot gate never opens either.
+#
+# The state EXPIRES: a stale stage-3 from an old incident must not send a later, unrelated blip
+# straight to a reboot.
+FLEET_STATE_DIR="${RELAY_STATE_DIR:-/var/lib/liftlab-relay}"
+mkdir -p "$FLEET_STATE_DIR" 2>/dev/null || FLEET_STATE_DIR="${HOME:-/tmp}/.liftlab-relay"
+mkdir -p "$FLEET_STATE_DIR" 2>/dev/null || FLEET_STATE_DIR=/tmp
+FLEET_STATE="$FLEET_STATE_DIR/fleet_escalation"
+FLEET_STATE_TTL="${RELAY_FLEET_STATE_TTL:-1800}"   # older than this = a different incident, start over
+
 FLEET_ZERO_SINCE=0        # epoch when fleet delivery first hit ~zero, 0 = delivering
 FLEET_DOWN=0              # 1 once the fleet-down condition has been declared
-FLEET_STAGE=0             # escalation stage reached: 1=restart-all 2=iface bounce 3=nagging
+FLEET_STAGE=0             # escalation stage reached: 1=restart-all 2=driver reload 3=reboot
 FLEET_LAST_NAG=0
-iface_bounce(){
-  # The 33h outage was a soft bcmgenet TX wedge that a reboot cleared. A link bounce may clear it
-  # without one — worth trying before giving up. Needs root; the service runs as askjitk, so this
-  # goes through sudo -n and says so plainly when it cannot.
-  if [ "$FLEET_IFACE_BOUNCE" != 1 ]; then
-    say "FLEET: interface bounce disabled (RELAY_FLEET_IFACE_BOUNCE=0) — skipping."
-    return 1
+FLEET_LAST_REBOOT=0       # epoch of the last reboot ATTEMPT (survives the reboot itself)
+
+fleet_state_save(){
+  printf '%s %s %s %s\n' "$FLEET_STAGE" "$FLEET_ZERO_SINCE" "$(date +%s)" "$FLEET_LAST_REBOOT" \
+    > "$FLEET_STATE" 2>/dev/null || true
+}
+fleet_state_load(){
+  [ -r "$FLEET_STATE" ] || return 0
+  local st zs wr rb now age
+  read -r st zs wr rb < "$FLEET_STATE" 2>/dev/null || return 0
+  now=$(date +%s); age=$(( now - ${wr:-0} ))
+  # The reboot timestamp is kept even when the rest expires: the "no reboot in the last hour" gate
+  # is about the machine, not about this incident.
+  FLEET_LAST_REBOOT=${rb:-0}
+  if [ "${wr:-0}" -gt 0 ] && [ "$age" -le "$FLEET_STATE_TTL" ] && [ "${st:-0}" -gt 0 ]; then
+    FLEET_STAGE=${st:-0}; FLEET_ZERO_SINCE=${zs:-0}
+    [ "$FLEET_ZERO_SINCE" -gt 0 ] && FLEET_DOWN=1
+    say "FLEET: resuming escalation at stage ${FLEET_STAGE} from ${FLEET_STATE} (written ${age}s ago)."
+    say "  The supervisor restarted mid-incident; without this the ladder would start at stage 1 again."
   fi
-  say "FLEET: bouncing ${IFACE} (down/up) to clear a possible NIC TX wedge."
+}
+fleet_state_load
+tx_packets(){ cat "/sys/class/net/${IFACE}/statistics/tx_packets" 2>/dev/null || echo 0; }
+
+# THE INTERFACE BOUNCE DOES NOT WORK ON THIS FAULT. Kept only because it is cheap and harmless to
+# try; it is no longer a rung on the ladder.
+#   `ip link set eth0 down` returns "RTNETLINK answers: Connection timed out" on a wedged bcmgenet
+#   PHY. Verified twice: 2026-08-01 and 2026-08-04. The command cannot reach the hardware, so it
+#   cannot fix the hardware.
+iface_bounce(){
+  if [ "$FLEET_IFACE_BOUNCE" != 1 ]; then return 1; fi
+  say "FLEET: trying a ${IFACE} link bounce (cheap, but has never cleared this fault)."
   if timeout "$CALL_TIMEOUT" sudo -n ip link set "$IFACE" down 2>/dev/null \
      && sleep 2 && timeout "$CALL_TIMEOUT" sudo -n ip link set "$IFACE" up 2>/dev/null; then
-    say "FLEET: ${IFACE} bounced; waiting 10s for the link to come back."
-    sleep 10
+    sleep 10; return 0
+  fi
+  say "FLEET: link bounce failed (expected on a wedged PHY: 'RTNETLINK answers: Connection timed out')."
+  return 1
+}
+
+# STAGE 2 — RELOAD THE NIC DRIVER.
+# The onboard Pi NIC (bcmgenet) stops transmitting silently. THERE IS NO SOFTWARE SIGNAL FOR THIS
+# BEYOND tx_packets NOT ADVANCING: dmesg shows nothing at all from the wedge — no error, no timeout,
+# no reset, nothing but ordinary post-boot lines. The driver does not know it has failed, so nothing
+# logs it and nothing traps. That is why this ladder tests tx_packets directly rather than waiting
+# for an error that never comes.
+#
+# Unloading and reloading the module re-initialises the controller, which a link bounce cannot do
+# because the bounce never reaches the wedged hardware.
+driver_reload(){
+  local before after
+  before=$(tx_packets)
+  say "FLEET recovery stage 2/3: reloading the ${IFACE} driver (modprobe -r ${NIC_MODULE}; modprobe ${NIC_MODULE})."
+  say "  tx_packets before: ${before}. dmesg carries NO signal for this fault, so this counter is the only test."
+  if ! timeout "$CALL_TIMEOUT" sudo -n modprobe -r "$NIC_MODULE" 2>/dev/null; then
+    say "FLEET: ERROR could not unload ${NIC_MODULE} — 'sudo -n modprobe' failed (no passwordless sudo?)."
+    say "  Add to sudoers:  askjitk ALL=(root) NOPASSWD: /usr/sbin/modprobe, /sbin/reboot"
+    return 1
+  fi
+  sleep 3
+  timeout "$CALL_TIMEOUT" sudo -n modprobe "$NIC_MODULE" 2>/dev/null || true
+  say "FLEET: ${NIC_MODULE} reloaded; waiting ${NIC_RELOAD_WAIT_S}s for the link and DHCP to settle."
+  sleep "$NIC_RELOAD_WAIT_S"
+  after=$(tx_packets)
+  if [ "$after" -gt "$before" ]; then
+    say "FLEET: tx_packets advanced ${before} -> ${after} — the NIC is transmitting again."
     return 0
   fi
-  say "FLEET: ERROR could not bounce ${IFACE} — 'sudo -n ip link' failed (no passwordless sudo?)."
-  say "  To enable this recovery add to sudoers:  askjitk ALL=(root) NOPASSWD: /usr/sbin/ip link set * up, /usr/sbin/ip link set * down"
-  say "  Until then a NIC TX wedge needs a manual reboot, which is what cost 33 hours."
+  say "FLEET: tx_packets did NOT advance (${before} -> ${after}) — the driver reload did not clear the wedge."
   return 1
+}
+
+# STAGE 3 — REBOOT, GATED.
+# A wedge that only a reboot clears must not need a human to notice it: today that cost 2 hours and
+# on 2026-08-01 it cost 33. But an ungated reboot on a persistent fault is a boot loop that destroys
+# more data than the wedge, so two conditions must BOTH hold.
+fleet_reboot(){
+  local now down_for since_reboot
+  now=$(date +%s)
+  down_for=$(( now - FLEET_ZERO_SINCE ))
+  since_reboot=$(( now - FLEET_LAST_REBOOT ))
+  if [ "$FLEET_REBOOT" != 1 ]; then
+    say "FLEET: reboot disabled (RELAY_FLEET_REBOOT=0) — stopping at stage 2. This needs a human."
+    return 1
+  fi
+  if [ "$down_for" -lt "$FLEET_REBOOT_MIN_DOWN_S" ]; then
+    say "FLEET: reboot gate CLOSED — fleet down ${down_for}s, needs ${FLEET_REBOOT_MIN_DOWN_S}s."
+    return 1
+  fi
+  if [ "$FLEET_LAST_REBOOT" -gt 0 ] && [ "$since_reboot" -lt "$FLEET_REBOOT_COOLDOWN_S" ]; then
+    say "FLEET: reboot gate CLOSED — last reboot attempt was ${since_reboot}s ago, cooldown is ${FLEET_REBOOT_COOLDOWN_S}s."
+    say "  Rebooting again now would be a loop. This fault needs a human, and probably the USB NIC."
+    return 1
+  fi
+  FLEET_LAST_REBOOT=$now
+  fleet_state_save                                  # RECORD BEFORE REBOOTING, or the cooldown is lost
+  sync
+  say "FLEET recovery stage 3/3: REBOOTING — down ${down_for}s, driver reload did not clear it."
+  say "  Gate satisfied: down >= ${FLEET_REBOOT_MIN_DOWN_S}s and no reboot attempt in ${FLEET_REBOOT_COOLDOWN_S}s."
+  if ! timeout "$CALL_TIMEOUT" sudo -n /sbin/reboot 2>/dev/null; then
+    say "FLEET: ERROR reboot failed — 'sudo -n /sbin/reboot' refused (no passwordless sudo?)."
+    say "  Add to sudoers:  askjitk ALL=(root) NOPASSWD: /usr/sbin/modprobe, /sbin/reboot"
+    return 1
+  fi
+  return 0
 }
 
 # ---------- soak loop ----------
@@ -543,25 +658,36 @@ while :; do
         say "  ${alive}/${NCH} ffmpeg alive, so this is NOT process death: the pipe is dead, not the processes."
         say "  This is the condition that went unnoticed for 33h on 2026-08-01."
       fi
-      # Escalate in order, one stage per pass, so each is given a chance to work before the next.
+      # Escalate in order, one stage per pass. The stage is SAVED after every change so a
+      # supervisor restart mid-incident resumes here instead of dropping back to stage 1 — the
+      # 2026-08-04 defect that kept this ladder pinned at stage 1 for two hours.
       case "$FLEET_STAGE" in
         0) say "FLEET recovery stage 1/3: restarting ALL ${NCH} ffmpeg."
            for ((k=0;k<NCH;k++)); do restart_stream "$k" "fleet-down stage 1: restart all"; done
-           FLEET_STAGE=1 ;;
-        1) say "FLEET recovery stage 2/3: still nothing after a full restart — bouncing the interface."
-           if iface_bounce; then
-             say "FLEET: link bounced; restarting all streams and re-testing."
-             for ((k=0;k<NCH;k++)); do restart_stream "$k" "fleet-down stage 2: post-bounce restart"; done
+           FLEET_STAGE=1; fleet_state_save ;;
+        1) say "FLEET recovery stage 2/3: a full restart changed nothing — the pipe is dead, not the processes."
+           iface_bounce || true          # cheap, and known not to work on this fault; never gates stage 2
+           if driver_reload; then
+             say "FLEET: driver reload restored transmission; restarting all streams and re-testing."
+             for ((k=0;k<NCH;k++)); do restart_stream "$k" "fleet-down stage 2: post-driver-reload restart"; done
            fi
-           FLEET_STAGE=2 ;;
+           FLEET_STAGE=2; fleet_state_save ;;
+        2) # Reboot, gated. fleet_reboot() refuses unless down long enough AND not rebooted recently.
+           if ! fleet_reboot; then
+             say "FLEET: stage 3 held — see the gate reason above. Will retry on the next pass."
+             # Stay at stage 2 so the gate is re-evaluated rather than falling through to nagging
+             # while the machine is still recoverable.
+             fleet_state_save
+           fi ;;
         *) # Nothing left to try automatically. Be unmissable rather than quiet.
            if [ $(( NOWS - FLEET_LAST_NAG )) -ge "$FLEET_NAG_S" ]; then
              FLEET_LAST_NAG=$NOWS
-             say "ERROR FLEET STILL DOWN after restart-all and interface bounce — ${ZERO_FOR}s with no delivery."
-             say "  ${alive}/${NCH} ffmpeg alive and delivering nothing. Likely a NIC TX wedge needing a reboot."
+             say "ERROR FLEET STILL DOWN after restart-all, driver reload and reboot — ${ZERO_FOR}s with no delivery."
+             say "  ${alive}/${NCH} ffmpeg alive and delivering nothing; tx_packets=$(tx_packets)."
              say "  uplink tx delta this interval: ${upl} Mbps; iface=${IFACE}"
+             say "  A reboot did not clear it. This is now a hardware call — see SITE_VISIT_REQUIRED.md (USB NIC)."
            fi
-           FLEET_STAGE=3 ;;
+           FLEET_STAGE=3; fleet_state_save ;;
       esac
     fi
   else
@@ -569,6 +695,9 @@ while :; do
       say "FLEET RECOVERED — delivery back to ${sumk}kbps after $(( NOWS - FLEET_ZERO_SINCE ))s down (reached stage ${FLEET_STAGE})."
     fi
     FLEET_ZERO_SINCE=0; FLEET_DOWN=0; FLEET_STAGE=0
+    # Clear the persisted stage on recovery. The reboot timestamp is deliberately KEPT (written by
+    # fleet_state_save) so the cooldown still applies to the next incident.
+    fleet_state_save
   fi
 
   # ---------- periodic channel re-resolve ----------
@@ -605,7 +734,7 @@ while :; do
   [ "$FLEET_ZERO_SINCE" != 0 ] && FLEET_DOWN_FOR=$(( NOWS - FLEET_ZERO_SINCE ))
   STATES_JSON="{"; for ((k=0;k<NCH;k++)); do STATES_JSON+="\"${CAMS[$k]}\":\"${STATE[$k]}\","; done
   STATES_JSON="${STATES_JSON%,}}"
-  payload="{\"sum_delivered_mbps\":${smbps},\"streams_alive\":${alive},\"streams_delivering\":${delivering},\"ff_cpu\":${cpu:-0},\"soc_temp\":${tp:-0},\"throttle_live\":\"${thr}\",\"mem_avail_mb\":${ma:-0},\"stall_restarts\":${STALL_RESTARTS:-0},\"per_stream\":${ps_json},\"fleet_down\":$([ "$FLEET_DOWN" = 1 ] && echo true || echo false),\"fleet_zero_for_s\":${FLEET_DOWN_FOR},\"fleet_stage\":${FLEET_STAGE},\"first_segment_est_s\":${FIRSTSEG_EST},\"grace_s\":$(grace_now),\"channel_source\":\"${CSRC}\",\"stream_states\":${STATES_JSON}}"
+  payload="{\"sum_delivered_mbps\":${smbps},\"streams_alive\":${alive},\"streams_delivering\":${delivering},\"ff_cpu\":${cpu:-0},\"soc_temp\":${tp:-0},\"throttle_live\":\"${thr}\",\"mem_avail_mb\":${ma:-0},\"stall_restarts\":${STALL_RESTARTS:-0},\"per_stream\":${ps_json},\"fleet_down\":$([ "$FLEET_DOWN" = 1 ] && echo true || echo false),\"fleet_zero_for_s\":${FLEET_DOWN_FOR},\"fleet_stage\":${FLEET_STAGE},\"tx_packets\":$(tx_packets),\"last_reboot_epoch\":${FLEET_LAST_REBOOT},\"first_segment_est_s\":${FIRSTSEG_EST},\"grace_s\":$(grace_now),\"channel_source\":\"${CSRC}\",\"stream_states\":${STATES_JSON}}"
   curl -s -o /dev/null --max-time 5 -X POST -H "Authorization: Bearer $GATEWAY_TOKEN" \
     -H "Content-Type: application/json" -d "$payload" "$CLOUD/api/gw/$GW/relay_status" 2>/dev/null || true
   prev_tx=$cur_tx; prev_sj=$cur_sj; prev_t=$now

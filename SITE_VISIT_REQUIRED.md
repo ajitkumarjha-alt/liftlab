@@ -1,11 +1,14 @@
-# Site visit required — three jobs that cannot be done remotely
+# Site visit required — four jobs that cannot be done remotely
 
 **For the facilities team. No software change can fix any of these; they all need someone at the
-building, with access to the lift cars.**
+building — three inside the lift cars, one in the comms room.**
 
 We have cameras watching seven lifts. They measure how long the doors take to close, how many people
-get on and off, and which floor the car stopped at. Three separate problems are currently limiting
-what we can report, and all three need physical work on site.
+get on and off, and which floor the car stopped at. Four separate problems are currently limiting
+what we can report, and all four need physical work on site.
+
+**One of them (Job 4) needs a part ordered before the visit** — a USB ethernet adapter, about the
+price of a phone charger.
 
 Rough total: **half a day**, plus about a week of waiting afterwards for fresh data to accumulate.
 
@@ -117,6 +120,41 @@ describes four lifts and is being read as if it describes the building.
 
 ---
 
+## Job 4 — Bring a USB ethernet adapter for the Raspberry Pi (hardware to buy)
+
+**This one needs a part ordering, not just a visit.**
+
+**What is wrong.** The small computer in the comms room (a Raspberry Pi) sends all the video to the
+cloud through its built-in network port. **Twice in the last four days that built-in port has
+silently stopped sending.** It does not report an error. It does not drop the network link. The
+computer still looks completely healthy from every angle — the only way to tell is to notice that
+the counter of packets sent has stopped moving.
+
+Both times, the only thing that fixed it was a physical reboot:
+
+* **1 August** — 33 hours of video lost before anyone noticed.
+* **4 August** — 2 hours lost.
+
+We have just rebuilt the automatic recovery so the system reloads the network driver and, failing
+that, reboots itself — so a repeat should cost minutes rather than hours. But that is damage
+control, not a cure. The port itself is the problem.
+
+**What to buy.** A **USB 3.0 gigabit ethernet adapter** — a small dongle, widely available, roughly
+the price of a phone charger. Any reputable brand is fine; there is nothing special about the
+requirement.
+
+**What to do on site.** Plug it into a blue (USB 3) port on the Pi and move the network cable from
+the built-in port to the dongle. We do the configuration remotely. **About 10 minutes**, and it can
+be done during the same visit as the other jobs.
+
+**Why it helps.** The dongle uses a completely different network chip and driver, bypassing the
+built-in controller that is failing. It is a cheap stopgap ahead of the planned move to newer
+hardware, and it removes the fault we cannot otherwise detect or prevent.
+
+**Blocks:** nothing outright — but it is the difference between "this recurs and costs us data
+every few days" and "this stops happening". Given it has happened twice in four days, treat it as
+worth doing at the next visit rather than waiting for the hardware refresh.
+
 ## Suggested order and combined visit
 
 All of this can be done in one visit:
@@ -126,9 +164,13 @@ All of this can be done in one visit:
 | 1 | Check camera view, re-aim if moved | lift 1 | 30 min |
 | 2 | Check the three cameras have a clear view | lifts 5, 6, 7 | 15 min |
 | 3 | Ride full height, both directions, many floors | lifts 2, 4, 5, 6, 7 | 75 min |
+| 4 | Fit the USB ethernet adapter on the Pi (bring the part) | comms room | 10 min |
 
-**Total on site: roughly 2 hours.** Then about a week of normal running for enough fresh data to
+**Total on site: roughly 2 hours 10 minutes.** Then about a week of normal running for enough fresh data to
 accumulate before the numbers are usable.
+
+**Job 4 needs a part ordered in advance** — without the adapter in hand that job cannot happen, so
+order it before booking the visit.
 
 If time is short, **Job 3 is the highest value** — it takes three lifts from no data at all to
 usable data, which changes what the study can say about the building as a whole.
@@ -138,5 +180,6 @@ usable data, which changes what the study can say about the building as a whole.
 * Confirmation of what you found on lift 1 — had the camera moved, or was the view already clear?
 * Rough times when you rode each lift, so we can find the right recordings.
 * Anything that stopped you completing a job, and which lift it was.
+* Whether the USB adapter was fitted, and which port it went into.
 
 Nothing needs to be labelled, configured or written down beyond that. The rest is ours.

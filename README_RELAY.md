@@ -94,17 +94,70 @@ reason 33 hours passed. New fields: `fleet_down` (explicit boolean), `fleet_zero
 Every state change logs a transition line, so the next incident is diagnosable from the journal
 alone.
 
-### The interface bounce needs sudo
-
-The service runs as `askjitk`; `ip link` needs root. Without a sudoers entry the bounce logs an
-ERROR naming the missing permission and escalates to stage 3, and a NIC wedge still needs a manual
-reboot. To enable it:
+### The escalation ladder (rewritten 2026-08-04)
 
 ```
+stage 1  restart all seven ffmpeg
+stage 2  reload the NIC driver: modprobe -r bcmgenet ; modprobe bcmgenet
+         verify recovery by tx_packets ADVANCING
+stage 3  reboot — gated: fleet down >= 15 min AND no reboot attempt in the last hour
+```
+
+**Two defects fixed, both of which cost real hours.**
+
+**1. The ladder could never reach stage 2.** On 2026-08-04 the watchdog fired correctly every ~6
+minutes for two hours and ran stage 1/3 *every time*. Stage 1 does not restart the supervisor — it
+restarts the ffmpeg children — but its seven kill+launch cycles over a wedged NIC push one loop
+iteration past `RELAY_LOOP_STALL_S` (120 s), so the **supervisor self-watchdog** declares the loop
+wedged and SIGKILLs it. systemd restarts it 15 s later with `FLEET_STAGE=0` and the ladder begins
+again at the bottom. Supervisor PIDs walked 1018884 → 1020675 → 1022463 → 1024258 → 1026086.
+
+The stage now lives on disk (`$RELAY_STATE_DIR/fleet_escalation`, default
+`/var/lib/liftlab-relay/`) and is re-read at startup, so escalation resumes wherever it got to
+regardless of *why* the supervisor died. `FLEET_ZERO_SINCE` is persisted with it, because the
+reboot gate needs the true outage length — a restart loop would otherwise keep the outage looking
+freshly started and the gate would never open either. State older than
+`RELAY_FLEET_STATE_TTL` (30 min) is discarded so a stale stage-3 cannot send a later, unrelated
+blip straight to a reboot.
+
+**2. Stage 2 was the wrong action.** `ip link set eth0 down` returns
+`RTNETLINK answers: Connection timed out` on a wedged bcmgenet PHY — verified 2026-08-01 and
+2026-08-04. The command cannot reach the hardware, so it cannot fix the hardware. The bounce is
+still attempted (cheap, harmless) but it no longer *gates* anything; stage 2 is now a driver
+reload, which re-initialises the controller.
+
+### There is NO software signal for this fault except tx_packets
+
+**`dmesg` shows nothing at all from the wedge** — no error, no timeout, no reset, nothing but
+ordinary post-boot lines. The driver does not know it has failed, so nothing logs it and nothing
+traps. Every recovery step is therefore verified by reading
+`/sys/class/net/<iface>/statistics/tx_packets` and checking it *advances*. Do not go looking for a
+kernel message to trigger on; there isn't one, and waiting for one is how 33 hours passed.
+
+`tx_packets` and `last_reboot_epoch` are now published in the heartbeat, so the ladder's position
+and the NIC's real state are visible from the cloud.
+
+### Why the reboot is gated
+
+A wedge that only a reboot clears must not need a human to notice it: on 2026-08-04 that cost 2
+hours and on 2026-08-01 it cost 33. But an ungated reboot on a *persistent* fault is a boot loop
+that destroys more data than the wedge. Both conditions must hold, and the reboot timestamp is
+written to disk **before** the reboot is issued — otherwise the cooldown is lost across the very
+reboot it is meant to limit.
+
+Knobs: `RELAY_FLEET_REBOOT=0` disables stage 3, `RELAY_FLEET_REBOOT_MIN_DOWN_S` (900),
+`RELAY_FLEET_REBOOT_COOLDOWN_S` (3600), `RELAY_NIC_MODULE` (bcmgenet).
+
+### Stages 2 and 3 need sudo
+
+The service runs as `askjitk`; `modprobe` and `reboot` need root. Without a sudoers entry each
+stage logs an ERROR naming the missing permission and the wedge still needs a manual reboot — which
+is exactly the failure this ladder exists to remove. Add:
+
+```
+askjitk ALL=(root) NOPASSWD: /usr/sbin/modprobe, /sbin/reboot
 askjitk ALL=(root) NOPASSWD: /usr/sbin/ip link set * up, /usr/sbin/ip link set * down
 ```
-
-Set `RELAY_FLEET_IFACE_BOUNCE=0` to disable the stage entirely.
 
 ## Remove the temporary drop-ins once this lands
 
