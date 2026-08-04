@@ -352,6 +352,47 @@ It is deliberately stored **outside** the `liftlab/gateway.db/` prefix Litestrea
 generation cleanup can reach it. This is a one-off flat file, not part of any chain — restore it by
 downloading and opening it directly.
 
+## Outcome — VERIFIED RESTORABLE (2026-08-04 14:07 UTC)
+
+Despite the livelock described below, the regeneration completed and the result was **proven by an
+actual restore**, not inferred:
+
+```
+generation 56539de99e6d45cb   snapshot 00000000.snapshot.lz4  70,521,124 B  12:19:25Z
+WAL chain  0x00000000 .. 0x00000056   87 indices, ZERO gaps
+old generation 1950dae6522690d2 : 0 objects (fully removed)
+```
+
+```
+litestream restore -> applied wal through index 87 -> 238,874,624 bytes
+PRAGMA integrity_check       : ok
+gw_door_event    490,156      (+8,774 vs the 12:03 fallback baseline)
+transit_event     26,659      (+566)
+worker_telemetry   1,010      (+807, all 7 cameras present)
+newest row       2026-08-04 14:06:55 UTC  — within ~1 min of the restore
+```
+
+The old failure mode was `missing initial wal segment`. The new chain starts at index 0 — the same
+index as the snapshot — and is contiguous, which is precisely what was broken before.
+
+**This restore was run from a workstation, not from the gateway**, using the released
+`litestream v0.3.13` binary against a two-line config pointing at the GCS replica, with local ADC for
+credentials. That is worth knowing: **restorability can be verified without touching the box**, and
+should be, because a restore run on the machine you are trying to protect is not a real drill.
+
+```yaml
+# ls.yml — enough to verify a restore from anywhere with read access to the bucket
+dbs:
+  - path: /var/lib/liftlab/gateway.db     # the ORIGINAL path, used only as a key
+    replicas:
+      - type: gcs
+        bucket: liftlab-backup-lodha
+        path: liftlab/gateway.db
+```
+```
+litestream restore -config ls.yml -o /tmp/restored.db /var/lib/liftlab/gateway.db
+```
+
 ## Two things to know before running the regeneration again
 
 **1. The VM cannot write to GCS.** Its scopes are `devstorage.read_only`. Litestream writes using a
@@ -362,11 +403,22 @@ anything, because the upload gate precedes every destructive step.
 
 **2. Never delete the parent replica prefix — delete the specific generation.** The first working run
 issued `gcloud storage rm -r gs://.../liftlab/gateway.db`. That prefix is also where the *new*
-generation gets written. Litestream came back up, created generation `56539de99e6d45cb`, and started
-writing WAL into the very prefix the recursive delete was still walking — so the delete kept finding
-new objects to remove and **never converged**. It ran 100 minutes on ~14k objects and was still
-going, while saturating a 2-vCPU box enough to make SSH refuse connections.
+generation is written.
+
+*What actually happened, measured rather than assumed:* the delete enumerated the prefix **once**, at
+a moment when only the old generation existed, then worked through that fixed list. The new
+generation was created afterwards and so was never in the list. Sampling the new chain from GCS
+during the delete confirmed it: 87 → 90 WAL indices, **zero** indices lost, **zero** gaps, still
+anchored at index 0. My initial reading — that the delete was chasing Litestream's new writes in a
+livelock — was **wrong**. It was simply a slow recursive delete of ~14k objects over this box's
+flaky GCS link, with retries.
+
+It was still slow enough to matter: ~100 minutes, and enough CPU on a 2-vCPU box to make `sshd`
+refuse connections for roughly 40 minutes, which is why the run could not be supervised or cleanly
+aborted. And the design hazard is real even though it did not fire this time — had Litestream come
+back up *before* the enumeration finished, the new generation's objects would have been on the list.
 
 The script now takes the generation id *before* stopping Litestream, asserts Litestream actually
 stopped, deletes only `.../generations/<OLD_GEN_ID>/`, and bounds that delete with `timeout 600`.
-Leftover objects from an old generation are harmless junk; a livelock is not.
+Leftover objects from an old generation are harmless junk. A 100-minute delete that locks you out of
+the box is not — bounding it matters more than completing it.

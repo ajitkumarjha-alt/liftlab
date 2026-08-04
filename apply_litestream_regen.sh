@@ -90,14 +90,15 @@ systemctl stop litestream; sleep 2
   || { say "ABORT: litestream did not stop — a delete racing a live replica is what caused the livelock"; exit 1; }
 say "  litestream: $(systemctl is-active litestream)"
 
-# BUG FIXED 2026-08-04 (this cost a 100-minute livelock on the first run). Deleting the PARENT
-# prefix is wrong twice over:
-#   1. It targets gs://.../gateway.db, which is also where the NEW generation will be written. If
-#      litestream comes back up while the delete is still walking the prefix, the delete happily
-#      eats the new generation's WAL as fast as litestream writes it — and because litestream keeps
-#      producing objects, the recursive delete never converges. That is a livelock, not slowness:
-#      the first run ran 100 minutes on ~14k objects and was still going.
-#   2. It is unnecessary. Only the OLD generation is junk. Name it explicitly.
+# BUG FIXED 2026-08-04. Deleting the PARENT prefix is wrong twice over:
+#   1. It targets gs://.../gateway.db, which is also where the NEW generation gets written. On the
+#      first run this did NOT bite — the delete enumerated once, before the new generation existed,
+#      so the new chain was never on its list (verified from GCS: 87 -> 90 WAL indices during the
+#      delete, zero lost, zero gaps). But it is luck, not design: had litestream restarted before
+#      the enumeration finished, the new generation's objects would have been included.
+#   2. It is unnecessary and slow. ~14k objects took ~100 minutes over this box's flaky GCS link and
+#      consumed enough of a 2-vCPU box that sshd refused connections for ~40 minutes — so the run
+#      could not be supervised or aborted. Only the OLD generation is junk. Name it explicitly.
 OLD_GEN_ID=$(printf '%s' "$OLDGEN_RAW" | tr -d ' ')
 [ -n "$OLD_GEN_ID" ] || { say "no old generation to remove — starting litestream and continuing"; }
 if [ -n "$OLD_GEN_ID" ]; then
