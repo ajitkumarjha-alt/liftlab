@@ -342,3 +342,103 @@ Both would have produced false verdicts, and one had already fired:
    but uvicorn needs 8-35s to bind :9090. Probing early returns HTTP 000 in ~0.2ms, which the script
    scored as "still hanging" and rolled back a healthy deploy. Added a readiness gate on
    `/openapi.json`; the 000 branch now splits on elapsed time.
+
+---
+
+# Step 2 results (2026-08-04) — all three pieces built, acceptance NOT met
+
+**Deployed and live: (a) + (b). Rolled back: (c).** Live `dash_api.py` = `1fc1a9c5`.
+
+## The measurement that reframes step 2
+
+Windowing was expected to be the main lever. It is not, and the reason is the data shape:
+
+```
+gw_door_event spans 2026-07-20 .. 08-04 — about 15 days total
+  last 1d:   84,890      last 7d:  399,939
+  last 3d:  200,553      all:      459,436
+```
+
+**A 7-day window is 87% of the table.** And the sweep, run with (a) live, is unambiguous:
+
+```
+days=7    503 @ 35.3s      days=0.5   503 @ 25.5s
+days=3    503 @ 25.5s      days=0.25  503 @ 32.3s
+days=1    503 @ 36.7s      days=0.1   503 @ 25.5s
+```
+
+Shrinking the window **70x changed nothing**. So at that point the windowed reads were a negligible
+share of the cost, and the two unwindowed reads were essentially all of it.
+
+## Per piece
+
+**(a) window the era reads — DEPLOYED.** Pushed a `ts` floor into `_door_gpu_by_cam`, the `_tier2`
+main read, and `_door_transition_census`. `_tier2` previously took `t0/t1` and applied them by
+rebuilding the list *after* fetching everything — the exact materialise-then-slice removed here.
+Plans confirmed: `SEARCH gw_door_event USING INDEX ix_door_event (gateway_id=? AND cam=? AND ts>?)`
+— **the existing index already serves this shape; no new index needed.**
+Result: no measurable change on its own, for the reason above. It still earns its place: all-history
+grows without bound, a window does not.
+
+**(b) era census cached per (gw,cam) — DEPLOYED.** TTL 15m, single-flight, key space bounded at 32
+because `gw` is a path parameter (verified: 200 caller-supplied `gw` values -> 8 entries at a test
+bound of 8). Result: warm-census consecutive requests were still 503 @ 39.4 / 26.0 / 35.5 / 25.8s.
+
+**(c) alphabet on a schedule, persisted — BUILT, VERIFIED, ROLLED BACK.** The job itself works:
+
+```
+ch16: 49 floors from  19,425 rows  era=e79e50d3h2       13.26s
+ch27: 11 floors from  68,513 rows  era=425f92e1h2        9.02s
+ch29: 69 floors from 141,439 rows  era=260d4a0fh2Laa52  11.49s
+ch30:  6 floors from  17,884 rows  era=661a1fa0h2        1.76s
+                                          7 ok, 0 failed, 35.5s
+```
+
+A read never derives — `apply_gwalphabet.sh` refuses to install if `_tier2` still references
+`_derive_floor_alphabet`. Ordering is enforced: an empty table means `alphabet=None` = "accept all
+floors", a behaviour change, so the job runs and the table is verified populated *before* the new
+module is allowed to serve. Stored with `derived_at`, `evidence_rows`, `era`, `door_version`, and
+`/dash` surfaces `era_mismatch` when the alphabet's era differs from the metrics' era.
+
+Rolled back because the gate required at least one 200 in five and got **503 @ 25.3 / 30.5 / 30.0 /
+33.8 / 36.0s**.
+
+## Why the bar is still not met
+
+With the census and alphabet costs removed, the **windowed era reads became the bottleneck** — and
+the window barely bounds them, because 7 days is 87% of the data. Roughly 400k rows per request are
+still walked in Python for the flap/reopen state machine and the stops walk, which are sequential
+and do not reduce to SQL aggregates cleanly.
+
+## Options for the remaining gap — needs a decision, none taken
+
+1. **Precompute the per-camera aggregates on a schedule**, exactly the pattern (c) just proved:
+   `alphabet_job` did 7 cameras in 35.5s off the request path. Extending it to `door_gpu`/`tier2`
+   would take the whole walk off the request path and preserve every number. Largest change; most
+   likely to actually reach 2s.
+2. **Shorten the default window** to ~1-2 hours. Cheap, but it CHANGES WHAT THE NUMBERS MEAN — a
+   close-travel median over 2 hours is a different statistic from one over 7 days. A product call.
+3. **Raise the budget** and accept a slow-but-terminating page. Does not meet the 2s bar.
+
+## Acceptance
+
+| Criterion | State |
+|---|---|
+| `/dash/{gw}/data` under 2s | **NOT met** — 503 at the 25s budget |
+| RSS flat under sustained refresh | **met** (199 MB peak / 178 MB settled, 3 concurrent streams) |
+| Zero OOM kills over 24h | **on track** — none since 2026-08-03 18:00 (~10.5h at time of writing) |
+
+## Step 3 — held, and probably unnecessary
+
+`/ops` re-measured on a quiet gateway is **5.5s**, not the contaminated 14.1s. More importantly, the
+windowed `gw_door_event` queries now plan as `ix_door_event (gateway_id=? AND cam=? AND ts>?)` using
+the EXISTING index. Before running `apply_gwindex.sh`, re-measure `/ops` against 5.5s and check
+whether its floor-collapse queries still enter the index on `gateway_id` alone. Do not add write
+cost at ~3.5 writes/s for an index the query no longer needs.
+
+## Leftovers on the box
+
+`floor_alphabet` (7 rows) and `alphabet_job.py` remain installed but unused after the rollback.
+`liftlab-alphabet.timer` was **disabled** — my rollback path did not remove the timer it installed,
+so it would otherwise have kept running a 35s job every 30min for a table nothing reads. Re-enable
+with `systemctl enable --now liftlab-alphabet.timer` when (c) goes back in.
