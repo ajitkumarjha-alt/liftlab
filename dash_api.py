@@ -1070,6 +1070,97 @@ def _era_census(db, gw, cam):
         return v, t
 
 
+# ── floor alphabet: derived on a SCHEDULE, served from a table ─────────────────
+# The alphabet is deliberately ALL-ERA. Floors are physical: a template rebuild moves door_version
+# but not the building, and deriving admission from the current era alone made every young era start
+# floor-blind fleet-wide. So it cannot be windowed — but it was being re-derived from 247,019 rows
+# per request across cameras (ch29 alone: 141,430), which is the single largest cost on the page.
+#
+# THE RULE THAT MATTERS: a read NEVER triggers a derivation. `_alphabet_read` does a single indexed
+# lookup and returns whatever the table holds, even if it is hours stale or absent. If a read could
+# fall back to "just derive it now", the 140k-row walk would come straight back on the request path
+# under a new name, and with it the hang. Staleness is reported, never repaired inline.
+#
+# The stored row carries the era and door_version the derivation was computed under, so a consumer
+# can tell it was derived under a DIFFERENT instrument than the one it is now being applied to
+# rather than silently reading across an era boundary.
+_ALPHA_TABLE_READY = set()
+
+
+def _alphabet_table(db):
+    """Create the table once per connection-generation. Cheap: CREATE TABLE IF NOT EXISTS."""
+    db.execute("""CREATE TABLE IF NOT EXISTS floor_alphabet (
+        gateway_id TEXT, cam TEXT,
+        alphabet TEXT,              -- JSON list of admitted floor strings, or NULL for 'accept all'
+        detail TEXT,                -- JSON per-floor derivation detail (n, via, twin, anchored)
+        derived_at REAL,            -- epoch of the derivation
+        evidence_rows INTEGER,      -- how many floor-bearing rows it was derived from
+        era TEXT,                   -- the era resolved at derivation time
+        door_version TEXT,          -- the exact door_version of the newest evidence row
+        PRIMARY KEY (gateway_id, cam))""")
+
+
+def _alphabet_read(db, gw, cam):
+    """Serve the stored alphabet. NEVER derives. -> (alphabet:set|None, detail:dict, meta:dict)."""
+    try:
+        r = db.execute("SELECT alphabet, detail, derived_at, evidence_rows, era, door_version "
+                       "FROM floor_alphabet WHERE gateway_id=? AND cam=?", (gw, cam)).fetchone()
+    except sqlite3.OperationalError:
+        return None, {}, {"state": "no table — alphabet job has never run", "derived_at": None}
+    if not r:
+        return None, {}, {"state": "not yet derived — alphabet job has not covered this camera",
+                          "derived_at": None}
+    try:
+        alpha = json.loads(r["alphabet"]) if r["alphabet"] else None
+        detail = json.loads(r["detail"]) if r["detail"] else {}
+    except (ValueError, TypeError):
+        return None, {}, {"state": "stored alphabet unreadable", "derived_at": r["derived_at"]}
+    return (set(alpha) if alpha else None), detail, {
+        "state": "ok", "derived_at": r["derived_at"],
+        "age_s": (round(time.time() - r["derived_at"], 1) if r["derived_at"] else None),
+        "evidence_rows": r["evidence_rows"], "era": r["era"], "door_version": r["door_version"]}
+
+
+def alphabet_refresh(db, gw, cam):
+    """Derive and STORE. Call from the scheduler/CLI ONLY — never from a request handler.
+
+    Kept out of the read path on purpose: this is the 140k-row walk whose removal is the point of
+    the change. Returns the meta it wrote."""
+    _alphabet_table(db)
+    rows = _q(db, "SELECT ts, floor, reason, read_conf FROM gw_door_event "
+                  "WHERE gateway_id=? AND cam=? AND floor IS NOT NULL ORDER BY ts", (gw, cam))
+    derived, detail = _derive_floor_alphabet(rows, _labels_evidence(gw, cam))
+    dv = db.execute("SELECT door_version FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                    "AND door_version IS NOT NULL AND door_version<>'' AND ts IS NOT NULL "
+                    "ORDER BY ts DESC LIMIT 1", (gw, cam)).fetchone()
+    door_version = dv["door_version"] if dv else None
+    era = str(door_version or "").split("+")[0] or None
+    now = time.time()
+    db.execute("INSERT INTO floor_alphabet "
+               "(gateway_id,cam,alphabet,detail,derived_at,evidence_rows,era,door_version) "
+               "VALUES (?,?,?,?,?,?,?,?) "
+               "ON CONFLICT(gateway_id,cam) DO UPDATE SET "
+               "alphabet=excluded.alphabet, detail=excluded.detail, derived_at=excluded.derived_at, "
+               "evidence_rows=excluded.evidence_rows, era=excluded.era, "
+               "door_version=excluded.door_version",
+               (gw, cam, json.dumps(sorted(derived)) if derived else None,
+                json.dumps(detail), now, len(rows), era, door_version))
+    db.commit()
+    return {"gw": gw, "cam": cam, "n_admitted": len(derived or ()), "evidence_rows": len(rows),
+            "derived_at": now, "era": era, "door_version": door_version}
+
+
+def _age_phrase(ts):
+    if not ts:
+        return "never derived"
+    a = time.time() - ts
+    if a < 90:
+        return f"{a:.0f}s ago"
+    if a < 5400:
+        return f"{a/60:.0f}m ago"
+    return f"{a/3600:.1f}h ago"
+
+
 def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
     """Tier-2 for one camera, from the gw_door_event stream of ONE era.
 
@@ -1120,18 +1211,23 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
     # flip rules cap neighbour gaps at seconds, and an era change is a restart-sized gap. Labels
     # (labels.json) were always era-independent.
     manual = _floor_alphabet(cam)
-    # read_conf is REQUIRED by _derive_floor_alphabet (flip-kill mean-confidence, line ~802) — a
-    # sqlite3.Row raises IndexError on a missing column, and the 2026-07-29 all-era widening shipped
-    # without it, 500ing every dash_data call. Keep this SELECT in lockstep with the derivation.
-    alpha_rows = _q(db, "SELECT ts, floor, reason, read_conf FROM gw_door_event "
-                        "WHERE gateway_id=? AND cam=? AND floor IS NOT NULL ORDER BY ts", (gw, cam))
-    derived, alpha_detail = _derive_floor_alphabet(alpha_rows, _labels_evidence(gw, cam))
+    # READ ONLY. The derivation itself (the 140k-row all-era walk) belongs to alphabet_refresh(),
+    # which the scheduler runs off the request path. A stale table serves the read; it never
+    # triggers a recompute, because that is exactly how the hang would return under a new name.
+    derived, alpha_detail, alpha_meta = _alphabet_read(db, gw, cam)
     if manual is not None:
         alphabet, alpha_source = manual, "manual override (DASH_FLOOR_ALPHABET)"
     elif derived:
-        alphabet, alpha_source = derived, "derived from all-era evidence"
+        alphabet, alpha_source = derived, (
+            f"derived from all-era evidence ({alpha_meta.get('evidence_rows')} rows, era "
+            f"{alpha_meta.get('era')}, {_age_phrase(alpha_meta.get('derived_at'))})")
     else:
-        alphabet, alpha_source = None, "none (not enough evidence yet — accepting all)"
+        alphabet, alpha_source = None, f"none — {alpha_meta.get('state', 'unavailable')} (accepting all)"
+    # An alphabet derived under a DIFFERENT era than the one these metrics use is still valid
+    # evidence (floors are physical) but the mismatch is worth showing rather than hiding.
+    if alpha_meta.get("era") and era and alpha_meta["era"] != era:
+        alpha_meta = dict(alpha_meta, era_mismatch=(
+            f"alphabet derived under era {alpha_meta['era']}, metrics are era {era}"))
     conf = []
     for r in rows:
         if r["floor"] is None or r["reason"] not in DOOR_OK_REASONS:
@@ -1265,6 +1361,7 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
         "quality_reasons": list(DOOR_OK_REASONS),
         "floor_whitelist": (sorted(alphabet) if alphabet else None),
         "floor_alphabet_source": alpha_source,
+        "floor_alphabet_meta": alpha_meta,        # derived_at / age / evidence_rows / era — staleness visible
         "floor_alphabet_detail": [
             {"floor": f, "n": d["n"], "first": round(d["first"], 0), "last": round(d["last"], 0),
              "admitted": d["admitted"], "via": d["via"],
