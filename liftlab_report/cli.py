@@ -93,6 +93,8 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
     # OCCUPANCY: derived, reset at every idle gap, never presented as a measurement.
     occ = model.occupancy_periods(transits, stamps, validation, t0, t1)
     occ_summary = model.occupancy_summary(occ)
+    # The evidence table behind "per-floor is not viable yet". Shipped; the per-floor numbers are not.
+    attribution = model.cycle_attribution(gpu_cycles, transits, cams, t0, t1)
     coeff_blockers = model.coefficient_blockers(tier2_evidence, floor_speed, cams)
     profile = model.hourly_profile(transits, pi_cycles)
     fixed = model.parse_peak_window(peak_window)
@@ -219,6 +221,7 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         "floor_confidence": floor_conf,
         "tier2_evidence": tier2_evidence, "floor_speed": floor_speed,
         "per_floor_demand": per_floor, "occupancy": occ, "occupancy_summary": occ_summary,
+        "cycle_attribution": attribution,
         "coefficient_blockers": coeff_blockers,
         "analyzer_versions": analyzer_versions,
         "aggs": aggs, "transit_aggs": transit_aggs, "funnels": funnels,
@@ -265,6 +268,7 @@ def build_workbook(ctx):
     workbook.sheet_peak(wb, ctx, cd, anchors)
     workbook.sheet_raw(wb, ctx, anchors)
     workbook.sheet_coverage(wb, ctx, cd, anchors)
+    workbook.sheet_attribution(wb, ctx, anchors)
     workbook.sheet_tier2(wb, ctx, anchors)
     workbook.sheet_read_this_first(wb, ctx, anchors)
     wb.move_sheet("READ THIS FIRST", offset=-(len(wb.sheetnames) - 1))

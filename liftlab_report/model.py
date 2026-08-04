@@ -444,6 +444,66 @@ def direction_trustworthy(evidence: dict) -> dict[tuple, bool]:
     return out
 
 
+def cycle_attribution(cycles: list[dict], transits: list[dict], cams: list,
+                      t0: float, t1: float) -> dict[str, dict]:
+    """Per camera: can a crossing be attributed to a floor at all?
+
+    This is the evidence table behind "per-floor demand is not viable yet". It deliberately reports
+    the funnel rather than a single rate, because the two candidate blockers are distinguishable and
+    people keep reaching for the wrong one:
+
+        transits                    every crossing counted in the range
+        in_any_cycle                fell inside a DETECTED door cycle
+        in_cycle_with_floor         ...and that cycle carried a confident floor  <- the real ceiling
+        cycle_time_pct              how much of the range the doors were observably open
+
+    If in_any_cycle is low, the blocker is CYCLE DETECTION — the door engine never saw the opening
+    the passenger walked through. If in_any_cycle is high but in_cycle_with_floor is low, the
+    blocker is floor OCR. Measured 2026-08-04 it is emphatically the former: cycles cover
+    1.3-10.2% of wall time, so most crossings happen during openings that were never detected.
+    """
+    C: dict[str, list] = {}
+    T: dict[str, list] = {}
+    for c in cycles:
+        if t0 <= c["ts"] < t1 and not eras.in_gap(c["cam"], c["ts"]):
+            C.setdefault(c["cam"], []).append(c)
+    for t in transits:
+        if t0 <= t["ts"] < t1 and not eras.in_gap(t["cam"], t["ts"]):
+            T.setdefault(t["cam"], []).append(t)
+
+    out: dict[str, dict] = {}
+    for cam in sorted(set(cams) | set(C) | set(T)):
+        cs = sorted(C.get(cam, []), key=lambda c: c["ts"])
+        ts = sorted(T.get(cam, []), key=lambda t: t["ts"])
+        cover = sum(max(0.0, (c.get("close_ts") or c["ts"]) - c["ts"]) for c in cs)
+        in_any = in_floor = 0
+        i = 0
+        for t in ts:
+            while i < len(cs) and (cs[i].get("close_ts") or cs[i]["ts"]) < t["ts"]:
+                i += 1
+            j = i
+            while j < len(cs) and cs[j]["ts"] <= t["ts"]:
+                if (cs[j].get("close_ts") or cs[j]["ts"]) >= t["ts"]:
+                    in_any += 1
+                    if cs[j].get("floor") is not None:
+                        in_floor += 1
+                    break
+                j += 1
+        span = max(1.0, t1 - t0 - eras.gap_overlap_s(cam, t0, t1))
+        n_t = len(ts)
+        out[cam] = {
+            "cycles": len(cs), "transits": n_t,
+            "in_any_cycle": in_any, "in_cycle_with_floor": in_floor,
+            "pct_in_any": (100.0 * in_any / n_t) if n_t else None,
+            "pct_with_floor": (100.0 * in_floor / n_t) if n_t else None,
+            "cycle_time_s": round(cover), "cycle_time_pct": 100.0 * cover / span,
+            "blocker": ("no door calibration — zero cycles" if not cs else
+                        "floor OCR" if (in_any and in_floor / max(1, in_any) < 0.5) else
+                        "cycle detection"),
+        }
+    return out
+
+
 # Idle gap that ends a cabin-active period. Occupancy is only meaningful WITHIN a run of activity;
 # carrying a running total across a quiet night accumulates every counting error in between.
 OCCUPANCY_IDLE_GAP_S = 600.0

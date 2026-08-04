@@ -137,6 +137,40 @@ ordered `liftlab-precompute` job.
 
 ---
 
+# Occupancy — computed, measured, and deliberately NOT shipped (2026-08-04)
+
+Recorded so it is not re-attempted from scratch.
+
+`model.occupancy_periods()` exists and is correct: cumulative boarded-minus-alighted, **reset at
+every idle gap** (default 10 min) and at every `counting_version` change, reporting per period the
+camera's precision, the crossings accumulated, and an implied error bound. Negative values are
+recorded via `went_negative` / `min_raw` and clamped only for display.
+
+**It is not rendered anywhere, because of what it measures:**
+
+```
+569 periods over 7 days.  242 went NEGATIVE (42.5%).  Worst raw value: -24 (ch27)
+
+ch29 116 periods / 65 negative      ch27  81 / 47
+ch16  90 periods / 35 negative      ch30  75 / 28
+```
+
+A negative occupancy is proof the derivation broke — more people left the car than entered it. At
+**42.5 %** that is not an edge case to footnote, it is the typical outcome. The clamp would be
+hiding a broken result more often than a rounding artefact.
+
+The root cause is not a bug in the derivation: the system counts **door crossings, not occupancy**,
+at 83–95 % per-camera precision, and the estimate is a *difference* of two error-prone counts, so
+the errors add rather than cancel. Resetting at idle gaps bounds the drift; it does not fix the
+arithmetic.
+
+**Do not ship an occupancy figure until crossings are materially more accurate.** The FLOOR
+ATTRIBUTION sheet carries the finding (the 42.5 % rate) so the rejection is visible in the
+workbook without any occupancy number appearing in it.
+
+
+---
+
 # Verification gates — the pattern that cost four incidents
 
 Four failures in one week, all the same shape: **the gate proved something adjacent to what

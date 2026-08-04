@@ -1722,6 +1722,101 @@ def sheet_coverage(wb, ctx, cd, anchors):
 
 # ── TIER-2 EVIDENCE ───────────────────────────────────────────────────────────
 
+def sheet_attribution(wb, ctx, anchors):
+    """FLOOR ATTRIBUTION — why per-floor demand is not in this workbook, and what would fix it.
+
+    Ships the evidence, not the per-floor table. A per-floor breakdown built on ~10% of crossings
+    would be read as THE floor distribution; it is the distribution of the tenth that happened to
+    coincide with a detected, floor-read door cycle, which is a biased sample of the longer and
+    cleaner stops."""
+    att = ctx.get("cycle_attribution") or {}
+    if not att:
+        return
+    ws = wb.create_sheet("FLOOR ATTRIBUTION")
+    row = title(ws, "Floor attribution — why per-floor demand is not reported")
+    row += 1
+    cell(ws, row, 1,
+         "A crossing can only be given a floor if it happened inside a door cycle the engine "
+         "DETECTED, and that cycle carried a confident floor read. Those are two different gates, "
+         "and the funnel below separates them because people keep reaching for the wrong one. "
+         "The blocker here is CYCLE DETECTION, not floor OCR: door cycles cover a few per cent of "
+         "wall time, so most passengers cross during openings the door engine never saw.",
+         font=BODY_ITALIC, wrap=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+    ws.row_dimensions[row].height = 58
+    row += 2
+
+    hdr_row = row
+    row = header_row(ws, row, ["channel", "door cycles", "transits", "in a detected cycle",
+                               "…and it had a floor", "attributable %", "doors open, % of range",
+                               "blocker"])
+    first = row
+    for cam in sorted(att):
+        d = att[cam]
+        cell(ws, row, 1, _lbl(ws, cam))
+        cell(ws, row, 2, d["cycles"], F_INT, fill=FILL_NA if not d["cycles"] else None)
+        cell(ws, row, 3, d["transits"], F_INT)
+        cell(ws, row, 4, d["in_any_cycle"], F_INT)
+        cell(ws, row, 5, d["in_cycle_with_floor"], F_INT)
+        cell(ws, row, 6, (d["pct_with_floor"] or 0) / 100.0, F_PCT,
+             fill=FILL_WARN if (d["pct_with_floor"] or 0) < 50 else None)
+        cell(ws, row, 7, (d["cycle_time_pct"] or 0) / 100.0, F_PCT)
+        cell(ws, row, 8, d["blocker"], wrap=True,
+             fill=FILL_NA if d["cycles"] == 0 else None)
+        row += 1
+    anchors["attribution_table"] = ("FLOOR ATTRIBUTION", _rng(first, max(first, row - 1), 8))
+    row += 1
+
+    zero = sorted(c for c, d in att.items() if d["cycles"] == 0)
+    if zero:
+        cell(ws, row, 1,
+             f"{', '.join(_lbl(ws, c) for c in zero)} produced ZERO door cycles in this range — "
+             "they have never been door-calibrated, so they contribute no door timing, no floors "
+             "and no per-floor demand at all. That is a setup gap, not a measurement result.",
+             font=BODY_BOLD, wrap=True, fill=FILL_NA)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        ws.row_dimensions[row].height = 44
+        row += 2
+
+    row = section(ws, row, "WHAT WOULD MAKE PER-FLOOR VIABLE")
+    for line in (
+        "1. More door cycles DETECTED. The ceiling on attributable crossings is the share of "
+        "passenger traffic that happens inside an observed door cycle, and that is currently a "
+        "few per cent of wall time. Improving floor OCR does not move this.",
+        "2. Door calibration on the cameras with zero cycles, so they enter the funnel at all.",
+        "3. Only then does floor-read rate become the binding constraint — and on the cameras that "
+        "do produce cycles it is already the smaller of the two problems.",
+    ):
+        cell(ws, row, 1, line, wrap=True)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        ws.row_dimensions[row].height = 34
+        row += 1
+    row += 1
+
+    # Occupancy: ship the FINDING, never the numbers.
+    osum = ctx.get("occupancy_summary") or {}
+    if osum.get("n_periods"):
+        row = section(ws, row, "ESTIMATED OCCUPANCY — NOT REPORTED, AND WHY")
+        cell(ws, row, 1,
+             f"Cumulative boarded-minus-alighted was computed and DELIBERATELY NOT SHIPPED. Reset "
+             f"at every idle gap and every counting-version change, it still went NEGATIVE in "
+             f"{osum['n_went_negative']} of {osum['n_periods']} periods "
+             f"({osum['pct_negative']:.1f}%). A negative occupancy is proof the derivation broke — "
+             f"more people left the car than entered it. At this rate that is not an edge case to "
+             f"footnote, it is the typical outcome, so no occupancy figure appears in this "
+             f"workbook. The system counts door crossings; it does not measure how many people "
+             f"are in a lift.", font=BODY_BOLD, wrap=True, fill=FILL_WARN)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        ws.row_dimensions[row].height = 76
+        row += 1
+        anchors["occupancy_rejected"] = ("FLOOR ATTRIBUTION", f"A{row - 1}")
+
+    style.set_widths(ws, {1: 20, 2: 13, 3: 11, 4: 19, 5: 20, 6: 15, 7: 21, 8: 30})
+    freeze_below(ws, hdr_row)
+    style.print_setup(ws, repeat_row=hdr_row)
+    return ws
+
+
 def sheet_tier2(wb, ctx, anchors):
     """TIER-2 EVIDENCE — what floor attribution actually produced, and what each floor-dependent
     coefficient is really blocked on.
