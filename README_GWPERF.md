@@ -422,3 +422,72 @@ The script now takes the generation id *before* stopping Litestream, asserts Lit
 stopped, deletes only `.../generations/<OLD_GEN_ID>/`, and bounds that delete with `timeout 600`.
 Leftover objects from an old generation are harmless junk. A 100-minute delete that locks you out of
 the box is not — bounding it matters more than completing it.
+
+---
+
+# /reports on the e2-small — MEASURED, AND IT DOES NOT FIT (2026-08-04)
+
+**Verdict: the gateway cannot carry an export alongside the seven live streams. The button was
+built, deployed, measured, and then UNMOUNTED. Exports belong on dev-box.**
+
+The design did everything it was supposed to — niced child process, one at a time, never on the
+request path — and it still is not enough, because the constraint is CPU on a 2-vCPU box, not
+architecture.
+
+## The measurement
+
+Baseline, box quiet (a first attempt was thrown away: its baseline was taken while the box was still
+at load 7 from gate runs, which would have handed /ops a 36s allowance and produced a meaningless
+pass):
+
+```
+/dash/site-A/data : 0.75  0.98  0.73  1.05  1.47      worst 1.47s
+/ops/site-A/data  : 6.75  5.53  7.24  5.96  6.24      worst 7.24s
+```
+
+During a 30-day export (job niced at 10, in its own process):
+
+```
+/dash/site-A/data : 0.95  1.28  0.98  1.26  3.50      worst 3.50s   (2.4x baseline)
+/ops/site-A/data  : 18.01 8.75  6.99  26.29 8.49      worst 26.29s  (3.6x baseline)
+```
+
+**/ops degraded to 26.3 seconds.** That is a page an operator uses, made unusable for the duration.
+
+**/dash "passed" only against the lenient 3x rule in the harness.** Measured against this project's
+own stated /dash bar — under 2 seconds — its 3.50s spike is a breach too. Two different thresholds,
+same conclusion; the 3x rule was mine and it was too generous.
+
+## Throughput, for scale
+
+| range | wall clock on the e2-small | locally, for comparison | rows |
+|---|---:|---:|---:|
+| 7 days | **426 s** (7:06) | 41 s | 18,188 transits |
+| 30 days (all history) | **579 s** (9:39) | 55 s | 22,630 transits |
+
+Roughly **10x slower** than a workstation. Peak worker RSS 254-394 MB against 898 MB available, so
+**memory was never the problem** — the box has the RAM and lacks the CPU.
+
+## What was proven before the bar failed
+
+Not wasted: the mechanism is sound and all of it is reusable on dev-box.
+
+* submit -> poll -> download -> **workbook opens** (13 sheets, 2.7 MB for 7 days)
+* one job at a time held under load: `running=1, queued=3` at the cap, 6th submission -> HTTP 429
+* worker observed at `nice 10`, in its own session, RSS its own
+* static-copy db md5 **unchanged** by a full export; `query_only=1` and sqlite refused a write
+* broken DB -> job `failed` carrying its real error text, never a hang
+* output dir 0750, workbook 0640
+
+Not reached before the run was stopped: era-straddling build, empty range, kill-mid-run, retention
+sweep, unauthenticated download. The run was halted deliberately — each remaining queued export
+would have degraded /ops for another seven minutes to test something unrelated to the bar.
+
+## Current state
+
+`/reports` is **unmounted** (404). `reports_api.py`, `report_runner.py`, the `liftlab_report`
+package and openpyxl remain installed, and `main.py` is backed up either side of the change. Bringing
+it back is two lines in `main.py`; the reason not to is above, not in the code.
+
+**The fallback is dev-box**, which is where this should go: same code, same gate, no live streams to
+starve. Nothing about the module is gateway-specific except the `GATEWAY_DB` path it reads.
