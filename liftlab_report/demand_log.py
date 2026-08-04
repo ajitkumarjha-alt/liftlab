@@ -41,12 +41,8 @@ from . import eras, reader
 DARK = "—"                      # observed nothing. NOT zero.
 FLEET = "FLEET"
 
-# The door engine treats both of these as a confident floor read (gpu_door / dash_api
-# DOOR_OK_REASONS). reader.fetch_floor_read_status uses a NARROWER definition ('' or 'ok' only),
-# which currently scores every camera at zero confident reads because the engine actually emits
-# 'single_panel'. The floor note below states which definition it used so the two cannot be
-# silently confused.
-FLOOR_OK_REASONS = ("ok", "single_panel")
+# Single source of truth — see eras.FLOOR_OK_REASONS for what single_panel means and why it counts.
+FLOOR_OK_REASONS = tuple(r for r in eras.FLOOR_OK_REASONS if r)
 
 
 def _hour_floor(ts: float) -> datetime:

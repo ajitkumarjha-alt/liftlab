@@ -71,6 +71,9 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         # confident read so the "why there is no per-floor table" line is measured, not asserted.
         floor_conf = reader.fetch_floor_confidence(db, gw, t0, t1,
                                                    demand_log.FLOOR_OK_REASONS)
+        # TIER-2 evidence: per camera PER ERA, plus the confident reads the speed walk needs.
+        tier2_evidence = reader.fetch_tier2_evidence(db, gw, t0, t1)
+        confident_reads = reader.fetch_confident_reads(db, gw, t0, t1)
     finally:
         db.close()
 
@@ -83,6 +86,8 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
     dlog = demand_log.build(transits, cov_buckets, stamps, validation, cams, t0, t1,
                             reader.BUCKET_S)
     dlog_floor_note = demand_log.floor_attribution_note(floor_conf)
+    floor_speed = model.floor_speed_segments(confident_reads)
+    coeff_blockers = model.coefficient_blockers(tier2_evidence, floor_speed, cams)
     profile = model.hourly_profile(transits, pi_cycles)
     fixed = model.parse_peak_window(peak_window)
     peaks = model.peak_by_day(transits, pi_cycles, t0, t1, fixed)
@@ -206,6 +211,8 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         "validation": validation, "registry": registry,
         "demand_log": dlog, "demand_log_floor_note": dlog_floor_note,
         "floor_confidence": floor_conf,
+        "tier2_evidence": tier2_evidence, "floor_speed": floor_speed,
+        "coefficient_blockers": coeff_blockers,
         "analyzer_versions": analyzer_versions,
         "aggs": aggs, "transit_aggs": transit_aggs, "funnels": funnels,
         "boundaries": boundaries, "profile": profile, "peaks": peaks,

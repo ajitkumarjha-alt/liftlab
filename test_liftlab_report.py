@@ -1122,19 +1122,83 @@ def test_coefficient_scope_table_covers_all_eight_with_status(fixture_db):
 
 
 def test_scope_status_tracks_the_data_not_a_hardcoded_table(fixture_db):
-    """Floor-dependent coefficients are BLOCKED only while floor reads are."""
+    """C17/C18/C21/C22 stay BLOCKED, but each must name its OWN actual blocker.
+
+    Rewritten 2026-08-04. The old version asserted that blinding floor_status put
+    '0 confident reads' into every one of the four reasons — which passed only because the reason
+    was HARDCODED to the same string for all four. Floor attribution is not the blocker for
+    C21/C22 at all, so that assertion was locking in the wrong explanation."""
     ctx = _demand_ctx(fixture_db)
-    blinded = dict(ctx)
-    blinded["floor_status"] = {c: dict(d, confident=0)
-                               for c, d in ctx["floor_status"].items()}
-    scope = {c["id"]: c for c in narrative.coefficient_scope(blinded)}
+    scope = {c["id"]: c for c in narrative.coefficient_scope(ctx)}
     for cid in ("C17", "C18", "C21", "C22"):
         assert scope[cid]["status"] == "BLOCKED"
-        assert "0 confident reads" in scope[cid]["status_why"]
+        assert scope[cid]["status_why"], f"{cid} has no stated blocker"
+    # C21/C22 are blocked by a MISSING PARAMETER, C17/C18 by direction + segmentation. If these
+    # two reasons are ever identical again, the per-coefficient derivation has been lost.
+    assert scope["C21"]["status_why"] == scope["C22"]["status_why"]
+    assert scope["C17"]["status_why"] == scope["C18"]["status_why"]
+    assert scope["C21"]["status_why"] != scope["C17"]["status_why"], \
+        "C21/C22 and C17/C18 must not share one blocker — that was the hardcoded bug"
+    assert "rated speed" in scope["C21"]["status_why"]
+    assert "floor attribution" not in scope["C21"]["status_why"].lower()
     # C27 tracks whether closes were actually measured
     empty = dict(ctx, aggs={})
     assert {c["id"]: c for c in narrative.coefficient_scope(empty)
             }["C27"]["status"] == "NOT MEASURED"
+
+
+def test_single_panel_reads_count_as_confident(fixture_db):
+    """The bug this whole rewrite came from: reason='single_panel' is a good read from the one
+    calibrated panel. Scoring it non-confident reported cameras holding tens of thousands of
+    reads as floor-blind."""
+    assert "single_panel" in eras.FLOOR_OK_REASONS
+    db = reader.open_ro(fixture_db)
+    try:
+        t0, t1 = _ts("2026-07-14T00:00:00"), _ts("2026-08-02T00:00:00")
+        status = reader.fetch_floor_read_status(db, "site-A", t0, t1)
+        ev = reader.fetch_tier2_evidence(db, "site-A", t0, t1)
+    finally:
+        db.close()
+    # the per-era evidence must agree with the per-camera census on confident totals
+    per_cam = {}
+    for (cam, _era), d in ev.items():
+        per_cam[cam] = per_cam.get(cam, 0) + d["confident"]
+    for cam, d in status.items():
+        assert d["confident"] == per_cam.get(cam, 0), cam
+
+
+def test_tier2_evidence_is_split_per_era(fixture_db):
+    """A rebuild is a different instrument. A per-camera total would hide a camera that lost
+    floor reading at a rebuild behind its own earlier history (ch16: 19,424 -> 1 on live data)."""
+    db = reader.open_ro(fixture_db)
+    try:
+        ev = reader.fetch_tier2_evidence(db, "site-A",
+                                         _ts("2026-07-14T00:00:00"), _ts("2026-08-02T00:00:00"))
+    finally:
+        db.close()
+    assert ev, "no tier-2 evidence produced"
+    for key, d in ev.items():
+        assert isinstance(key, tuple) and len(key) == 2, key
+        assert d["rows"] >= d["confident"] >= 0
+        assert sum(d["arrow"].values()) <= d["confident"]
+
+
+def test_floor_speed_is_floors_per_second_not_a_speed_factor(fixture_db):
+    """C21/C22 need a share of RATED speed. Nothing here may imply we have that."""
+    db = reader.open_ro(fixture_db)
+    try:
+        reads = reader.fetch_confident_reads(db, "site-A",
+                                             _ts("2026-07-14T00:00:00"),
+                                             _ts("2026-08-02T00:00:00"))
+    finally:
+        db.close()
+    speed = model.floor_speed_segments(reads)
+    for _key, v in speed.items():
+        for fps in v["up"] + v["down"]:
+            assert 0 < fps <= eras.MAX_FLOORS_PER_S, fps
+    blockers = model.coefficient_blockers({}, speed, ["ch16"])
+    assert blockers["C21"]["measurable_as"].startswith("floors per second")
+    assert "not a speed factor" in blockers["C21"]["measurable_as"]
 
 
 def test_demand_assumption_is_tracked_and_names_its_blocker(fixture_db):
@@ -1336,7 +1400,7 @@ def test_sheets_are_frozen_and_the_raw_sheet_filters(fixture_db):
     t0, t1 = _ts("2026-07-22T00:00:00"), _ts("2026-07-26T00:00:00")
     wb = cli.build_workbook(cli.build_context(fixture_db, "site-A", t0, t1))
     assert wb["RAW"].auto_filter.ref, "RAW has no autofilter"
-    for name in ("SUMMARY", "RAW", "PER-LIFT", "TIER-2 BLOCKED"):
+    for name in ("SUMMARY", "RAW", "PER-LIFT", "TIER-2 EVIDENCE"):
         assert wb[name].freeze_panes, f"{name} has no frozen header"
     for name in ("SUMMARY", "RAW", "PER-LIFT"):
         assert wb[name].page_setup.orientation == "landscape"

@@ -139,7 +139,7 @@ Two guards follow from it, both reported rather than applied silently:
 | **PEAK ANALYSIS** | Per day: worst 5-min boarding window (or the fixed window), peak:average ratio, peak-demand % when `--population` given; coefficients inside peak windows vs all-day, per era. |
 | **RAW** | Row-level era-tagged export — the audit trail. Every row carries instrument, counting_version, era, precision-at-time, and an in-declared-gap flag. |
 | **COVERAGE & ERAS** | Boundaries crossed with row counts each side, gap windows excluded, per-channel coverage % and row counts by era. A channel with zero rows is listed, not omitted. |
-| **TIER-2 BLOCKED** | Floor-attribution status per channel (confident / no_read / ambiguous / invalid, glyphs seen) — documents why C21/C22 remain unmeasurable. |
+| **TIER-2 EVIDENCE** | Floor attribution as it really is. Read quality per camera **per era** (a rebuild is a different instrument); floors-per-second between consecutive confident reads with n; the arrow-direction distribution; and a verdict per coefficient naming **its own** blocker. Was titled TIER-2 BLOCKED and reported zero confident reads fleet-wide — see the correction below. |
 
 Charts are native Excel charts. Every one gets visible tick labels on **both**
 axes with an explicit number format, horizontal gridlines (vertical off), a
@@ -198,6 +198,56 @@ explicitly scoped.
   1", the gateway calls it ch16. The channel is appended on each lift's first
   mention per sheet ("lift 1 (ch16)"), and an unnamed lift is marked as such
   rather than given an invented name from its channel number.
+
+## ⚠ Correction (2026-08-04): the Tier-2 sheet was reporting zero confident reads
+
+**The headline verdict did not change — C17, C18, C21 and C22 remain unmeasurable — but almost
+everything the workbook said *about why* was wrong.**
+
+`fetch_floor_read_status()` counted a read as confident only when `reason` was `''` or `'ok'`. The
+door engine emits `ok` when **two** panels agree, and `single_panel` when only one panel is
+calibrated and that panel read successfully. A single-panel camera therefore emits `single_panel`
+for **every good read it will ever produce** and never `ok`. Scoring those as non-confident reported
+the entire fleet as floor-blind while ch27/ch29/ch30 held roughly 150,000 confident reads between
+them. `dash_api.DOOR_OK_REASONS` and `door_event_api.py` already used the wider set; this module was
+the outlier. The definition now lives once, in `eras.FLOOR_OK_REASONS`.
+
+`single_panel` is a read that passed the same per-panel bar as each half of an `ok`; what it lacks is
+the cross-check, not quality. The residual risk is real and is stated on the sheet: a single panel
+cannot catch a **systematic** misread, which is what the derived floor alphabet defends against.
+
+### The verdicts were hardcoded, and one comment said the opposite
+
+`model.py` emitted `"not measurable — needs floor attribution"` and `narrative.py` set `BLOCKED`
+for all four coefficients unconditionally, regardless of the data. Meanwhile `eras.py` claimed the
+status was *"computed per run from the data, never declared, so the table cannot drift"* — true of
+the other four coefficients, false of these. Both are fixed: blockers are now derived by
+`model.coefficient_blockers()` and each coefficient names what actually stops it.
+
+### What actually blocks each one
+
+* **C21 / C22 (speed factors).** Floor attribution is **not** the blocker. Floors-per-second is
+  measured now, from consecutive confident reads, with thousands of segments per camera. But C21/C22
+  are a share of **rated speed**, and converting floors/s needs the inter-floor distance and the
+  car's rated speed — neither is held in this database. Same class of gap as C19's rated capacity.
+  The sheet reports floors/s and says plainly that it is not a speed factor.
+* **C17 / C18 (probable stops).** Floor attribution is **not** the blocker either. The blockers are
+  (a) **degenerate arrow direction** — ch27 reads 100 % `down` and ch30 83 % `up` / 0 % `down`, which
+  is physically impossible and means the ROI or reader is miscalibrated, so any up/down split built
+  on it is unsound; (b) a large share of door cycles carry no attributable floor, so stops-per-trip
+  would undercount; (c) trip segmentation is not implemented in this report.
+* **ch16 alone is genuinely floor-blind** — 1 confident read in its current era. That turned out to
+  be its own fault: see `INCIDENT_ch16_floor_blind.md`.
+
+### Open item — `gpu_era_id()` truncates the era
+
+`gpu_era_id()` takes `door_version.split('+')[0][:8]`, assuming the templates half is exactly 8
+characters. Live data violates that: rebuilds carry a hand-added tag (`e79e50d3h2`,
+`260d4a0fh2Laa52`). Truncation merges a rebuild into the era it replaced — which is how ch16's drop
+from 19,424 confident reads to 1 stayed hidden behind a single total. The Tier-2 evidence table now
+uses `eras.templates_era()` (untruncated). **`gpu_era_id` is unchanged, because it also groups door
+cycles, and regrouping those moves every cycle-derived figure in the report.** That means
+cycle-derived figures may still be pooling across a tagged rebuild. Not yet investigated.
 
 ## The DEMAND LOG export
 

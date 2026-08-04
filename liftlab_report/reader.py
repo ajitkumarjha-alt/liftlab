@@ -285,8 +285,11 @@ def fetch_gpu_cycles(db, gw: str, t0: float, t1: float) -> tuple[list[dict], dic
 
 def fetch_floor_read_status(db, gw: str, t0: float, t1: float) -> dict[str, dict]:
     """Tier-2 floor-attribution status per cam over the range: confident reads,
-    no_read, ambiguous, invalid, distinct glyphs seen. Documents WHY C21/C22
-    are unavailable."""
+    no_read, ambiguous, invalid, distinct glyphs seen.
+
+    'confident' uses eras.FLOOR_OK_REASONS, which INCLUDES single_panel. Until 2026-08-04 it was
+    ('', 'ok') only, so every single-panel camera scored zero and the TIER-2 sheet reported the
+    whole fleet as floor-blind while ch27/ch29/ch30 held ~150k confident reads between them."""
     rows = _q(db, "SELECT cam, floor, reason, read_conf FROM gw_door_event "
                   "WHERE gateway_id=? AND ts>=? AND ts<?", (gw, t0, t1))
     out = {}
@@ -296,7 +299,7 @@ def fetch_floor_read_status(db, gw: str, t0: float, t1: float) -> dict[str, dict
                                       "glyphs": set()})
         d["rows"] += 1
         reason = (r["reason"] or "").strip()
-        if r["floor"] is not None and reason in ("", "ok"):
+        if r["floor"] is not None and reason in eras.FLOOR_OK_REASONS:
             d["confident"] += 1
             d["glyphs"].add(str(r["floor"]))
         elif reason.startswith("no_read") or (r["floor"] is None and not reason):
@@ -338,6 +341,63 @@ def fetch_floor_confidence(db, gw: str, t0: float, t1: float,
               (*ok_reasons, gw, t0, t1))
     return {r["cam"]: {"confident": int(r["conf"] or 0), "total": int(r["total"] or 0)}
             for r in rows}
+
+
+def fetch_tier2_evidence(db, gw: str, t0: float, t1: float) -> dict[tuple, dict]:
+    """{(cam, era): evidence} — the real Tier-2 picture, per camera PER ERA.
+
+    Per era, not just per camera, because a template rebuild is a different instrument: ch16 held
+    19,424 confident reads in era e79e50d3 and 1 in e79e50d3h2, and a per-camera total would hide
+    that entirely behind a healthy-looking number.
+
+    Returns per key: rows, confident, no_read, ambiguous, invalid, other, glyphs, and `arrow`
+    (the direction distribution over confident reads — the evidence that C17/C18's up/down split
+    is or is not trustworthy)."""
+    out: dict[tuple, dict] = {}
+
+    def _slot(cam, dv):
+        return out.setdefault((cam, eras.templates_era(dv)),
+                              {"rows": 0, "confident": 0, "no_read": 0, "ambiguous": 0,
+                               "invalid": 0, "other": 0, "glyphs": set(),
+                               "arrow": {}, "door_version": dv})
+
+    for r in _q(db, "SELECT cam, door_version, floor, reason, direction, COUNT(*) n "
+                    "FROM gw_door_event WHERE gateway_id=? AND ts>=? AND ts<? "
+                    "GROUP BY cam, door_version, floor, reason, direction",
+                (gw, t0, t1)):
+        d = _slot(r["cam"], r["door_version"])
+        n = int(r["n"])
+        reason = (r["reason"] or "").strip()
+        d["rows"] += n
+        if r["floor"] is not None and reason in eras.FLOOR_OK_REASONS:
+            d["confident"] += n
+            d["glyphs"].add(str(r["floor"]))
+            key = r["direction"] if r["direction"] else "(no arrow)"
+            d["arrow"][key] = d["arrow"].get(key, 0) + n
+        elif reason.startswith("no_read") or (r["floor"] is None and not reason):
+            d["no_read"] += n
+        elif reason.startswith("ambiguous"):
+            d["ambiguous"] += n
+        elif reason.startswith("invalid_label"):
+            d["invalid"] += n
+        else:
+            d["other"] += n
+    for d in out.values():
+        d["glyphs"] = sorted(d["glyphs"])
+    return out
+
+
+def fetch_confident_reads(db, gw: str, t0: float, t1: float) -> list[dict]:
+    """Confident floor reads in time order, for the floors-per-second walk. Only the columns the
+    walk needs, and only confident rows, so this stays far smaller than the full row fetch."""
+    marks = ",".join("?" for _ in eras.FLOOR_OK_REASONS)
+    rows = _q(db, f"SELECT cam, door_version, ts, floor FROM gw_door_event "
+                  f"WHERE gateway_id=? AND ts>=? AND ts<? AND floor IS NOT NULL "
+                  f"AND COALESCE(reason,'') IN ({marks}) ORDER BY cam, door_version, ts",
+              (gw, t0, t1, *eras.FLOOR_OK_REASONS))
+    return [{"cam": r["cam"], "era": eras.templates_era(r["door_version"]),
+             "ts": float(r["ts"]), "floor": r["floor"]}
+            for r in rows if r["ts"] is not None]
 
 
 def fetch_analyzer_versions(db, gw: str) -> dict[str, str]:

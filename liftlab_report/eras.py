@@ -97,9 +97,14 @@ STUDY_SCOPE = ("5 projects across different categories, analysed one at a "
 # ── The sheet (MEP-02 v28) ───────────────────────────────────────────────────
 SHEET_NAME = "MEP-02 v28"
 
-# The eight assumed coefficients under test. `measurable` says what it would
-# take to measure each here; the STATUS is computed per run from the data, never
-# declared, so the table cannot drift from what the export actually contains.
+# The eight assumed coefficients under test. `needs` states what it would take to measure each.
+#
+# STATUS PROVENANCE (corrected 2026-08-04): the status for every coefficient is computed per run
+# from the data by narrative.coefficient_scope(). This comment previously claimed that was true of
+# all eight "never declared, so the table cannot drift" — it was NOT true of C17/C18/C21/C22, which
+# were hardcoded to BLOCKED in narrative.py and to "not measurable" in model.py regardless of what
+# the data showed. They are now derived like the rest, each naming its own actual blocker. If you
+# add a coefficient, derive its status; do not declare it.
 COEFFICIENTS = [
     {"id": "C17", "name": "probable stops, up peak",
      "assumes": "how many floors a car stops at on an up trip",
@@ -264,6 +269,57 @@ def pi_era_id(epoch_ts: float) -> str:
     return "pi_watch/ctmax30"
 
 
+# ── what counts as a CONFIDENT floor read ────────────────────────────────────
+# DoorFloorEngine.process (gpu_door.py) emits reason ∈ ok | single_panel | disagree | ambiguous |
+# no_read:
+#   ok           = TWO panels read the same floor (agree-or-discard reconciliation)
+#   single_panel = ONE panel configured; that panel returned status=='ok'. The read passed the same
+#                  per-panel bar as each half of an 'ok'; what it lacks is the cross-check.
+# Cameras running single-panel (panel1 cells not calibrated) emit single_panel for EVERY good read
+# and never 'ok'. Scoring those as non-confident reports a camera with tens of thousands of reads as
+# floor-blind — which is exactly what this module did until 2026-08-04, and it is what made the
+# TIER-2 sheet claim zero confident reads fleet-wide.
+#
+# dash_api.DOOR_OK_REASONS and door_event_api.py both already use the wider set; this module was the
+# outlier. '' is kept as a defensive case for a null reason carrying a floor.
+#
+# THE RESIDUAL RISK IS REAL AND IS NOT HIDDEN: a single panel cannot catch a SYSTEMATIC misread, and
+# a stable single-glyph confusion self-corroborates (19->18->17 read as 79->78->77). That is what the
+# derived floor alphabet with its anchoring and flip-kill rules defends against, and why the TIER-2
+# sheet publishes the per-reason census beside the count rather than the count alone.
+FLOOR_OK_REASONS = ("", "ok", "single_panel")
+
+# Plausibility ceiling for a floors/second segment, mirroring dash_api.MAX_FLOORS_PER_S. A segment
+# above this is an OCR slip, not a lift.
+MAX_FLOORS_PER_S = 3.0
+
+
+def floor_index(label) -> int | None:
+    """Physical index for a floor label, or None when it cannot be ordered.
+
+    Numeric labels map by int(). Anything else (G, LG, MEP, P3) needs a declared order this report
+    does not hold, so it is EXCLUDED from speed rather than guessed at."""
+    try:
+        return int(str(label).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def templates_era(door_version: str) -> str:
+    """The FULL templates half of door_version, untruncated.
+
+    gpu_era_id() truncates this to 8 chars on the assumption that door_version is exactly
+    templates_hash[:8]+'+'+geometry_hash[:8]. Live data violates that: rebuilds carry a hand-added
+    tag, e.g. 'e79e50d3h2+54509e75' and '260d4a0fh2Laa52+495e8f48'. Truncating merges a rebuild
+    into the era it replaced — which hid ch16 dropping from 19,424 confident reads in e79e50d3 to
+    1 in e79e50d3h2 behind a single healthy-looking total.
+
+    Used by the Tier-2 evidence, which must show a rebuild as its own instrument. gpu_era_id is
+    deliberately left alone here: it also groups door CYCLES, and changing that regroups every
+    cycle-derived figure in the report. See README_REPORT.md for that open item."""
+    return (door_version or "").split("+", 1)[0] or "unversioned"
+
+
 def gpu_era_id(door_version: str) -> str:
     """door_version is templates_hash[:8]+'+'+geometry_hash[:8] — a content
     hash with no ordering. The era is the templates half, prefix-matched."""
@@ -345,7 +401,7 @@ def lift_label_with_channel(cam: str) -> str:
 # operator-entered fact. Lifts serving the SAME floor range are one bank. Where
 # the field is blank the lift stays UNKNOWN: a bank is never inferred from
 # channel number, from observed floors (floor attribution is unreliable — see
-# TIER-2 BLOCKED), or from anything else. Guessing a bank would silently merge
+# TIER-2 EVIDENCE), or from anything else. Guessing a bank would silently merge
 # two design cases.
 
 def normalise_floor_range(raw: str | None) -> str:

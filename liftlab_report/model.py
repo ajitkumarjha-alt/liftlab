@@ -331,7 +331,8 @@ def parse_peak_window(spec: str) -> tuple[int, int] | None:
 
 # ── vs-the-sheet coefficient rows ────────────────────────────────────────────
 
-def vs_sheet_rows(aggs: dict[tuple, dict], cam: str) -> list[dict]:
+def vs_sheet_rows(aggs: dict[tuple, dict], cam: str,
+                  blockers: dict | None = None) -> list[dict]:
     """One row per MEP-02 coefficient per instrument-era for `cam`. Verdicts
     are mechanical (stats.verdict_vs_threshold); where a coefficient cannot be
     measured the row says so instead of vanishing."""
@@ -397,19 +398,134 @@ def vs_sheet_rows(aggs: dict[tuple, dict], cam: str) -> list[dict]:
             "verdict": ("observed residual reported — no sheet value to compare"
                         if lt["n"] else "not measurable in this era"),
         })
-    for coeff, why in (
-            ("C17 probable stops (up)", "needs trip segmentation from floor attribution"),
-            ("C18 probable stops (down)", "needs trip segmentation from floor attribution"),
-            ("C21 speed factor (up)", "needs floor attribution"),
-            ("C22 speed factor (down)", "needs floor attribution")):
+    # C17/C18/C21/C22 — verdict unchanged (still not measurable), but the REASON is now derived
+    # per coefficient from the data instead of the hardcoded "needs floor attribution", which was
+    # wrong: floor attribution works on ch27/ch29/ch30.
+    blockers = blockers or {}
+    for cid, coeff in (("C17", "C17 probable stops (up)"),
+                       ("C18", "C18 probable stops (down)"),
+                       ("C21", "C21 speed factor (up)"),
+                       ("C22", "C22 speed factor (down)")):
+        b = blockers.get(cid) or {}
         rows.append({
             "coefficient": coeff, "era": "—", "assumption": "per sheet",
             "threshold": None, "observed": None, "n": 0, "ci": (None, None),
-            "verdict": f"not measurable — {why}; see TIER-2 BLOCKED",
+            "verdict": ("not measurable — "
+                        + (b.get("blocker") or "needs floor attribution")
+                        + "; see TIER-2 EVIDENCE"),
+            "blocker_evidence": b.get("evidence"),
+            "measurable_as": b.get("measurable_as"),
         })
     for r in rows:
         r.setdefault("suppressed", False)
     return rows
+
+
+def coefficient_blockers(tier2_evidence: dict, speed: dict, cams: list) -> dict[str, dict]:
+    """Per-coefficient blocker for C17/C18/C21/C22, DERIVED from the data.
+
+    These four were previously hardcoded — model.py emitted "not measurable — needs floor
+    attribution" and narrative.py set BLOCKED, both regardless of the data. The verdict was right
+    by accident: floor attribution stopped being the blocker once single_panel reads were counted
+    (ch27/ch29/ch30 hold ~150k confident reads), but the coefficients are still not reportable, for
+    reasons the workbook was not stating. Each blocker below names what actually stops it.
+
+    Returns {cid: {status, blocker, evidence, measurable_as}}."""
+    live = {k: v for k, v in tier2_evidence.items() if v["rows"]}
+    # cameras whose CURRENT era can attribute floors at all
+    seeing = sorted({cam for (cam, _era), v in live.items() if v["confident"] > 0})
+    blind = sorted({cam for cam in cams
+                    if not any(v["confident"] for (c, _e), v in live.items() if c == cam)})
+
+    # ── C21/C22: floors-per-second IS measured; the speed FACTOR is not derivable ──
+    n_up = sum(len(v["up"]) for v in speed.values())
+    n_dn = sum(len(v["down"]) for v in speed.values())
+    per_cam = ", ".join(
+        f"{cam} up n={len(v['up'])}/down n={len(v['down'])}"
+        for (cam, _era), v in sorted(speed.items()) if v["up"] or v["down"])
+    speed_blocker = {
+        "status": "BLOCKED",
+        "blocker": "rated speed and floor-to-floor height are not held in this database",
+        "evidence": (f"floors-per-second IS measured: {n_up:,} up segments and {n_dn:,} down "
+                     f"segments from consecutive confident reads ({per_cam or 'none'}). "
+                     f"Floor attribution is NOT the blocker. Converting floors/s into 'share of "
+                     f"rated speed' needs the inter-floor distance and the car's rated speed, "
+                     f"neither of which is in this database — the same class of gap as C19's "
+                     f"rated capacity."),
+        "measurable_as": "floors per second (reported on TIER-2 EVIDENCE), not a speed factor",
+    }
+
+    # ── C17/C18: floor attribution is not the blocker; three others are ──
+    arrow_lines, degenerate = [], []
+    for (cam, era), v in sorted(live.items()):
+        if not v["confident"]:
+            continue
+        tot = sum(v["arrow"].values()) or 1
+        share = {k: 100.0 * n / tot for k, n in v["arrow"].items()}
+        arrow_lines.append(f"{cam} " + "/".join(f"{k} {share[k]:.0f}%" for k in sorted(share)))
+        directional = {k: s for k, s in share.items() if k in ("up", "down")}
+        # A lift that only ever shows one arrow is physically impossible -> the arrow ROI or the
+        # reader is miscalibrated, and any up/down SPLIT built on it is not trustworthy.
+        if directional and (len(directional) == 1 or max(directional.values()) > 95.0):
+            degenerate.append(cam)
+    stops_blocker = {
+        "status": "BLOCKED",
+        "blocker": ("arrow direction is degenerate on some cameras, and trip segmentation is not "
+                    "implemented"),
+        "evidence": ("Floor attribution is NOT the blocker — "
+                     + (f"{', '.join(seeing)} attribute floors. " if seeing else "no camera does. ")
+                     + "Arrow distribution over confident reads: "
+                     + ("; ".join(arrow_lines) if arrow_lines else "none") + ". "
+                     + (f"Physically impossible one-way arrow on {', '.join(sorted(set(degenerate)))} "
+                        f"— a lift does not travel in only one direction, so the ROI or the reader "
+                        f"is miscalibrated and any up/down split built on it is unsound. "
+                        if degenerate else "")
+                     + "Trip segmentation (grouping stops into directional runs) is not implemented "
+                       "in this report, and a large share of door cycles carry no attributable "
+                       "floor, so stops-per-trip would undercount."),
+        "measurable_as": None,
+    }
+    out = {"C21": dict(speed_blocker), "C22": dict(speed_blocker),
+           "C17": dict(stops_blocker), "C18": dict(stops_blocker)}
+    for cid in out:
+        out[cid]["floor_blind_cams"] = blind
+        out[cid]["attributing_cams"] = seeing
+    return out
+
+
+def floor_speed_segments(reads: list[dict]) -> dict[tuple, dict]:
+    """{(cam, era): {up: [floors/s], down: [...], skipped_unmappable, skipped_implausible}}.
+
+    A segment is the transition between two CONSECUTIVE confident reads that changed floor:
+    |Δindex| / Δt. Direction comes from the floor INDEX change, not the arrow glyph — which matters,
+    because the arrow is degenerate on some cameras while the index is not.
+
+    This is what C21/C22 would be built on. It is floors per SECOND, NOT a speed factor: converting
+    to "share of rated speed" needs floor-to-floor height and the car's rated speed, neither of
+    which this database holds. See coefficient_blockers()."""
+    out: dict[tuple, dict] = {}
+    prev_key = prev = None
+    for r in reads:
+        key = (r["cam"], r["era"])
+        d = out.setdefault(key, {"up": [], "down": [], "skipped_unmappable": 0,
+                                 "skipped_implausible": 0})
+        if key != prev_key:
+            prev_key, prev = key, None
+        i1 = eras.floor_index(r["floor"])
+        if i1 is None:
+            d["skipped_unmappable"] += 1
+            prev = None            # cannot bridge a segment across an unorderable floor
+            continue
+        if prev is not None:
+            i0, dt = prev[0], r["ts"] - prev[1]
+            if dt > 0 and i1 != i0:
+                fps = abs(i1 - i0) / dt
+                if fps > eras.MAX_FLOORS_PER_S:
+                    d["skipped_implausible"] += 1
+                else:
+                    (d["up"] if i1 > i0 else d["down"]).append(fps)
+        prev = (i1, r["ts"])
+    return out
 
 
 # ── demand by lift and hour ──────────────────────────────────────────────────

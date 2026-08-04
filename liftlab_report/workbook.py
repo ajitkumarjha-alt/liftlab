@@ -493,7 +493,7 @@ def sheet_vs_sheet(wb, ctx, cd, anchors):
         first_hdr = first_hdr or hdr_row
         row = header_row(ws, row, headers)
         cam_first = row
-        for r in vs_sheet_rows(ctx["aggs"], cam):
+        for r in vs_sheet_rows(ctx["aggs"], cam, ctx.get("coefficient_blockers")):
             cell(ws, row, 1, r["coefficient"])
             cell(ws, row, 2, r["era"])
             if isinstance(r["assumption"], str):
@@ -1248,7 +1248,7 @@ def sheet_demand(wb, ctx, cd, anchors):
     cell(ws, row, 1,
          "Demand PER FLOOR — where people get on and off — is not here because "
          "floor attribution produced no confident reads at all in this range "
-         "(see TIER-2 BLOCKED). That blocks origin/destination demand, the "
+         "(see TIER-2 EVIDENCE). That blocks origin/destination demand, the "
          "C21/C22 speed factors and the C17/C18 probable-stops coefficients. "
          "Per-lift and per-hour demand, shown above, is not blocked by it.",
          font=BODY_BOLD, wrap=True)
@@ -1720,47 +1720,142 @@ def sheet_coverage(wb, ctx, cd, anchors):
     return ws
 
 
-# ── TIER-2 BLOCKED ───────────────────────────────────────────────────────────
+# ── TIER-2 EVIDENCE ───────────────────────────────────────────────────────────
 
 def sheet_tier2(wb, ctx, anchors):
-    ws = wb.create_sheet("TIER-2 BLOCKED")
-    row = title(ws, "Floor attribution status — why C21/C22 (and C17/C18 trip "
-                    "segmentation) are unavailable")
+    """TIER-2 EVIDENCE — what floor attribution actually produced, and what each floor-dependent
+    coefficient is really blocked on.
+
+    This sheet used to be titled TIER-2 BLOCKED and reported ZERO confident reads on every camera,
+    because the confident-read test excluded reason='single_panel' — which is what a
+    single-panel-calibrated camera emits for every good read. ch27/ch29/ch30 held roughly 150k
+    confident reads while the sheet said none. The verdict (C17/C18/C21/C22 not measurable) has NOT
+    changed; the evidence and the reasoning have, and each coefficient now names its own blocker
+    instead of sharing one that was wrong for all four."""
+    ws = wb.create_sheet("TIER-2 EVIDENCE")
+    row = title(ws, "Floor attribution — what was actually read, and what each "
+                    "floor-dependent coefficient is blocked on")
+    row += 1
+    cell(ws, row, 1,
+         "'Confident' means a non-null floor with reason in "
+         + "/".join(r or "(blank)" for r in eras.FLOOR_OK_REASONS)
+         + ". single_panel is a read from the ONE calibrated panel that passed the same per-panel "
+           "bar as each half of an 'ok' — it lacks the second panel's cross-check, not quality. "
+           "Counting it as non-confident reported cameras holding tens of thousands of reads as "
+           "floor-blind. The per-reason census sits beside the count so the weaker assurance stays "
+           "visible: a single panel cannot catch a SYSTEMATIC misread, which is what the derived "
+           "floor alphabet defends against.",
+         font=BODY_ITALIC, wrap=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
+    ws.row_dimensions[row].height = 58
+    row += 2
+
+    row = section(ws, row, "READ QUALITY, PER CAMERA PER ERA")
+    cell(ws, row, 1, "Split by era on purpose: a template rebuild is a different instrument, and a "
+                     "per-camera total would hide a camera that lost floor reading at a rebuild "
+                     "behind its own earlier history.", font=BODY_ITALIC, wrap=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
+    ws.row_dimensions[row].height = 30
     row += 1
     hdr_row = row
-    row = header_row(ws, row, [
-        "channel", "door rows in range", "confident reads", "no_read",
-        "ambiguous", "invalid_label", "other", "glyphs seen (alphabet state)"])
+    row = header_row(ws, row, ["channel", "era", "door rows", "confident reads", "confident %",
+                               "no_read", "ambiguous", "invalid_label", "other"])
     first = row
-    for cam in ctx["cams"]:
-        d = ctx["floor_status"].get(cam)
-        cell(ws, row, 1, cam)
-        if not d:
-            cell(ws, row, 2, 0, F_INT)
-            cell(ws, row, 8, "no gw_door_event rows in range", fill=FILL_NA)
-            row += 1
+    ev = ctx.get("tier2_evidence") or {}
+    for (cam, era), d in sorted(ev.items()):
+        if not d["rows"]:
             continue
-        cell(ws, row, 2, d["rows"], F_INT)
-        cell(ws, row, 3, d["confident"], F_INT,
+        cell(ws, row, 1, cam)
+        cell(ws, row, 2, era)
+        cell(ws, row, 3, d["rows"], F_INT)
+        cell(ws, row, 4, d["confident"], F_INT,
              fill=FILL_NA if not d["confident"] else None)
-        cell(ws, row, 4, d["no_read"], F_INT)
-        cell(ws, row, 5, d["ambiguous"], F_INT)
-        cell(ws, row, 6, d["invalid"], F_INT)
-        cell(ws, row, 7, d["other"], F_INT)
-        cell(ws, row, 8, ", ".join(d["glyphs"][:40])
-             + (" …" if len(d["glyphs"]) > 40 else ""), wrap=True)
+        cell(ws, row, 5, (d["confident"] / d["rows"]) if d["rows"] else 0, F_PCT)
+        cell(ws, row, 6, d["no_read"], F_INT)
+        cell(ws, row, 7, d["ambiguous"], F_INT)
+        cell(ws, row, 8, d["invalid"], F_INT)
+        cell(ws, row, 9, d["other"], F_INT)
         row += 1
-    anchors["tier2_table"] = ("TIER-2 BLOCKED", _rng(first, max(first, row - 1), 8))
+    anchors["tier2_table"] = ("TIER-2 EVIDENCE", _rng(first, max(first, row - 1), 9))
+    row += 2
+
+    row = section(ws, row, "TRAVEL BETWEEN STOPS — FLOORS PER SECOND (not a speed factor)")
+    cell(ws, row, 1,
+         "Measured from consecutive confident reads that changed floor: |change in floor| / change "
+         "in time, with direction taken from the floor INDEX change — NOT the arrow glyph, which "
+         "is unreliable (see below). This is floors per SECOND. It is NOT C21/C22, which are a "
+         "share of RATED speed: that conversion needs the inter-floor distance and the car's rated "
+         "speed, and neither is held in this database. Same class of gap as C19's rated capacity.",
+         font=BODY_ITALIC, wrap=True)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
+    ws.row_dimensions[row].height = 48
     row += 1
-    cell(ws, row, 1, "C21/C22 speed factors need per-stop floor attribution "
-                     "(confident reads on consecutive stops). C17/C18 need trip "
-                     "segmentation on top of that. Until the confident-read rate "
-                     "supports it, these stay blocked — the gap is documented "
-                     "here rather than absent.", font=BODY_BOLD, wrap=True)
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
-    ws.row_dimensions[row].height = 44
-    style.set_widths(ws, {1: 12, 2: 20, 3: 18, 4: 14, 5: 14, 6: 16, 7: 12,
-                          8: 50})
+    row = header_row(ws, row, ["channel", "era", "up segments n", "up median (fl/s)",
+                               "down segments n", "down median (fl/s)", "unorderable floors",
+                               "implausible rejected", ""])
+    sp_first = row
+    speed = ctx.get("floor_speed") or {}
+    for (cam, era), v in sorted(speed.items()):
+        if not (v["up"] or v["down"]):
+            continue
+        up, dn = sorted(v["up"]), sorted(v["down"])
+        cell(ws, row, 1, cam)
+        cell(ws, row, 2, era)
+        cell(ws, row, 3, len(up), F_INT)
+        cell(ws, row, 4, (up[len(up) // 2] if up else 0), F_SEC_PLAIN)
+        cell(ws, row, 5, len(dn), F_INT)
+        cell(ws, row, 6, (dn[len(dn) // 2] if dn else 0), F_SEC_PLAIN)
+        cell(ws, row, 7, v["skipped_unmappable"], F_INT)
+        cell(ws, row, 8, v["skipped_implausible"], F_INT)
+        row += 1
+    anchors["tier2_speed"] = ("TIER-2 EVIDENCE", _rng(sp_first, max(sp_first, row - 1), 8))
+    row += 2
+
+    row = section(ws, row, "ARROW DIRECTION ON CONFIDENT READS — why the up/down split is unsound")
+    row = header_row(ws, row, ["channel", "era", "up", "down", "no arrow", "verdict", "", "", ""])
+    ar_first = row
+    for (cam, era), d in sorted(ev.items()):
+        if not d["confident"]:
+            continue
+        tot = sum(d["arrow"].values()) or 1
+        up = d["arrow"].get("up", 0)
+        dn = d["arrow"].get("down", 0)
+        na = tot - up - dn
+        bad = bool((up or dn) and (not up or not dn or max(up, dn) > 0.95 * (up + dn)))
+        cell(ws, row, 1, cam)
+        cell(ws, row, 2, era)
+        cell(ws, row, 3, up / tot, F_PCT)
+        cell(ws, row, 4, dn / tot, F_PCT)
+        cell(ws, row, 5, na / tot, F_PCT)
+        cell(ws, row, 6,
+             ("ONE-WAY ONLY — physically impossible; ROI or reader miscalibrated"
+              if bad else "both directions seen"),
+             fill=FILL_WARN if bad else None, wrap=True)
+        row += 1
+    anchors["tier2_arrow"] = ("TIER-2 EVIDENCE", _rng(ar_first, max(ar_first, row - 1), 6))
+    row += 2
+
+    row = section(ws, row, "VERDICT PER COEFFICIENT — unchanged, but now for the right reason")
+    for cid in ("C17", "C18", "C21", "C22"):
+        b = (ctx.get("coefficient_blockers") or {}).get(cid) or {}
+        cell(ws, row, 1, cid, font=BODY_BOLD)
+        cell(ws, row, 2, b.get("status", "BLOCKED"), font=BODY_BOLD, fill=FILL_NA)
+        cell(ws, row, 3, b.get("blocker", ""), wrap=True)
+        ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=9)
+        ws.row_dimensions[row].height = 30
+        row += 1
+        cell(ws, row, 3, b.get("evidence", ""), font=BODY_ITALIC, wrap=True)
+        ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=9)
+        ws.row_dimensions[row].height = 66
+        row += 1
+        if b.get("measurable_as"):
+            cell(ws, row, 3, "measurable instead as: " + b["measurable_as"], font=BODY_BOLD)
+            ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=9)
+            row += 1
+        row += 1
+    anchors["tier2_verdict"] = ("TIER-2 EVIDENCE", f"A{max(1, row - 1)}")
+
+    style.set_widths(ws, {1: 12, 2: 22, 3: 16, 4: 16, 5: 14, 6: 16, 7: 18, 8: 18, 9: 14})
     freeze_below(ws, hdr_row)
     style.print_setup(ws, repeat_row=hdr_row)
     return ws

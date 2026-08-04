@@ -502,7 +502,7 @@ def _f_per_floor_blocked(ctx, anchors):
     confident = sum(d.get("confident", 0) for d in fs.values())
     if not rows or confident:
         return []
-    sheet, rng = _anchor(anchors, "tier2_table", "TIER-2 BLOCKED")
+    sheet, rng = _anchor(anchors, "tier2_table", "TIER-2 EVIDENCE")
     sentence = (
         f"Demand PER FLOOR — where people get on and off — cannot be reported "
         f"at all. Not one of the {rows:,} door observations in this range "
@@ -514,9 +514,11 @@ def _f_per_floor_blocked(ctx, anchors):
         None, TOO_EARLY,
         f"0 confident floor reads out of {rows:,} door observations",
         n=0,
-        extra=["This is the same blocker behind the C21/C22 speed factors and "
-               "the C17/C18 probable-stops coefficients. Fixing the "
-               "floor-indicator reading unblocks all of them together."])]
+        extra=["Floor reading also gates the C17/C18 probable-stops coefficients, but it is NOT "
+               "the only thing gating them, and it is not what gates C21/C22 at all — those need "
+               "a rated speed and floor-to-floor height this database does not hold. See TIER-2 "
+               "EVIDENCE for each coefficient's actual blocker; fixing the OCR does not unblock "
+               "them together."])]
 
 
 def _f_open_travel(ctx, anchors):
@@ -704,9 +706,10 @@ def cannot_say_yet(ctx: dict) -> list[dict]:
                     f"confident floor read. Without knowing the floor of "
                     f"consecutive stops, travel between floors cannot be timed "
                     f"and trips cannot be segmented."),
-            "to_fix": ("Get the floor-indicator OCR reading reliably (see "
-                       "TIER-2 BLOCKED for what the cameras are currently "
-                       "seeing), then re-export.")})
+            "to_fix": ("Get the floor-indicator OCR reading reliably (see TIER-2 EVIDENCE for "
+                       "what the cameras are currently seeing), then re-export. Note this alone "
+                       "does not unblock C21/C22, which additionally need a rated speed and "
+                       "floor-to-floor height that are not held anywhere.")})
     elif rows and confident:
         pct = 100.0 * confident / rows
         if pct < 50:
@@ -924,7 +927,7 @@ def sheet_guide() -> list[tuple[str, str]]:
                             "measuring setup changed, and which quiet periods "
                             "are outages we know about versus ones we don't — "
                             "how much weight the measurements can bear."),
-        ("TIER-2 BLOCKED", "Which assumed coefficients this site could not "
+        ("TIER-2 EVIDENCE", "Which assumed coefficients this site could not "
                            "measure at all, and exactly what is stopping "
                            "each one."),
     ]
@@ -1033,11 +1036,19 @@ def coefficient_scope(ctx: dict) -> list[dict]:
     status["B24"] = (("MEASURED", f"n={n_lost:,} stops") if n_lost else
                      ("NOT MEASURED", "needs dwell measured against passenger "
                                       "load"))
-    blocked = ("BLOCKED", f"floor attribution produced {confident:,} confident "
-                          f"reads in this range — without the floor of "
-                          f"consecutive stops this cannot be computed")
+    # C17/C18/C21/C22 — status stays BLOCKED, but the REASON is now derived per coefficient.
+    # This block used to assign one hardcoded "floor attribution produced N confident reads"
+    # sentence to all four, which was wrong on two counts: floor attribution is not the blocker
+    # for C21/C22 at all, and it is not the blocker for C17/C18 either once single_panel reads
+    # are counted. Each now names what actually stops it.
+    blockers = ctx.get("coefficient_blockers") or {}
     for cid in ("C17", "C18", "C21", "C22"):
-        status[cid] = blocked
+        b = blockers.get(cid)
+        if b:
+            status[cid] = (b.get("status", "BLOCKED"), b.get("blocker", ""))
+        else:
+            status[cid] = ("BLOCKED", f"floor attribution produced {confident:,} confident "
+                                      f"reads in this range")
 
     out = []
     for c in eras.COEFFICIENTS:
