@@ -137,6 +137,71 @@ ordered `liftlab-precompute` job.
 
 ---
 
+# Verification gates — the pattern that cost four incidents
+
+Four failures in one week, all the same shape: **the gate proved something adjacent to what
+mattered, and passing it meant less than it appeared to.**
+
+| # | The gate | What it actually proved | What shipped anyway |
+|---|---|---|---|
+| 1 | `smoke-import` in `apply_dashperf.sh` | that the **installed** module imports | it never loaded the staged file at all — `cd $APP` puts the CWD ahead of `PYTHONPATH` for `-c`, so it validated code it had never read |
+| 2 | the same smoke-import | that *a* router attribute exists | `door_router` vs `door_event_router` — caught by hand before deploy, not by the gate |
+| 3 | `bash -n relay_soak.sh` | that the file **parses** | `NIC_MODULE_LOADABLE` read at line 376, assigned at 518 — under `set -u` a crash 3s after launch, crash-looped by systemd |
+| 4 | `smoke-import` in `apply_gwingest.sh` | that `ops_api` **imports** and routes register | `_f()` undefined inside the handler body — Python resolves names at call time, so every relay heartbeat 500'd for six minutes |
+
+Two sentences carry all four:
+
+> **import != executes.  parse != starts.**
+
+A module that imports proves nothing about whether its handlers run. A script that parses proves
+nothing about whether it starts. In every case the gate exercised a *cheaper* property than the one
+being claimed, and the gap between them is exactly where the defect lived.
+
+## The rule
+
+**Every gate must exercise the thing it claims to verify**, and the test for a gate is:
+
+> *Would it have caught the last failure of this kind?*
+
+Not "is it green" — green was never the problem. All four gates were green. The question is whether
+the gate is *sensitive* to the failure it is standing in front of, and the only way to know is to
+break the code deliberately and watch the gate fail.
+
+**Every gate in this repo has now been demonstrated against a deliberately broken copy**, and the
+demonstration is part of the commit rather than a claim in a comment:
+
+* `smoke_relay_start.sh` — runs the real `relay_soak.sh` to its first loop turns with the outside
+  world stubbed. On a copy with the unbound variable reintroduced: `bash -n` **passes**, all 56 unit
+  tests **pass**, and the smoke **fails with 9 errors** naming the variable and the line.
+* `smoke_ingest.sh` — starts a scratch uvicorn from the **staged** directory against a scratch DB
+  and POSTs a realistic payload to every producer-facing ingest endpoint. On a copy with the `_f()`
+  NameError reintroduced: the import gate still prints **"smoke ok"**, while the ingest gate returns
+  **HTTP 500** and quotes `NameError: name '_f' is not defined`.
+
+## Two assertions, not one
+
+`smoke_ingest.sh` asserts **2xx AND that the row landed**. A handler returning 200 while silently
+swallowing the write is the same defect class as `_q()` returning `[]` on `OperationalError`: a
+success signal over missing data. That one has already bitten this codebase once — it is why a
+timeout used to render as an empty dashboard panel instead of an error — so the gate does not accept
+a status code as evidence that anything was stored.
+
+## Gates run PRE-INSTALL, against the staged file
+
+Both smoke tests run before anything is written to the live path, so a failure costs nothing: the
+live file is untouched and the running service never restarts. A post-install check fires *after*
+the damage and is not a gate, it is a post-mortem. `smoke_ingest.sh` proves it is testing the right
+code by asserting `module.__file__` starts with the staged directory — failure #1 above is precisely
+what happens when nothing checks that.
+
+The one architectural constraint worth recording: FastAPI's `TestClient` would be tidier than
+spawning uvicorn, but it needs `httpx`, which is not installed on the gateway. **A deploy gate must
+not install packages on a production box in order to run itself**, so the gate spawns a scratch
+uvicorn on a high port instead, using only what is already there.
+
+
+---
+
 # Final acceptance (2026-08-04)
 
 ## The architecture that worked

@@ -193,8 +193,30 @@ traps. Every recovery step is therefore verified by reading
 `/sys/class/net/<iface>/statistics/tx_packets` and checking it *advances*. Do not go looking for a
 kernel message to trigger on; there isn't one, and waiting for one is how 33 hours passed.
 
-`tx_packets` and `last_reboot_epoch` are now published in the heartbeat, so the ladder's position
-and the NIC's real state are visible from the cloud.
+`tx_packets` and `last_reboot_epoch` are published in the heartbeat as **TOP-LEVEL payload fields**
+— *not* inside `per_stream`. An earlier note here said to look for them in `per_stream`; that was
+wrong and no amount of waiting would have made that check pass. `per_stream` carries only the
+per-camera delivery figures (`{"ch16": 441, "ch27": 237, ...}`).
+
+They are stored in their own `relay_status` columns. To check them on the gateway:
+
+```
+sqlite3 /var/lib/liftlab/gateway.db \
+  "SELECT datetime(ts,'unixepoch'), tx_packets, last_reboot_epoch, gw_rss_mb
+     FROM relay_status ORDER BY id DESC LIMIT 5;"
+```
+
+A healthy reading looks like this — `tx_packets` climbing every heartbeat is the NIC transmitting,
+and it flatlining while streams still report alive is the wedge:
+
+```
+2026-08-04 10:27:29  tx_packets=1756828  last_reboot=0.0  rss=64
+2026-08-04 10:26:57  tx_packets=1749330  last_reboot=0.0  rss=65
+```
+
+Note the ingest had to be taught to keep them: the relay sent both from the moment it was deployed,
+but `ops_api` had no columns and no code reading them, so they were accepted and silently dropped
+until 2026-08-04. Sending a field and storing a field are two changes, not one.
 
 ### Why the reboot is gated
 

@@ -52,6 +52,37 @@ assert hasattr(ops_api, '_self_rss_mb')
 print('smoke ok:', door_event_api.__file__)" ); then
   say "SMOKE-IMPORT FAILED — nothing installed."; rm -rf "$TMPD"; exit 1
 fi
+
+# ── INGEST GATE (runs before ANY mutation) ───────────────────────────────────
+# The smoke-import above proves the modules LOAD and the routes register. It does NOT prove the
+# handlers run: Python resolves names at call time, so a NameError inside a handler body sails
+# straight through it. That is exactly what happened on 2026-08-04 — this script printed "smoke ok",
+# installed, and every relay heartbeat 500'd for six minutes on `_f` not being defined in ops_api.
+#
+# smoke_ingest.sh starts a scratch uvicorn from the STAGED directory against a scratch DB and POSTs
+# a realistic payload to every producer-facing ingest endpoint, asserting 2xx AND that the row
+# landed. Verified: it returns HTTP 500 + the NameError on a copy with that bug reintroduced, while
+# the import gate above still says "smoke ok" on the same file.
+if [ -f /tmp/smoke_ingest.sh ]; then
+  INGEST_STAGE=$(mktemp -d)
+  cp /tmp/door_event_api.py /tmp/ops_api.py "$INGEST_STAGE/" 2>/dev/null
+  # analysis_api is not being changed here, but its endpoints share the scratch app, so take the
+  # installed copy to exercise transit/analyzer_status alongside the staged files.
+  cp "$APP/analysis_api.py" "$INGEST_STAGE/" 2>/dev/null
+  say "ingest gate: POSTing to every producer endpoint against the STAGED code ..."
+  if ! bash /tmp/smoke_ingest.sh "$INGEST_STAGE" "$APP"; then
+    say "ABORT: an ingest handler did not accept a real payload. NOTHING INSTALLED — the live"
+    say "  ingest is untouched and still working. This is the gate 2026-08-04 needed."
+    rm -rf "$INGEST_STAGE"; exit 1
+  fi
+  rm -rf "$INGEST_STAGE"
+  say "ingest gate: PASSED — every endpoint returned 2xx and the row landed."
+else
+  say "WARN: /tmp/smoke_ingest.sh not present — INGEST GATE SKIPPED."
+  say "  Fetch it alongside the modules. Without it, a handler that 500s on every request will"
+  say "  install cleanly and take the heartbeat down, which is what happened on 2026-08-04."
+fi
+
 rm -rf "$TMPD"
 
 STAMP=$(date +%Y%m%d-%H%M%S)
