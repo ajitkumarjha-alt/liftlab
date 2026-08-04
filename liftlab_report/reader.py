@@ -361,9 +361,15 @@ def fetch_tier2_evidence(db, gw: str, t0: float, t1: float) -> dict[tuple, dict]
                                "invalid": 0, "other": 0, "glyphs": set(),
                                "arrow": {}, "door_version": dv})
 
-    for r in _q(db, "SELECT cam, door_version, floor, reason, direction, COUNT(*) n "
-                    "FROM gw_door_event WHERE gateway_id=? AND ts>=? AND ts<? "
-                    "GROUP BY cam, door_version, floor, reason, direction",
+    # n_arrow_labels may not exist on an older DB; degrade to NULL rather than failing the export.
+    try:
+        db.execute("SELECT n_arrow_labels FROM gw_door_event LIMIT 1").fetchone()
+        nal_col = "n_arrow_labels"
+    except sqlite3.OperationalError:
+        nal_col = "NULL"
+    for r in _q(db, f"SELECT cam, door_version, floor, reason, direction, {nal_col} nal, COUNT(*) n "
+                    f"FROM gw_door_event WHERE gateway_id=? AND ts>=? AND ts<? "
+                    f"GROUP BY cam, door_version, floor, reason, direction, {nal_col}",
                 (gw, t0, t1)):
         d = _slot(r["cam"], r["door_version"])
         n = int(r["n"])
@@ -372,7 +378,17 @@ def fetch_tier2_evidence(db, gw: str, t0: float, t1: float) -> dict[tuple, dict]
         if r["floor"] is not None and reason in eras.FLOOR_OK_REASONS:
             d["confident"] += n
             d["glyphs"].add(str(r["floor"]))
-            key = r["direction"] if r["direction"] else "(no arrow)"
+            # DIRECTION IS NULL WHERE THE READER COULD ONLY NAME ONE ARROW. Such a row's direction
+            # is not a reading, it is the only value the classifier could return. Rows written
+            # before 2026-08-04 carry NULL here — unknown, so they are counted as reported and the
+            # distribution-based degeneracy warning on TIER-2 EVIDENCE still covers them.
+            nal = r["nal"]
+            unqualified = nal is not None and int(nal) < 2
+            if unqualified:
+                d["arrow_unqualified"] = d.get("arrow_unqualified", 0) + n
+                key = "(suppressed: reader knows one arrow)"
+            else:
+                key = r["direction"] if r["direction"] else "(no arrow)"
             d["arrow"][key] = d["arrow"].get(key, 0) + n
         elif reason.startswith("no_read") or (r["floor"] is None and not reason):
             d["no_read"] += n

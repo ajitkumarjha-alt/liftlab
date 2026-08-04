@@ -478,7 +478,20 @@ class FloorReader:
             acell = (self.arrow_cell[0] + dx, self.arrow_cell[1] + dy, self.arrow_cell[2], self.arrow_cell[3])
             arrow, arr_s = self._match(crop(panel_gray, acell), self.arrow_labels)
             if arrow is not None and arr_s >= self.min_score:
-                direction, _ = arrow, scores.append(arr_s)
+                # A SINGLE-CLASS CLASSIFIER OUTPUT IS NOT A MEASUREMENT. arrow_labels is filtered to
+                # the arrows that have TEMPLATES, and a template only exists for an arrow the
+                # operator labelled during calibration. If the labelled sample happened to catch the
+                # lift travelling one way, only that arrow gets a template — and then this match can
+                # only ever return that one direction, at any confidence, forever.
+                # That is not hypothetical: ch27 was calibrated from crops labelled with 'V' (down)
+                # only and reported 100% down; ch30 from '^' (up) only and reported 83% up / 0% down.
+                # Both physically impossible, and both invisible downstream because nothing recorded
+                # how many arrows the reader could even name. The score still contributes to
+                # read_conf exactly as before, so FLOOR reading is unchanged — only the direction
+                # claim is withheld.
+                if len(self.arrow_labels) >= 2:
+                    direction = arrow
+                scores.append(arr_s)
         floor_str = "".join(chars)
         if self.valid_floors is not None and floor_str not in self.valid_floors:
             # Assembled to a floor this tower does not have -> not a confident read. Keep the string
@@ -835,7 +848,12 @@ class DoorFloorEngine:
         if candidates is None and reads and reads[0].get("cells"):
             candidates = {"cells": reads[0]["cells"], "shift": reads[0].get("shift")}
         stop = self.floor.update(t, floor, direction) if floor else None
+        # n_arrow_labels: how many DISTINCT arrows this camera's reader can name at all. Below 2 the
+        # direction field is suppressed above, and this column is what lets a consumer tell
+        # "this lift went down" from "this camera can only say down".
+        n_arrow_labels = len(self.readers[0][1].arrow_labels) if self.readers else 0
         out = {"t": t, "floor": floor, "direction": direction, "door_state": self.door.state,
+               "n_arrow_labels": n_arrow_labels,
                "openness": (round(float(openness), 3) if openness is not None else None),
                "read_conf": (round(float(conf), 3) if conf is not None else None),
                "panels_agreed": agreed, "reason": reason, "n_panels": len(self.readers),

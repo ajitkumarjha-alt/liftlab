@@ -1608,3 +1608,47 @@ def test_cycles_never_pool_across_a_tagged_rebuild(fixture_db):
             eras.templates_era(r["door_version"]))
     for key, real in groups.items():
         assert len(real) == 1, f"{key} still merges {sorted(real)}"
+
+
+def test_direction_is_suppressed_when_the_reader_knows_one_arrow(tmp_path):
+    """A single-class classifier cannot be wrong, so its output is not evidence. Rows whose reader
+    could name only one arrow must not contribute a direction to the distribution."""
+    import sqlite3 as _sq
+    p = tmp_path / "g.db"
+    db = _sq.connect(str(p))
+    db.executescript("""
+      CREATE TABLE gw_door_event (id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT,
+        ts REAL, floor TEXT, direction TEXT, door_state TEXT, openness REAL, read_conf REAL,
+        panels_agreed INTEGER, reason TEXT, close_travel_s REAL, door_version TEXT,
+        templates_hash TEXT, received_at REAL, candidates TEXT, n_arrow_labels INTEGER);
+      CREATE TABLE channel_map (gateway_id TEXT, channel INTEGER, is_lift INTEGER, label TEXT,
+        marked_at REAL, PRIMARY KEY (gateway_id, channel));""")
+    base = _ts("2026-07-22T09:00:00")
+    rows = [("site-A", "ch27", base + i, "32", "down", "open", 0.9, "single_panel", "aa+bb", 1)
+            for i in range(10)]                       # reader knows ONE arrow
+    rows += [("site-A", "ch29", base + i, "12", "up", "open", 0.9, "single_panel", "cc+dd", 2)
+             for i in range(6)]                       # reader knows BOTH
+    db.executemany("INSERT INTO gw_door_event (gateway_id,cam,ts,floor,direction,door_state,"
+                   "read_conf,reason,door_version,n_arrow_labels) VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    db.commit(); db.close()
+
+    rdb = reader.open_ro(str(p))
+    try:
+        ev = reader.fetch_tier2_evidence(rdb, "site-A", base - 10, base + 10_000)
+    finally:
+        rdb.close()
+    ch27 = ev[("ch27", "aa")]
+    ch29 = ev[("ch29", "cc")]
+    # ch27's 'down' must NOT be reported as a direction
+    assert "down" not in ch27["arrow"], ch27["arrow"]
+    assert ch27.get("arrow_unqualified") == 10
+    # ch29's is a real reading and survives
+    assert ch29["arrow"].get("up") == 6
+    assert not ch29.get("arrow_unqualified")
+
+
+def test_engine_suppresses_direction_below_two_arrow_templates():
+    """The suppression must live in the reader itself, not only in the report."""
+    src = open("gpu_door.py").read()
+    assert "if len(self.arrow_labels) >= 2:" in src
+    assert '"n_arrow_labels": n_arrow_labels' in src

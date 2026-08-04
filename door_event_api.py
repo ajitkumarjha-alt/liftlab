@@ -125,6 +125,15 @@ def _db():
         db.execute("ALTER TABLE gw_door_event ADD COLUMN candidates TEXT")   # reason='ambiguous' top-2 [[lab,score],..]
     except sqlite3.OperationalError:
         pass                                                    # already present
+    try:
+        # How many DISTINCT arrows the reader could name when this row was produced. Below 2 the
+        # engine suppresses `direction` entirely, because a single-class classifier cannot be wrong
+        # and therefore cannot be evidence: ch27 reported 100% down and ch30 83% up / 0% down purely
+        # because their calibration samples only ever labelled one arrow. NULL on rows written
+        # before 2026-08-04 — unknown, not zero, and not backfilled.
+        db.execute("ALTER TABLE gw_door_event ADD COLUMN n_arrow_labels INTEGER")
+    except sqlite3.OperationalError:
+        pass                                                    # already present
     db.execute("""CREATE TABLE IF NOT EXISTS floor_sample (
       id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT, ts REAL,
       floor TEXT, direction TEXT, read_conf REAL, panels_agreed INTEGER, reason TEXT,
@@ -199,13 +208,15 @@ async def door_event_ingest(gw: str, request: Request, authorization: str = Head
     cand = d.get("candidates")
     cand = json.dumps(cand) if cand else None                # [[lab,score],[lab,score]] when reason='ambiguous'
     db = _db()
+    nal = d.get("n_arrow_labels")
     db.execute("INSERT INTO gw_door_event (gateway_id,cam,ts,floor,direction,door_state,openness,read_conf,"
-               "panels_agreed,reason,close_travel_s,door_version,templates_hash,candidates,received_at) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               "panels_agreed,reason,close_travel_s,door_version,templates_hash,candidates,"
+               "n_arrow_labels,received_at) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (gw, cam, float(d.get("ts", time.time())), floor, direction, ds, _f(d.get("openness")),
                 _f(d.get("read_conf")), 1 if d.get("panels_agreed") else 0, str(d.get("reason", "")),
                 _f(d.get("close_travel_s")), str(d.get("door_version", "")), str(d.get("templates_hash", "")),
-                cand, time.time()))
+                cand, (int(nal) if nal is not None else None), time.time()))
     db.commit()
     db.close()
     return {"ok": True}

@@ -1821,14 +1821,21 @@ def sheet_tier2(wb, ctx, anchors):
         up = d["arrow"].get("up", 0)
         dn = d["arrow"].get("down", 0)
         na = tot - up - dn
-        bad = bool((up or dn) and (not up or not dn or max(up, dn) > 0.95 * (up + dn)))
+        unq = d.get("arrow_unqualified", 0)
+        # Two ways the split is unusable: the reader could only NAME one arrow (recorded, direction
+        # suppressed at source), or the distribution is degenerate on rows written before that was
+        # recorded. Both are flagged; the first is a fact, the second an inference.
+        bad = bool(unq) or bool((up or dn) and (not up or not dn or max(up, dn) > 0.95 * (up + dn)))
         cell(ws, row, 1, cam)
         cell(ws, row, 2, era)
         cell(ws, row, 3, up / tot, F_PCT)
         cell(ws, row, 4, dn / tot, F_PCT)
         cell(ws, row, 5, na / tot, F_PCT)
         cell(ws, row, 6,
-             ("ONE-WAY ONLY — physically impossible; ROI or reader miscalibrated"
+             ("DIRECTION SUPPRESSED — this camera's reader has templates for only one arrow, "
+              "so a direction from it is not a reading. Needs recalibration crops covering both "
+              "travel directions." if unq else
+              "ONE-WAY ONLY — physically impossible; ROI or reader miscalibrated"
               if bad else "both directions seen"),
              fill=FILL_WARN if bad else None, wrap=True)
         row += 1

@@ -236,6 +236,7 @@ the other four coefficients, false of these. Both are fixed: blockers are now de
   is physically impossible and means the ROI or reader is miscalibrated, so any up/down split built
   on it is unsound; (b) a large share of door cycles carry no attributable floor, so stops-per-trip
   would undercount; (c) trip segmentation is not implemented in this report.
+* **Direction from ch27/ch30 is now suppressed at source.** Their readers have a template for only one arrow, so the direction they emitted was the only value they could return, not a reading. `gw_door_event.n_arrow_labels` records how many arrows the reader could name; the engine withholds `direction` below 2, and the report treats it as null. Recalibration needs someone riding the lifts — see `SITE_VISIT_REQUIRED.md`.
 * **ch16 alone is genuinely floor-blind** — 1 confident read in its current era. That turned out to
   be its own fault: see `INCIDENT_ch16_floor_blind.md`.
 
