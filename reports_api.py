@@ -27,6 +27,7 @@ through an authenticated route that streams them, and deleted after RETENTION_DA
 tmpfs (so a workbook competes with RAM the streams need) and world-readable. Both were real problems
 this week.
 """
+import json
 import os
 import shutil
 import sqlite3
@@ -56,6 +57,39 @@ RETENTION_DAYS = float(os.environ.get("REPORT_RETENTION_DAYS", "7"))
 MIN_FREE_GB = float(os.environ.get("REPORT_MIN_FREE_GB", "2"))
 NICE = int(os.environ.get("REPORT_NICE", "10"))
 POLL_S = 2.0
+
+# DEV-BOX DEPLOYMENT. On the gateway these are unset and everything below is inert: the DB is live,
+# there is no restore, and the page says so. On dev-box the database is an hourly Litestream RESTORE
+# from GCS, which makes two things mandatory:
+#   1. the page must show the RESTORE POINT, never "now" — an hourly snapshot presented as live data
+#      is a wrong answer delivered confidently, which is worse than no page at all;
+#   2. the refresh must not swap the file under a running export, hence a lock both sides take.
+DB_LOCK = os.environ.get("LIFTLAB_DB_LOCK", "")          # flock path; "" disables locking
+RESTORE_STATE = os.environ.get("LIFTLAB_RESTORE_STATE", "")   # json written by the refresh job
+
+
+def restore_state():
+    """What the refresh job last did. A FAILED refresh is not a cosmetic problem: this database is a
+    continuous restore test of the backup chain, so a refresh that stops working is a backup alarm.
+    It is surfaced on the page rather than logged quietly."""
+    if not RESTORE_STATE:
+        return {"mode": "live", "note": "reading the live gateway database"}
+    try:
+        with open(RESTORE_STATE) as fh:
+            st = json.load(fh)
+    except FileNotFoundError:
+        return {"mode": "restore", "ok": False, "stale": True,
+                "error": "no restore has completed yet — the page is showing nothing, or an old file"}
+    except Exception as e:
+        return {"mode": "restore", "ok": False, "error": f"restore state unreadable: {e!r}"}
+    st["mode"] = "restore"
+    ra = st.get("restored_at")
+    if ra:
+        age = time.time() - float(ra)
+        st["age_s"] = age
+        # Two missed hourly refreshes. One can be a blip; two is a pattern worth a red banner.
+        st["stale"] = age > 2 * 3600
+    return st
 
 IST = eras.IST
 
@@ -110,6 +144,8 @@ def _spawn(job_id):
     env = dict(os.environ)
     env["REPORTS_DB"] = REPORTS_DB
     env["REPORTS_DIR"] = str(REPORTS_DIR)
+    if DB_LOCK:
+        env["LIFTLAB_DB_LOCK"] = DB_LOCK      # the worker holds it for the whole build
     log = REPORTS_DIR / f"job-{job_id}.log"
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(REPORTS_DIR, 0o750)
@@ -339,6 +375,13 @@ async def submit(request: Request):
     return {"ok": True, "job_id": jid, "queued_ahead": n_q}
 
 
+@reports_router.get("/reports/data-as-of")
+def data_as_of():
+    """The restore point. Deliberately its own endpoint so the page can poll it independently of the
+    job list — a stale-data banner must keep updating even when nothing is exporting."""
+    return restore_state()
+
+
 @reports_router.get("/reports/jobs")
 def jobs(limit: int = 10):
     start_supervisor()
@@ -409,6 +452,12 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .note.warn{background:var(--warnbg);color:var(--warn);border:1px solid rgba(138,97,0,.25)}
 .note.err{background:var(--errbg);color:var(--err);border:1px solid rgba(170,17,17,.25)}
 .note.ok{color:var(--ok)}
+.asof{border-radius:10px;padding:12px 14px;margin:0 0 14px;border:1px solid var(--line);
+ background:var(--card);font-size:13px}
+.asof b{font-size:15px}
+.asof.stale{background:var(--warnbg);color:var(--warn);border-color:rgba(138,97,0,.35)}
+.asof.broken{background:var(--errbg);color:var(--err);border-color:rgba(170,17,17,.35)}
+.asof .sub2{font-size:12px;opacity:.85;margin-top:4px}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
 th{color:var(--mut);font-weight:600}
@@ -425,6 +474,8 @@ __NAVCSS__
 </style>
 __NAV__
 <div class=wrap>
+
+<div id=asof></div>
 
 <div class=card>
   <h2>Export a report</h2>
@@ -606,6 +657,31 @@ function loadJobs(){
     el.innerHTML=h+'</table>';
   }).catch(function(){});
 }
+
+function loadAsOf(){
+  fetch('/reports/data-as-of').then(function(x){return x.json()}).then(function(a){
+    var el=document.getElementById('asof'), h='';
+    if(a.mode==='live'){
+      h='<div class=asof><b>Live data.</b> <span class=sub2>This page reads the gateway database '+
+        'directly; figures are current as of the moment you export.</span></div>';
+    } else if(a.ok===false){
+      h='<div class="asof broken"><b>The hourly refresh is FAILING.</b>'+
+        '<div class=sub2>'+(a.error||'unknown error')+
+        '</div><div class=sub2>This database is restored from the backup chain, so a refresh that '+
+        'stops working is a <b>backup alarm</b>, not just a stale report. Anything you export below '+
+        'is from the last good restore'+(a.restored_at_h?(' — '+a.restored_at_h):'')+'.</div></div>';
+    } else {
+      var cls = a.stale ? 'asof stale' : 'asof';
+      h='<div class="'+cls+'"><b>Data as of '+(a.data_max_ts_h||a.restored_at_h||'unknown')+' IST</b>'+
+        '<div class=sub2>Restored from the backup chain at '+(a.restored_at_h||'?')+
+        (a.age_h?(' · '+a.age_h+' ago'):'')+'. <b>This is not live data.</b> The gateway keeps '+
+        'collecting; anything after the timestamp above is not in this copy.'+
+        (a.stale?' <b>The refresh is overdue — more than two hours old.</b>':'')+'</div></div>';
+    }
+    el.innerHTML=h;
+  }).catch(function(){});
+}
+loadAsOf(); setInterval(loadAsOf,60000);
 
 document.getElementById('f').addEventListener('change',checkRange);
 document.getElementById('t').addEventListener('change',checkRange);

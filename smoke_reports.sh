@@ -280,6 +280,50 @@ else
   bad "no workbook found to check permissions on"
 fi
 
+# ── retention sweep ──────────────────────────────────────────────────────────
+# Asserts the FILE IS GONE, not that a delete command exited zero. On 2026-08-04 a cleanup ran
+#   sudo rm -f /var/lib/liftlab/reports/*.xlsx
+# and reported success while deleting nothing: the glob is expanded by the INVOKING shell, which
+# could not read the 0750 directory, so it matched nothing and `rm -f` exited 0 on a literal path.
+# Two workbooks of resident movement data stayed on disk. `rm -f` cannot fail, so its exit status is
+# never evidence — only a subsequent existence check is.
+echo
+echo "== retention sweep actually deletes the workbook =="
+if [ -n "${JOB:-}" ] && [ "${ST:-}" = done ]; then
+  SWEPT=$("$PY" - "$STAGED" "$APP" "$TMP/main/reports.db" "$TMP/main/out" "$JOB" <<'PYSWEEP'
+import os, sys, sqlite3, time
+staged, app, jobs, outdir, jid = sys.argv[1:6]
+os.environ["REPORTS_DB"] = jobs
+os.environ["REPORTS_DIR"] = outdir
+sys.path.insert(0, staged); sys.path.insert(1, app)
+import reports_api
+db = sqlite3.connect(jobs)
+path = db.execute("SELECT output_path FROM report_job WHERE id=?", (jid,)).fetchone()[0]
+assert path and os.path.exists(path), f"nothing to sweep: {path}"
+# age it past retention, then call the SAME function the supervisor calls
+db.execute("UPDATE report_job SET finished_at=? WHERE id=?",
+           (time.time() - (reports_api.RETENTION_DAYS + 1) * 86400, jid))
+db.commit(); db.close()
+d = reports_api._jobs(); reports_api._sweep(d)
+st = d.execute("SELECT status, output_path FROM report_job WHERE id=?", (jid,)).fetchone()
+d.close()
+print(f"{path}|{st[0]}|{os.path.exists(path)}")
+PYSWEEP
+)
+  SPATH=${SWEPT%%|*}; REST=${SWEPT#*|}; SSTAT=${REST%%|*}; SEXISTS=${REST##*|}
+  [ "$SSTAT" = expired ] && ok "swept job marked expired (was done)" || bad "swept job status=$SSTAT (expected expired)"
+  if [ "$SEXISTS" = False ]; then ok "workbook is GONE from disk (checked by existence, not exit code)"
+  else bad "workbook STILL ON DISK after the sweep: $SPATH"; fi
+  # belt and braces: ask the filesystem again, from the shell, as the user that owns the dir
+  if [ -e "$SPATH" ]; then bad "second check: $SPATH still exists"; else ok "second check: path does not exist"; fi
+  # and the download route must now refuse with an explanation rather than a stack trace
+  RC=$(curl -s -o "$TMP/exp.body" -w '%{http_code}' --max-time 20 "http://127.0.0.1:$MAIN_PORT/reports/download/$JOB")
+  [ "$RC" = 410 ] && ok "download of an expired job -> 410" || bad "expired download -> $RC (expected 410)"
+  grep -qi "retention" "$TMP/exp.body" 2>/dev/null && ok "410 explains WHY (retention)" || bad "410 carries no explanation"
+else
+  bad "no completed job available to test the retention sweep"
+fi
+
 echo
 echo "== reports gate: $PASS passed, $FAIL failed =="
 [ "$FAIL" = 0 ]

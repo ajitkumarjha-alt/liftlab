@@ -65,6 +65,19 @@ def main(argv):
                (os.getpid(), time.time(), job_id))
     db.commit(); db.close()
 
+    # DB LOCK (dev-box only; unset on the gateway, where the database is live and never swapped).
+    # The hourly Litestream refresh replaces gateway.db by atomic rename. A build that started
+    # before the swap would keep reading the OLD inode — not corrupt, but it would silently report
+    # a different restore point than the page claims. Hold the lock for the WHOLE build so the
+    # refresh waits, and so a refresh in progress delays this build rather than racing it.
+    lock_path = os.environ.get("LIFTLAB_DB_LOCK", "")
+    lock_fh = None
+    if lock_path:
+        import fcntl
+        lock_fh = open(lock_path, "w")
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)     # blocking: a refresh takes ~1-2 min, worth waiting
+        print(f"acquired db lock {lock_path}", file=sys.stderr)
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(OUT_DIR, 0o750)          # resident movement data — never world-readable
     out = OUT_DIR / f"liftlab-report-{job_id}-{r_from[:10]}_{r_to[:10]}.xlsx"

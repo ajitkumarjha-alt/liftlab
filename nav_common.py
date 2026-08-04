@@ -28,6 +28,9 @@ _TOP = [
     ("fleet", "Fleet", None),                 # resolved from DASH_FLEET_URL
     ("floorcheck", "Floorcheck", "/floorcheck/{gw}/{cam}"),
     ("validate", "Validate", "/validate"),
+    # Points at the gateway path; that route now serves a stub explaining the move and linking
+    # dev-box. Keeping the nav entry is deliberate — removing it would leave people wondering where
+    # reports went, which is the same failure as a 404, just quieter.
     ("reports", "Reports", "/reports"),
 ]
 
