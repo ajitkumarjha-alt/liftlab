@@ -491,3 +491,24 @@ it back is two lines in `main.py`; the reason not to is above, not in the code.
 
 **The fallback is dev-box**, which is where this should go: same code, same gate, no live streams to
 starve. Nothing about the module is gateway-specific except the `GATEWAY_DB` path it reads.
+
+## A cleanup that silently did nothing (2026-08-04)
+
+Removing the proof-run workbooks with
+
+```bash
+sudo rm -f /var/lib/liftlab/reports/*.xlsx
+```
+
+reported success and deleted nothing. The glob is expanded by the **invoking** shell, before sudo —
+and that user cannot read a `0750 liftlab:liftlab` directory, so it matched nothing, `rm -f` got a
+literal unmatched path, and exited 0. Two workbooks of resident movement data stayed on disk while
+the command said it had removed them.
+
+```bash
+sudo sh -c "rm -f /var/lib/liftlab/reports/*.xlsx"   # glob expands UNDER sudo
+```
+
+Same shape as the week's other failures: a command that reports success without doing the thing.
+`rm -f` in particular cannot fail, which is exactly why it cannot be trusted as evidence — verify by
+listing afterwards, under the same privilege that could see the files in the first place.
