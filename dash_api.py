@@ -235,9 +235,51 @@ def _range_bounds(period, from_d="", to_d=""):
 
 
 def _in_range(ep, t0, t1):
-    if t0 is None:
+    """Half-open [t0, t1). Either bound may be None meaning unbounded on that side — a "last 7 days"
+    window has a floor but no ceiling, so rows arriving mid-request are not silently dropped."""
+    if t0 is None and t1 is None:
         return True
-    return ep is not None and t0 <= ep < t1
+    if ep is None:
+        return False
+    if t0 is not None and ep < t0:
+        return False
+    if t1 is not None and ep >= t1:
+        return False
+    return True
+
+
+# ── the /dash read window ─────────────────────────────────────────────────────
+# /dash/{gw}/data used to read every camera's ENTIRE history on every page load, which is why it
+# never terminated. It is now bounded: `days` (default 7) is a floor on ts, pushed into SQL so the
+# rows are never fetched, not filtered in Python after the fact. ix_door_event(gateway_id,cam,ts)
+# serves exactly this shape, so the window is an index range scan.
+#
+# ALL HISTORY is still reachable, but only by asking: days=0. It is labelled expensive in the
+# response so a caller cannot stumble into it, and it is never what a default load runs.
+WINDOW_DAYS = float(os.environ.get("DASH_WINDOW_DAYS", "7"))
+
+
+def _ts_clause(t0, t1):
+    """SQL fragment + args for a ts window. Appended to an existing WHERE, so it starts with AND.
+    Pushing the bound into SQL is the whole point: the rows must never be fetched."""
+    sql, args = "", []
+    if t0 is not None:
+        sql += " AND ts >= ?"; args.append(t0)
+    if t1 is not None:
+        sql += " AND ts < ?"; args.append(t1)
+    return sql, args
+
+
+def _window(days=None):
+    """-> (t0, t1, meta). t1 stays None: 'last N days' has no ceiling."""
+    d = WINDOW_DAYS if days is None else float(days)
+    if d <= 0:
+        return None, None, {"days": None, "all_history": True, "expensive": True,
+                            "label": "all history",
+                            "note": "unbounded read — explicitly requested via days=0"}
+    t0 = time.time() - d * 86400.0
+    return t0, None, {"days": d, "from": t0, "all_history": False, "expensive": False,
+                      "label": f"last {d:g}d"}
 
 
 def _ist_today_epoch():
@@ -403,7 +445,7 @@ def _join_diagnostics(stops, transits, matched):
     }
 
 
-def _door_transition_census(db, gw, cam, era):
+def _door_transition_census(db, gw, cam, era, t0=None, t1=None):
     """WHERE do this camera's door cycles die — walked from the stored door_state sequence, so it
     works on existing rows with no GPU change. The GPU DoorTracker moves closed -> opening -> open ->
     closing -> closed; a completed cycle is the full path, and close_travel is only emitted on
@@ -415,8 +457,10 @@ def _door_transition_census(db, gw, cam, era):
     key), so consecutive rows with a state change are real transitions. Heartbeat re-emits of the
     SAME state are collapsed here, so a run of identical states counts as one occupancy, not many.
     """
+    _w, _wargs = _ts_clause(t0, t1)
     rows = _q(db, "SELECT ts, door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
-                  "AND door_version LIKE ? AND door_state IS NOT NULL ORDER BY ts, id", (gw, cam, era + "%"))
+                  "AND door_version LIKE ? AND door_state IS NOT NULL" + _w + " ORDER BY ts, id",
+              (gw, cam, era + "%", *_wargs))
     # Same guard-regime cut as the close-travel pool: pre-guard transitions are the mispairing era's
     # artifacts; a funnel over them diagnoses a tracker that no longer runs.
     if _GUARD_EPOCH is not None:
@@ -474,7 +518,7 @@ def _door_transition_census(db, gw, cam, era):
     }
 
 
-def _door_gpu_by_cam(db, gw, cams):
+def _door_gpu_by_cam(db, gw, cams, t0=None, t1=None):
     """GPU-era close-travel, from gw_door_event COMPLETED CYCLES (close_travel_s not null), per camera
     and per that camera's own era. This is the live instrument; _door_by_cam is the retired Pi one.
     They are reported SEPARATELY and never merged — different sensors on different clocks.
@@ -491,9 +535,10 @@ def _door_gpu_by_cam(db, gw, cams):
             out[cam] = {"era": None, "reason": "no gw_door_event rows in any era", "n_rows": 0,
                         "n_cycles": 0, "n": 0}
             continue
+        w, wargs = _ts_clause(t0, t1)
         rows = _q(db, "SELECT ts, door_state, close_travel_s ct FROM gw_door_event "
-                      "WHERE gateway_id=? AND cam=? AND door_version LIKE ? AND door_state IS NOT NULL "
-                      "ORDER BY ts, id", (gw, cam, era + "%"))
+                      "WHERE gateway_id=? AND cam=? AND door_version LIKE ? AND door_state IS NOT NULL"
+                      + w + " ORDER BY ts, id", (gw, cam, era + "%", *wargs))
         # GUARD-REGIME CUT. The 5f1488a time-guards changed what gets emitted without moving the era,
         # so pre-guard mispairings share the era with clean rows. With DASH_DOOR_GUARD_TS set, the
         # quotable pool is post-guard rows only; the excluded count stays visible, never silent.
@@ -1001,14 +1046,18 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
         e["first"] = min(e["first"], r["t0"])
         e["last"] = max(e["last"], r["t1"])
     eras_list = sorted(era_census.values(), key=lambda e: (e["last"] or 0), reverse=True)
+    _w, _wargs = _ts_clause(t0, t1)
     rows = _q(db, "SELECT ts, floor, direction, door_state, reason, read_conf FROM gw_door_event "
-                  "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
-              (gw, cam, era + "%"))
+                  "WHERE gateway_id=? AND cam=? AND door_version LIKE ?" + _w + " ORDER BY ts",
+              (gw, cam, era + "%", *_wargs))
     # Optional DATE RANGE on top of the era. Both sides are filtered together: leaving transits
     # unfiltered while narrowing the door rows would join riders to windows that are no longer in
     # the result, and the per-floor totals would exceed the range they claim to describe.
-    if t0 is not None:
-        rows = [r for r in rows if _in_range(r["ts"], t0, t1)]
+    # `rows` is already windowed by SQL above — filtering it again here would be the exact
+    # materialise-then-slice this change removes. Transits come from a separate read and still need
+    # the same bound applied, because joining riders to windows outside the range would inflate the
+    # per-floor totals past the range they claim to describe.
+    if t0 is not None or t1 is not None:
         transits = [t for t in transits if _in_range(t[0], t0, t1)]
     if not rows:
         return None
@@ -1207,7 +1256,7 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
         "transits_total": len(transits),
         "era_span": [era_t0, era_t1],
         "door_open_seconds": round(open_seconds, 1),
-        "transition_census": _door_transition_census(db, gw, cam, era),
+        "transition_census": _door_transition_census(db, gw, cam, era, t0, t1),
         "floor_order_declared": bool(FLOOR_ORDER),
     }
 
@@ -1273,11 +1322,11 @@ def _latest(db, table, gw):
 
 
 @dash_router.get("/dash/{gw}/data")
-def dash_data(gw: str, era: str = ""):
+def dash_data(gw: str, era: str = "", days: float | None = None):
     db = _db()
     _budget_arm(db, DATA_BUDGET_S)
     try:
-        return _dash_data_inner(db, gw, era)
+        return _dash_data_inner(db, gw, era, days)
     except DashTimeout as e:
         # 503 + Retry-After, NOT 500: the request was abandoned deliberately, the data is not known
         # to be broken, and a caller that retries later may well succeed. The body names the phase
@@ -1295,13 +1344,14 @@ def dash_data(gw: str, era: str = ""):
         db.close()
 
 
-def _dash_data_inner(db, gw: str, era: str = ""):
+def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
     now = time.time()
+    t0, t1, window = _window(days)
     cams = _cameras(db, gw)
     _budget_check("door_by_cam")
     door = _door_by_cam(db, gw)                      # Pi-era (gw_event), RETIRED instrument
     _budget_check("door_gpu_by_cam")
-    door_gpu = _door_gpu_by_cam(db, gw, [c["cam"] for c in cams])   # GPU-era (gw_door_event), LIVE
+    door_gpu = _door_gpu_by_cam(db, gw, [c["cam"] for c in cams], t0, t1)  # GPU-era, LIVE
     _budget_check("transit_by_cam")
     trans = _transit_by_cam(db, gw)
     xfer = _transfer_by_cam(db, gw)
@@ -1315,7 +1365,7 @@ def _dash_data_inner(db, gw: str, era: str = ""):
     tier2 = {}
     for c in cams:
         _budget_check(f"tier2:{c['cam']}")
-        v = _tier2(db, gw, c["cam"], tj.get(c["cam"], []), era_override=era)
+        v = _tier2(db, gw, c["cam"], tj.get(c["cam"], []), t0, t1, era_override=era)
         if v:
             tier2[c["cam"]] = v
     ana = _analyzers(db, gw)
@@ -1414,6 +1464,10 @@ def _dash_data_inner(db, gw: str, era: str = ""):
                        "unlock": "floor OCR (template-match the LED digits + direction arrow)"}
 
     return JSONResponse({"t": now, "gw": gw, "ist_today": _ist_today_str(),
+                         # WHAT RANGE THESE NUMBERS DESCRIBE. Every close-travel / stop / per-floor
+                         # figure below is computed over this window, not over all history. Default
+                         # is 7 days; days=0 asks for all history and is flagged expensive.
+                         "window": window,
                          "pi": pi, "relay": relay, "gpu": gpu,
                          "cameras": out_cams, "headline": headline, "registry": registry,
                          "floor_coverage": floor_cov, "tier2": tier2, "unavailable": unavailable,
@@ -2437,7 +2491,11 @@ function load(){
     })
     .then(function(d){
       inflight=null; fails=0; DATA=d;
-      document.getElementById('stamp').textContent='· '+d.ist_today+' · updated '+new Date().toLocaleTimeString();
+      /* State the RANGE these numbers describe. Windowing changed what the close-travel medians,
+         stop counts and per-floor totals mean — they are now a window, not all history — so the
+         page must say so rather than let an operator read a 7-day median as a lifetime one. */
+      var w=d.window||{}, wl=w.label?(' · '+w.label+(w.expensive?' ⚠ expensive':'')):'';
+      document.getElementById('stamp').textContent='· '+d.ist_today+wl+' · updated '+new Date().toLocaleTimeString();
       render();
       scheduleLoad(REFRESH_MS);
     })
