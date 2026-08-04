@@ -13,7 +13,7 @@
 #
 # FILES NEEDED IN /tmp:
 #   apply_reports.sh reports_api.py report_runner.py nav_common.py apply_reports_patch.py
-#   smoke_reports.sh
+#   smoke_reports.sh liftlab_report/ (the package directory) lift_banks.json
 #   sudo bash /tmp/apply_reports.sh
 set -uo pipefail
 APP=/opt/liftlab-b3/cloud
@@ -23,10 +23,17 @@ OWNER=liftlab
 GW="${GW:-site-A}"
 FILES="reports_api.py report_runner.py nav_common.py"
 say(){ echo "[reports] $*"; }
+# DISCOVERED 2026-08-04: the gateway has never carried the report tooling at all — no
+# liftlab_report package and no openpyxl in its venv. /reports is useless without both, so this
+# deploy installs them. openpyxl is the package's ONLY third-party dependency (checked by walking
+# every import in liftlab_report/), which is why this stays a small addition to a 53MB venv rather
+# than dragging numpy/pandas onto a 2GB box.
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
 for f in $FILES apply_reports_patch.py smoke_reports.sh; do
   [ -f "/tmp/$f" ] || { echo "missing /tmp/$f"; exit 2; }
 done
+[ -d /tmp/liftlab_report ] || { echo "missing /tmp/liftlab_report (the report package)"; exit 2; }
+[ -f /tmp/lift_banks.json ] || { echo "missing /tmp/lift_banks.json (bank sidecar)"; exit 2; }
 id "$OWNER" >/dev/null 2>&1 || OWNER=root
 
 grep -q 'reports_router' /tmp/reports_api.py   || { say "ABORT: reports_api.py has no reports_router"; exit 2; }
@@ -42,6 +49,27 @@ fi
 
 $PY -m py_compile /tmp/reports_api.py /tmp/report_runner.py /tmp/nav_common.py \
   || { say "compile failed — nothing changed"; exit 1; }
+
+# ── the report tooling itself (absent from this box until now) ───────────────
+if ! $PY -c "import openpyxl" 2>/dev/null; then
+  say "installing openpyxl into the venv (the report package's only third-party dependency) ..."
+  $PY -m pip install --quiet --no-input openpyxl \
+    || { say "ABORT: could not install openpyxl — nothing else changed"; exit 1; }
+fi
+$PY -c "import openpyxl; print('  openpyxl', openpyxl.__version__)" \
+  || { say "ABORT: openpyxl still not importable"; exit 1; }
+
+rm -rf "$APP/liftlab_report"
+cp -r /tmp/liftlab_report "$APP/liftlab_report"
+rm -rf "$APP/liftlab_report/__pycache__"
+install -o "$OWNER" -g "$OWNER" -m 644 /tmp/lift_banks.json "$APP/lift_banks.json"
+install -o "$OWNER" -g "$OWNER" -m 644 /tmp/lift_banks.json "$APP/liftlab_report/lift_banks.json"
+chown -R "$OWNER:$OWNER" "$APP/liftlab_report"
+say "installed liftlab_report package + lift_banks.json"
+( cd "$APP" && $PY -c "
+from liftlab_report import cli, eras, workbook
+print('  report package imports OK; coefficients:', len(eras.COEFFICIENTS))" ) \
+  || { say "ABORT: the report package does not import on this box"; exit 1; }
 
 # smoke-import the CANDIDATES. sys.path.insert INSIDE the interpreter is the only ordering that
 # binds: `cd $APP` puts CWD ahead of PYTHONPATH and would silently import the installed module.
