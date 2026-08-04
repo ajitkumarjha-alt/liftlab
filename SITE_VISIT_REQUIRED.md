@@ -29,9 +29,16 @@ Some shorthand used below:
 
 ## Job 1 — Lift 1 (ch16): the camera can no longer see the floor indicator
 
-**What is wrong.** On **29 July 2026 at 04:15** this camera stopped being able to read the floor
-indicator, and has not read it since. Before that it was reading the floor successfully about
-46 % of the time — roughly 19,400 successful reads. Since then it has managed **one**.
+**What is wrong.** On **25 July 2026, between 06:00 and 12:00 UTC** (last good reading 08:12 UTC),
+this camera stopped being able to read the floor indicator, and has not read it since. Before that it
+was reading the floor successfully about 46 % of the time — roughly 19,400 successful reads. Since
+then it has managed **one**.
+
+> **DATE CORRECTED 4 August.** An earlier version of this note said 29 July at 04:15. That was our
+> mistake — we had misread a software-version boundary as the moment of failure. **The camera stopped
+> working on 25 July, four days earlier.** If you are checking maintenance logs, cleaning schedules or
+> access records, please look at **25 July morning**, not 29 July. Nothing happened to this camera on
+> 29 July; that date was one of our own software updates, fleet-wide.
 
 Nothing in our software changed at that moment. We checked: the settings, the reading templates and
 the region we look at were all identical either side of the break. The system also stopped even
@@ -51,10 +58,22 @@ service visit that morning would fit.
 4. Tell us when you are done; we re-run the calibration remotely and confirm reads resume.
 5. If the camera looks untouched and the indicator is plainly visible, say so — that changes the
    diagnosis and we investigate differently.
+6. **While you are in front of this camera, also photograph the DOORS as the picture sees them** —
+   one frame with the doors fully open, one mid-close, one fully shut. Send all three.
 
-**Time:** about 30 minutes. **Blocks:** all floor-related data on lift 1 — which floors it serves,
-how long it travels between them, and where people get on and off. Door-close timing on lift 1 is
-unaffected and still working.
+   *Why:* separately from the floor indicator, lift 1 produces roughly **50 % more short false
+   "door moved" blips than the other lifts** (47 % of its door events, against 30 % on lifts 2 and 3)
+   — within the same software version, so it is not a software difference. Something in this
+   camera's view is being mistaken for door movement: a reflection, a mirror, a poster, passing
+   people, or the doors sitting only partly in frame. Three photographs would tell us which, and we
+   cannot get them remotely — the system only stores its *conclusions* about the doors, never the
+   picture it drew them from.
+
+**Time:** about 30 minutes (plus 5 minutes for the three door photographs). **Blocks:** all
+floor-related data on lift 1 — which floors it serves, how long it travels between them, and where
+people get on and off. Door-close *timing* on lift 1 remains valid; what the photographs would
+unblock is why lift 1 registers so many false door blips, which currently costs us usable door
+cycles on that lift.
 
 ---
 

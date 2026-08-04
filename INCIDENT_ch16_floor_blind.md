@@ -1,10 +1,14 @@
-# INCIDENT — ch16 (lift 1) went floor-blind on 2026-07-29, and nothing noticed for six days
+# INCIDENT — ch16 (lift 1) went floor-blind on 2026-07-25, and nothing noticed for ten days
 
 **Status: OPEN, not investigated. Written up only.** Found while correcting the Tier-2 confident-read
 definition (see `README_REPORT.md`); it is a separate fault and is deliberately not fixed there.
 
-**Severity: this camera has produced no usable floor data since 2026-07-29 04:15 UTC.** Every
+**Severity: this camera has produced no usable floor data since 2026-07-25 08:12 UTC.** Every
 floor-dependent figure for lift 1 is derived from 1 confident read.
+
+> **DATE CORRECTED 2026-08-04 — the original write-up named 2026-07-29 04:15. That is wrong,**
+> **and it would have sent a site engineer to the wrong day.** See "Correction" below. The
+> failure is four days earlier; 07-29 04:15 is an unrelated software deploy.
 
 ---
 
@@ -20,8 +24,47 @@ ch16's floor reading collapsed from 46 % of door observations to effectively zer
 | `e79e50d3h2+87e5c93f` | 3 | 0 | 0 % | 07-30 06:16 → 06:20 |
 | `e79e50d3h2+54509e75` | 23,160 | **1** | **0.004 %** | 07-30 06:25 → present |
 
-The break is sharp: the last healthy row is 07-29 04:14:03 and the first dead row is 07-29 04:15:09,
-about one minute apart.
+~~The break is sharp: the last healthy row is 07-29 04:14:03 and the first dead row is 07-29 04:15:09,
+about one minute apart.~~
+
+## Correction (2026-08-04): the table above misreads an era boundary as the failure
+
+The table aggregates by `door_version`, so it reports **when each era ended**, not when reads stopped.
+The `e79e50d3+7b1c0bad` era does contain 19,424 confident reads — but **every one of them predates
+2026-07-25 08:12:39 UTC**, and the era then ran for four more days producing zero. "Last healthy row
+07-29 04:14:03" is the last row *of that era*, not the last row *with a confident read*.
+
+Confident reads (`reason` in `ok` / `single_panel` / `''`), 6-hour buckets:
+
+| bucket (UTC) | rows | confident | rate |
+|---|---:|---:|---:|
+| 07-25 00:00 | 7,607 | 4,862 | 63.9 % |
+| 07-25 06:00 | 3,869 | 2,115 | 54.7 % |
+| **07-25 12:00** | 1,388 | **0** | **0 %** |
+| 07-25 18:00 | 724 | 0 | 0 % |
+| 07-26 00:00 | 3,452 | 0 | 0 % |
+| … through 07-30 18:00 | | 0 | 0 % |
+
+**Last confident floor read: 2026-07-25 08:12:39 UTC.** The failure window is 07-25 between 06:00 and
+12:00 UTC — a different day, and a different maintenance window, from the one originally recorded.
+
+### What actually happened on 07-29 04:15
+
+That timestamp is the **`h2` tracker-logic deploy**, and it is fleet-wide, not a ch16 event:
+
+| cam | first `h2` row |
+|---|---|
+| ch27 | 07-29 04:15:07 |
+| ch29 | 07-29 04:15:08 |
+| ch16 | 07-29 04:15:09 |
+| ch30 | 07-30 15:17:30 |
+
+Three cameras within two seconds. `h2` is `TRACKER_LOGIC` in `gpu_door.py:79` — "close-start
+hysteresis band + debounce (2026-07-29 flap fix)". It has nothing to do with floor OCR, and it did
+not cause the blindness, which had already been in place for four days.
+
+The open question in this document — *"what is `h2`, which commit or calibration applied it on
+07-29 ~04:15"* — is therefore **answered, and it is not the culprit.**
 
 ## The templates did not change — and neither did the geometry
 

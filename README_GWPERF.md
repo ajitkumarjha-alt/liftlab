@@ -293,3 +293,80 @@ It does set the job's runtime (~533s) and therefore its duty cycle: at 1h that i
 requests. The windowed `gw_door_event` queries now plan onto all three columns of the EXISTING
 `ix_door_event`. Re-measure `/ops` against 5.5s before running `apply_gwindex.sh`; do not add write
 cost at ~3.5 writes/s for an index the query no longer needs.
+
+---
+
+# Litestream — the backup was never restorable, and what was done about it (2026-08-04)
+
+## The finding
+
+While verifying that the newly-deployed `worker_telemetry` table replicated, a restore was attempted
+for the first time in a while. **It failed, at every timestamp tried:**
+
+```
+cannot find max wal index for restore: missing initial wal segment:
+generation=1950dae6522690d2 index=00005d8e offset=337872
+```
+
+Litestream was `active`, shipping WAL segments to GCS continuously, and `litestream snapshots` listed
+a recent 68 MB snapshot. **None of that meant the backup worked.** The WAL chain had a gap, so
+`litestream restore` could not reconstruct the database at any point in time.
+
+**Shipping is not restorability. The only evidence that a backup works is a restore.** The deploy
+scripts now run one rather than inferring it from replication activity.
+
+## When the gap dates from, and why
+
+The generation in use (`1950dae6522690d2`) began **2026-08-04T02:29:37Z**; the surviving snapshot was
+written at 10:29:14Z at index 24568. The missing segment is index `00005d8e` (23950) — *older* than
+the snapshot that needed it. The journal shows the mechanism:
+
+```
+"retainer error" ... error="delete wal segments before index: ...
+   oauth2: cannot fetch token: dial tcp 192.178.211.95:443: i/o timeout"
+"monitor error"  ... error="... TLS handshake timeout"      (x8 in 24h)
+"sync error"     ... error="checkpoint: mode=PASSIVE err=database is locked"   (x7 in 24h)
+```
+
+GCS API flakiness from this box interrupted the **retainer** partway through deleting superseded WAL
+segments, leaving the chain inconsistent — some segments removed, later ones kept. The `database is
+locked` checkpoint failures (clustered 08-03 15:43 → 08-04 03:53, none since) prevented clean WAL
+truncation and widened the window in which that could happen.
+
+**How far back the loss goes is not knowable from the replica** — the generation itself only dates to
+02:29 on 08-04, and no earlier generation survives. Treat everything before 2026-08-04 12:19 UTC as
+having no point-in-time backup.
+
+## The pre-generation fallback snapshot
+
+Taken before touching anything, with `sqlite3 .backup` (online backup API, safe against the live WAL
+database), `PRAGMA integrity_check` = `ok` on the copy, then uploaded and size-verified:
+
+```
+gs://liftlab-backup-lodha/liftlab/manual-snapshots/gateway-pre-generation-20260804.db
+  234,713,088 bytes   2026-08-04T12:03:47Z
+  gw_door_event=481,382   transit_event=26,093   worker_telemetry=203
+```
+
+It is deliberately stored **outside** the `liftlab/gateway.db/` prefix Litestream owns, so no
+generation cleanup can reach it. This is a one-off flat file, not part of any chain — restore it by
+downloading and opening it directly.
+
+## Two things to know before running the regeneration again
+
+**1. The VM cannot write to GCS.** Its scopes are `devstorage.read_only`. Litestream writes using a
+service-account key (`GOOGLE_APPLICATION_CREDENTIALS=/etc/liftlab/backup-key.json` on its unit).
+`apply_litestream_regen.sh` reuses that key inside a throwaway `CLOUDSDK_CONFIG` so the box's global
+`gcloud` auth is left alone. The first run aborted here with a 403 — correctly, **before** deleting
+anything, because the upload gate precedes every destructive step.
+
+**2. Never delete the parent replica prefix — delete the specific generation.** The first working run
+issued `gcloud storage rm -r gs://.../liftlab/gateway.db`. That prefix is also where the *new*
+generation gets written. Litestream came back up, created generation `56539de99e6d45cb`, and started
+writing WAL into the very prefix the recursive delete was still walking — so the delete kept finding
+new objects to remove and **never converged**. It ran 100 minutes on ~14k objects and was still
+going, while saturating a 2-vCPU box enough to make SSH refuse connections.
+
+The script now takes the generation id *before* stopping Litestream, asserts Litestream actually
+stopped, deletes only `.../generations/<OLD_GEN_ID>/`, and bounds that delete with `timeout 600`.
+Leftover objects from an old generation are harmless junk; a livelock is not.
