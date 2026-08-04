@@ -54,7 +54,13 @@ def _db() -> sqlite3.Connection:
         db.execute("ALTER TABLE relay_status ADD COLUMN stall_restarts INTEGER")
     except sqlite3.OperationalError:
         pass                                       # column already present
-    for col in ("guard_state TEXT", "guard_floor REAL", "gw_rss_mb INTEGER"):
+    # tx_packets / last_reboot_epoch: sent by the relay since 2026-08-04 and, until this was added,
+    # silently DROPPED by this ingest — the payload carried them, no column existed, and nothing
+    # read them. tx_packets is the ONLY signal the silent bcmgenet TX wedge produces (dmesg shows
+    # nothing at all), so storing it is what makes the next wedge visible from the cloud instead of
+    # only from a shell on the Pi. last_reboot_epoch exposes the escalation ladder's reboot cooldown.
+    for col in ("guard_state TEXT", "guard_floor REAL", "gw_rss_mb INTEGER",
+                "tx_packets INTEGER", "last_reboot_epoch REAL"):
         try:
             db.execute(f"ALTER TABLE relay_status ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -104,8 +110,8 @@ async def relay_status_ingest(gw: str, request: Request, authorization: str = He
     db.execute(
         "INSERT INTO relay_status (gateway_id,ts,sum_delivered_mbps,streams_alive,streams_delivering,"
         "ff_cpu,soc_temp,throttle_live,mem_avail_mb,door_fps,guard_trips,stall_restarts,per_stream,"
-        "guard_state,guard_floor,gw_rss_mb) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "guard_state,guard_floor,gw_rss_mb,tx_packets,last_reboot_epoch) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (gw, time.time(), d.get("sum_delivered_mbps"), d.get("streams_alive"), d.get("streams_delivering"),
          d.get("ff_cpu"), d.get("soc_temp"), d.get("throttle_live"), d.get("mem_avail_mb"),
          d.get("door_fps"), d.get("guard_trips", 0), d.get("stall_restarts", 0),
@@ -113,7 +119,10 @@ async def relay_status_ingest(gw: str, request: Request, authorization: str = He
          # guard_state: ok | cooldown (stopped, will retry) | down (gave up, needs a human).
          d.get("guard_state", "ok"), d.get("guard_floor"),
          # the gateway's OWN RSS, not the Pi's — the growth curve for the next OOM
-         _self_rss_mb()))
+         _self_rss_mb(),
+         # from the Pi: the NIC's transmit counter (the wedge's only signal) and the epoch of the
+         # last automatic reboot attempt (0 = never), so the cooldown is auditable from here.
+         _f(d.get("tx_packets")), _f(d.get("last_reboot_epoch"))))
     db.execute("DELETE FROM relay_status WHERE gateway_id=? AND id NOT IN "
                "(SELECT id FROM relay_status WHERE gateway_id=? ORDER BY id DESC LIMIT 720)", (gw, gw))
     db.commit()

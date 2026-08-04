@@ -32,6 +32,7 @@ id "$OWNER" >/dev/null 2>&1 || OWNER=root
 
 grep -q 'n_arrow_labels' /tmp/door_event_api.py || { say "ABORT: door_event_api.py has no n_arrow_labels"; exit 2; }
 grep -q 'gw_rss_mb' /tmp/ops_api.py             || { say "ABORT: ops_api.py has no gw_rss_mb"; exit 2; }
+grep -q 'tx_packets' /tmp/ops_api.py            || { say "ABORT: ops_api.py does not persist tx_packets"; exit 2; }
 
 $PY -m py_compile /tmp/door_event_api.py /tmp/ops_api.py || { say "compile failed — nothing changed"; exit 1; }
 
