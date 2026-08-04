@@ -82,13 +82,28 @@ fi
 # smoke_relay_start.sh runs the REAL candidate to completion of its first loop turns with the
 # outside world stubbed. Verified to FAIL on that exact bug and pass without it.
 if [ -f /tmp/smoke_relay_start.sh ]; then
-  say "startup gate: running smoke_relay_start.sh against the CANDIDATE (~60s) ..."
-  if ! bash /tmp/smoke_relay_start.sh /tmp/relay_soak.sh; then
+  # RUN AS THE SERVICE USER, NOT ROOT. The unit is User=askjitk, and the first Pi run of this gate
+  # executed as root out of /tmp — which is NOEXEC there, so the stubs could not run and the gate
+  # blamed relay_soak.sh for its own environment. Dropping to askjitk also puts the smoke's workdir
+  # under that user's HOME, which is executable, and matches the permissions the service really has.
+  SMOKE_AS="${SMOKE_AS:-askjitk}"
+  if id "$SMOKE_AS" >/dev/null 2>&1 && [ "$(id -un)" != "$SMOKE_AS" ]; then
+    cp /tmp/smoke_relay_start.sh /tmp/relay_soak.sh "/home/$SMOKE_AS/" 2>/dev/null || true
+    chown "$SMOKE_AS:$SMOKE_AS" "/home/$SMOKE_AS/smoke_relay_start.sh" "/home/$SMOKE_AS/relay_soak.sh" 2>/dev/null || true
+    say "startup gate: running as $SMOKE_AS (the unit's User=), ~60s ..."
+    SMOKE_CMD="runuser -u $SMOKE_AS -- bash /home/$SMOKE_AS/smoke_relay_start.sh /home/$SMOKE_AS/relay_soak.sh"
+    command -v runuser >/dev/null 2>&1 || SMOKE_CMD="su -s /bin/bash -c 'bash /home/$SMOKE_AS/smoke_relay_start.sh /home/$SMOKE_AS/relay_soak.sh' $SMOKE_AS"
+  else
+    say "startup gate: running as $(id -un), ~60s ..."
+    SMOKE_CMD="bash /tmp/smoke_relay_start.sh /tmp/relay_soak.sh"
+  fi
+  if ! eval "$SMOKE_CMD"; then
     say "ABORT: the candidate does not START. Nothing installed, relay left exactly as it is."
     say "  This is the gate that 13577bec needed and did not have."
     exit 1
   fi
   say "startup gate: PASSED — the candidate starts and reaches its main loop."
+  rm -f "/home/${SMOKE_AS:-askjitk}/smoke_relay_start.sh" "/home/${SMOKE_AS:-askjitk}/relay_soak.sh" 2>/dev/null || true
 else
   say "WARN: /tmp/smoke_relay_start.sh not present — startup gate SKIPPED."
   say "  Fetch it alongside relay_soak.sh. Without it, a script that cannot start will install"
