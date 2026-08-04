@@ -1,0 +1,20 @@
+# Python bytecode. These were being committed — 14 .pyc files reached the repo, one of them
+# before this branch existed. They are build output: machine-specific, regenerated on import, and
+# they turn every `git add -A` into a noisy diff that hides the real change.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# pytest / tooling state
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Report output. liftlab-report writes here by default when /mnt/user-data/outputs is absent;
+# workbooks and CSVs are generated artefacts, not source.
+reports/
+*.xlsx
+
+# Local virtualenvs
+.venv/
+venv/
