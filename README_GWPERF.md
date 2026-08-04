@@ -8,23 +8,51 @@ Start the next session from the measurements below rather than re-deriving them.
 
 ---
 
-## THE NUMBER THE FIX HAS TO MOVE
+## THE HEADLINE FACT: /dash/{gw}/data DOES NOT TERMINATE
+
+Measured from browser DevTools plus direct timing (2026-08-03):
 
 ```
-_tier2("ch29")            42.98 s        <- one camera, one call
-  era rows                77,905
-  all-era rows           170,839
-  all-era rows w/ floor  140,793
-  transits joined          4,815
+/dash              (page shell)   200, 6.5 s, 48.1 kB     <- the shell is FINE
+/dash/site-A/data                 000, 600 s, 0.0 kB      <- curl --max-time 600
+                                  DevTools: Pending, 0.0 kB
 ```
 
-Measured with `cProfile`, **with the `itertools.islice` allocation fix already applied**. Seven
-cameras run this per `/dash/{gw}/data` request, which is why a 240 s verification ceiling was not
-enough.
+**This is not a slow endpoint. It is a non-terminating one.** Caddy is not involved — it logged zero
+dash errors and proxies the shell fine.
 
-**The fix must bound the read in SQL with a time window.** Reducing Python allocation is not enough —
-that was already tried and it moved the wrong quantity. `_tier2` is slow because it pulls 170k rows
-per camera into the process, not because of how it slices them once they are there.
+The consequence is the important part: **every `/dash` page load leaves a query running on the box
+that never finishes.** The dashboard auto-refreshes, so hours of an open tab pile up non-terminating
+work. That is very likely the major contributor to the sustained load and to the OOM kills below.
+
+### Do not quote 42.98 s as the live cost
+
+An earlier note in this file cited `_tier2("ch29") = 42.98 s`. That figure was measured **under
+`cProfile` instrumentation**, which inflates it, and it is **not** the live cost. It is retained only
+as a relative signal that `_tier2` dominates. The real live behaviour is "does not complete".
+
+What is still trustworthy from that run is the row volume, because those are counts, not timings:
+
+```
+ch29   era rows                77,905
+       all-era rows           170,839
+       all-era rows w/ floor  140,793
+       transits joined          4,815
+```
+
+Seven cameras, three near-full reads each, per request.
+
+## The fix — required shape, not a suggestion
+
+1. **`/dash/{gw}/data` must aggregate in SQL with a bounded time window. Default: last 7 days.**
+2. **No materialising history in Python.** Reducing allocation was already tried (`rows[idx+1:]` →
+   `itertools.islice`) and it moves the wrong quantity. The problem is the volume pulled into the
+   process, not how it is handled once there.
+3. **An all-history view, if kept at all, must be explicitly requested and labelled expensive.** It
+   must never be what a default page load runs.
+4. **The endpoint needs a server-side timeout.** A query that overruns must return an error, not run
+   forever. A request that hangs while holding resources is precisely how a slow page becomes an OOM
+   — see the two kills below. This is a hard requirement, not a nicety.
 
 ---
 
@@ -98,18 +126,30 @@ is a semantic change, not a free optimisation).
 ## Measured endpoint baselines (2026-08-03, DB at 210 MB / 428,615 gw_door_event rows)
 
 ```
-/ops/site-A/data    20.2, 15.0, 12.9, 13.5, 8.8 s   (mean 14.1 s)
-/dash/site-A/data   >200 s, HTTP 000 on both samples (curl --max-time 200)
+/ops/site-A/data    20.2, 15.0, 12.9, 13.5, 8.8 s   (mean 14.1 s)   <- slow, but TERMINATES
+/dash               200, 6.5 s, 48.1 kB                             <- page shell, fine
+/dash/site-A/data   000 at 600 s, 0.0 kB                            <- DOES NOT TERMINATE
 ```
 
-These are worse than the 6–19 s / 4.8–9.3 s originally reported; the DB has grown.
+`/ops` is worse than the 4.8–9.3 s originally reported (the DB has grown) but it does finish, and it
+already aggregates in SQL with time windows — which is exactly the shape `/dash` needs and lacks.
+`/dash/{gw}/data` is a different class of problem: it never returns.
 
-## The OOM, and what the RSS curve actually shows
+## The OOM is RECURRING, on unmodified code
+
+Two kills in ~13 hours, the second one **after** everything of mine had been rolled back and with
+the deployed hashes verified original:
 
 ```
 Aug 03 04:44:16 kernel: Out of memory: Killed process 2550731 (uvicorn)
                         total-vm:2721820kB, anon-rss:1481176kB
+Aug 03 18:00:36 kernel: Out of memory: Killed process 3054399 (uvicorn)
+                        total-vm:2761292kB, anon-rss:1492008kB      <- ORIGINAL code
 ```
+
+This is standing production behaviour, not an artefact of the perf work. `systemd` restarts the
+gateway each time, so it self-heals, but every kill takes the segment ingest and the heartbeat
+endpoints down with it. Treat it as an open incident independent of the `/dash` latency work.
 
 Sampled every 10 s after the restart:
 
@@ -152,18 +192,37 @@ refresh load before /dash is considered fixed.**
 
 ## Next session
 
-1. Get the `cProfile` attribution for `_tier2` (the run completed the call at 42.98 s but the
-   `pstats` output was never written — rerun `profile_tier2.py`).
-2. Rewrite the per-camera reads as **SQL-bounded windowed aggregates**. Note the era census and the
-   all-era alphabet read are the ones that resist windowing on semantic grounds — decide those
-   deliberately, they change reported numbers.
-3. Only then deploy, then soak `/dash` under sustained refresh and confirm RSS holds flat.
+**Do not deploy without supervising the run to its verification step.** Two attempts have already
+failed verification and auto-rolled back; a third under a dropping tunnel risks dying between
+`install` and `restore`, which is the one window `apply_dashperf.sh` cannot recover from.
+
+1. Rewrite `/dash/{gw}/data` per the four required points above: SQL-bounded window defaulting to
+   7 days, no Python materialisation, all-history only on explicit request and labelled expensive,
+   and a server-side timeout that errors instead of hanging.
+2. The era census (`GROUP BY door_version`) and the all-era floor-alphabet read are the two that
+   resist windowing on **semantic** grounds — the alphabet is deliberately all-era (see
+   `_derive_floor_alphabet`). Decide those explicitly; narrowing them changes reported numbers, so
+   it is a product call, not an optimisation.
+3. Deploy, then soak `/dash` under sustained refresh. **Acceptance is not latency alone: RSS must
+   hold flat under sustained refresh load.** A fast `/dash` that re-inflates memory is not a fix.
+4. `apply_gwindex.sh` (the two /ops indexes) is independent of all this and still unrun.
 
 ### Operational cautions
 
-- **SSH via the IAP tunnel was unavailable for 20+ minute stretches** all session while Caddy stayed
-  responsive (401 in 0.43 s). Budget for it; it dominated elapsed time. Do not start a deploy you
-  cannot supervise through to its verification step.
+- **SSH: use the direct internal route, not the IAP tunnel.** `gcloud compute ssh
+  --tunnel-through-iap` was unavailable for 20+ minute stretches all session while Caddy stayed
+  responsive (401 in 0.43 s) and the instance read `RUNNING`. This works and is far more reliable
+  from dev-box (same VPC, 10.160.0.4 -> 10.160.0.2):
+
+  ```bash
+  ssh -i ~/.ssh/google_compute_engine -o StrictHostKeyChecking=no 10.160.0.2 'uptime'
+  ```
+
+  The IAP flakiness dominated elapsed time. Do not start a deploy you cannot supervise through to
+  its verification step — `apply_dashperf.sh` can only auto-restore if the session survives to run
+  the restore.
+- **Careful with `pkill -f` over ssh**: a pattern that appears in your own `bash -c` command line
+  matches the shell running it and kills the session. Use a bracket guard (`[r]ss.sh`).
 - `gateway.db-wal` has sat at ~60 MB while holding ~668 live pages (~2.7 MB). This is an inflated
   container from the outage that SQLite never shrinks — wasted disk, not a correctness problem.
   **Do not run `wal_checkpoint(TRUNCATE)` while Litestream is replicating**: Litestream does its own
