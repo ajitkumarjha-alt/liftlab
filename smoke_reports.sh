@@ -140,9 +140,72 @@ PYX
   fi
 fi
 
+# ── read-only discipline ─────────────────────────────────────────────────────
+# The requirement is "verify the DB file md5 is unchanged after a full export, as the CLI proof
+# does". That proof runs against a STATIC snapshot. Run verbatim against the LIVE gateway it is a
+# false positive: measured 2026-08-04, gateway.db's md5 changed once in 100 seconds with NO export
+# running at all (WAL size constant at 4,231,272 — the ingest writer checkpointing pages into the
+# main file). A 66s export straddles that regardless of what it does, so the check would fail
+# forever and teach everyone to ignore it.
+#
+# So it is done twice, in the two forms that can actually be true:
+#   1. against a STATIC COPY, where md5 stability means what the CLI proof means;
+#   2. by asking the connection directly — query_only, and a write that must be refused.
+echo
+echo "== read-only discipline =="
 MD5_AFTER=$(md5sum "$GDB" | cut -d' ' -f1)
-if [ "$MD5_BEFORE" = "$MD5_AFTER" ]; then ok "gateway.db md5 UNCHANGED by the export ($MD5_BEFORE)"
-else bad "gateway.db md5 CHANGED: $MD5_BEFORE -> $MD5_AFTER — the report path is not read-only"; fi
+if [ "$MD5_BEFORE" = "$MD5_AFTER" ]; then
+  ok "live gateway.db md5 unchanged across the export ($MD5_BEFORE)"
+else
+  echo "  note  live gateway.db md5 moved ($MD5_BEFORE -> $MD5_AFTER). NOT attributable to the"
+  echo "        export: this file mutates under normal ingest. The two checks below are the ones"
+  echo "        that carry the claim."
+fi
+
+# 1. md5 over a STATIC copy — the CLI proof's condition, reproduced where it holds
+CP="$TMP/static-gateway.db"
+sqlite3 "$GDB" ".backup '$CP'" 2>/dev/null || cp "$GDB" "$CP"
+S_BEFORE=$(md5sum "$CP" | cut -d' ' -f1)
+SJ="$TMP/static"; mkdir -p "$SJ/out"
+S_PORT=$(free_port 18380)
+if start_app "$S_PORT" "$SJ" "$CP" 3; then
+  curl -s --max-time 20 -X POST -H 'Content-Type: application/json'     -d "{"from":"$FROM","to":"$TO"}" "http://127.0.0.1:$S_PORT/reports/submit" >/dev/null
+  SST=""
+  for i in $(seq 1 120); do
+    SST=$(curl -s --max-time 10 "http://127.0.0.1:$S_PORT/reports/job/1" |           "$PY" -c "import sys,json;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+    case "$SST" in done|failed) break;; esac
+    sleep 2
+  done
+  S_AFTER=$(md5sum "$CP" | cut -d' ' -f1)
+  if [ "$SST" = done ] && [ "$S_BEFORE" = "$S_AFTER" ]; then
+    ok "STATIC db md5 UNCHANGED by a full export ($S_BEFORE) — the CLI proof's condition"
+  elif [ "$SST" != done ]; then
+    bad "static-copy export did not complete (status=$SST) — cannot judge md5"
+  else
+    bad "STATIC db md5 CHANGED: $S_BEFORE -> $S_AFTER — the report path WRITES to the database"
+  fi
+else
+  bad "static-copy app did not start"
+fi
+
+# 2. ask the connection itself. This is the direct evidence, and it is valid on a live box.
+if ( cd "$APP" && PYTHONPATH="$STAGED:$APP" "$PY" -c "
+import sys
+sys.path.insert(0, '$STAGED')
+from liftlab_report import reader
+db = reader.open_ro('$GDB')
+assert db.execute('PRAGMA query_only').fetchone()[0] == 1, 'query_only is not set'
+try:
+    db.execute('CREATE TABLE _probe_should_fail (x INT)')
+except Exception:
+    print('    query_only=1 and writes are refused')
+else:
+    raise SystemExit('WRITE SUCCEEDED — the connection is not read-only')
+db.close()" ); then
+  ok "report connection is read-only (query_only=1, write refused by sqlite)"
+else
+  bad "the report connection accepted a write — read-only discipline is broken"
+fi
 
 # ── negative control ─────────────────────────────────────────────────────────
 echo

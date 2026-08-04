@@ -80,10 +80,14 @@ from fastapi import FastAPI
 import reports_api, nav_common
 assert reports_api.__file__.startswith('$TMPD'), 'imported the WRONG module: '+reports_api.__file__
 assert nav_common.__file__.startswith('$TMPD'), 'imported the WRONG nav: '+nav_common.__file__
-a=FastAPI(); a.include_router(reports_api.reports_router); a.openapi()
-assert '/reports' in [r.path for r in a.routes], 'the page route did not register'
-assert '/reports/download/{job_id}' in [r.path for r in a.routes], 'download route missing'
-print('smoke ok:', reports_api.__file__)" ); then
+a=FastAPI(); a.include_router(reports_api.reports_router)
+# Assert against the OpenAPI schema, not app.routes: on this FastAPI version include_router leaves
+# _IncludedRouter objects in .routes which have no .path, so the obvious check raises AttributeError
+# instead of answering the question. The schema is the authoritative list of what is reachable.
+paths = a.openapi()['paths']
+for want in ('/reports', '/reports/submit', '/reports/download/{job_id}', '/reports/job/{job_id}'):
+    assert want in paths, f'route {want} did not register; got {sorted(paths)}'
+print('smoke ok:', reports_api.__file__, '| routes:', len(paths))" ); then
   say "SMOKE-IMPORT FAILED — nothing installed."; rm -rf "$TMPD"; exit 1
 fi
 
