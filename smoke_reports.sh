@@ -24,6 +24,12 @@ PY="$APP/.venv/bin/python"
 GDB="${GATEWAY_DB:-/var/lib/liftlab/gateway.db}"
 
 TMP=$(mktemp -d); PIDS=""
+# This gate builds a REAL workbook from the REAL database, so its scratch tree holds resident
+# movement data for the length of the run. mktemp -d is 0700, but assert it rather than trust it —
+# on a world-readable /tmp the difference between 0700 and 0755 is the whole protection.
+chmod 700 "$TMP"
+PERM=$(stat -c %a "$TMP")
+[ "$PERM" = 700 ] || { echo "  FAIL  scratch dir is $PERM, refusing to build resident data in it"; exit 2; }
 cleanup(){ for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; rm -rf "$TMP"; }
 trap cleanup EXIT
 PASS=0; FAIL=0
@@ -197,6 +203,17 @@ echo "== the page renders and carries nav =="
 P=$(curl -s --max-time 20 "http://127.0.0.1:$MAIN_PORT/reports")
 case "$P" in *"Export a report"*) ok "/reports renders";; *) bad "/reports did not render";; esac
 case "$P" in *"__NAV__"*) bad "nav placeholder left unsubstituted in the page";; *) ok "nav substituted";; esac
+
+echo
+echo "== output permissions (resident movement data) =="
+OUTF=$(find "$TMP/main/out" -name '*.xlsx' 2>/dev/null | head -1)
+if [ -n "$OUTF" ]; then
+  DP=$(stat -c %a "$TMP/main/out"); FP=$(stat -c %a "$OUTF")
+  case "$DP" in 750|700) ok "output dir is $DP (not world-readable)";; *) bad "output dir is $DP";; esac
+  case "$FP" in 640|600) ok "workbook is $FP (not world-readable)";; *) bad "workbook is $FP";; esac
+else
+  bad "no workbook found to check permissions on"
+fi
 
 echo
 echo "== reports gate: $PASS passed, $FAIL failed =="
