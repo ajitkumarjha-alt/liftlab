@@ -371,17 +371,6 @@ supervisor_watchdog(){
 supervisor_watchdog $$ &
 WD_PID=$!
 say "supervisor watchdog armed: loop must tick every ${LOOP_STALL_S}s (hb=$HB_FILE, pid $WD_PID)"
-# The recovery ladder's REAL shape on THIS machine, stated once at startup rather than left to be
-# inferred from what does or does not appear in the journal during an outage.
-if [ "$NIC_MODULE_LOADABLE" = 1 ]; then
-  say "FLEET ladder: 1) restart all ffmpeg  2) reload ${NIC_MODULE}  3) reboot (gated: down >= ${FLEET_REBOOT_MIN_DOWN_S}s, no reboot within ${FLEET_REBOOT_COOLDOWN_S}s)"
-else
-  say "FLEET ladder: 1) restart all ffmpeg  2) UNAVAILABLE (${NIC_MODULE} is built into the kernel, not a module — cannot be reloaded)  3) reboot (gated: down >= ${FLEET_REBOOT_MIN_DOWN_S}s, no reboot within ${FLEET_REBOOT_COOLDOWN_S}s)"
-  say "  There is NO automatic step between restarting ffmpeg and rebooting on this hardware."
-  say "  A USB ethernet adapter would restore stage 2 — its driver IS loadable. See SITE_VISIT_REQUIRED.md."
-fi
-say "FLEET escalation state: ${FLEET_STATE} (fs=${FLEET_STATE_FS}, survives reboot=$([ "$FLEET_REBOOT_SAFE" = 1 ] && echo yes || echo NO))"
-[ "$FLEET_REBOOT_SAFE" = 1 ] || say "  WARNING: reboot recovery is DISABLED because the cooldown could not survive a reboot."
 sleep 6
 prev_tx=$(tx_bytes); prev_sj=$(live_stats_json); prev_t=$(date +%s.%N)
 declare -A PREVB; for ((i=0;i<NCH;i++)); do PREVB[$i]=$(stat_bytes "$prev_sj" "${CAMS[$i]}"); PREVJ[${PIDS[$i]}]=$(pid_jiffies "${PIDS[$i]}"); done
@@ -519,6 +508,25 @@ if nic_module_loadable; then
 else
   NIC_MODULE_LOADABLE=0
 fi
+
+# ── STARTUP BANNER ───────────────────────────────────────────────────────────
+# Deliberately placed HERE, not up with the supervisor-watchdog line where it reads more naturally.
+# It quotes NIC_MODULE_LOADABLE, FLEET_STATE, FLEET_STATE_FS and FLEET_REBOOT_SAFE, all of which are
+# assigned in the blocks above — and this script runs under `set -u`, so printing it any earlier is
+# an "unbound variable" crash 3s after the seven ffmpeg launch, which systemd then crash-loops.
+# That shipped on 2026-08-04 (relay_soak.sh 13577bec) and had to be rolled back on the Pi.
+# If you move this, move it DOWN, never up.
+# The recovery ladder's REAL shape on THIS machine, stated once at startup rather than left to be
+# inferred from what does or does not appear in the journal during an outage.
+if [ "$NIC_MODULE_LOADABLE" = 1 ]; then
+  say "FLEET ladder: 1) restart all ffmpeg  2) reload ${NIC_MODULE}  3) reboot (gated: down >= ${FLEET_REBOOT_MIN_DOWN_S}s, no reboot within ${FLEET_REBOOT_COOLDOWN_S}s)"
+else
+  say "FLEET ladder: 1) restart all ffmpeg  2) UNAVAILABLE (${NIC_MODULE} is built into the kernel, not a module — cannot be reloaded)  3) reboot (gated: down >= ${FLEET_REBOOT_MIN_DOWN_S}s, no reboot within ${FLEET_REBOOT_COOLDOWN_S}s)"
+  say "  There is NO automatic step between restarting ffmpeg and rebooting on this hardware."
+  say "  A USB ethernet adapter would restore stage 2 — its driver IS loadable. See SITE_VISIT_REQUIRED.md."
+fi
+say "FLEET escalation state: ${FLEET_STATE} (fs=${FLEET_STATE_FS}, survives reboot=$([ "$FLEET_REBOOT_SAFE" = 1 ] && echo yes || echo NO))"
+[ "$FLEET_REBOOT_SAFE" = 1 ] || say "  WARNING: reboot recovery is DISABLED because the cooldown could not survive a reboot."
 
 # THE INTERFACE BOUNCE DOES NOT WORK ON THIS FAULT. Kept only because it is cheap and harmless to
 # try; it is no longer a rung on the ladder.

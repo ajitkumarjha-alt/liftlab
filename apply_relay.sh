@@ -71,6 +71,30 @@ if ! bash /tmp/relay_soak.sh --selftest; then
   exit 1
 fi
 
+# ---------- STARTUP GATE (runs before ANY mutation) ----------
+# DOES THE SCRIPT ACTUALLY START? `bash -n` parses but never executes, so it cannot see a variable
+# read before assignment — and under `set -u` that is a hard crash, not a warning. On 2026-08-04
+# relay_soak.sh 13577bec did exactly that: NIC_MODULE_LOADABLE was read at line 376 and assigned at
+# 518, so it died ~3s after launching the seven ffmpeg and systemd crash-looped it. `bash -n` passed
+# and all 56 unit tests passed, because the unit tests extract individual FUNCTIONS and never run
+# the top-to-bottom startup path.
+#
+# smoke_relay_start.sh runs the REAL candidate to completion of its first loop turns with the
+# outside world stubbed. Verified to FAIL on that exact bug and pass without it.
+if [ -f /tmp/smoke_relay_start.sh ]; then
+  say "startup gate: running smoke_relay_start.sh against the CANDIDATE (~60s) ..."
+  if ! bash /tmp/smoke_relay_start.sh /tmp/relay_soak.sh; then
+    say "ABORT: the candidate does not START. Nothing installed, relay left exactly as it is."
+    say "  This is the gate that 13577bec needed and did not have."
+    exit 1
+  fi
+  say "startup gate: PASSED — the candidate starts and reaches its main loop."
+else
+  say "WARN: /tmp/smoke_relay_start.sh not present — startup gate SKIPPED."
+  say "  Fetch it alongside relay_soak.sh. Without it, a script that cannot start will install"
+  say "  cleanly and crash-loop, which is what happened on 2026-08-04."
+fi
+
 # ---------- 1. retire the door watch ----------
 if [ "${KEEP_WATCH:-0}" = 1 ]; then
   say "KEEP_WATCH=1 — leaving liftlab-watch alone (relay is guard-free either way)"
