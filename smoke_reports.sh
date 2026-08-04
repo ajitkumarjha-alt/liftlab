@@ -169,7 +169,9 @@ S_BEFORE=$(md5sum "$CP" | cut -d' ' -f1)
 SJ="$TMP/static"; mkdir -p "$SJ/out"
 S_PORT=$(free_port 18380)
 if start_app "$S_PORT" "$SJ" "$CP" 3; then
-  curl -s --max-time 20 -X POST -H 'Content-Type: application/json'     -d "{"from":"$FROM","to":"$TO"}" "http://127.0.0.1:$S_PORT/reports/submit" >/dev/null
+  curl -s --max-time 20 -X POST -H 'Content-Type: application/json' \
+    -d "{\"from\":\"$FROM\",\"to\":\"$TO\"}" \
+    "http://127.0.0.1:$S_PORT/reports/submit" >/dev/null
   SST=""
   for i in $(seq 1 120); do
     SST=$(curl -s --max-time 10 "http://127.0.0.1:$S_PORT/reports/job/1" |           "$PY" -c "import sys,json;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
