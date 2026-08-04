@@ -181,18 +181,31 @@ def _supervise_once(db):
                 pass
 
     # 3. start the next queued job, only if nothing is running (global one-at-a-time lock).
+    #
+    # CLAIM BEFORE SPAWN. The job must be flipped out of 'queued' by THIS function, atomically,
+    # before the worker is started. Letting the worker set its own status='running' looks tidier and
+    # is a double-spawn bug: python takes ~1s to boot, the supervisor ticks every 2s, so the next
+    # tick still sees the row as 'queued' with nothing 'running' and starts a SECOND worker for the
+    # same job — two processes writing one output path. The UPDATE ... WHERE status='queued' is the
+    # lock; rowcount tells us whether we won it.
     running = db.execute("SELECT COUNT(*) FROM report_job WHERE status='running'").fetchone()[0]
     if running == 0:
         nxt = db.execute("SELECT id FROM report_job WHERE status='queued' "
                          "ORDER BY created_at LIMIT 1").fetchone()
         if nxt:
+            jid = nxt[0]
+            cur = db.execute("UPDATE report_job SET status='running', started_at=? "
+                             "WHERE id=? AND status='queued'", (now, jid))
+            db.commit()
+            if cur.rowcount != 1:
+                return                      # someone else claimed it; nothing to do this tick
             try:
-                p = _spawn(nxt[0])
-                db.execute("UPDATE report_job SET pid=? WHERE id=?", (p.pid, nxt[0]))
+                proc = _spawn(jid)
+                db.execute("UPDATE report_job SET pid=? WHERE id=?", (proc.pid, jid))
                 db.commit()
             except Exception as e:
                 db.execute("UPDATE report_job SET status='failed', finished_at=?, error_text=? "
-                           "WHERE id=?", (time.time(), f"could not start worker: {e!r}", nxt[0]))
+                           "WHERE id=?", (time.time(), f"could not start worker: {e!r}", jid))
                 db.commit()
 
 

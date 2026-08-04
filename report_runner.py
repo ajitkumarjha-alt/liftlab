@@ -57,8 +57,12 @@ def main(argv):
         # Already terminal. Refuse rather than produce a second workbook for the same row: a job
         # that reports 'done' twice with different files is worse than one that never started.
         print(f"job {job_id} is {status}, not runnable", file=sys.stderr); db.close(); return 2
-    db.execute("UPDATE report_job SET status='running', started_at=?, pid=? WHERE id=?",
-               (time.time(), os.getpid(), job_id))
+    # The supervisor CLAIMED this row (status->running) before spawning us, which is what makes
+    # one-at-a-time actually hold. We only record our pid, so the supervisor can kill us on timeout
+    # and can tell a crashed worker from a slow one. Do not re-stamp started_at: the supervisor's
+    # timestamp is when the job really began contending for the box.
+    db.execute("UPDATE report_job SET pid=?, started_at=COALESCE(started_at, ?) WHERE id=?",
+               (os.getpid(), time.time(), job_id))
     db.commit(); db.close()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
