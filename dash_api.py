@@ -1070,6 +1070,117 @@ def _era_census(db, gw, cam):
         return v, t
 
 
+# ── per-camera aggregates: computed on a SCHEDULE, served from a table ────────
+# The last thing on the request path. door_gpu and tier2 walk a camera's era rows in Python — the
+# flap/reopen state machine and the stop walk are SEQUENTIAL, so they do not reduce to SQL
+# aggregates, and windowing does not help: gw_door_event spans ~15 days, so a 7-day bound is 87% of
+# the table and a sweep from days=7 down to days=0.1 (70x less data) changed the outcome not at all.
+# So the walk moves off the request path entirely, the same way the alphabet did.
+#
+# ERA HYGIENE IS THE POINT, not an extra. The key is (gateway_id, cam, counting_version,
+# door_version) and a read must match the CURRENT values exactly. An aggregate computed under a
+# different door engine or a different counting version describes a different instrument; serving
+# it because the camera name matches would be a silent lie. A key mismatch reads as "not computed
+# for the current era", never as data.
+#
+# The window is part of the contract too: an aggregate is computed for ONE window, so a request for
+# a different one is reported as not-precomputed rather than served from the wrong range. A custom
+# window can never trigger a live walk — that is exactly the hang coming back.
+_AGG_TABLE_READY = set()
+
+
+def _aggregate_table(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS door_aggregate (
+        gateway_id TEXT, cam TEXT,
+        counting_version TEXT,      -- '' when the analyser has not reported one
+        door_version TEXT,          -- FULL door_version, not the era prefix
+        window_days REAL,           -- the window this aggregate describes
+        door_gpu TEXT,              -- JSON: _door_gpu_by_cam's entry for this cam
+        tier2 TEXT,                 -- JSON: _tier2's return, or NULL when it had nothing to say
+        computed_at REAL,
+        source_rows INTEGER,        -- rows the walk consumed, so a thin aggregate is visible
+        compute_ms INTEGER,
+        PRIMARY KEY (gateway_id, cam, counting_version, door_version, window_days))""")
+
+
+def _current_keys(db, gw, cam):
+    """(counting_version, door_version) as they are RIGHT NOW — the era-hygiene key."""
+    dv = db.execute("SELECT door_version FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                    "AND door_version IS NOT NULL AND door_version<>'' AND ts IS NOT NULL "
+                    "ORDER BY ts DESC LIMIT 1", (gw, cam)).fetchone()
+    cv = db.execute("SELECT counting_version FROM analyzer_status WHERE gateway_id=? AND cam=?",
+                    (gw, cam)).fetchone()
+    return ((cv["counting_version"] if cv and cv["counting_version"] else ""),
+            (dv["door_version"] if dv else None))
+
+
+def _aggregate_read(db, gw, cam, window_days):
+    """Serve the stored aggregate. NEVER computes. -> (door_gpu|None, tier2|None, meta).
+
+    meta['state'] is always set and is what distinguishes "not computed yet" from a real zero."""
+    cv, dv = _current_keys(db, gw, cam)
+    if dv is None:
+        return None, None, {"state": "no door rows for this camera in any era",
+                            "computed_at": None, "current_door_version": None}
+    try:
+        r = db.execute("SELECT door_gpu, tier2, computed_at, source_rows, compute_ms "
+                       "FROM door_aggregate WHERE gateway_id=? AND cam=? AND counting_version=? "
+                       "AND door_version=? AND window_days=?",
+                       (gw, cam, cv, dv, float(window_days))).fetchone()
+    except sqlite3.OperationalError:
+        return None, None, {"state": "not yet computed — the precompute job has never run",
+                            "computed_at": None, "current_door_version": dv}
+    if not r:
+        return None, None, {
+            "state": "not yet computed for the current era/window",
+            "computed_at": None, "current_counting_version": cv, "current_door_version": dv,
+            "window_days": window_days,
+            "detail": "an aggregate exists only for the era, counting version and window it was "
+                      "computed under; nothing is served across those boundaries"}
+    try:
+        dg = json.loads(r["door_gpu"]) if r["door_gpu"] else None
+        t2 = json.loads(r["tier2"]) if r["tier2"] else None
+    except (ValueError, TypeError):
+        return None, None, {"state": "stored aggregate unreadable", "computed_at": r["computed_at"]}
+    return dg, t2, {"state": "ok", "computed_at": r["computed_at"],
+                    "age_s": (round(time.time() - r["computed_at"], 1) if r["computed_at"] else None),
+                    "source_rows": r["source_rows"], "compute_ms": r["compute_ms"],
+                    "counting_version": cv, "door_version": dv, "window_days": window_days}
+
+
+def aggregate_refresh(db, gw, cam, window_days=None):
+    """Walk the rows and STORE. Scheduler/CLI ONLY — never a request handler."""
+    _aggregate_table(db)
+    d = WINDOW_DAYS if window_days is None else float(window_days)
+    t0, t1, _ = _window(d)
+    cv, dv = _current_keys(db, gw, cam)
+    if dv is None:
+        return {"gw": gw, "cam": cam, "skipped": "no door rows"}
+    t_start = time.time()
+    dg_all = _door_gpu_by_cam(db, gw, [cam], t0, t1)
+    tj = _transits_for_join(db, gw)
+    t2 = _tier2(db, gw, cam, tj.get(cam, []), t0, t1)
+    dg = dg_all.get(cam)
+    src = (dg or {}).get("n_rows") or (t2 or {}).get("rows_in_era") or 0
+    ms = int((time.time() - t_start) * 1000)
+    db.execute("INSERT INTO door_aggregate (gateway_id,cam,counting_version,door_version,"
+               "window_days,door_gpu,tier2,computed_at,source_rows,compute_ms) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?) "
+               "ON CONFLICT(gateway_id,cam,counting_version,door_version,window_days) DO UPDATE SET "
+               "door_gpu=excluded.door_gpu, tier2=excluded.tier2, computed_at=excluded.computed_at, "
+               "source_rows=excluded.source_rows, compute_ms=excluded.compute_ms",
+               (gw, cam, cv, dv, d, json.dumps(dg) if dg else None,
+                json.dumps(t2) if t2 else None, time.time(), src, ms))
+    db.commit()
+    # Keep the table from growing an entry per retired era forever.
+    db.execute("DELETE FROM door_aggregate WHERE gateway_id=? AND cam=? AND NOT "
+               "(counting_version=? AND door_version=?)", (gw, cam, cv, dv))
+    db.commit()
+    return {"gw": gw, "cam": cam, "source_rows": src, "compute_ms": ms,
+            "has_tier2": t2 is not None, "counting_version": cv, "door_version": dv,
+            "window_days": d}
+
+
 # ── floor alphabet: derived on a SCHEDULE, served from a table ─────────────────
 # The alphabet is deliberately ALL-ERA. Floors are physical: a template rebuild moves door_version
 # but not the building, and deriving admission from the current era alone made every young era start
@@ -1487,24 +1598,25 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
     cams = _cameras(db, gw)
     _budget_check("door_by_cam")
     door = _door_by_cam(db, gw)                      # Pi-era (gw_event), RETIRED instrument
-    _budget_check("door_gpu_by_cam")
-    door_gpu = _door_gpu_by_cam(db, gw, [c["cam"] for c in cams], t0, t1)  # GPU-era, LIVE
+    # PRECOMPUTED, never derived here. Both door_gpu and tier2 come from door_aggregate, which the
+    # precompute job fills off the request path. A missing entry is reported as pending — it is
+    # NEVER allowed to read as "this camera has no data".
+    door_gpu, tier2, agg_meta = {}, {}, {}
+    for c in cams:
+        _cam = c["cam"]
+        dg, t2, meta = _aggregate_read(db, gw, _cam, window.get("days") if window else None)
+        agg_meta[_cam] = meta
+        if dg is not None:
+            door_gpu[_cam] = dg
+        if t2 is not None:
+            tier2[_cam] = t2
+    pending_cams = sorted(c for c, m in agg_meta.items() if m.get("state") != "ok")
+    agg_computed_at = [m["computed_at"] for m in agg_meta.values() if m.get("computed_at")]
     _budget_check("transit_by_cam")
     trans = _transit_by_cam(db, gw)
     xfer = _transfer_by_cam(db, gw)
     floor_cov = _floor_coverage(db, gw)
     registry = _registry(db, gw)
-    _budget_check("transits_for_join")
-    tj = _transits_for_join(db, gw)
-    # Per-camera check: _tier2 does most of its work walking rows in Python, where the SQL progress
-    # handler never fires. Checking once per camera bounds the overrun to one camera's work instead
-    # of letting the whole seven-camera loop run past the deadline unnoticed.
-    tier2 = {}
-    for c in cams:
-        _budget_check(f"tier2:{c['cam']}")
-        v = _tier2(db, gw, c["cam"], tj.get(c["cam"], []), t0, t1, era_override=era)
-        if v:
-            tier2[c["cam"]] = v
     ana = _analyzers(db, gw)
     val = _validations(db, gw)
     w = _latest(db, "watch_status", gw)
@@ -1588,7 +1700,22 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
     # nothing in this era. Leaving it hardcoded would keep claiming Tier-2 is impossible while the
     # numbers sat one table over.
     unavailable = None
-    if not tier2:
+    # PENDING IS NOT ABSENCE. If tier2 is empty only because the precompute has not covered these
+    # cameras yet, saying "no reads in this era" would be the same class of lie as the _q bug that
+    # turned a timeout into an empty panel. The ceiling claim is only made when every camera has a
+    # COMPUTED aggregate that genuinely had nothing to report.
+    if not tier2 and pending_cams:
+        unavailable = {"reason": "not yet computed",
+                       "detail": (f"{len(pending_cams)} camera(s) have no precomputed aggregate for "
+                                  f"the current era/window yet: {', '.join(pending_cams)}. This is a "
+                                  f"pending computation, NOT an absence of data — the precompute job "
+                                  f"(liftlab-precompute.timer) fills it off the request path."),
+                       "pending_cams": pending_cams,
+                       "blocks": ["stops per floor", "boardings/alightings per floor",
+                                  "C17/C18 probable up/down stops", "C21/C22 speed factors"],
+                       "unlock": "wait for the next precompute run, or run alphabet_job.py/"
+                                 "precompute_job.py by hand"}
+    elif not tier2:
         if floor_cov["with_floor"] == 0 and floor_cov["total"] > 0:
             detail = (f"gw_event.floor is NULL on all {floor_cov['total']} rows, and no camera has "
                       f"door reads in its own era (DASH_DOOR_ERA={DOOR_ERA})")
@@ -1605,6 +1732,17 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
                          # figure below is computed over this window, not over all history. Default
                          # is 7 days; days=0 asks for all history and is flagged expensive.
                          "window": window,
+                         # STALENESS OF THE HISTORICAL PANELS. door_gpu/tier2/headline come from
+                         # door_aggregate, computed off the request path. Per-camera state lives in
+                         # aggregates.per_cam; pending cameras are listed explicitly so an operator
+                         # can tell "not computed yet" from "nothing to report".
+                         "aggregates": {
+                             "per_cam": agg_meta,
+                             "pending_cams": pending_cams,
+                             "computed_at": (min(agg_computed_at) if agg_computed_at else None),
+                             "oldest_age_s": (round(now - min(agg_computed_at), 1)
+                                              if agg_computed_at else None),
+                             "source": "door_aggregate (precomputed off the request path)"},
                          "pi": pi, "relay": relay, "gpu": gpu,
                          "cameras": out_cams, "headline": headline, "registry": registry,
                          "floor_coverage": floor_cov, "tier2": tier2, "unavailable": unavailable,
