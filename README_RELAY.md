@@ -98,10 +98,65 @@ alone.
 
 ```
 stage 1  restart all seven ffmpeg
-stage 2  reload the NIC driver: modprobe -r bcmgenet ; modprobe bcmgenet
-         verify recovery by tx_packets ADVANCING
+stage 2  reload the NIC driver  <-- UNAVAILABLE ON THIS PI, see below
 stage 3  reboot — gated: fleet down >= 15 min AND no reboot attempt in the last hour
 ```
+
+### ⚠ On this Pi the ladder is really: restart ffmpeg, then reboot
+
+**`bcmgenet` is compiled into the kernel, not built as a module.** `lsmod` does not list it and
+`modprobe -r bcmgenet` answers `Module bcmgenet not found`. Verified 2026-08-04. **Stage 2 is a
+permanent no-op on this hardware — there is no automatic step between "restart ffmpeg" and "reboot
+the machine".**
+
+This is detected at startup with `modinfo`, not assumed, because it is a property of the kernel
+build and a **USB ethernet adapter's driver IS loadable** — fitting one restores the rung. The
+relay logs the ladder's real shape once at startup rather than leaving it to be inferred from a
+`modprobe` failing every six minutes:
+
+```
+FLEET ladder: 1) restart all ffmpeg  2) UNAVAILABLE (bcmgenet is built into the kernel,
+              not a module — cannot be reloaded)  3) reboot (gated: ...)
+  There is NO automatic step between restarting ffmpeg and rebooting on this hardware.
+  A USB ethernet adapter would restore stage 2 — its driver IS loadable.
+```
+
+When stage 2 is unavailable the ladder does not spend a six-minute pass proving it again: it moves
+to the reboot gate immediately. The gate's own timing conditions still apply, so this cannot
+shortcut the 15-minute requirement.
+
+### The reboot gate is now the only automatic recovery — how it is guarded
+
+Four conditions, all verified by behavioural tests in `test_relay_soak.sh`:
+
+| Condition | Behaviour |
+|---|---|
+| Fleet down < 15 min | **Refuse.** Give stage 1 time to work. |
+| Down >= 15 min, never rebooted | **Open.** |
+| Down >= 15 min, rebooted < 1 h ago | **Refuse.** This is the loop guard. |
+| Down >= 15 min, rebooted > 1 h ago | **Open.** |
+
+Two properties the gate depends on, both tested:
+
+* **The reboot timestamp is written to disk *before* `reboot` is issued**, followed by `sync`. Write
+  it afterwards and it is lost in the very reboot it is meant to limit, and every boot looks like
+  the first.
+* **"Down for" is computed from the *persisted* `FLEET_ZERO_SINCE`**, not from process start.
+  Without that, the restart loop that caused the original defect would keep the outage looking
+  freshly started and the 15-minute gate would never open either.
+
+**And if the state cannot survive a reboot, the relay refuses to reboot at all.** The state
+directory's filesystem is checked with `stat -f`; on `tmpfs` or `ramfs` the cooldown would evaporate
+during the reboot and this would become a boot loop on a machine reachable only over the network it
+just took down. Better to wait for a human than to power-cycle forever. Startup logs which it is:
+
+```
+FLEET escalation state: /var/lib/liftlab-relay/fleet_escalation (fs=ext4, survives reboot=yes)
+```
+
+`/var/lib/liftlab-relay` must exist and be writable by `askjitk` — the service cannot create it. If
+it is missing the script falls back to `$HOME/.liftlab-relay`, and only then to `/tmp`, which trips
+the guard above and disables reboot recovery.
 
 **Two defects fixed, both of which cost real hours.**
 
@@ -120,11 +175,15 @@ freshly started and the gate would never open either. State older than
 `RELAY_FLEET_STATE_TTL` (30 min) is discarded so a stale stage-3 cannot send a later, unrelated
 blip straight to a reboot.
 
-**2. Stage 2 was the wrong action.** `ip link set eth0 down` returns
-`RTNETLINK answers: Connection timed out` on a wedged bcmgenet PHY — verified 2026-08-01 and
-2026-08-04. The command cannot reach the hardware, so it cannot fix the hardware. The bounce is
-still attempted (cheap, harmless) but it no longer *gates* anything; stage 2 is now a driver
-reload, which re-initialises the controller.
+**2. Stage 2 was the wrong action — and on this hardware there is no right one.**
+`ip link set eth0 down` returns `RTNETLINK answers: Connection timed out` on a wedged bcmgenet PHY
+— verified 2026-08-01 and 2026-08-04. The command cannot reach the hardware, so it cannot fix the
+hardware. The bounce is still attempted (cheap, harmless) but no longer *gates* anything.
+
+A driver reload **would** re-initialise the controller, and that is what stage 2 does — except that
+`bcmgenet` is built into this kernel and cannot be unloaded. So on this Pi the rung does not exist,
+and the honest ladder is stage 1 then a gated reboot. That is a hardware limitation, not a software
+one, and the fix is the USB adapter in `SITE_VISIT_REQUIRED.md`.
 
 ### There is NO software signal for this fault except tx_packets
 

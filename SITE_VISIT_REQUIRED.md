@@ -120,9 +120,10 @@ describes four lifts and is being read as if it describes the building.
 
 ---
 
-## Job 4 — Bring a USB ethernet adapter for the Raspberry Pi (hardware to buy)
+## Job 4 — USB ethernet adapter for the Raspberry Pi — **REQUIRED, not optional**
 
-**This one needs a part ordering, not just a visit.**
+**This one needs a part ordering, not just a visit. It has been escalated from "worth doing" to
+"required" since this note was first written — see why below.**
 
 **What is wrong.** The small computer in the comms room (a Raspberry Pi) sends all the video to the
 cloud through its built-in network port. **Twice in the last four days that built-in port has
@@ -147,13 +148,30 @@ requirement.
 the built-in port to the dongle. We do the configuration remotely. **About 10 minutes**, and it can
 be done during the same visit as the other jobs.
 
-**Why it helps.** The dongle uses a completely different network chip and driver, bypassing the
-built-in controller that is failing. It is a cheap stopgap ahead of the planned move to newer
-hardware, and it removes the fault we cannot otherwise detect or prevent.
+**Why this is now required rather than a nice-to-have.**
 
-**Blocks:** nothing outright — but it is the difference between "this recurs and costs us data
-every few days" and "this stops happening". Given it has happened twice in four days, treat it as
-worth doing at the next visit rather than waiting for the hardware refresh.
+We built automatic recovery in three steps: (1) restart the video senders, (2) reset the network
+driver, (3) reboot the whole machine as a last resort. Step 2 is the gentle one — it fixes the
+fault in about twenty seconds without disturbing anything else.
+
+**On this Pi, step 2 turns out to be impossible.** The built-in network driver is welded into the
+system software rather than being a separate loadable piece, so it cannot be reset on its own.
+We confirmed this on 4 August. That leaves nothing between "restart the video senders" — which does
+not fix this fault — and "reboot the entire machine".
+
+So today, every occurrence of this fault costs a full reboot. We have made that reboot automatic and
+put safety limits on it, but rebooting a machine in a comms room, over the network it has just
+stopped using, is not something anyone should be relying on as routine recovery.
+
+**A USB adapter fixes that directly.** Its driver *is* a separate loadable piece, so plugging one in
+restores the gentle middle step. Recovery becomes a twenty-second driver reset instead of a full
+reboot — and the failing built-in port is bypassed entirely, so the fault should stop happening at
+all.
+
+**Blocks:** it does not block a measurement, but it is the difference between "this recurs every few
+days and each time costs a reboot" and "this stops happening". Given two occurrences in four days,
+and that reboot is now our only automatic remedy, **please order the part before booking the
+visit.**
 
 ## Suggested order and combined visit
 
@@ -164,13 +182,14 @@ All of this can be done in one visit:
 | 1 | Check camera view, re-aim if moved | lift 1 | 30 min |
 | 2 | Check the three cameras have a clear view | lifts 5, 6, 7 | 15 min |
 | 3 | Ride full height, both directions, many floors | lifts 2, 4, 5, 6, 7 | 75 min |
-| 4 | Fit the USB ethernet adapter on the Pi (bring the part) | comms room | 10 min |
+| 4 | Fit the USB ethernet adapter on the Pi (**bring the part — required**) | comms room | 10 min |
 
 **Total on site: roughly 2 hours 10 minutes.** Then about a week of normal running for enough fresh data to
 accumulate before the numbers are usable.
 
-**Job 4 needs a part ordered in advance** — without the adapter in hand that job cannot happen, so
-order it before booking the visit.
+**Job 4 needs a part ordered in advance and is now REQUIRED** — without the adapter in hand that job
+cannot happen, so order it before booking the visit. It is the only one of the four that changes how
+the system recovers from a fault rather than what it can measure.
 
 If time is short, **Job 3 is the highest value** — it takes three lifts from no data at all to
 usable data, which changes what the study can say about the building as a whole.

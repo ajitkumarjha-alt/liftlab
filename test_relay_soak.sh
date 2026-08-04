@@ -245,6 +245,74 @@ grep -q 'iface_bounce || true' "$SRC" && ok "link bounce no longer gates escalat
 # tx_packets is the ONLY signal: dmesg is silent on this fault
 grep -q 'statistics/tx_packets' "$SRC" && ok "tx_packets is read as the recovery test"                                        || bad "no tx_packets check"
 
+echo
+echo "== 9. stage 2 is a no-op on this kernel and must say so, not fail =="
+grep -q 'nic_module_loadable(){ modinfo' "$SRC" && ok "module loadability is DETECTED, not assumed" \
+                                               || bad "no module-loadability detection"
+grep -q 'return 2                                        # 2 = not applicable' "$SRC" \
+  && ok "unavailable stage 2 is distinct from a failed stage 2" \
+  || bad "stage 2 cannot distinguish 'not applicable' from 'tried and failed'"
+grep -q 'UNAVAILABLE (\${NIC_MODULE} is built into the kernel' "$SRC" \
+  && ok "startup states the ladder's REAL shape" || bad "ladder shape not stated at startup"
+# and it must not shell out to a modprobe that cannot work
+awk '/^driver_reload\(\)/,/^}/' "$SRC" | grep -q 'NIC_MODULE_LOADABLE" != 1' \
+  && ok "no modprobe attempted when the module is built in" || bad "still attempts a doomed modprobe"
+
+echo
+echo "== 10. the reboot gate — the ONLY automatic recovery left =="
+GATE_DIR=$(mktemp -d)
+gate(){  # $1=down_for_s  $2=seconds_since_last_reboot ("" = never)  $3=fs override
+  ( set +u
+    say(){ echo "$*"; }
+    IFACE=lo; NIC_MODULE=bcmgenet
+    FLEET_REBOOT=1
+    FLEET_REBOOT_MIN_DOWN_S=900
+    FLEET_REBOOT_COOLDOWN_S=3600
+    FLEET_REBOOT_SAFE=${3:-1}
+    FLEET_STATE_FS=${4:-ext4}
+    FLEET_STATE_DIR="$GATE_DIR"; FLEET_STATE="$GATE_DIR/fleet_escalation"
+    now=$(date +%s)
+    FLEET_ZERO_SINCE=$(( now - $1 ))
+    FLEET_LAST_REBOOT=$([ -n "$2" ] && echo $(( now - $2 )) || echo 0)
+    FLEET_STAGE=2
+    fleet_state_save(){ printf '%s %s %s %s\n' "$FLEET_STAGE" "$FLEET_ZERO_SINCE" "$(date +%s)" "$FLEET_LAST_REBOOT" > "$FLEET_STATE"; }
+    # stub the actual reboot so the test never issues one
+    timeout(){ shift; case "$*" in *reboot*) echo "__REBOOT_ISSUED__"; return 0;; esac; return 0; }
+    eval "$(extract fleet_reboot)"
+    fleet_reboot >/dev/null 2>&1; echo "rc=$?"
+    [ -f "$FLEET_STATE" ] && echo "saved=$(cat "$FLEET_STATE")" ) }
+
+# down 10 min -> gate must REFUSE (needs 15)
+R=$(gate 600 "" | grep '^rc=')
+chk "refuses when down < 15 min" "$R" "rc=1"
+# down 20 min, never rebooted -> gate must OPEN
+R=$(gate 1200 "" | grep -c '^rc=0')
+chk "opens when down >= 15 min and never rebooted" "$R" "1"
+# down 20 min but rebooted 10 min ago -> cooldown must REFUSE
+R=$(gate 1200 600 | grep '^rc=')
+chk "refuses inside the 1h cooldown" "$R" "rc=1"
+# down 20 min, rebooted 2h ago -> cooldown expired, must OPEN
+R=$(gate 1200 7200 | grep -c '^rc=0')
+chk "opens once the cooldown has expired" "$R" "1"
+# state on tmpfs -> must REFUSE outright (cooldown could not survive the reboot)
+R=$(gate 1200 "" 0 tmpfs | grep '^rc=')
+chk "refuses when state cannot survive a reboot (loop guard)" "$R" "rc=1"
+
+# the timestamp MUST be on disk before the reboot is issued, or the cooldown is lost across it
+SAVED=$(gate 1200 "" | grep '^saved=')
+[ -n "$SAVED" ] && ok "reboot timestamp persisted BEFORE the reboot was issued" \
+                || bad "no state written before reboot — cooldown would be lost"
+# ...and the persisted timestamp must be ~now, not 0
+TS=$(echo "$SAVED" | awk '{print $4}')
+NOWT=$(date +%s)
+[ -n "$TS" ] && [ "$TS" -gt $(( NOWT - 30 )) ] && ok "persisted reboot timestamp is the CURRENT attempt" \
+                                                || bad "persisted reboot timestamp is stale/zero ($TS)"
+# the down-for calculation must use the PERSISTED zero-since, not process start
+grep -q 'down_for=$(( now - FLEET_ZERO_SINCE ))' "$SRC" \
+  && ok "down-for is computed from the persisted FLEET_ZERO_SINCE" \
+  || bad "down-for does not use the persisted zero-since"
+rm -rf "$GATE_DIR"
+
 rm -f /tmp/_r1 /tmp/_r1b /tmp/_r2 /tmp/_r4
 echo
 echo "== $PASS passed, $FAIL failed =="

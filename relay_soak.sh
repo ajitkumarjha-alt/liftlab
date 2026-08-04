@@ -371,6 +371,17 @@ supervisor_watchdog(){
 supervisor_watchdog $$ &
 WD_PID=$!
 say "supervisor watchdog armed: loop must tick every ${LOOP_STALL_S}s (hb=$HB_FILE, pid $WD_PID)"
+# The recovery ladder's REAL shape on THIS machine, stated once at startup rather than left to be
+# inferred from what does or does not appear in the journal during an outage.
+if [ "$NIC_MODULE_LOADABLE" = 1 ]; then
+  say "FLEET ladder: 1) restart all ffmpeg  2) reload ${NIC_MODULE}  3) reboot (gated: down >= ${FLEET_REBOOT_MIN_DOWN_S}s, no reboot within ${FLEET_REBOOT_COOLDOWN_S}s)"
+else
+  say "FLEET ladder: 1) restart all ffmpeg  2) UNAVAILABLE (${NIC_MODULE} is built into the kernel, not a module — cannot be reloaded)  3) reboot (gated: down >= ${FLEET_REBOOT_MIN_DOWN_S}s, no reboot within ${FLEET_REBOOT_COOLDOWN_S}s)"
+  say "  There is NO automatic step between restarting ffmpeg and rebooting on this hardware."
+  say "  A USB ethernet adapter would restore stage 2 — its driver IS loadable. See SITE_VISIT_REQUIRED.md."
+fi
+say "FLEET escalation state: ${FLEET_STATE} (fs=${FLEET_STATE_FS}, survives reboot=$([ "$FLEET_REBOOT_SAFE" = 1 ] && echo yes || echo NO))"
+[ "$FLEET_REBOOT_SAFE" = 1 ] || say "  WARNING: reboot recovery is DISABLED because the cooldown could not survive a reboot."
 sleep 6
 prev_tx=$(tx_bytes); prev_sj=$(live_stats_json); prev_t=$(date +%s.%N)
 declare -A PREVB; for ((i=0;i<NCH;i++)); do PREVB[$i]=$(stat_bytes "$prev_sj" "${CAMS[$i]}"); PREVJ[${PIDS[$i]}]=$(pid_jiffies "${PIDS[$i]}"); done
@@ -453,6 +464,19 @@ mkdir -p "$FLEET_STATE_DIR" 2>/dev/null || FLEET_STATE_DIR=/tmp
 FLEET_STATE="$FLEET_STATE_DIR/fleet_escalation"
 FLEET_STATE_TTL="${RELAY_FLEET_STATE_TTL:-1800}"   # older than this = a different incident, start over
 
+# ── IS THE STATE ACTUALLY PERSISTENT? ────────────────────────────────────────
+# The one-hour reboot cooldown is the only thing standing between "recover automatically" and "boot
+# loop on a machine nobody can reach except over the network it just took down". That guarantee is
+# worth exactly as much as the storage it is written to: on tmpfs the timestamp evaporates during
+# the very reboot it is meant to limit, and every boot looks like the first.
+# So if the state cannot survive a reboot, DO NOT REBOOT. A wedge that waits for a human is bad;
+# a Pi power-cycling itself every few minutes with no console is worse.
+FLEET_STATE_FS=$(stat -f -c %T "$FLEET_STATE_DIR" 2>/dev/null || echo unknown)
+case "$FLEET_STATE_FS" in
+  tmpfs|ramfs) FLEET_REBOOT_SAFE=0 ;;
+  *)           FLEET_REBOOT_SAFE=1 ;;
+esac
+
 FLEET_ZERO_SINCE=0        # epoch when fleet delivery first hit ~zero, 0 = delivering
 FLEET_DOWN=0              # 1 once the fleet-down condition has been declared
 FLEET_STAGE=0             # escalation stage reached: 1=restart-all 2=driver reload 3=reboot
@@ -481,6 +505,21 @@ fleet_state_load(){
 fleet_state_load
 tx_packets(){ cat "/sys/class/net/${IFACE}/statistics/tx_packets" 2>/dev/null || echo 0; }
 
+# ── CAN THE DRIVER BE RELOADED AT ALL? ───────────────────────────────────────
+# On this Pi it cannot: bcmgenet is COMPILED INTO THE KERNEL, not built as a module. `lsmod` does
+# not list it and `modprobe -r bcmgenet` answers "Module bcmgenet not found". Verified 2026-08-04.
+# There is therefore NO rung between "restart ffmpeg" and "reboot the machine" on the onboard NIC.
+#
+# Detected rather than assumed, because it is a property of the kernel build and a USB ethernet
+# adapter WOULD be loadable — fitting one restores this rung. Reported once at startup so the
+# ladder's real shape is visible in the journal instead of implied by a modprobe that always fails.
+nic_module_loadable(){ modinfo "$NIC_MODULE" >/dev/null 2>&1; }
+if nic_module_loadable; then
+  NIC_MODULE_LOADABLE=1
+else
+  NIC_MODULE_LOADABLE=0
+fi
+
 # THE INTERFACE BOUNCE DOES NOT WORK ON THIS FAULT. Kept only because it is cheap and harmless to
 # try; it is no longer a rung on the ladder.
 #   `ip link set eth0 down` returns "RTNETLINK answers: Connection timed out" on a wedged bcmgenet
@@ -508,6 +547,13 @@ iface_bounce(){
 # because the bounce never reaches the wedged hardware.
 driver_reload(){
   local before after
+  if [ "$NIC_MODULE_LOADABLE" != 1 ]; then
+    # No modprobe attempt: it cannot succeed, and a failing command in the journal every six
+    # minutes reads like a broken permission rather than a kernel that never had this rung.
+    say "FLEET stage 2 UNAVAILABLE: ${NIC_MODULE} is built into the kernel, not a module — it cannot be reloaded."
+    say "  Skipping straight to the gated reboot. Fitting a USB ethernet adapter restores this rung."
+    return 2                                        # 2 = not applicable, distinct from 1 = tried and failed
+  fi
   before=$(tx_packets)
   say "FLEET recovery stage 2/3: reloading the ${IFACE} driver (modprobe -r ${NIC_MODULE}; modprobe ${NIC_MODULE})."
   say "  tx_packets before: ${before}. dmesg carries NO signal for this fault, so this counter is the only test."
@@ -539,7 +585,13 @@ fleet_reboot(){
   down_for=$(( now - FLEET_ZERO_SINCE ))
   since_reboot=$(( now - FLEET_LAST_REBOOT ))
   if [ "$FLEET_REBOOT" != 1 ]; then
-    say "FLEET: reboot disabled (RELAY_FLEET_REBOOT=0) — stopping at stage 2. This needs a human."
+    say "FLEET: reboot disabled (RELAY_FLEET_REBOOT=0) — stopping short of a reboot. This needs a human."
+    return 1
+  fi
+  if [ "$FLEET_REBOOT_SAFE" != 1 ]; then
+    say "FLEET: reboot REFUSED — escalation state lives on ${FLEET_STATE_FS} (${FLEET_STATE_DIR}),"
+    say "  which does not survive a reboot. The one-hour cooldown would be lost on every boot and"
+    say "  this would become a reboot loop. Point RELAY_STATE_DIR at persistent storage to enable it."
     return 1
   fi
   if [ "$down_for" -lt "$FLEET_REBOOT_MIN_DOWN_S" ]; then
@@ -665,13 +717,24 @@ while :; do
         0) say "FLEET recovery stage 1/3: restarting ALL ${NCH} ffmpeg."
            for ((k=0;k<NCH;k++)); do restart_stream "$k" "fleet-down stage 1: restart all"; done
            FLEET_STAGE=1; fleet_state_save ;;
-        1) say "FLEET recovery stage 2/3: a full restart changed nothing — the pipe is dead, not the processes."
+        1) say "FLEET recovery stage 2: a full restart changed nothing — the pipe is dead, not the processes."
            iface_bounce || true          # cheap, and known not to work on this fault; never gates stage 2
-           if driver_reload; then
+           driver_reload; DR=$?
+           if [ "$DR" = 0 ]; then
              say "FLEET: driver reload restored transmission; restarting all streams and re-testing."
              for ((k=0;k<NCH;k++)); do restart_stream "$k" "fleet-down stage 2: post-driver-reload restart"; done
-           fi
-           FLEET_STAGE=2; fleet_state_save ;;
+             FLEET_STAGE=2; fleet_state_save
+           elif [ "$DR" = 2 ]; then
+             # Stage 2 does not exist on this kernel. Do not spend a whole six-minute pass proving
+             # that again — go to the gate now. The gate has its own timing conditions, so this
+             # cannot shortcut the "down >= 15 min" requirement.
+             FLEET_STAGE=2; fleet_state_save
+             if ! fleet_reboot; then
+               say "FLEET: reboot gate held — see reason above. Retrying on the next pass."
+             fi
+           else
+             FLEET_STAGE=2; fleet_state_save
+           fi ;;
         2) # Reboot, gated. fleet_reboot() refuses unless down long enough AND not rebooted recently.
            if ! fleet_reboot; then
              say "FLEET: stage 3 held — see the gate reason above. Will retry on the next pass."
