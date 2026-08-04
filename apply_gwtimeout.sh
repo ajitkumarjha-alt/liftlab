@@ -37,6 +37,10 @@ grep -q 'DashTimeout' /tmp/dash_api.py \
   || { say "ABORT: /tmp/dash_api.py has no DashTimeout — wrong file?"; exit 2; }
 grep -q 'set_progress_handler' /tmp/dash_api.py \
   || { say "ABORT: /tmp/dash_api.py has no progress handler — running SQL would be uninterruptible"; exit 2; }
+grep -q 'if(inflight) return;' /tmp/dash_api.py \
+  || { say "ABORT: /tmp/dash_api.py has no client in-flight guard — the page would still stack requests"; exit 2; }
+grep -q 'setInterval(load' /tmp/dash_api.py && ! grep -q 'This was .load(); setInterval(load' /tmp/dash_api.py \
+  && { say "ABORT: /tmp/dash_api.py still arms setInterval(load, ...)"; exit 2; }
 
 $PY -m py_compile /tmp/dash_api.py || { say "compile failed — nothing changed"; exit 1; }
 

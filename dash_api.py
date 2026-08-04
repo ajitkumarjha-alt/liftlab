@@ -2381,14 +2381,76 @@ function loadTrends(){
 }
 
 function render(){ if(!DATA)return; nav(); strip(DATA); headline(DATA); unavail(DATA); if(mode==='cams'){tabs(DATA); panel(DATA);} }
-function load(){
-  var eq=eraQuery();
-  fetch('/dash/'+GW+'/data'+(eq?('?'+eq):'')).then(function(r){return r.json()}).then(function(d){
-    DATA=d; document.getElementById('stamp').textContent='· '+d.ist_today+' · updated '+new Date().toLocaleTimeString();
-    render();
-  }).catch(function(){document.getElementById('stamp').textContent='· FETCH FAILED';});
+
+/* ── DATA REFRESH: one in flight, bounded failures, backoff ────────────────────
+   This was `load(); setInterval(load, 15000);` — a fixed timer with NO in-flight guard and no
+   failure cap. Because /dash/{gw}/data could not finish, a single tab left open produced 46
+   requests in 11.7h with ~25 simultaneously Pending, each stranding a query the gateway could
+   never complete. That is what drove the two OOM kills: closing the tab alone took /ops from
+   17.9s to 0.005s and load from 5.38 to 0.74.
+
+   Three rules, and the first is the one that matters:
+     1. NEVER start a request while one is outstanding. `inflight` is the guard; the timer is only
+        ever re-armed from a settled request, so overlap is structurally impossible rather than
+        merely unlikely.
+     2. Stop after MAX_FAILS consecutive failures and hand the operator an explicit retry. An
+        auto-refreshing page that retries forever is a load generator pointed at a sick server.
+     3. Back off between retries (15s -> 30s -> 60s) instead of a fixed cadence.
+   Also: a non-2xx is now an ERROR, not data. The old code fed the response straight to .json()
+   and would happily render the 503 timeout body as if it were a dashboard. */
+var REFRESH_MS = 15000;
+var MAX_FAILS  = 3;
+var inflight   = null;      // AbortController (or sentinel) while a request is outstanding
+var fails      = 0;
+var timer      = null;
+var stopped    = false;
+
+function scheduleLoad(ms){
+  if(timer){clearTimeout(timer); timer=null;}
+  if(stopped) return;
+  timer = setTimeout(load, ms);
 }
-load(); setInterval(load, 15000);
+function backoffMs(){ return REFRESH_MS * Math.pow(2, Math.min(fails,3)); }
+
+function dataUnavailable(msg){
+  stopped = true;
+  if(timer){clearTimeout(timer); timer=null;}
+  var el = document.getElementById('stamp');
+  el.innerHTML = '· <b style="color:#c33">data unavailable</b> · '+esc(String(msg||'').slice(0,160))
+    +' <button id=retrybtn style="margin-left:6px;padding:2px 8px;cursor:pointer">retry</button>';
+  var b = document.getElementById('retrybtn');
+  if(b) b.onclick = function(){ fails=0; stopped=false; el.textContent='· retrying…'; load(); };
+}
+
+function load(){
+  if(inflight) return;                       // rule 1: never overlap
+  var eq = eraQuery();
+  var ac = (window.AbortController ? new AbortController() : null);
+  inflight = ac || {};
+  fetch('/dash/'+GW+'/data'+(eq?('?'+eq):''), ac?{signal:ac.signal}:undefined)
+    .then(function(r){
+      if(!r.ok){                             // 503 timeout body is an error, never data
+        return r.json().catch(function(){return {};}).then(function(b){
+          var e=new Error((b&&b.detail)||('HTTP '+r.status)); e.status=r.status; throw e; });
+      }
+      return r.json();
+    })
+    .then(function(d){
+      inflight=null; fails=0; DATA=d;
+      document.getElementById('stamp').textContent='· '+d.ist_today+' · updated '+new Date().toLocaleTimeString();
+      render();
+      scheduleLoad(REFRESH_MS);
+    })
+    .catch(function(err){
+      inflight=null; fails++;
+      if(fails>=MAX_FAILS){ dataUnavailable((err&&err.message)||'request failed'); return; }
+      var wait=backoffMs();
+      document.getElementById('stamp').textContent='· fetch failed ('+fails+'/'+MAX_FAILS
+        +') · retrying in '+Math.round(wait/1000)+'s';
+      scheduleLoad(wait);
+    });
+}
+load();
 </script>"""
 
 
