@@ -54,12 +54,33 @@ def _db() -> sqlite3.Connection:
         db.execute("ALTER TABLE relay_status ADD COLUMN stall_restarts INTEGER")
     except sqlite3.OperationalError:
         pass                                       # column already present
-    for col in ("guard_state TEXT", "guard_floor REAL"):
+    for col in ("guard_state TEXT", "guard_floor REAL", "gw_rss_mb INTEGER"):
         try:
             db.execute(f"ALTER TABLE relay_status ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass                                   # column already present
     return db
+
+
+def _self_rss_mb():
+    """THIS process's RSS in MB, read straight from /proc — one small file, no psutil dependency.
+
+    Recorded on every relay heartbeat (see relay_status_ingest). On 2026-08-03 the gateway grew to
+    1.48 GB on a 1.97 GB box and the kernel OOM-killed it; all anyone had afterwards was the single
+    endpoint reading in the kernel log, which cannot distinguish a slow leak from a burst. Sampling
+    here gives the next occurrence a growth CURVE, and it costs nothing extra to store: relay_status
+    is already trimmed to the newest 720 rows, so this rides along inside a fixed-size table.
+
+    Note this is the GATEWAY's memory, not the Pi's — mem_avail_mb in the same row is the Pi's.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None                                # non-Linux or /proc unavailable — not worth failing a heartbeat over
+    return None
 
 
 def _auth(gw: str, authorization: str) -> None:
@@ -83,14 +104,16 @@ async def relay_status_ingest(gw: str, request: Request, authorization: str = He
     db.execute(
         "INSERT INTO relay_status (gateway_id,ts,sum_delivered_mbps,streams_alive,streams_delivering,"
         "ff_cpu,soc_temp,throttle_live,mem_avail_mb,door_fps,guard_trips,stall_restarts,per_stream,"
-        "guard_state,guard_floor) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "guard_state,guard_floor,gw_rss_mb) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (gw, time.time(), d.get("sum_delivered_mbps"), d.get("streams_alive"), d.get("streams_delivering"),
          d.get("ff_cpu"), d.get("soc_temp"), d.get("throttle_live"), d.get("mem_avail_mb"),
          d.get("door_fps"), d.get("guard_trips", 0), d.get("stall_restarts", 0),
          json.dumps(d.get("per_stream", {})),
          # guard_state: ok | cooldown (stopped, will retry) | down (gave up, needs a human).
-         d.get("guard_state", "ok"), d.get("guard_floor")))
+         d.get("guard_state", "ok"), d.get("guard_floor"),
+         # the gateway's OWN RSS, not the Pi's — the growth curve for the next OOM
+         _self_rss_mb()))
     db.execute("DELETE FROM relay_status WHERE gateway_id=? AND id NOT IN "
                "(SELECT id FROM relay_status WHERE gateway_id=? ORDER BY id DESC LIMIT 720)", (gw, gw))
     db.commit()
