@@ -11,9 +11,26 @@ Live `dash_api.py` = `1f79edb6`, branch `gw-timeout`.
 | 2b | Era census cached per (gw,cam), bounded key space | **DEPLOYED** |
 | 2c | Floor alphabet derived on a schedule, persisted | **DEPLOYED** (stage 1 of the precompute job) |
 | 2d | Per-camera aggregates precomputed off the request path | **DEPLOYED** |
-| 3 | `/ops` indexes (`apply_gwindex.sh`) | held, **re-measure first — probably unnecessary** |
+| 3 | `/ops` indexes (`apply_gwindex.sh`) | **DROPPED — not deferred** (see Decisions closed) |
 
 `/dash/{gw}/data` went from **never terminating** (000 at 600s) to a median of **0.77s**.
+
+## Decisions closed (2026-08-04) — do not relitigate these
+
+**`liftlab-alphabet.timer` is RETIRED. Do not recreate it.** The floor-alphabet derivation is
+**stage 1 of the single ordered `liftlab-precompute` job**, not its own timer. This was a deliberate
+deviation from an instruction to re-enable the alphabet timer, and it was **reviewed and accepted**:
+stage 2 (`aggregate_refresh`) depends on stage 1, because `_tier2` reads the stored alphabet to
+decide which floor reads are admissible. Two independent timers could race and bake a
+missing-or-stale-alphabet aggregate into a cached result that then serves reads. One job enforces the
+ordering; two timers only hope for it. If you find yourself about to add a second timer, don't.
+
+**Step 3 (`apply_gwindex.sh`) is DROPPED, not deferred.** `/ops` is 5.5s on a quiet gateway, and the
+windowed `gw_door_event` queries already plan onto all three columns of the EXISTING `ix_door_event`.
+That does not justify write cost at ~3.5 writes/second. The script is left in the tree for its
+reasoning; if the case ever changes, **re-derive it from fresh measurement rather than resurrecting
+this proposal** — the numbers it was originally argued from (the 14.1s `/ops` baseline) were
+contaminated by stranded `/dash` requests and are not a valid starting point.
 
 ---
 
@@ -100,7 +117,7 @@ and do not reduce to SQL aggregates cleanly.
 | RSS flat under sustained refresh | **met** (199 MB peak / 178 MB settled, 3 concurrent streams) |
 | Zero OOM kills over 24h | **on track** — none since 2026-08-03 18:00 (~10.5h at time of writing) |
 
-## Step 3 — held, and probably unnecessary
+## Step 3 — DROPPED (superseded; kept for the reasoning only)
 
 `/ops` re-measured on a quiet gateway is **5.5s**, not the contaminated 14.1s. More importantly, the
 windowed `gw_door_event` queries now plan as `ix_door_event (gateway_id=? AND cam=? AND ts>?)` using
@@ -113,7 +130,9 @@ cost at ~3.5 writes/s for an index the query no longer needs.
 `floor_alphabet` (7 rows) and `alphabet_job.py` remain installed but unused after the rollback.
 `liftlab-alphabet.timer` was **disabled** — my rollback path did not remove the timer it installed,
 so it would otherwise have kept running a 35s job every 30min for a table nothing reads. Re-enable
-with `systemctl enable --now liftlab-alphabet.timer` when (c) goes back in.
+**DO NOT re-enable `liftlab-alphabet.timer` — it no longer exists and must not be recreated.**
+See "Decisions closed" at the top of this file: the alphabet is now stage 1 of the single
+ordered `liftlab-precompute` job.
 
 
 ---
@@ -169,7 +188,7 @@ overturned.
 This is a background-job cost, not a request-path cost, so it does not affect the acceptance bar.
 It does set the job's runtime (~533s) and therefore its duty cycle: at 1h that is ~15%.
 
-## Step 3 — still held, and the case for it has weakened further
+## Step 3 — DROPPED (2026-08-04)
 
 `/ops` was 5.5s on a quiet gateway, and the earlier 14.1s was contaminated by stranded `/dash`
 requests. The windowed `gw_door_event` queries now plan onto all three columns of the EXISTING
