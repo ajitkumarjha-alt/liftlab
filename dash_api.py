@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -117,10 +118,84 @@ def _db():
     return db
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# REQUEST TIME BUDGET
+#
+# WHY THIS EXISTS. /dash/{gw}/data does not merely run slow — it does not terminate. Measured
+# 2026-08-03: the page shell returns 200 in 6.5s, but the data fetch returned 000 after a full
+# 600s with 0 bytes (DevTools shows it Pending forever). The page auto-refreshes, so an open tab
+# strands one non-terminating request after another, each holding its row set, until the kernel
+# reaps the process: two OOM kills in ~13h, anon-rss 1.48 GB and 1.49 GB, on unmodified code.
+#
+# A budget does not make the endpoint fast. It converts an OUTAGE into an ERROR MESSAGE — the
+# request lets go of its memory and the caller learns why. That is worth shipping on its own,
+# ahead of the query rewrite, because it is what stops a slow page from killing the gateway.
+#
+# TWO MECHANISMS, because either alone leaves a hole:
+#   * set_progress_handler aborts SQL that is ALREADY EXECUTING. Without it a single long query is
+#     uninterruptible from Python and no between-phase check ever gets a turn.
+#   * _budget_check() between phases catches the Python-side walking of rows, which SQLite cannot
+#     see and the progress handler therefore never fires for.
+#
+# The deadline is thread-local: Starlette runs `def` endpoints in the anyio threadpool, so each
+# concurrent request gets its own, and a budget armed by one request cannot abort another's query.
+DATA_BUDGET_S = float(os.environ.get("DASH_DATA_BUDGET_S", "25"))
+_PROGRESS_STEPS = 20000                      # VM instructions between progress-handler calls
+
+
+class DashTimeout(Exception):
+    """This request exceeded its wall-clock budget and was aborted mid-flight."""
+
+
+_budget = threading.local()
+
+
+def _budget_expired():
+    d = getattr(_budget, "deadline", None)
+    return d is not None and time.monotonic() >= d
+
+
+def _budget_arm(db, budget_s):
+    """Start this request's clock and make running SQL interruptible."""
+    _budget.deadline = time.monotonic() + budget_s
+    _budget.budget_s = budget_s
+    # Returning non-zero from the handler makes SQLite abort the statement with
+    # OperationalError('interrupted'), which _q turns into DashTimeout below.
+    db.set_progress_handler(lambda: 1 if _budget_expired() else 0, _PROGRESS_STEPS)
+
+
+def _budget_disarm(db):
+    _budget.deadline = None
+    try:
+        db.set_progress_handler(None, 0)
+    except Exception:
+        pass
+
+
+def _budget_elapsed():
+    b = getattr(_budget, "budget_s", None)
+    d = getattr(_budget, "deadline", None)
+    if b is None or d is None:
+        return None
+    return round(b - (d - time.monotonic()), 2)
+
+
+def _budget_check(where):
+    """Between-phase guard. Call at points where a lot of Python work is about to start."""
+    if _budget_expired():
+        raise DashTimeout(where)
+
+
 def _q(db, sql, args=()):
     try:
         return db.execute(sql, args).fetchall()
     except sqlite3.OperationalError:
+        # A budget abort arrives here as OperationalError('interrupted'). Returning [] would turn a
+        # TIMEOUT into a silently empty panel — the dashboard would report "no rows" for a camera
+        # holding tens of thousands of them, which is worse than an error because it looks like data.
+        # Only the genuine "table not created yet" case may fall through to the honest empty.
+        if _budget_expired():
+            raise DashTimeout("sql")
         return []                            # table not created yet -> honest empty, never a 500
 
 
@@ -1200,22 +1275,53 @@ def _latest(db, table, gw):
 @dash_router.get("/dash/{gw}/data")
 def dash_data(gw: str, era: str = ""):
     db = _db()
+    _budget_arm(db, DATA_BUDGET_S)
+    try:
+        return _dash_data_inner(db, gw, era)
+    except DashTimeout as e:
+        # 503 + Retry-After, NOT 500: the request was abandoned deliberately, the data is not known
+        # to be broken, and a caller that retries later may well succeed. The body names the phase
+        # that ran out so the next person does not have to re-derive where the time went.
+        return JSONResponse(
+            {"error": "timeout",
+             "detail": (f"/dash/{gw}/data exceeded its {DATA_BUDGET_S:g}s budget and was aborted "
+                        f"during '{e}'. This endpoint walks the full history of every camera on "
+                        f"every request; until it is bounded in SQL it can outrun any budget."),
+             "phase": str(e), "budget_s": DATA_BUDGET_S, "elapsed_s": _budget_elapsed(),
+             "gw": gw, "t": time.time()},
+            status_code=503, headers={"Retry-After": "30"})
+    finally:
+        _budget_disarm(db)
+        db.close()
+
+
+def _dash_data_inner(db, gw: str, era: str = ""):
     now = time.time()
     cams = _cameras(db, gw)
+    _budget_check("door_by_cam")
     door = _door_by_cam(db, gw)                      # Pi-era (gw_event), RETIRED instrument
+    _budget_check("door_gpu_by_cam")
     door_gpu = _door_gpu_by_cam(db, gw, [c["cam"] for c in cams])   # GPU-era (gw_door_event), LIVE
+    _budget_check("transit_by_cam")
     trans = _transit_by_cam(db, gw)
     xfer = _transfer_by_cam(db, gw)
     floor_cov = _floor_coverage(db, gw)
     registry = _registry(db, gw)
+    _budget_check("transits_for_join")
     tj = _transits_for_join(db, gw)
-    tier2 = {c["cam"]: _tier2(db, gw, c["cam"], tj.get(c["cam"], []), era_override=era) for c in cams}
-    tier2 = {k: v for k, v in tier2.items() if v}
+    # Per-camera check: _tier2 does most of its work walking rows in Python, where the SQL progress
+    # handler never fires. Checking once per camera bounds the overrun to one camera's work instead
+    # of letting the whole seven-camera loop run past the deadline unnoticed.
+    tier2 = {}
+    for c in cams:
+        _budget_check(f"tier2:{c['cam']}")
+        v = _tier2(db, gw, c["cam"], tj.get(c["cam"], []), era_override=era)
+        if v:
+            tier2[c["cam"]] = v
     ana = _analyzers(db, gw)
     val = _validations(db, gw)
     w = _latest(db, "watch_status", gw)
     r = _latest(db, "relay_status", gw)
-    db.close()
 
     # ---- top strip: PI ----
     pi = None
