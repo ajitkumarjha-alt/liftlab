@@ -122,7 +122,10 @@ async def relay_status_ingest(gw: str, request: Request, authorization: str = He
          _self_rss_mb(),
          # from the Pi: the NIC's transmit counter (the wedge's only signal) and the epoch of the
          # last automatic reboot attempt (0 = never), so the cooldown is auditable from here.
-         _f(d.get("tx_packets")), _f(d.get("last_reboot_epoch"))))
+         # Passed raw like every other value in this INSERT. The coercion helper used here at first
+         # lives in door_event_api.py, not this module — that copy-paste is what 500'd every relay
+         # heartbeat on 2026-08-04. SQLite coerces on the way in and None stays NULL.
+         d.get("tx_packets"), d.get("last_reboot_epoch")))
     db.execute("DELETE FROM relay_status WHERE gateway_id=? AND id NOT IN "
                "(SELECT id FROM relay_status WHERE gateway_id=? ORDER BY id DESC LIMIT 720)", (gw, gw))
     db.commit()
