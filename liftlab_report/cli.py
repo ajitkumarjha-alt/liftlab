@@ -87,6 +87,12 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
                             reader.BUCKET_S)
     dlog_floor_note = demand_log.floor_attribution_note(floor_conf)
     floor_speed = model.floor_speed_segments(confident_reads)
+    # PER-FLOOR DEMAND: join transits to the stop they happened in. Cycles already carry a floor,
+    # so this is the join, not a re-walk of the door stream.
+    per_floor = model.per_floor_demand(gpu_cycles, transits, stamps, tier2_evidence, t0, t1)
+    # OCCUPANCY: derived, reset at every idle gap, never presented as a measurement.
+    occ = model.occupancy_periods(transits, stamps, validation, t0, t1)
+    occ_summary = model.occupancy_summary(occ)
     coeff_blockers = model.coefficient_blockers(tier2_evidence, floor_speed, cams)
     profile = model.hourly_profile(transits, pi_cycles)
     fixed = model.parse_peak_window(peak_window)
@@ -212,6 +218,7 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         "demand_log": dlog, "demand_log_floor_note": dlog_floor_note,
         "floor_confidence": floor_conf,
         "tier2_evidence": tier2_evidence, "floor_speed": floor_speed,
+        "per_floor_demand": per_floor, "occupancy": occ, "occupancy_summary": occ_summary,
         "coefficient_blockers": coeff_blockers,
         "analyzer_versions": analyzer_versions,
         "aggs": aggs, "transit_aggs": transit_aggs, "funnels": funnels,

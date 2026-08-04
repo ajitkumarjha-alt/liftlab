@@ -421,6 +421,210 @@ def vs_sheet_rows(aggs: dict[tuple, dict], cam: str,
     return rows
 
 
+def direction_trustworthy(evidence: dict) -> dict[tuple, bool]:
+    """{(cam, era): bool} — may an up/down split be emitted for this camera?
+
+    Only when the reader could actually NAME both arrows. ch27's templates contain only 'down' and
+    ch30's only 'up' (verified 2026-08-04 from the built .npz), so their direction field is the one
+    value their classifier can return, not a reading. `arrow_unqualified` counts rows the engine
+    itself suppressed; for older rows written before n_arrow_labels existed, a distribution that is
+    entirely or almost entirely one direction is the same evidence after the fact."""
+    out = {}
+    for key, d in evidence.items():
+        if not d.get("confident"):
+            out[key] = False
+            continue
+        if d.get("arrow_unqualified"):
+            out[key] = False            # the engine said so at source
+            continue
+        up, dn = d["arrow"].get("up", 0), d["arrow"].get("down", 0)
+        both = up > 0 and dn > 0
+        lopsided = (up + dn) > 0 and max(up, dn) > 0.95 * (up + dn)
+        out[key] = bool(both and not lopsided)
+    return out
+
+
+# Idle gap that ends a cabin-active period. Occupancy is only meaningful WITHIN a run of activity;
+# carrying a running total across a quiet night accumulates every counting error in between.
+OCCUPANCY_IDLE_GAP_S = 600.0
+
+
+def occupancy_periods(transits: list[dict], stamps: dict, validation: dict,
+                      t0: float, t1: float, idle_gap_s: float | None = None) -> dict[tuple, list]:
+    """ESTIMATED occupancy per cabin-active period. DERIVED FROM CROSSINGS — NOT A MEASUREMENT.
+
+    The system counts door crossings, not people in a car. Cumulative boarded-minus-alighted is
+    therefore an ESTIMATE whose error compounds with every cycle: at a per-camera precision of
+    83-95%, roughly 1 crossing in 6 to 1 in 20 is wrong, and those errors accumulate in one
+    direction as often as not. A running total across a whole day is meaningless.
+
+    So it is bounded two ways:
+      * RESET TO ZERO at every idle gap (default 10 min with no transit). A period is one run of
+        cabin activity, and the estimate never carries across one.
+      * Each period reports the camera's precision, the number of crossings accumulated, and an
+        implied error bound, so the figure is never quotable without its uncertainty.
+
+    NEGATIVE OCCUPANCY IS A BROKEN DERIVATION, NOT A SMALL NUMBER. More people left the car than
+    entered it, which cannot happen — it means missed boardings, double-counted alightings, or a
+    period boundary in the wrong place. The display clamps at zero, but `went_negative` and
+    `min_raw` are recorded so the clamp can never hide it.
+
+    -> {(cam, counting_version): [period, ...]}
+    """
+    gap = OCCUPANCY_IDLE_GAP_S if idle_gap_s is None else float(idle_gap_s)
+    by: dict[tuple, list] = {}
+    seq: dict[str, list] = {}
+    for t in transits:
+        if not (t0 <= t["ts"] < t1) or eras.in_gap(t["cam"], t["ts"]):
+            continue
+        seq.setdefault(t["cam"], []).append(t)
+    for cam, ts_list in seq.items():
+        ts_list.sort(key=lambda t: t["ts"])
+        v = validation.get(cam) or {}
+        prec = v.get("precision_pct")
+        cur = None
+        for t in ts_list:
+            ver = eras.counting_version_at(cam, t["ts"], stamps)
+            new_period = (cur is None or t["ts"] - cur["last_ts"] > gap
+                          or ver != cur["counting_version"])   # era hygiene ends a period too
+            if new_period:
+                if cur:
+                    by.setdefault((cam, cur["counting_version"]), []).append(cur)
+                cur = {"cam": cam, "counting_version": ver, "start_ts": t["ts"], "last_ts": t["ts"],
+                       "boarded": 0, "alighted": 0, "n_crossings": 0,
+                       "raw": 0, "peak_raw": 0, "min_raw": 0, "went_negative": False,
+                       "precision_pct": prec}
+            cur["last_ts"] = t["ts"]
+            cur["n_crossings"] += 1
+            if t["direction"] == "in":
+                cur["boarded"] += 1; cur["raw"] += 1
+            else:
+                cur["alighted"] += 1; cur["raw"] -= 1
+            cur["peak_raw"] = max(cur["peak_raw"], cur["raw"])
+            cur["min_raw"] = min(cur["min_raw"], cur["raw"])
+            if cur["raw"] < 0:
+                cur["went_negative"] = True
+        if cur:
+            by.setdefault((cam, cur["counting_version"]), []).append(cur)
+
+    for periods in by.values():
+        for p in periods:
+            p["end_ts"] = p["last_ts"]
+            p["duration_s"] = round(p["end_ts"] - p["start_ts"], 1)
+            p["estimated_occupancy"] = max(0, p["raw"])       # clamped for DISPLAY only
+            p["clamped"] = p["raw"] < 0
+            # Implied error bound: each crossing carries (1 - precision) chance of being wrong, and
+            # the estimate is a DIFFERENCE of two counts, so the errors do not cancel — they add.
+            # Stated as a plain +/- on the accumulated crossings rather than a confidence interval,
+            # because the per-crossing errors are not independent enough to justify one.
+            if p["precision_pct"] is not None:
+                err = (1.0 - p["precision_pct"] / 100.0) * p["n_crossings"]
+                p["error_bound"] = round(err, 1)
+                p["error_note"] = (f"+/-{err:.0f} people at {p['precision_pct']:.0f}% precision "
+                                   f"over {p['n_crossings']} crossings")
+            else:
+                p["error_bound"] = None
+                p["error_note"] = "unvalidated camera — no precision, so no error bound"
+    return by
+
+
+def occupancy_summary(periods_by_key: dict) -> dict:
+    """Fleet-level honesty check: how often did the derivation break?"""
+    tot = neg = 0
+    for periods in periods_by_key.values():
+        for p in periods:
+            tot += 1
+            neg += 1 if p["went_negative"] else 0
+    return {"n_periods": tot, "n_went_negative": neg,
+            "pct_negative": (100.0 * neg / tot) if tot else None}
+
+
+def per_floor_demand(cycles: list[dict], transits: list[dict], stamps: dict,
+                     evidence: dict, t0: float, t1: float) -> dict:
+    """Per-floor stops / boardings / alightings, by joining transits to the stop they happened in.
+
+    THE JOIN RULE, stated because every number below depends on it:
+      A transit at time T is attributed to the door cycle whose [open_ts, close_ts] contains T, on
+      the SAME camera. The floor is that cycle's confident floor read. A transit matching no cycle,
+      or matching a cycle with no floor, is UNATTRIBUTED and counted as such — never silently
+      dropped and never assigned to a neighbouring floor.
+
+    FAILURE MODES, all of which are reported rather than hidden:
+      * no floor on the cycle — the doors opened, the panel was not read. Dominant on ch27/ch30.
+      * transit outside every cycle — the counter saw a crossing while the doors were, as far as
+        the door engine knows, shut. Clock skew between the two producers lands here: transit_event
+        comes from the GPU counting worker and gw_door_event from the door engine, two processes
+        with independent clocks, so a boundary-adjacent crossing can fall outside its own stop.
+      * a cycle with no transits is a real stop with nobody crossing — counted as a stop, zero
+        riders. That is NOT the same as an unattributed transit and is kept distinct.
+      * DIRECTION is emitted only where the reader can name both arrows (see
+        direction_trustworthy). Where it cannot, up/down stay None rather than inheriting the one
+        value the classifier is capable of producing.
+
+    Era hygiene: keyed by (cam, counting_version, era). Nothing is pooled across either.
+    """
+    dirs_ok = direction_trustworthy(evidence)
+    by_cam_cycles: dict[str, list] = {}
+    for c in cycles:
+        if not (t0 <= c["ts"] < t1) or eras.in_gap(c["cam"], c["ts"]):
+            continue
+        by_cam_cycles.setdefault(c["cam"], []).append(c)
+    for v in by_cam_cycles.values():
+        v.sort(key=lambda c: c["ts"])
+
+    by_cam_transits: dict[str, list] = {}
+    for t in transits:
+        if not (t0 <= t["ts"] < t1) or eras.in_gap(t["cam"], t["ts"]):
+            continue
+        by_cam_transits.setdefault(t["cam"], []).append(t)
+    for v in by_cam_transits.values():
+        v.sort(key=lambda t: t["ts"])
+
+    out: dict[tuple, dict] = {}
+    for cam, cyc in by_cam_cycles.items():
+        tr = by_cam_transits.get(cam, [])
+        ti = 0
+        for c in cyc:
+            ver = eras.counting_version_at(cam, c["ts"], stamps)
+            era = c.get("era_id") or "unversioned"
+            key = (cam, ver, era)
+            d = out.setdefault(key, {"floors": {}, "n_stops": 0, "n_stops_no_floor": 0,
+                                     "n_transits_attributed": 0, "n_transits_total": 0,
+                                     "direction_ok": dirs_ok.get((cam, era), False)})
+            d["n_stops"] += 1
+            close = c.get("close_ts") or (c["ts"] + eras.DOOR_OPEN_MAX_S
+                                          if hasattr(eras, "DOOR_OPEN_MAX_S") else c["ts"] + 60.0)
+            # both lists ascending -> one forward pass, not a rescan per stop
+            while ti < len(tr) and tr[ti]["ts"] < c["ts"]:
+                ti += 1
+            j, matched = ti, []
+            while j < len(tr) and tr[j]["ts"] <= close:
+                matched.append(tr[j]); j += 1
+            floor = c.get("floor")
+            if floor is None:
+                d["n_stops_no_floor"] += 1
+                continue                       # its transits stay unattributed, by construction
+            f = d["floors"].setdefault(str(floor), {
+                "stops": 0, "boarded": 0, "alighted": 0, "up_stops": None, "down_stops": None})
+            f["stops"] += 1
+            if d["direction_ok"]:
+                if f["up_stops"] is None:
+                    f["up_stops"] = f["down_stops"] = 0
+                cd = c.get("direction")
+                if cd == "up":
+                    f["up_stops"] += 1
+                elif cd == "down":
+                    f["down_stops"] += 1
+            for t in matched:
+                f["boarded" if t["direction"] == "in" else "alighted"] += 1
+                d["n_transits_attributed"] += 1
+    for (cam, _v, _e), d in out.items():
+        d["n_transits_total"] = len(by_cam_transits.get(cam, []))
+        d["attribution_pct"] = (100.0 * d["n_transits_attributed"] / d["n_transits_total"]
+                                if d["n_transits_total"] else None)
+    return out
+
+
 def coefficient_blockers(tier2_evidence: dict, speed: dict, cams: list) -> dict[str, dict]:
     """Per-coefficient blocker for C17/C18/C21/C22, DERIVED from the data.
 
