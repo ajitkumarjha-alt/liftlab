@@ -139,6 +139,43 @@ post "analyzer_status (GPU worker)" "/api/gw/$GW/analyzer_status" \
   "{\"cam\":\"ch29\",\"counting_version\":\"2026-07-28-registry-zones\",\"zones\":\"registry\",\"uptime_s\":3600,\"segments\":1200,\"dropped\":8,\"posted\":140,\"last_transit_ts\":$TS,\"mode\":\"live\",\"door_opens_since_transit\":0,\"s_since_transit_post\":12,\"hist_rate_hr\":40.0,\"proc_ms\":1800,\"seg_budget_ms\":2000,\"drop_frac\":0.0}" \
   analyzer_status "gateway_id='$GW' AND cam='ch29'"
 
+# APPEND-ONLY HISTORY is a SIBLING write inside the same handler: the upsert can succeed while the
+# history insert silently does not (wrong table, missing column, a throttle that never opens). The
+# endpoint returns 200 either way. Assert the history row separately — and assert the THROTTLE, since
+# a throttle stuck open turns a 60s-per-cam table into a per-segment one and balloons a replicated DB.
+echo
+echo "== append-only worker_telemetry (history is a separate write from the upsert) =="
+WT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM worker_telemetry WHERE gateway_id='$GW' AND cam='ch29';" 2>/dev/null || echo 0)
+if [ "${WT:-0}" -ge 1 ]; then ok "history row landed in worker_telemetry ($WT)"; else
+  bad "analyzer_status returned 2xx but worker_telemetry is EMPTY — the history append is broken"
+fi
+
+# Second POST immediately after the first: the throttle (WORKER_TELEMETRY_MIN_S, default 60s) must
+# suppress it. Same cam, so this is the throttled path, not a new-cam path.
+curl -s -o /dev/null --max-time 20 -X POST -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' \
+  -d "{\"cam\":\"ch29\",\"counting_version\":\"2026-07-28-registry-zones\",\"uptime_s\":3660,\"segments\":1210,\"dropped\":9,\"posted\":141,\"last_transit_ts\":$TS,\"mode\":\"live\",\"proc_ms\":1810,\"seg_budget_ms\":2000,\"drop_frac\":0.0074}" \
+  "http://127.0.0.1:$PORT/api/gw/$GW/analyzer_status"
+WT2=$(sqlite3 "$DB" "SELECT COUNT(*) FROM worker_telemetry WHERE gateway_id='$GW' AND cam='ch29';" 2>/dev/null || echo 0)
+if [ "${WT2:-0}" = "${WT:-0}" ]; then ok "throttle held: second POST within 60s added no row (still $WT2)"; else
+  bad "throttle FAILED: rows went $WT -> $WT2 on a second POST — table will grow per-heartbeat, not per-60s"
+fi
+
+# The upsert must still be a single row per cam. If the history change ever turned the upsert into an
+# append, the dashboard's "current state" read silently becomes "some arbitrary old state".
+AS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM analyzer_status WHERE gateway_id='$GW' AND cam='ch29';" 2>/dev/null || echo 0)
+if [ "${AS:-0}" = 1 ]; then ok "analyzer_status still upserts: exactly 1 row for ch29"; else
+  bad "analyzer_status has $AS rows for ch29 — the upsert path changed; the dashboard reads this"
+fi
+
+# The prune must use the index, not scan. A global `WHERE ts < ?` cannot use ix_wtele and full-scans
+# the table on every append inside the request handler.
+PLAN=$(sqlite3 "$DB" "EXPLAIN QUERY PLAN DELETE FROM worker_telemetry WHERE gateway_id='$GW' AND cam='ch29' AND ts < 1;" 2>/dev/null)
+case "$PLAN" in
+  *"USING INDEX ix_wtele"*) ok "prune is an indexed SEARCH (not a full scan)";;
+  *) bad "prune would SCAN: $PLAN";;
+esac
+
 echo
 echo "== handler-body faults must FAIL this gate =="
 # A NameError inside a handler is invisible to an import check. Confirm the gate is actually

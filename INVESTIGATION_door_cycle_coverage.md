@@ -4,6 +4,12 @@
 C17/C18, transfer time, and — the part that matters most — it makes close-travel a measurement on a
 **selected subset** of cycles rather than all of them.
 
+**SUPERSEDED IN PART — read `INVESTIGATION_ch16_second_mechanism.md` first.** Two claims below are
+now known to be wrong: the completion rates in §1 have a **contaminated denominator** (~31-46% of
+what is counted as an "episode" is a sub-3s phantom excursion, not a door cycle), and the
+"sampling holes" mechanism in §3 misreads emit-on-change gaps as gaps in observation. Corrected
+figures and the real mechanism are in that document.
+
 **Headline: `close_th` is not the story, and C27 is NOT biased — see section 4.** The engine's own note (*"close_th too low, doors never
 read fully shut"*) is contradicted by the data. The loss is upstream and it is a **sampling**
 problem, not a threshold one.
@@ -12,7 +18,9 @@ problem, not a threshold one.
 
 ## 1. Where openings die
 
-Per opening episode, current era, 7 days:
+Per opening episode, current era, 7 days. **CAVEAT: these denominators are contaminated** — see
+`INVESTIGATION_ch16_second_mechanism.md` §3. Excluding sub-3s phantom episodes that never reach
+`closing`, completion is ch16 13.9%, ch27 20.1%, ch30 22.8%, not the figures below.
 
 | cam | openings | reached `open` | reached `closing` | **completed** |
 |---|---:|---:|---:|---:|
@@ -45,7 +53,7 @@ little mass lies **between** 0.10 and 0.30 (ch16: 30.1 % → 31.7 %, i.e. 1.6 po
 band). The signal is bimodal — mostly shut or mostly open — with very little time observed in
 transit. That is the shape of a **sparsely sampled** fast transition, not a threshold set too low.
 
-## 3. The mechanism: the closing motion is never observed
+## 3. The mechanism — PARTLY WRONG, see the correction at the end of this section
 
 What follows an `open` state:
 
@@ -67,8 +75,17 @@ Observation cadence confirms it:
 | ch29 | 0.16 s | 6.26 s | 60.07 s | 14.0 % | 11.1 % |
 | ch30 | 1.52 s | 6.33 s | 60.03 s | 39.4 % | 13.5 % |
 
-(The 60 s values are the idle heartbeat re-emit. The operative figure is the **> 2 s** column: a
-door closes in roughly 2–3 s, so a gap of that order routinely straddles the entire descent.)
+(The 60 s values are the idle heartbeat re-emit.)
+
+**CORRECTION.** The table above does NOT measure observation cadence. `gw_door_event` is
+emit-on-change: `door_event_changed` keys on `(floor, direction, door_state)` and **openness is not
+in the key**, so a row is written on a state/floor/direction change or the 60 s heartbeat — never
+per observation. Inside a fetched segment the door is examined at 12.5 fps whether or not anything
+is emitted. These gaps are therefore intervals between **state changes**, and a long one is
+consistent with a stable state that was observed continuously. ch16's 60 s p90 in particular
+reflects its 98% floor `no_read` (few key changes), not a blind detector. The real funnel loss is
+`open -> closing`, and the discriminator is in
+`INVESTIGATION_ch16_second_mechanism.md` §4-5.
 
 ### The upstream cause — NOT yet established
 
@@ -159,9 +176,10 @@ respect. But the specific reason to doubt C27 has been tested and did not hold.
 ## 6. To investigate next, in order
 
 1. ~~Test the sampling bias.~~ **DONE — section 4. C27 survives; the pool is smaller, not skewed.**
-2. **The second loss mechanism.** ch16 drops only 3.7 % of segments yet completes 24.2 % of cycles,
-   so segment loss is not the whole story and on ch16 it is not even most of it. This is now the
-   largest unexplained gap. See `INVESTIGATION_gpu_segment_coverage.md` §4.
+2. ~~The second loss mechanism on ch16.~~ **DONE — `INVESTIGATION_ch16_second_mechanism.md`.**
+   The premise did not hold: ch16's signal is healthy, ~46% of its "episodes" were phantoms, and
+   the corrected deficit (13.9% vs peers' 20-23%) is modest. The dominant loss is FLEET-WIDE —
+   over half of all `closing` states revert to `open`, on every camera.
 3. **Land append-only drop telemetry** before attempting the drop-vs-completion correlation.
    `analyzer_status` is upserted — one row per camera, no history — so that correlation cannot
    currently be computed at all. See §5 of the same document.

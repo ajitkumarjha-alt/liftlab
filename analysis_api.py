@@ -276,8 +276,15 @@ async def analyzer_status_ingest(gw: str, request: Request, authorization: str =
                     d.get("drop_rate_hr"), d.get("seg_budget_ms"), d.get("analyze_fps"),
                     d.get("segments"), d.get("dropped"), d.get("posted"),
                     d.get("door_opens_since_transit"), d.get("s_since_transit_post")))
-        db.execute("DELETE FROM worker_telemetry WHERE ts < ?",
-                   (now - 86400.0 * float(os.environ.get("WORKER_TELEMETRY_KEEP_DAYS", "14")),))
+        # Prune THIS CAM only, so the DELETE matches the ix_wtele prefix (gateway_id,cam,ts).
+        # A global `WHERE ts < ?` cannot use that index — ts is not a usable prefix — so it
+        # full-scans the table on every append: measured 28-58ms over 141k rows, ~7x/min, inside
+        # the ingest handler on a one-core box. Per-cam is an indexed SEARCH at 0.005ms.
+        # Every live cam prunes itself each time it appends; a camera that stops posting keeps its
+        # last 14 days (~2.3MB) until it returns, which is the useful direction to fail in.
+        db.execute("DELETE FROM worker_telemetry WHERE gateway_id=? AND cam=? AND ts < ?",
+                   (gw, cam,
+                    now - 86400.0 * float(os.environ.get("WORKER_TELEMETRY_KEEP_DAYS", "14"))))
     db.commit()
     db.close()
     return {"ok": True}
