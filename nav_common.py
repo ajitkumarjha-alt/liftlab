@@ -28,6 +28,7 @@ _TOP = [
     ("fleet", "Fleet", None),                 # resolved from DASH_FLEET_URL
     ("floorcheck", "Floorcheck", "/floorcheck/{gw}/{cam}"),
     ("validate", "Validate", "/validate"),
+    ("reports", "Reports", "/reports"),
 ]
 
 # The per-camera setup chain, in the order it is actually performed. `collect` is an ACTION (a button
