@@ -321,9 +321,23 @@ def templates_era(door_version: str) -> str:
 
 
 def gpu_era_id(door_version: str) -> str:
-    """door_version is templates_hash[:8]+'+'+geometry_hash[:8] — a content
-    hash with no ordering. The era is the templates half, prefix-matched."""
-    return (door_version or "").split("+", 1)[0][:8] or "unversioned"
+    """The GPU era id — the FULL templates half of door_version.
+
+    This used to truncate to 8 characters, on the documented assumption that door_version is
+    exactly templates_hash[:8]+'+'+geometry_hash[:8]. Live data violates that: rebuilds carry a
+    hand-added tag (e79e50d3h2, 260d4a0fh2Laa52). Truncating merged a rebuild into the era it
+    replaced, and because this function also groups door CYCLES, close-travel was being pooled
+    across rebuild boundaries — 7,539 of 10,571 cycles (71%) sat in a merged group.
+
+    Measured effect of splitting them (2026-08-04): no verdict flipped, but every reported n and
+    CI moved, and pooling made the study look MORE converged than it is —
+        ch29 pooled n=171 median 2.231 CI [1.442, 3.225]
+             split  n=101 median 2.129 CI [1.176, 3.383]   <- true CI is 0.42s WIDER
+        ch16 pooled n=680 median 2.185 ; current era n=596 median 2.122
+        ch27 pooled n=2417 median 3.258 ; current era n=2384 median 3.278
+    Since the stopping rule ends the study when the CI band clears the line, an artificially
+    narrow CI is the one error this report must not make."""
+    return templates_era(door_version)
 
 
 # ── Bank mapping (sidecar; registry edits are out of scope for this module) ──

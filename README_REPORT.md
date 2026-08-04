@@ -239,15 +239,28 @@ the other four coefficients, false of these. Both are fixed: blockers are now de
 * **ch16 alone is genuinely floor-blind** — 1 confident read in its current era. That turned out to
   be its own fault: see `INCIDENT_ch16_floor_blind.md`.
 
-### Open item — `gpu_era_id()` truncates the era
+### Resolved — `gpu_era_id()` no longer truncates the era
 
-`gpu_era_id()` takes `door_version.split('+')[0][:8]`, assuming the templates half is exactly 8
-characters. Live data violates that: rebuilds carry a hand-added tag (`e79e50d3h2`,
-`260d4a0fh2Laa52`). Truncation merges a rebuild into the era it replaced — which is how ch16's drop
-from 19,424 confident reads to 1 stayed hidden behind a single total. The Tier-2 evidence table now
-uses `eras.templates_era()` (untruncated). **`gpu_era_id` is unchanged, because it also groups door
-cycles, and regrouping those moves every cycle-derived figure in the report.** That means
-cycle-derived figures may still be pooling across a tagged rebuild. Not yet investigated.
+`gpu_era_id()` took `door_version.split('+')[0][:8]`, assuming the templates half is exactly 8
+characters. Live rebuilds carry a hand-added tag (`e79e50d3h2`, `260d4a0fh2Laa52`), so truncation
+merged a rebuild into the era it replaced — and because that function also groups door **cycles**,
+close-travel was being pooled across rebuild boundaries.
+
+**Measured before fixing: 7,539 of 10,571 cycles (71 %) sat in a merged group.**
+
+| cam | pooled (before) | split (after) |
+|---|---|---|
+| ch16 | n=680, median 2.185, CI [1.965, 2.443] | `e79e50d3` n=84 median 3.046 · **`e79e50d3h2` n=596 median 2.122 CI [1.901, 2.380]** |
+| ch27 | n=2417, median 3.258, CI [3.111, 3.449] | `425f92e1` n=33 median 2.319 · **`425f92e1h2` n=2384 median 3.278 CI [3.130, 3.457]** |
+| ch29 | n=171, median 2.231, CI [1.442, 3.225] | `260d4a0f` n=28 · `260d4a0fh2` n=42 · **`260d4a0fh2Laa52` n=101 median 2.129 CI [1.176, 3.383]** |
+
+**No verdict flipped** — every CI that straddled the 2.00 s assumption still straddles it, and
+ch27's still clears it. But every reported n and CI moved, and the direction of the error is the
+dangerous one: **pooling made the study look more converged than it is.** ch29's true current-era CI
+is 0.42 s *wider* than the pooled one. Since the stopping rule ends the study when the CI band
+clears the line, an artificially narrow CI is the one error this report must not make. Fixed, with
+two regression tests.
+
 
 ## The DEMAND LOG export
 

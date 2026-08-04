@@ -1576,3 +1576,35 @@ def test_demand_log_coverage_cannot_exceed_100_under_a_gap(fixture_db):
             assert r["coverage_pct"] <= 100.0, f"coverage over 100%: {r}"
         # hours observed can never exceed the hours in a day either
         assert 0 <= r["hours_observed"] <= 24, r
+
+
+def test_gpu_era_id_does_not_merge_a_tagged_rebuild():
+    """Regression: gpu_era_id truncated the templates half to 8 chars, so a hand-tagged rebuild
+    ('e79e50d3h2') collapsed into the era it replaced ('e79e50d3'). Because gpu_era_id also groups
+    door CYCLES, close-travel was pooled across the boundary — 71% of cycles on live data — and
+    pooling produced NARROWER CIs than the truth, which is the one error the stopping rule cannot
+    tolerate."""
+    assert eras.gpu_era_id("e79e50d3h2+54509e75") != eras.gpu_era_id("e79e50d3+7b1c0bad")
+    assert eras.gpu_era_id("e79e50d3h2+54509e75") == "e79e50d3h2"
+    assert eras.gpu_era_id("260d4a0fh2Laa52+495e8f48") == "260d4a0fh2Laa52"
+    # and it must agree with the untruncated helper the Tier-2 evidence uses
+    for dv in ("e79e50d3+7b1c0bad", "e79e50d3h2+54509e75", "260d4a0fh2Laa52+495e8f48", "", None):
+        assert eras.gpu_era_id(dv) == eras.templates_era(dv)
+
+
+def test_cycles_never_pool_across_a_tagged_rebuild(fixture_db):
+    """A cycle group must contain exactly one real templates era."""
+    db = reader.open_ro(fixture_db)
+    try:
+        rows = reader.fetch_gpu_rows(db, "site-A", _ts("2026-07-14T00:00:00"),
+                                     _ts("2026-08-02T00:00:00"))
+        cycles, _f = reader.fetch_gpu_cycles(db, "site-A", _ts("2026-07-14T00:00:00"),
+                                             _ts("2026-08-02T00:00:00"))
+    finally:
+        db.close()
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["cam"], eras.gpu_era_id(r["door_version"])), set()).add(
+            eras.templates_era(r["door_version"]))
+    for key, real in groups.items():
+        assert len(real) == 1, f"{key} still merges {sorted(real)}"
