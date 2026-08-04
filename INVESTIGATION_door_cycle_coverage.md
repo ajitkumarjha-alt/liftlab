@@ -4,7 +4,7 @@
 C17/C18, transfer time, and — the part that matters most — it makes close-travel a measurement on a
 **selected subset** of cycles rather than all of them.
 
-**Headline: `close_th` is not the story.** The engine's own note (*"close_th too low, doors never
+**Headline: `close_th` is not the story, and C27 is NOT biased — see section 4.** The engine's own note (*"close_th too low, doors never
 read fully shut"*) is contradicted by the data. The loss is upstream and it is a **sampling**
 problem, not a threshold one.
 
@@ -70,40 +70,83 @@ Observation cadence confirms it:
 (The 60 s values are the idle heartbeat re-emit. The operative figure is the **> 2 s** column: a
 door closes in roughly 2–3 s, so a gap of that order routinely straddles the entire descent.)
 
-### The likely upstream cause, already measured elsewhere
+### The upstream cause — NOT yet established
 
-The GPU fleet journal on 2026-08-04 shows every worker running **3.8×–4.8× over budget with
-`drop_frac = 66.667 %`**:
+An earlier draft blamed the GPU fleet running **3.8–4.8× over budget at `drop_frac = 66.7%`**. That
+snapshot was taken minutes after I restarted all seven workers to deploy `gpu_door.py`, so it
+overstated the steady state — but the correction over-shot too. The accurate picture is **bimodal**:
+mostly healthy, with a real and persistent bad mode (ch29 runs 2.38× over budget in steady state;
+workers at 66.7% are still present in the journal).
+
+The mechanism is now understood: **holes are whole dropped 2 s segments, not sparse sampling.** Inside
+a fetched segment the door is sampled at 12.5 fps — 25× finer than needed. Every drop is a 2.0 s
+blind window, the same order as the ~2.5 s close it would have to contain. That is why the p90 gaps
+above sit at 2–3 segment multiples.
+
+**But drops do not fully explain this document's completion deficit.** ch16 drops only 3.7 % of
+segments and still completes just 24.2 % of cycles — so a second mechanism exists and on ch16 it
+dominates. Full analysis, the ranked options, and the telemetry prerequisite that currently blocks
+the causal test are in **`INVESTIGATION_gpu_segment_coverage.md`**.
+
+## 4. C27 SAMPLING BIAS — TESTED, AND C27 SURVIVES
+
+**Result: the bias hypothesis is NOT supported. C27 stands as reported.**
+
+The hypothesis was that a slow close is more likely to be caught by a sparse sampler than a fast
+one, so the completed-cycle pool would skew slow and the C27 median would be biased high.
+
+### The first metric was circular — recording it so it is not repeated
+
+Correlating `close_travel_s` against the largest sampling hole measured *inside* the cycle window
+gave a strong-looking result: Spearman **rho = +0.352**, with stratified medians climbing
+1.882 → 2.607 → 4.121 → 5.981 s from densest to sparsest quartile. It looked like a large bias.
+
+It is an artefact. A longer close means a longer window, which mechanically gives a large hole more
+opportunity to occur inside it:
 
 ```
-seg timing: throughput=7946ms ... vs budget=2000ms -> 3.97x OVER-BUDGET
-            COMPUTE-bound (GPU); drop_frac=66.667% dropped_total=2
+Spearman rho(in-cycle max gap, cycle duration) = +0.887
 ```
 
-Two-thirds of segments dropped produces exactly these holes. The chain is:
+The metric is nearly a restatement of the thing it was supposed to predict. **Do not quote the
+in-cycle numbers, including the per-camera ones below** — they are all contaminated the same way.
+
+### The controlled test
+
+Sampling density measured in a **fixed 60 s window ending when the cycle opens** — the same length
+for every cycle, and causally prior to the close it is being correlated with:
+
+| ambient max hole before the cycle | n | median close_travel | 95% CI |
+|---|---:|---:|---|
+| 0.08–7.60 s (densest) | 1,121 | 2.488 s | [2.305, 2.721] |
+| 7.61–10.39 s | 1,121 | 2.689 s | [2.484, 2.915] |
+| 10.39–15.99 s | 1,121 | 2.686 s | [2.464, 2.987] |
+| 15.99–59.50 s (sparsest) | 1,121 | 2.420 s | [2.264, 2.688] |
 
 ```
-workers over budget -> 66.7% of segments dropped -> openness sampled with 2-9s holes
-  -> the closing descent falls between samples -> 'closing' never observed
-  -> no complete cycle -> cycle count is a fraction of real stops
+Spearman rho(ambient gap, close_travel_s) = -0.019
+Spearman rho(ambient n,   close_travel_s) = -0.033   (would need to be clearly negative)
 ```
 
-This is a **throughput** problem surfacing as a door-detection problem. `close_th` is downstream of
-it and blameless.
+**Flat.** No monotone trend, deltas within ±0.2 s, CIs overlapping throughout, and both correlations
+indistinguishable from zero. Cycles occurring during sparsely-sampled periods do **not** have longer
+closes than cycles during densely-sampled ones.
 
-## 4. Why this matters more than coverage — the comparability question
+### Why the mechanism did not bite
 
-Cycles complete only when the closing motion was sampled. **A slow close is more likely to be
-caught by a sparse sampler than a fast one**, purely because it occupies more sampling opportunities.
+Because the failure mode is **omission, not distortion**. `close_travel_s` is stamped from the
+tracker's own state crossings — `close_start` at the near_open crossing, `close_full` at `close_th`.
+When samples are missing, the cycle usually fails to complete **at all** (which is exactly the
+coverage loss in sections 1–3) rather than completing with an inflated duration. Dropped samples
+remove cycles from the pool; they do not stretch the survivors. Among cycles that did complete, the
+descent *was* observed, and the measurement is sound.
 
-So the completed-cycle pool is plausibly **biased toward slower closes**, and `close_travel_s` — the
-study's headline C27 measurement, currently reported at a median of ~2.1–3.3 s against a 2.00 s
-assumption — may be **biased high** by a mechanism that has nothing to do with the doors.
+**C27 is a measurement on a smaller pool than it should be, but not a biased one.** Coverage and
+comparability are separable here, and only coverage is damaged.
 
-**This is a hypothesis with a stated mechanism, not an established result.** It has not been tested,
-and it should be before the C27 finding is quoted further. A direct test: compare `close_travel_s`
-against the observation density around each cycle. If well-sampled cycles show systematically faster
-closes than sparsely-sampled ones, the bias is real and quantifiable.
+Residual caveat, stated honestly: this rules out the *proposed* mechanism — ambient sampling density
+predicting close duration. It does not prove the completing cycles are representative in every other
+respect. But the specific reason to doubt C27 has been tested and did not hold.
 
 ## 5. What this gates
 
@@ -115,12 +158,14 @@ closes than sparsely-sampled ones, the bias is real and quantifiable.
 
 ## 6. To investigate next, in order
 
-1. **Test the bias in section 4** before anything else. It is the only item that touches a figure
-   already being reported.
-2. Establish whether the GPU over-budget condition is the cause: does completion rate track
-   `drop_frac` per camera and over time? ch29 has the worst completion (17.5 %) — check its
-   throughput against the others.
-3. Only then consider engine thresholds. On this evidence `close_th` should not be touched: it is
+1. ~~Test the sampling bias.~~ **DONE — section 4. C27 survives; the pool is smaller, not skewed.**
+2. **The second loss mechanism.** ch16 drops only 3.7 % of segments yet completes 24.2 % of cycles,
+   so segment loss is not the whole story and on ch16 it is not even most of it. This is now the
+   largest unexplained gap. See `INVESTIGATION_gpu_segment_coverage.md` §4.
+3. **Land append-only drop telemetry** before attempting the drop-vs-completion correlation.
+   `analyzer_status` is upserted — one row per camera, no history — so that correlation cannot
+   currently be computed at all. See §5 of the same document.
+4. Only then consider engine thresholds. On this evidence `close_th` should not be touched: it is
    reachable, it is reached, and closings that are observed complete almost without exception.
 
 ## 7. What NOT to do
