@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 
 from openpyxl.utils import get_column_letter
 
-from . import charts, eras, model, narrative, stats, style
+from . import charts, demand_log, eras, model, narrative, stats, style
 from .charts import ChartData  # re-exported: cli builds one and passes it in
 from .eras import GPU_ENGINE, PI_WATCH
 from .reader import precision_str
@@ -1298,6 +1298,68 @@ def _rng_cols(first_row, last_row, first_col, last_col) -> str:
 
 
 # ── PEAK ANALYSIS ────────────────────────────────────────────────────────────
+
+
+def sheet_demand_log(wb, ctx, anchors):
+    """DEMAND LOG — the flat, per-hour table. The same rows the CSV carries.
+
+    This is deliberately the least interpreted sheet in the workbook: no means, no modelling, no
+    charts. One row per hour per lift plus a FLEET row per hour, so a reader can check any headline
+    figure elsewhere in this workbook against the counts it came from."""
+    log = ctx.get("demand_log")
+    if not log:
+        return
+    ws = wb.create_sheet("DEMAND LOG")
+    row = title(ws, "Demand log — hourly counts, exactly as recorded")
+    row += 1
+    for line in ctx.get("demand_log_notes", []):
+        cell(ws, row, 1, line, font=BODY_ITALIC, wrap=True)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        ws.row_dimensions[row].height = 30
+        row += 1
+    row += 1
+
+    row = section(ws, row, "HOURLY — one row per lift per hour, plus FLEET")
+    hdr = [h for _, h in demand_log.HOURLY_COLS]
+    header_row(ws, row, hdr)
+    first = row + 1
+    row += 1
+    # DARK is a string, so it never needs a number format; the counts always do — this workbook
+    # forbids a bare number landing in a General-format cell.
+    for r in log["hourly"]:
+        for i, (k, _) in enumerate(demand_log.HOURLY_COLS, start=1):
+            v = r.get(k)
+            cell(ws, row, i, "" if v is None else v,
+                 fmt=(F_INT if isinstance(v, (int, float)) else None),
+                 font=BODY_BOLD if r["camera"] == demand_log.FLEET else BODY,
+                 fill=FILL_NA if v == demand_log.DARK else None)
+        row += 1
+    anchors["demand_log_hourly"] = (ws.title, _rng(first, row - 1, len(hdr)))
+    freeze_below(ws, first)
+    row += 2
+
+    row = section(ws, row, "DAILY ROLLUP")
+    hdr2 = [h for _, h in demand_log.DAILY_COLS]
+    header_row(ws, row, hdr2)
+    first2 = row + 1
+    row += 1
+    for r in log["daily"]:
+        for i, (k, _) in enumerate(demand_log.DAILY_COLS, start=1):
+            v = r.get(k)
+            if k == "coverage_pct":
+                # F_PCT supplies the '%' and expects a FRACTION. The CSV column is literally
+                # 'coverage %' and carries 0-100, so it is scaled here and ONLY here.
+                cell(ws, row, i, "" if v is None else v / 100.0,
+                     fmt=(F_PCT if v is not None else None))
+            else:
+                cell(ws, row, i, "" if v is None else v,
+                     fmt=(F_INT if isinstance(v, (int, float)) else None))
+        row += 1
+    anchors["demand_log_daily"] = (ws.title, _rng(first2, row - 1, len(hdr2)))
+
+    for i, w in enumerate((18, 10, 22, 10, 10, 30, 34, 10), start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    return row
 
 def sheet_peak(wb, ctx, cd, anchors):
     from .model import aggregate_cycles

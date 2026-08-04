@@ -11,8 +11,8 @@ from datetime import datetime
 import pytest
 from openpyxl.utils.cell import coordinate_to_tuple
 
-from liftlab_report import (charts, cli, eras, model, narrative, reader, stats,
-                            workbook)
+from liftlab_report import (charts, cli, demand_log, eras, model, narrative,
+                            reader, stats, workbook)
 from liftlab_report.fixtures import FRAME_QUANTUM_S, make_fixture
 
 
@@ -1340,3 +1340,175 @@ def test_sheets_are_frozen_and_the_raw_sheet_filters(fixture_db):
         assert wb[name].freeze_panes, f"{name} has no frozen header"
     for name in ("SUMMARY", "RAW", "PER-LIFT"):
         assert wb[name].page_setup.orientation == "landscape"
+
+
+# ── DEMAND LOG ───────────────────────────────────────────────────────────────
+# The export exists to enforce three things: dark is never zero, counting versions are never
+# pooled, and gap rows never counted. Each gets a test that fails loudly if it regresses.
+
+def _dlog(fixture_db, frm="2026-07-21T00:00:00", to="2026-07-25T00:00:00"):
+    return cli.build_context(fixture_db, "site-A", _ts(frm), _ts(to))
+
+
+def test_demand_log_dark_hour_is_dash_never_zero(fixture_db):
+    """The whole point of the export: an unobserved hour must not read as 'carried nobody'."""
+    log = _dlog(fixture_db)["demand_log"]
+    dark = [r for r in log["hourly"] if r["observed"] == "no"]
+    assert dark, "fixture produced no unobserved hours — test cannot prove the rule"
+    for r in dark:
+        assert r["boarded"] == demand_log.DARK, r
+        assert r["alighted"] == demand_log.DARK, r
+        assert r["boarded"] != 0 and r["alighted"] != 0
+
+
+def test_demand_log_observed_but_idle_hour_is_a_real_zero(fixture_db):
+    """The converse: observed and counted nobody IS a zero, and must not be dashed."""
+    log = _dlog(fixture_db)["demand_log"]
+    zeros = [r for r in log["hourly"]
+             if r["observed"] == "yes" and r["camera"] != demand_log.FLEET
+             and r["boarded"] == 0]
+    for r in zeros:
+        assert r["boarded"] == 0 and r["alighted"] != demand_log.DARK
+
+
+def test_demand_log_never_pools_counting_versions(fixture_db):
+    """A (hour, camera) that spans two builds must yield one row per build, never a blend."""
+    ctx = _dlog(fixture_db, "2026-07-14T00:00:00", "2026-07-25T00:00:00")
+    log = ctx["demand_log"]
+    seen = {}
+    for r in log["hourly"]:
+        if r["camera"] == demand_log.FLEET:
+            continue
+        seen.setdefault((r["timestamp_ist"], r["camera"]), set()).add(r["counting_version"])
+    multi = {k: v for k, v in seen.items() if len(v) > 1}
+    # whichever cameras straddle, each version is its own row — never merged into one
+    for key, vers in multi.items():
+        rows = [r for r in log["hourly"]
+                if (r["timestamp_ist"], r["camera"]) == key]
+        assert len(rows) == len(vers)
+    # and the daily rollup carries the version so two builds cannot be summed into one total
+    assert all("counting_version" in r for r in log["daily"])
+
+
+def test_demand_log_fleet_row_is_per_version_and_sums_observed_only(fixture_db):
+    log = _dlog(fixture_db)["demand_log"]
+    by_hour = {}
+    for r in log["hourly"]:
+        by_hour.setdefault(r["timestamp_ist"], []).append(r)
+    for ts, rows in by_hour.items():
+        fleets = [r for r in rows if r["camera"] == demand_log.FLEET]
+        assert fleets, f"no FLEET row for {ts}"
+        for f in fleets:
+            if f["boarded"] == demand_log.DARK:
+                continue
+            cams = [r for r in rows
+                    if r["camera"] != demand_log.FLEET and r["observed"] == "yes"
+                    and r["counting_version"] == f["counting_version"]]
+            assert f["boarded"] == sum(r["boarded"] for r in cams)
+            assert f["alighted"] == sum(r["alighted"] for r in cams)
+
+
+def test_demand_log_excludes_gap_transits(fixture_db):
+    """Gap rows are excluded from counts, matching aggregate_transits."""
+    ctx = _dlog(fixture_db, "2026-07-14T00:00:00", "2026-08-02T00:00:00")
+    log = ctx["demand_log"]
+    counted = sum(r["boarded"] + r["alighted"] for r in log["hourly"]
+                  if r["camera"] != demand_log.FLEET
+                  and isinstance(r["boarded"], int))
+    pooled = sum(a["boarded"] + a["alighted"] for a in ctx["transit_aggs"].values())
+    assert counted == pooled, "demand log and transit_aggs disagree on what was counted"
+
+
+def test_demand_log_daily_coverage_never_exceeds_100(fixture_db):
+    log = _dlog(fixture_db)["demand_log"]
+    for r in log["daily"]:
+        if r["coverage_pct"] is not None:
+            assert 0.0 <= r["coverage_pct"] <= 100.0, r
+
+
+def test_demand_log_csv_carries_its_caveats(fixture_db, tmp_path):
+    """A demand table mailed onward without 'dark is not zero' will be misread — so the
+    caveats ride inside the file, not alongside it."""
+    ctx = _dlog(fixture_db)
+    paths = demand_log.write_csvs(tmp_path / "r.xlsx", ctx, ctx["demand_log"],
+                                  ctx["demand_log_floor_note"])
+    assert len(paths) == 2
+    for p in paths:
+        text = p.read_text(encoding="utf-8")
+        head = [l for l in text.splitlines() if l.startswith("#")]
+        assert head, f"{p.name} has no provenance header"
+        joined = " ".join(head)
+        assert "NOT OBSERVED" in joined and "not a zero" in joined
+        assert "PERSONS CURRENTLY IN LIFT IS NOT INCLUDED" in joined
+        assert "PER-FLOOR DEMAND IS NOT INCLUDED" in joined
+        # the data itself must still parse as ordinary CSV once comments are skipped
+        import csv as _csv
+        rows = list(_csv.reader(l for l in text.splitlines() if not l.startswith("#")))
+        assert len(rows) >= 2 and rows[0][0].startswith(("timestamp", "date"))
+
+
+def test_demand_log_format_flag_selects_outputs(fixture_db, tmp_path):
+    base = ["--from", "2026-07-21T00:00:00", "--to", "2026-07-25T00:00:00",
+            "--db", fixture_db, "--gateway", "site-A"]
+    csv_only = cli.run_all(base + ["--out", str(tmp_path / "a.xlsx"), "--format", "csv"])
+    assert all(p.suffix == ".csv" for p in csv_only) and len(csv_only) == 2
+    assert not (tmp_path / "a.xlsx").exists(), "--format csv must not write a workbook"
+
+    xlsx_only = cli.run_all(base + ["--out", str(tmp_path / "b.xlsx"), "--format", "xlsx"])
+    assert [p.suffix for p in xlsx_only] == [".xlsx"]
+
+    both = cli.run_all(base + ["--out", str(tmp_path / "c.xlsx"), "--format", "both"])
+    assert sorted(p.suffix for p in both) == [".csv", ".csv", ".xlsx"]
+    # run() keeps its single-Path contract for prove_report.py and web callers
+    assert cli.run(base + ["--out", str(tmp_path / "d.xlsx")]).suffix == ".xlsx"
+
+
+def test_demand_log_sheet_present_and_matches_row_count(fixture_db, tmp_path):
+    from openpyxl import load_workbook
+    ctx = _dlog(fixture_db)
+    wb = cli.build_workbook(ctx)
+    out = tmp_path / "wb.xlsx"
+    wb.save(out)
+    got = load_workbook(out)
+    assert "DEMAND LOG" in got.sheetnames
+    ws = got["DEMAND LOG"]
+    body = [r for r in ws.iter_rows(values_only=True)
+            if r and r[0] and str(r[0])[:4].isdigit() and ":" in str(r[0])]
+    assert len(body) == len(ctx["demand_log"]["hourly"])
+
+
+def test_demand_log_floor_note_is_measured_not_asserted(fixture_db):
+    """The 'why no per-floor table' line must come from counted reads, per camera."""
+    ctx = _dlog(fixture_db)
+    note = ctx["demand_log_floor_note"]
+    assert "PER-FLOOR DEMAND IS NOT INCLUDED" in note
+    conf = ctx["floor_confidence"]
+    if conf:
+        cam = sorted(conf)[0]
+        assert f"{cam} {conf[cam]['confident']}/{conf[cam]['total']}" in note
+
+
+def test_demand_log_has_no_occupancy_column(fixture_db):
+    """Occupancy is not derivable from crossings; it must not appear by any name."""
+    log = _dlog(fixture_db)["demand_log"]
+    banned = ("occupan", "in_lift", "inside", "net", "current")
+    for cols in (demand_log.HOURLY_COLS, demand_log.DAILY_COLS):
+        for key, header in cols:
+            assert not any(b in key.lower() or b in header.lower() for b in banned), key
+    for r in log["hourly"][:5]:
+        assert not any(any(b in k.lower() for b in banned) for k in r)
+
+
+def test_demand_log_coverage_cannot_exceed_100_under_a_gap(fixture_db):
+    """Regression: real data produced 190.5% because observed hours were credited by BUCKET
+    midpoint while the denominator subtracted gap SECONDS. Both sides must use the same rule,
+    so an hour that was entirely an outage can never be counted as observed."""
+    ctx = cli.build_context(fixture_db, "site-A",
+                            _ts("2026-07-14T00:00:00"), _ts("2026-08-02T00:00:00"))
+    daily = ctx["demand_log"]["daily"]
+    assert daily, "fixture produced no daily rows"
+    for r in daily:
+        if r["coverage_pct"] is not None:
+            assert r["coverage_pct"] <= 100.0, f"coverage over 100%: {r}"
+        # hours observed can never exceed the hours in a day either
+        assert 0 <= r["hours_observed"] <= 24, r

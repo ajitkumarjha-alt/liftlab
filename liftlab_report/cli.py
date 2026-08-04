@@ -18,7 +18,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from . import eras, model, reader, workbook
+from . import demand_log, eras, model, reader, workbook
 
 
 class ReportError(Exception):
@@ -67,6 +67,10 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         transits = reader.fetch_transits(db, gw, t0, t1)
         floor_status = reader.fetch_floor_read_status(db, gw, t0, t1)
         cov_buckets = reader.coverage_buckets(db, gw, cams, t0, t1)
+        # DEMAND LOG source data. floor_confidence uses the door engine's own definition of a
+        # confident read so the "why there is no per-floor table" line is measured, not asserted.
+        floor_conf = reader.fetch_floor_confidence(db, gw, t0, t1,
+                                                   demand_log.FLOOR_OK_REASONS)
     finally:
         db.close()
 
@@ -76,6 +80,9 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
     aggs = model.aggregate_cycles(all_cycles, t0, t1, min_close_s=floor_s)
     suspected_gaps = model.detect_suspected_gaps(all_cycles, transits, cams, t0, t1)
     transit_aggs = model.aggregate_transits(transits, stamps, t0, t1)
+    dlog = demand_log.build(transits, cov_buckets, stamps, validation, cams, t0, t1,
+                            reader.BUCKET_S)
+    dlog_floor_note = demand_log.floor_attribution_note(floor_conf)
     profile = model.hourly_profile(transits, pi_cycles)
     fixed = model.parse_peak_window(peak_window)
     peaks = model.peak_by_day(transits, pi_cycles, t0, t1, fixed)
@@ -190,13 +197,15 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         })
     raw_rows.sort(key=lambda r: r["ts_epoch"])
 
-    return {
+    ctx = {
         "t0": t0, "t1": t1,
         "from_iso": datetime.fromtimestamp(t0, eras.IST).isoformat(),
         "to_iso": datetime.fromtimestamp(t1, eras.IST).isoformat(),
         "generated_at": datetime.now(eras.IST).isoformat(timespec="seconds"),
         "gw": gw, "db_path": str(db_path), "cams": cams, "banks": banks,
         "validation": validation, "registry": registry,
+        "demand_log": dlog, "demand_log_floor_note": dlog_floor_note,
+        "floor_confidence": floor_conf,
         "analyzer_versions": analyzer_versions,
         "aggs": aggs, "transit_aggs": transit_aggs, "funnels": funnels,
         "boundaries": boundaries, "profile": profile, "peaks": peaks,
@@ -218,6 +227,10 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         "fleet_quantum_s": fleet_quantum,
         "transits": transits,
     }
+    # Built last: the provenance lines quote ctx's own range/gateway/precision fields, and
+    # they must be identical in the CSV and the sheet so the two can never disagree.
+    ctx["demand_log_notes"] = demand_log.notes(ctx, dlog) + [dlog_floor_note]
+    return ctx
 
 
 def build_workbook(ctx):
@@ -234,6 +247,7 @@ def build_workbook(ctx):
     workbook.sheet_per_lift(wb, ctx, cd, anchors)
     workbook.sheet_fleet(wb, ctx, cd, anchors)
     workbook.sheet_demand(wb, ctx, cd, anchors)
+    workbook.sheet_demand_log(wb, ctx, anchors)
     workbook.sheet_peak(wb, ctx, cd, anchors)
     workbook.sheet_raw(wb, ctx, anchors)
     workbook.sheet_coverage(wb, ctx, cd, anchors)
@@ -245,7 +259,7 @@ def build_workbook(ctx):
     return wb
 
 
-def run(argv=None) -> Path:
+def run_all(argv=None) -> list:
     ap = argparse.ArgumentParser(
         prog="liftlab-report",
         description="Export an era-hygienic Excel workbook of lift analytics "
@@ -255,6 +269,12 @@ def run(argv=None) -> Path:
     ap.add_argument("--to", dest="to_ts", required=True,
                     help="range end (exclusive), ISO timestamp (naive = IST)")
     ap.add_argument("--out", default=None, help="output .xlsx path")
+    ap.add_argument("--format", dest="fmt", choices=("csv", "xlsx", "both"),
+                    default="both",
+                    help="which outputs to write. 'csv' writes the DEMAND LOG as two CSVs "
+                         "(hourly + daily rollup) and skips the workbook; 'xlsx' writes only "
+                         "the workbook (which contains the same rows as a DEMAND LOG sheet); "
+                         "'both' (default) writes both.")
     ap.add_argument("--peak-window", default="auto",
                     help="'auto' (worst 5-min window per day) or fixed HH:MM-HH:MM")
     ap.add_argument("--population", type=int, default=None,
@@ -282,7 +302,6 @@ def run(argv=None) -> Path:
                         peak_window=args.peak_window,
                         population=args.population, banks_path=args.banks,
                         min_close_s=args.min_close)
-    wb = build_workbook(ctx)
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -291,15 +310,35 @@ def run(argv=None) -> Path:
         f0 = datetime.fromtimestamp(t0, eras.IST).strftime("%Y%m%d")
         f1 = datetime.fromtimestamp(t1, eras.IST).strftime("%Y%m%d")
         out = default_out_dir() / f"liftlab-report_{f0}-{f1}_{stamp}.xlsx"
-    wb.save(out)
-    return out
+
+    written = []
+    if args.fmt in ("csv", "both"):
+        written += demand_log.write_csvs(out, ctx, ctx["demand_log"],
+                                         ctx["demand_log_floor_note"])
+    if args.fmt in ("xlsx", "both"):
+        wb = build_workbook(ctx)
+        wb.save(out)
+        written.append(out)
+    return written
+
+
+def run(argv=None) -> Path:
+    """The PRIMARY artifact, as a single Path.
+
+    Kept returning one Path because prove_report.py and any web caller depend on that contract;
+    run_all() is the one that reports everything written. When a workbook was produced it is the
+    primary (it embeds the same DEMAND LOG rows as a sheet); under --format csv the hourly CSV is."""
+    written = run_all(argv)
+    xlsx = [p for p in written if p.suffix == ".xlsx"]
+    return xlsx[0] if xlsx else written[0]
 
 
 def main(argv=None) -> int:
     try:
-        out = run(argv)
+        written = run_all(argv)
     except ReportError as e:
         print(f"liftlab-report: {e}", file=sys.stderr)
         return 2
-    print(f"wrote {out}")
+    for p in written:
+        print(f"wrote {p}")
     return 0

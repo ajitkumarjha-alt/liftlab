@@ -44,6 +44,7 @@ declares a bank compliant, or advises a design change.
 
 ```
 liftlab-report --from <ISO ts> --to <ISO ts> [--out <path>]
+               [--format csv|xlsx|both]
                [--peak-window auto|HH:MM-HH:MM] [--population N]
                [--min-close 0.5]
                [--db <path>] [--gateway site-A] [--banks lift_banks.json]
@@ -62,6 +63,11 @@ liftlab-report --from <ISO ts> --to <ISO ts> [--out <path>]
   `$LIFTLAB_MIN_CLOSE_S`). See below.
 * `--db` — defaults to `$GATEWAY_DB`, then `/var/lib/liftlab/gateway.db`.
 * `--banks` — bank sidecar (see below).
+* `--format` — which outputs to write (default `both`).
+  * `csv` — writes the DEMAND LOG only, as two CSVs beside `--out`:
+    `<name>_demand-log-hourly.csv` and `<name>_demand-log-daily.csv`. No workbook.
+  * `xlsx` — the workbook only. It contains the same rows as a **DEMAND LOG** sheet.
+  * `both` — both of the above.
 
 Setup on liftlab-cloud (one-off):
 
@@ -129,6 +135,7 @@ Two guards follow from it, both reported rather than applied silently:
 | **PER-LIFT** | One block per channel: bank, counting_version, **precision beside every count**, per-era door-cycle stats (median/p85/min-max/histogram), dwell distribution, transits with per-hour rate (gap-excluded), coverage %. |
 | **FLEET** | **Unweighted sums**, labelled as such, with the per-lift precision range shown (never a silently-averaged precision). Grouped by bank; warns when the bank column is unpopulated. Fleet close-travel is `n/a — spans eras`. |
 | **DEMAND BY LIFT AND HOUR** | Per counting era (never pooled): **mean boardings/alightings per observed day, by hour** — the coverage-comparable figure — with the **total observed** counts beneath each as whole people. Totals are *not* comparable between lifts, because coverage ranges widely and a lift watched longer shows a bigger total regardless; the caption says so and points back at the means. Dark hours read `—` in every matrix, never 0. Then the observed-days matrix behind every cell, busiest hour per lift, peak 5-min demand vs the 8 % assumption (or an explicit BLOCKED without `--population`), and load balance. Carries the **canonical busiest hour** with its definition. |
+| **DEMAND LOG** | The flat table: **one row per hour per lift, plus a FLEET row per hour**, and a daily rollup (date, lift, totals, hours observed, coverage %). The least interpreted sheet in the workbook — no means, no modelling, no charts — so any headline figure elsewhere can be checked against the counts it came from. Identical rows to the CSVs. Dark hours read `—`, never 0. |
 | **PEAK ANALYSIS** | Per day: worst 5-min boarding window (or the fixed window), peak:average ratio, peak-demand % when `--population` given; coefficients inside peak windows vs all-day, per era. |
 | **RAW** | Row-level era-tagged export — the audit trail. Every row carries instrument, counting_version, era, precision-at-time, and an in-declared-gap flag. |
 | **COVERAGE & ERAS** | Boundaries crossed with row counts each side, gap windows excluded, per-channel coverage % and row counts by era. A channel with zero rows is listed, not omitted. |
@@ -191,6 +198,52 @@ explicitly scoped.
   1", the gateway calls it ch16. The channel is appended on each lift's first
   mention per sheet ("lift 1 (ch16)"), and an unnamed lift is marked as such
   rather than given an invented name from its channel number.
+
+## The DEMAND LOG export
+
+`boarded` = `transit_event` rows with `direction='in'`; `alighted` = `direction='out'`. These are
+**door crossings, not people** — one person crossing twice counts twice.
+
+Three rules the export exists to enforce, each with a test that fails if it regresses:
+
+1. **Dark is never zero.** A camera not observed in an hour is written `—`. `0` means the camera
+   *was* watched and counted nobody. Reading the first as the second understates demand exactly
+   where coverage is worst. Observation comes from coverage buckets (any row in any stream), not
+   from transit rows, so a lift that was up and genuinely idle still reads `0`.
+2. **Counting versions are never pooled.** The grouping key includes the counting version in
+   effect at that timestamp, so a camera spanning two builds inside one hour produces two rows.
+   FLEET rows are per version for the same reason. The daily rollup carries a `counting_version`
+   column — an addition to the requested columns, because splitting is the only way to avoid
+   blending two builds into one daily total.
+3. **Gap rows are excluded** and those hours are not credited as observed, matching
+   `aggregate_transits()`.
+
+Coverage % uses **hour slots judged by the hour's own midpoint** on both sides of the ratio. An
+earlier version counted observed hours by 15-minute bucket midpoint while subtracting gap
+*seconds* from the denominator; real data then produced `190.5%` coverage, because a bucket can
+land just outside an outage and credit an hour the denominator has already written off. Observed
+hours are now a subset of usable hours, so the ratio is ≤ 100 % by construction, not by clamping.
+
+### What the export deliberately does not contain
+
+* **Persons currently in the lift.** The system counts crossings, not occupancy. A running
+  boarded-minus-alighted figure would accumulate each camera's counting error across every cycle
+  and drift without bound. Per-camera precision is printed in the CSV header so the size of what
+  would compound is visible.
+* **Any per-floor breakdown.** The note is **measured, not asserted**: it prints confident floor
+  reads per camera over the requested range (non-null floor with `reason` in `ok`/`single_panel`,
+  the door engine's own definition) and names the cameras that are effectively floor-blind.
+  Attribution is not uniform — on 2026-08-02 ch29 read 32682/39046 while ch16 read 0/6114 — so a
+  per-floor table would be solid for some lifts and fabricated for others.
+
+> ⚠ `reader.fetch_floor_read_status()` counts a confident read as `reason` in `''`/`'ok'` only.
+> The engine actually emits `single_panel`, so that function currently scores **every camera at
+> zero** confident reads. `fetch_floor_confidence()` (used by this export) uses the engine's
+> definition. Both are kept — they answer different questions — but do not read one as the other.
+
+The caveats are written into the CSV as leading `#` comment lines rather than shipped separately:
+a demand table forwarded without its "dark is not zero" line will be misread. `pandas` skips them
+with `comment='#'`; a spreadsheet shows them as text rows above the header.
 
 ## Banks
 

@@ -323,6 +323,23 @@ def fetch_transits(db, gw: str, t0: float, t1: float) -> list[dict]:
             for r in rows if r["ts"] is not None]
 
 
+def fetch_floor_confidence(db, gw: str, t0: float, t1: float,
+                           ok_reasons: tuple = ("ok", "single_panel")) -> dict[str, dict]:
+    """{cam: {confident, total}} over the range, aggregated in SQL.
+
+    'confident' uses the DOOR ENGINE's definition — a non-null floor with reason in ok_reasons.
+    fetch_floor_read_status() above uses a narrower one ('' or 'ok' only) and therefore scores
+    every camera at zero today, because the engine actually emits 'single_panel'. Both are kept:
+    this one answers "can a per-floor table be built", that one documents the Tier-2 ceiling."""
+    marks = ",".join("?" for _ in ok_reasons)
+    rows = _q(db, f"SELECT cam, COUNT(*) total, "
+                  f"SUM(CASE WHEN floor IS NOT NULL AND reason IN ({marks}) THEN 1 ELSE 0 END) conf "
+                  f"FROM gw_door_event WHERE gateway_id=? AND ts>=? AND ts<? GROUP BY cam",
+              (*ok_reasons, gw, t0, t1))
+    return {r["cam"]: {"confident": int(r["conf"] or 0), "total": int(r["total"] or 0)}
+            for r in rows}
+
+
 def fetch_analyzer_versions(db, gw: str) -> dict[str, str]:
     return {r["cam"]: r["counting_version"]
             for r in _q(db, "SELECT cam, counting_version FROM analyzer_status "
