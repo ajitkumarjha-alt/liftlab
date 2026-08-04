@@ -1023,6 +1023,53 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
     return admitted, detail
 
 
+# ── era census, cached per (gw, cam) ──────────────────────────────────────────
+# This is the "every era this camera ever wrote" list behind the era selector. It CANNOT be
+# windowed: its whole job is to surface eras the auto-newest default would hide (the 41,789 pre-h2
+# ch16 rows that read as data loss), so a 7-day bound would defeat it. But it is a GROUP BY over
+# every row the camera has ever written — with a TEMP B-TREE — on every page load, per camera.
+#
+# It is also almost perfectly cacheable: the answer only changes when a NEW era appears, which is a
+# rebuild-sized event, not a per-second one. So compute it at most once per _CENSUS_TTL.
+#
+# Bounded key space, deliberately: `gw` is a path parameter, so a caller controls part of the key.
+# An unbounded dict here would be a memory leak reachable from outside — the same hole that had to
+# be closed on the heavy cache. Newest _CENSUS_MAX entries are kept; a dropped entry costs one
+# recompute, never a wrong answer.
+_CENSUS_TTL = float(os.environ.get("DASH_CENSUS_TTL_S", "900"))     # 15 min
+_CENSUS_MAX = 32
+_census_lock = threading.Lock()
+_census_cache = {}                                  # (gw, cam) -> {"t": epoch, "v": [...]}
+
+
+def _era_census(db, gw, cam):
+    """-> (eras_list, computed_at). Newest-era-first list of {era, rows, first, last}."""
+    key = (gw, cam)
+    with _census_lock:
+        hit = _census_cache.get(key)
+        if hit and (time.time() - hit["t"]) < _CENSUS_TTL:
+            return hit["v"], hit["t"]
+        # Computed INSIDE the lock so concurrent requests wait for one result instead of each
+        # starting its own full-table GROUP BY — the stacking that produced the OOM.
+        acc = {}
+        for r in _q(db, "SELECT door_version dv, COUNT(*) n, MIN(ts) t0, MAX(ts) t1 "
+                        "FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                        "AND door_version IS NOT NULL AND door_version<>'' "
+                        "GROUP BY door_version", (gw, cam)):
+            pfx = str(r["dv"]).split("+")[0]
+            e = acc.setdefault(pfx, {"era": pfx, "rows": 0, "first": r["t0"], "last": r["t1"]})
+            e["rows"] += r["n"]
+            e["first"] = min(e["first"], r["t0"])
+            e["last"] = max(e["last"], r["t1"])
+        v = sorted(acc.values(), key=lambda e: (e["last"] or 0), reverse=True)
+        t = time.time()
+        _census_cache[key] = {"t": t, "v": v}
+        if len(_census_cache) > _CENSUS_MAX:
+            for k, _ in sorted(_census_cache.items(), key=lambda kv: kv[1]["t"])[:-_CENSUS_MAX]:
+                _census_cache.pop(k, None)
+        return v, t
+
+
 def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
     """Tier-2 for one camera, from the gw_door_event stream of ONE era.
 
@@ -1036,16 +1083,7 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
         return None
     # Era census for the selector: every era this camera has EVER written, with span + row count,
     # so the UI can offer "view that week" instead of auto-newest silently hiding it.
-    era_census = {}
-    for r in _q(db, "SELECT door_version dv, COUNT(*) n, MIN(ts) t0, MAX(ts) t1 FROM gw_door_event "
-                    "WHERE gateway_id=? AND cam=? AND door_version IS NOT NULL AND door_version<>'' "
-                    "GROUP BY door_version", (gw, cam)):
-        p = str(r["dv"]).split("+")[0]
-        e = era_census.setdefault(p, {"era": p, "rows": 0, "first": r["t0"], "last": r["t1"]})
-        e["rows"] += r["n"]
-        e["first"] = min(e["first"], r["t0"])
-        e["last"] = max(e["last"], r["t1"])
-    eras_list = sorted(era_census.values(), key=lambda e: (e["last"] or 0), reverse=True)
+    eras_list, eras_computed_at = _era_census(db, gw, cam)
     _w, _wargs = _ts_clause(t0, t1)
     rows = _q(db, "SELECT ts, floor, direction, door_state, reason, read_conf FROM gw_door_event "
                   "WHERE gateway_id=? AND cam=? AND door_version LIKE ?" + _w + " ORDER BY ts",
@@ -1220,6 +1258,8 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
         "era": era,
         "era_source": era_src,
         "eras": eras_list,                        # every era this camera ever wrote (selector data)
+        "eras_computed_at": eras_computed_at,     # cached; age visible so staleness is not silent
+        "eras_age_s": round(time.time() - eras_computed_at, 1),
         "expected_era": exp_era, "built_at": built_at, "stale_templates": stale_templates,
         "era_filter": era_note,
         "quality_reasons": list(DOOR_OK_REASONS),
