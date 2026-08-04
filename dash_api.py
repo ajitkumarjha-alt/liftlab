@@ -18,6 +18,7 @@ Every panel carries its own timestamp.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -1392,7 +1393,12 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
             end_ts = None
             floor_src = r if (r["floor"] is not None and r["reason"] in DOOR_OK_REASONS
                               and (alphabet is None or str(r["floor"]) in alphabet)) else None
-            for nxt in rows[idx + 1:]:
+            # islice, NOT rows[idx+1:]. The slice copied the whole remaining list on EVERY
+            # door-open transition, and the loop below breaks after a handful of rows, so the copy
+            # was pure waste — linear work, quadratic allocation. Measured cost of leaving it in:
+            # ch27's precompute took 303s for 145,828 rows while ch29 took 33s for 78,580 — 1.9x the
+            # rows, 9.2x the time. Same rows, same order, same breaks; no copy.
+            for nxt in itertools.islice(rows, idx + 1, None):
                 if (nxt["ts"] or 0) - (r["ts"] or 0) > DOOR_OPEN_MAX_S:
                     break
                 # A confident read from INSIDE the cycle is the best floor evidence: the car is
@@ -1529,20 +1535,27 @@ def _transits_for_join(db, gw):
 
 
 def _transit_by_cam(db, gw):
+    """Per-camera boarded/alighted totals + today's counts, AGGREGATED IN SQL.
+
+    This used to SELECT every transit row for the gateway and tally them in Python — 22k+ row
+    objects materialised on every /dash load to produce five numbers per camera. The counting rule
+    is preserved exactly: 'in' is a boarding and ANYTHING ELSE is an alighting (so a NULL or
+    unrecognised direction still lands where it always did), and last_ts still ignores rows with
+    no timestamp. Only the arithmetic moved; no reported number changes.
+    """
     today = _ist_today_epoch()
-    rows = _q(db, "SELECT cam, direction, ts FROM transit_event WHERE gateway_id=?", (gw,))
-    by = {}
-    for r in rows:
-        d = by.setdefault(r["cam"], {"bt": 0, "at": 0, "b": 0, "a": 0, "last": None})
-        ins = r["direction"] == "in"
-        d["b" if ins else "a"] += 1
-        if r["ts"] and r["ts"] >= today:
-            d["bt" if ins else "at"] += 1
-        if r["ts"] and (d["last"] is None or r["ts"] > d["last"]):
-            d["last"] = r["ts"]
-    return {cam: {"boarded_today": d["bt"], "alighted_today": d["at"],
-                  "boarded_total": d["b"], "alighted_total": d["a"], "last_ts": d["last"]}
-            for cam, d in by.items()}
+    rows = _q(db, "SELECT cam, "
+                  "SUM(direction='in') b, "
+                  "SUM(direction IS NULL OR direction<>'in') a, "
+                  "SUM(direction='in' AND ts IS NOT NULL AND ts>=?) bt, "
+                  "SUM((direction IS NULL OR direction<>'in') AND ts IS NOT NULL AND ts>=?) at, "
+                  "MAX(NULLIF(ts, 0)) last_ts "     # NULLIF: the Python version tested `if r['ts']`,
+                                                    # which skipped ts=0 as falsy. MAX would not.
+                  "FROM transit_event WHERE gateway_id=? GROUP BY cam", (today, today, gw))
+    return {r["cam"]: {"boarded_today": r["bt"] or 0, "alighted_today": r["at"] or 0,
+                       "boarded_total": r["b"] or 0, "alighted_total": r["a"] or 0,
+                       "last_ts": r["last_ts"]}
+            for r in rows}
 
 
 def _analyzers(db, gw):

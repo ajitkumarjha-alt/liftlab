@@ -24,7 +24,12 @@ PY=$APP/.venv/bin/python
 SVC=liftlab-cloud
 OWNER=liftlab
 GW="${GW:-site-A}"
-EVERY="${EVERY:-20min}"
+# CADENCE vs DUTY CYCLE. The job walks a 7-day window; recomputing it every few minutes buys no
+# freshness a human could perceive and costs real CPU on a 2-vCPU box that has OOMed twice. At the
+# first measured runtime (428s) a 20min timer ran ~35% of the time and visibly contended with the
+# request path — /dash samples taken while it ran were 2-3.8s, and the job is the reason. 1h keeps
+# the aggregates well inside their own staleness tolerance at a fraction of the load.
+EVERY="${EVERY:-1h}"
 say(){ echo "[precompute] $*"; }
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
 for f in dash_api.py precompute_job.py; do [ -f "/tmp/$f" ] || { echo "missing /tmp/$f"; exit 2; }; done
