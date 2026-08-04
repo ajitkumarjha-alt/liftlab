@@ -319,11 +319,25 @@ Peak RSS under the OOM-causing pattern is now ~200 MB instead of 1.4 GB.
 
 Both would have produced false verdicts, and one had already fired:
 
-1. **The smoke test imported the wrong module.** `cd $APP && PYTHONPATH=$TMPD:$APP python -c
-   'import dash_api'` prepends the CWD for `-c`, and the CWD wins over `PYTHONPATH` — so it loaded
-   the ALREADY-INSTALLED module and printed "smoke ok" for code it never saw. `apply_dashperf.sh`
-   has the same shape, so **2026-08-03's two "smoke ok" lines were vacuous.** Fixed with
-   `sys.path.insert(0, TMPD)` plus an assertion on `dash_api.__file__`.
+1. **The smoke test imported the wrong module — read this before trusting any past "verified".**
+   `cd $APP && PYTHONPATH=$TMPD:$APP python -c 'import dash_api'` prepends the CWD for `-c`, and the
+   CWD wins over `PYTHONPATH`. So it imported the ALREADY-INSTALLED module and printed "smoke ok"
+   for code it had never loaded. `apply_dashperf.sh` has the same shape, so **both of
+   2026-08-03's "smoke ok" lines were vacuous — that gate was testing the file already on disk, not
+   the candidate being deployed.**
+
+   Fixed with `sys.path.insert(0, TMPD)` inside the interpreter (the only ordering that actually
+   binds) plus an assertion on `dash_api.__file__`, so a wrong-module import now fails loudly
+   instead of passing silently.
+
+   **Precisely how much this invalidated, because the distinction matters:** the smoke gate was
+   worthless, but it was not the only gate. Both 2026-08-03 deploys still installed the real file,
+   restarted the service, and ran a genuine HTTP check against the running process — and that check
+   is what failed and triggered the rollback. So those deploys were *not* "verified against
+   nothing": the end-to-end verification was real and did its job. What was lost was the early
+   warning. A file that imported cleanly on disk but broke on import would have sailed past the
+   smoke gate and been caught only after the ingest was already down, by the restart check. The
+   consequence was a weaker safety net, not a false PASS.
 2. **Connection-refused read as a hang.** `systemctl is-active` goes green when the process forks,
    but uvicorn needs 8-35s to bind :9090. Probing early returns HTTP 000 in ~0.2ms, which the script
    scored as "still hanging" and rolled back a healthy deploy. Added a readiness gate on
