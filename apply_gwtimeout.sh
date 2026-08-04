@@ -40,13 +40,21 @@ grep -q 'set_progress_handler' /tmp/dash_api.py \
 
 $PY -m py_compile /tmp/dash_api.py || { say "compile failed — nothing changed"; exit 1; }
 
+# SMOKE-IMPORT THE CANDIDATE, NOT THE INSTALLED FILE.
+# `cd $APP` makes Python prepend the CWD to sys.path for -c, and the CWD wins over PYTHONPATH — so
+# the obvious `cd $APP && PYTHONPATH=$TMPD:$APP python -c 'import dash_api'` silently imports the
+# ALREADY-INSTALLED module and reports "smoke ok" for code it never loaded. sys.path.insert(0,...)
+# inside the interpreter is the only ordering that actually binds. The assertions below exist to
+# make a wrong-module import fail loudly instead of passing vacuously.
 TMPD=$(mktemp -d); cp /tmp/dash_api.py "$TMPD/dash_api.py"
-if ! ( cd "$APP" && PYTHONPATH="$TMPD:$APP" $PY -c "
+if ! ( cd "$APP" && PYTHONPATH="$APP" $PY -c "
+import sys; sys.path.insert(0, '$TMPD')
 from fastapi import FastAPI
 import dash_api
+assert dash_api.__file__.startswith('$TMPD'), 'imported the WRONG dash_api: '+dash_api.__file__
 a=FastAPI(); a.include_router(dash_api.dash_router); a.openapi()
 assert hasattr(dash_api,'DashTimeout') and hasattr(dash_api,'_budget_arm')
-print('smoke ok, budget default', dash_api.DATA_BUDGET_S,'s')" ); then
+print('smoke ok:', dash_api.__file__, '| budget default', dash_api.DATA_BUDGET_S, 's')" ); then
   say "SMOKE-IMPORT FAILED — not installing. Live app untouched."; rm -rf "$TMPD"; exit 1
 fi
 rm -rf "$TMPD"
@@ -78,7 +86,20 @@ for i in $(seq 1 30); do [ "$(systemctl is-active "$SVC")" = active ] && break; 
 if [ "$(systemctl is-active "$SVC")" != active ]; then
   say "service did not come up"; journalctl -u "$SVC" -n 30 --no-pager; restore; exit 1
 fi
-sleep 3
+
+# READINESS GATE. `systemctl is-active` goes green the moment the process forks, but uvicorn takes
+# 8-35s to import the app and bind :9090 (observed in this unit's own journal). Probing before it
+# listens gives curl 000 in ~0.2ms — connection refused, which is NOT the hang we are testing for.
+# Distinguishing those two is the whole point of this gate: without it a healthy deploy fails
+# verification and gets rolled back for the wrong reason.
+say "waiting for :9090 to accept connections ..."
+READY=""
+for i in $(seq 1 60); do
+  if curl -s -o /dev/null --max-time 5 "http://127.0.0.1:9090/openapi.json" 2>/dev/null; then READY=1; break; fi
+  sleep 2
+done
+[ -n "$READY" ] || { say "port 9090 never accepted a connection after 120s"; journalctl -u "$SVC" -n 30 --no-pager; restore; exit 1; }
+say "  listening after ~$(( i * 2 ))s"
 
 # ── VERIFY TERMINATION ────────────────────────────────────────────────────────
 # Ceiling = budget + 40s slack. The slack matters: the progress handler only fires between SQLite VM
@@ -94,7 +115,13 @@ case "$CODE" in
   200) say "  200: completed inside the budget." ;;
   503) say "  503: the budget aborted it — THIS IS THE EXPECTED RESULT until step 2 lands."
        head -c 400 /tmp/gwtimeout_probe.json; echo ;;
-  000) say "VERIFY FAILED: still hanging at ${CEIL}s. The budget did not take effect."; restore; exit 1 ;;
+  000) # 000 is ambiguous: a hang exhausts --max-time, a refused connection returns in microseconds.
+       if awk "BEGIN{exit !($SECS < 5)}"; then
+         say "VERIFY FAILED: connection refused after ${SECS}s — the app is not serving, not hanging."
+       else
+         say "VERIFY FAILED: still hanging at ${CEIL}s. The budget did not take effect."
+       fi
+       journalctl -u "$SVC" -n 25 --no-pager; restore; exit 1 ;;
   *)   say "VERIFY FAILED: unexpected HTTP $CODE"; head -c 400 /tmp/gwtimeout_probe.json; echo; restore; exit 1 ;;
 esac
 
