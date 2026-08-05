@@ -60,6 +60,87 @@ def load_phantom(path, cam):
     return truth_io.load_phantoms(cam, path)
 
 
+def replay_h3(cam, video, roi, skip_before, stride):
+    """Replay the STATE-ONLY h3 engine. -> (events, diag).
+
+    h3 consumes a closedness scalar, not an edge column, so it is driven differently from h2: one
+    decode collects the state-band crops, the closed template is built from the TRAIN split of the
+    door-closed windows, `ncc_top` is computed against it, and the tracker is run over that series.
+    Identical construction to position_closedness.py, so the two tools cannot disagree about what
+    ncc_top is.
+
+    THE CIRCULARITY THIS CARRIES, STATED UP FRONT. The template is built from frames inside the
+    door-closed windows, and those same windows are where phantoms are scored. The train split is
+    the first 40% of each window and the test split is the rest, so the score is reported BOTH ways
+    below: over all windows, and over the unseen test portion only. The test-split number is the
+    honest one.
+    """
+    import cv2
+    import numpy as np
+    import gpu_door
+    from door_signal_v2 import TEMPLATE_WH, TOP_BAND_Y, closed_window_frames
+
+    top_wh = (TEMPLATE_WH[0], max(8, TEMPLATE_WH[1] // 4))
+    x, y, w, h = roi
+    sy0, sy1 = TOP_BAND_Y                      # state band — the configuration TEST A passes on
+    cap = cv2.VideoCapture(os.path.expanduser(video))
+    if not cap.isOpened():
+        raise SystemExit(f"cannot open {video}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frames, crops = [], []
+    i = 0
+    while True:
+        ok, fr = cap.read()
+        if not ok:
+            break
+        i += 1
+        if stride > 1 and (i % stride):
+            continue
+        if (i - 1) / fps < skip_before:
+            continue
+        g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+        frames.append(i)
+        crops.append(cv2.resize(g[sy0:sy1, x:x + w], top_wh))
+    cap.release()
+    frames = np.array(frames); crops = np.stack(crops)
+
+    pos = {f: k for k, f in enumerate(frames)}
+    tidx = [pos[f] for f in closed_window_frames(cam, "train") if f in pos]
+    if len(tidx) < 3:
+        raise SystemExit(f"{cam}: only {len(tidx)} train-split closed frames resolved for the template")
+    tpl = np.median(crops[tidx], axis=0).astype(np.uint8)
+
+    T = tpl.astype(np.float32).ravel(); T = T - T.mean()
+    tn = float(np.sqrt((T * T).sum()))
+    state = np.zeros(len(crops))
+    for a in range(0, len(crops), 4000):
+        C = crops[a:a + 4000].astype(np.float32).reshape(-1, T.size)
+        C -= C.mean(axis=1, keepdims=True)
+        nn = np.sqrt((C * C).sum(axis=1)); nn[nn < 1e-6] = np.inf
+        state[a:a + len(C)] = (C @ T) / (nn * tn)
+
+    tr = gpu_door.DoorTrackerH3()
+    events = []
+    for k, f in enumerate(frames):
+        t = (f - 1) / fps
+        cyc = tr.update(t, float(state[k]))
+        if cyc:
+            ce = cyc["close_full"]
+            events.append({"cam": cam, "ts": ce, "close_ts": ce,
+                           "close_f": int(round(ce * fps)),
+                           "close_travel_s": cyc["close_travel_s"], "raw": cyc})
+    diag = {"fps": round(fps, 2), "frames": n, "size": f"{W}x{H}", "roi": (x, y, w, h),
+            "openness_n": len(state),
+            "openness_min": round(float(state.min()), 3),
+            "openness_max": round(float(state.max()), 3),
+            "openness_span": round(float(state.max() - state.min()), 3),
+            "n_template": len(tidx), "suppressed": tr.suppressed,
+            "occluded": sum(1 for e in events if e["raw"].get("occluded"))}
+    return events, diag
+
+
 def replay(video, roi, osd_base_ep, skip_before, stride, roi_scale):
     """-> (events, diag). events are gw_door_event-shaped dicts with OSD-mapped ts."""
     import cv2
@@ -153,15 +234,24 @@ def main():
     ap.add_argument("--tol", type=float, default=5.0)
     ap.add_argument("--truth", default="tools/groundtruth_20260805.csv")
     ap.add_argument("--phantoms", default="tools/phantom_periods_20260805.csv")
+    ap.add_argument("--tracker", choices=("h2", "h3"), default="h2",
+                    help="h2 = the incumbent edge-column engine; h3 = the state-only engine")
     a = ap.parse_args()
 
     roi = [float(v) for v in a.roi.split(",")]
     truth = load_truth(a.truth, a.cam)
     phantoms = load_phantom(a.phantoms, a.cam)
-    ev, diag = replay(a.video, roi, 0.0, a.skip_before, a.frame_stride, a.roi_scale)
 
     import gpu_door
-    print(f"=== {a.cam}  tracker={gpu_door.TRACKER_LOGIC}  {os.path.basename(a.video)} ===")
+    if a.tracker == "h3":
+        ev, diag = replay_h3(a.cam, a.video, [int(round(v)) for v in roi], a.skip_before,
+                             a.frame_stride)
+        logic = gpu_door.TRACKER_LOGIC_H3
+    else:
+        ev, diag = replay(a.video, roi, 0.0, a.skip_before, a.frame_stride, a.roi_scale)
+        logic = gpu_door.TRACKER_LOGIC
+
+    print(f"=== {a.cam}  tracker={logic}  {os.path.basename(a.video)} ===")
     print(f"  video {diag['size']} @ {diag['fps']}fps  roi={diag['roi']}  "
           f"openness span={diag['openness_span']} (min {diag['openness_min']} max {diag['openness_max']})")
     if not diag["openness_span"]:
@@ -170,6 +260,21 @@ def main():
         return 2
 
     m, missed, ph, unm, gradable = score(ev, truth, phantoms, a.tol, a.cam)
+    if a.tracker == "h3":
+        print(f"  state template from {diag['n_template']} train-split closed frames; "
+              f"refractory suppressed {diag['suppressed']} emissions; "
+              f"{diag['occluded']} cycles flagged occluded")
+        # Phantoms scored on the UNSEEN portion of the windows as well as on all of them: the
+        # template is built from the first 40% of each window, so the full-window count is partly
+        # self-confirming. The test-split count is the honest one.
+        import truth_io as _ti
+        seen_ph = 0
+        for e, p in ph:
+            cut = p["start_f"] + int((p["end_f"] - p["start_f"]) * 0.4)
+            if e["close_f"] < cut:
+                seen_ph += 1
+        print(f"  phantom split: {seen_ph} inside the template's TRAIN portion, "
+              f"{len(ph) - seen_ph} inside the unseen TEST portion")
     print(f"  emitted {len(ev)} close events; hand-timed closes gradable: {len(gradable)}")
     print()
     print(f"  {'DETECTED':<10} {len(m)}/{len(gradable)}")
@@ -184,7 +289,9 @@ def main():
             es = f"{e['close_travel_s']:.2f}" if e["close_travel_s"] is not None else "-"
             er = (f"{e['close_travel_s'] - t['travel_s']:+.2f}"
                   if (t["travel_s"] is not None and e["close_travel_s"] is not None) else "-")
-            print(f"  {t['end_f']:>11} {e['close_f']:>9} {d:>6.1f} {hs:>7} {es:>9} {er:>7}  {t['status']}")
+            occ = "  OCCLUDED" if e.get("raw", {}).get("occluded") else ""
+            print(f"  {t['end_f']:>11} {e['close_f']:>9} {d:>6.1f} {hs:>7} {es:>9} {er:>7}  "
+                  f"{t['status']}{occ}")
         errs = [e["close_travel_s"] - t["travel_s"] for e, t, _ in m
                 if t["travel_s"] is not None and e["close_travel_s"] is not None]
         if errs:

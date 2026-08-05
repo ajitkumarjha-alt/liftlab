@@ -1,0 +1,27 @@
+=== ch27  tracker=h3-state  ch27_clean.mp4 ===
+  video 704x576 @ 24.89fps  roi=(125, 3, 238, 397)  openness span=1.188 (min -0.191 max 0.997)
+  state template from 42 train-split closed frames; refractory suppressed 0 emissions; 5 cycles flagged occluded
+  phantom split: 0 inside the template's TRAIN portion, 0 inside the unseen TEST portion
+  emitted 54 close events; hand-timed closes gradable: 13
+
+  DETECTED   13/13
+  MISSED     0
+  PHANTOM    0   (events inside verified door-CLOSED windows)
+  UNMATCHED  41  (emitted, no truth within 5s, not in a phantom window)
+
+  truth end_f    emit_f    d_s  hand_s  engine_s   err_s  status
+         6385      6407    0.9    2.12         -       -  clean
+         8504      8541    1.5    2.08         -       -  clean
+        10595     10631    1.4    1.60         -       -  clean
+        11677     11715    1.5    1.72         -       -  clean
+        16127     16167    1.6    2.40         -       -  clean
+        17912     17961    2.0    1.56         -       -  clean
+        20592     20673    3.3    2.12         -       -  clean
+        21317     21389    2.9    4.76         -       -  complex_excluded
+        29104     29103    0.0    2.24         -       -  clean
+        37672     37689    0.7    2.24         -       -  clean
+        38342     38359    0.7    2.16         -       -  clean
+        43203     43237    1.4    2.16         -       -  clean
+        46263     46241    0.9    6.28         -       -  complex_excluded
+
+  UNMATCHED emissions: f6111(-s), f9747(-s), f14245(-s), f14863(-s), f15777(-s), f17509(-s), f18601(-s), f19121(-s), f19883(-s), f20105(-s), f23015(-s), f23469(-s) ... +29 more

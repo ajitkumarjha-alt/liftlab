@@ -222,6 +222,170 @@ class DoorTracker:
         return cyc
 
 
+# Tracker LOGIC revision for the STATE-ONLY engine. NOT the default: TRACKER_LOGIC above still reads
+# "h2" and nothing in the worker selects this yet. Selecting it is a deploy decision, taken elsewhere.
+TRACKER_LOGIC_H3 = "h3-state"
+
+
+class DoorTrackerH3:
+    """State-only door engine. Detects door CYCLES from a closedness signal and does NOT time them.
+
+    WHY STATE-ONLY. h2 measures travel from a signal that was never validated to carry travel, and
+    three passes of TEST B have now failed to validate one: `ncc_top` saturates above head height
+    (ed42761), and the column-wise position proxy's ramp foot wanders on ch27 (668cf46). h2's own
+    clean-corpus numbers are 41 phantom emissions on ch27 against 13 real closes, and one travel
+    value produced per camera against 4 and 11 timed closes. The state half, by contrast, is
+    validated: TEST A passes at AUC 1.000 / LOO 99.1% on ch27 and 0.958 / 89.6% on ch30.
+
+    So this engine ships the half that is validated and refuses the half that is not. Every cycle
+    carries `close_travel_s = None` with a reason — not because the measurement was implausible, as
+    h2's withholding clause means, but because THIS ENGINE DOES NOT MEASURE IT. A consumer that sees
+    null gets an explicit reason string rather than a gap it has to interpret.
+
+    INPUT is a closedness scalar per frame — high when the leaf is shut. `ncc_top` against a
+    per-camera closed template is what it was validated on. Levels are taken from ROLLING
+    percentiles of the signal's own recent history, as h2 does for its edge column, so a lighting
+    change or a floor change moves both plateaus together instead of stranding the state machine.
+
+    WHAT KILLS THE PHANTOMS. Three things, in order of how much each is doing:
+      * a REFRACTORY window after every emission — h2's ch27 phantoms come in bursts inside stretches
+        where the door never moves, so the first emission is the error and the next four are the
+        error repeated;
+      * requiring a confident OPEN plateau before a close can be armed at all — a door that never
+        opened cannot close, and h2's state machine could re-enter 'closing' from a dead band;
+      * hysteresis with a dead band between the plateaus, so noise in the middle advances nothing.
+
+    OCCLUSION is reported, not silently absorbed, and it is measured as REVERSALS rather than as
+    time in the dead band. Every descent spends nearly all its frames in the dead band — that is
+    what a ramp is — so dead-band time flags clean closes and is useless as a signal. What an
+    occlusion actually looks like is the closedness falling back from its running maximum while the
+    leaf keeps shutting: someone stepped through the band. A descent with too many such reversals,
+    or one that takes longer than `max_descent_s`, is emitted with `occluded=True`: the cycle
+    happened, but the engine is telling the consumer it could not see it cleanly.
+    """
+
+    def __init__(self, open_th=0.15, closed_th=0.85, ref_window=600, min_span=0.08,
+                 close_debounce_s=0.32, refractory_s=6.0, max_descent_s=12.0,
+                 reversal_drop=0.25, reversal_frac=0.15, min_open_s=0.4):
+        self.open_th = open_th                  # normalised closedness at/below this = confidently open
+        self.closed_th = closed_th              # at/above this = confidently closed
+        self.min_span = min_span                # raw p10..p90 span below this = signal not trustworthy
+        self.close_debounce_s = close_debounce_s   # closed plateau must hold this long to emit
+        self.refractory_s = refractory_s        # no second emission within this of the last one
+        self.max_descent_s = max_descent_s      # longer than this open->closed = flag occluded
+        self.reversal_drop = reversal_drop      # fall from the descent's running max that counts as a reversal
+        self.reversal_frac = reversal_frac      # reversal frames / descent frames above this = occluded
+        self.min_open_s = min_open_s            # the open plateau must hold this long to arm a close
+        self._vals = deque(maxlen=ref_window)
+        self.state = "unknown"                  # unknown | open | descending | closed
+        self._open_since = None
+        self._desc_from = None
+        self._runmax = 0.0
+        self._reversals = 0
+        self._dead = 0
+        self._nframes = 0
+        self._closed_since = None
+        self._last_emit_t = None
+        self.cycles = []
+        self.suppressed = 0                     # emissions withheld by the refractory — counted, not hidden
+
+    def _levels(self):
+        if len(self._vals) < 40:
+            return None, None
+        arr = np.fromiter(self._vals, dtype=np.float32)
+        return float(np.percentile(arr, 10)), float(np.percentile(arr, 90))
+
+    def closedness(self, v):
+        lo, hi = self._levels()
+        if lo is None or (hi - lo) < self.min_span:
+            return None
+        return float(np.clip((v - lo) / (hi - lo), 0.0, 1.0))
+
+    def update(self, t, v):
+        """Feed one frame's raw closedness. Returns a completed cycle dict, or None."""
+        if v is None:
+            return None
+        self._vals.append(v)
+        c = self.closedness(v)
+        if c is None:
+            return None
+
+        if c <= self.open_th:
+            if self.state in ("unknown", "closed"):
+                self.state = "open"
+                self._open_since = t
+            elif self.state == "descending":
+                # recovered to fully open before reaching closed — not a close
+                self.state = "open"
+                self._open_since = t
+                self._desc_from = None
+            self._closed_since = None
+            return None
+
+        if self.state == "open":
+            if (t - (self._open_since or t)) < self.min_open_s:
+                return None                      # the open plateau has not held long enough to arm
+            if c < self.closed_th:
+                self.state = "descending"
+                self._desc_from = t
+                self._dead, self._nframes = 1, 1
+                self._runmax, self._reversals = c, 0
+            return None
+
+        if self.state == "descending":
+            self._nframes += 1
+            if c < self._runmax - self.reversal_drop:
+                self._reversals += 1               # fell back while the leaf should be shutting
+            self._runmax = max(self._runmax, c)
+            if c < self.closed_th:
+                self._dead += 1
+                return None
+            if self._closed_since is None:
+                self._closed_since = t
+            if (t - self._closed_since) < self.close_debounce_s:
+                return None
+            return self._emit(t)
+
+        # state == "closed" or "unknown" with c above open_th: nothing to arm, stay put
+        if self.state == "unknown":
+            self.state = "closed"
+        return None
+
+    def _emit(self, t):
+        desc_s = t - self._desc_from if self._desc_from else None
+        dead_frac = (self._dead / self._nframes) if self._nframes else 1.0
+        rev_frac = (self._reversals / self._nframes) if self._nframes else 0.0
+        occluded = bool((desc_s is not None and desc_s > self.max_descent_s)
+                        or rev_frac > self.reversal_frac)
+        self.state = "closed"
+        self._closed_since = None
+        self._desc_from = None
+        self._open_since = None
+
+        if self._last_emit_t is not None and (t - self._last_emit_t) < self.refractory_s:
+            self.suppressed += 1
+            return None
+        self._last_emit_t = t
+
+        cyc = {
+            "close_full": t,
+            "close_ts": t,
+            "ts": t,
+            # NOT a withheld measurement — an unmeasured one. h2's null means "computed, implausible,
+            # dropped"; this null means "this engine does not compute it at all".
+            "close_travel_s": None,
+            "close_quality": ("not-measured: h3 is a state-only engine; travel is unvalidated "
+                              "(TEST B failed three passes) and is sampled by hand weekly instead"),
+            "occluded": occluded,
+            "descent_s": None if desc_s is None else round(desc_s, 3),
+            "dead_band_frac": round(dead_frac, 3),
+            "reversal_frac": round(rev_frac, 3),
+            "tracker": TRACKER_LOGIC_H3,
+        }
+        self.cycles.append(cyc)
+        return cyc
+
+
 # ============================================================ 3. FloorReader (template OCR)
 def ncc(a, b):
     """Normalised cross-correlation of two same-size arrays. 1.0 = identical pattern, ~0 = unrelated.

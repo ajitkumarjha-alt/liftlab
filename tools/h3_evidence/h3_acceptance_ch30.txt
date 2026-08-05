@@ -1,0 +1,22 @@
+=== ch30  tracker=h3-state  ch30_peak.mp4 ===
+  video 704x576 @ 24.99fps  roi=(2, 2, 335, 446)  openness span=0.741 (min 0.254 max 0.995)
+  state template from 30 train-split closed frames; refractory suppressed 0 emissions; 0 cycles flagged occluded
+  phantom split: 0 inside the template's TRAIN portion, 0 inside the unseen TEST portion
+  emitted 17 close events; hand-timed closes gradable: 8
+
+  DETECTED   8/8
+  MISSED     0
+  PHANTOM    0   (events inside verified door-CLOSED windows)
+  UNMATCHED  9  (emitted, no truth within 5s, not in a phantom window)
+
+  truth end_f    emit_f    d_s  hand_s  engine_s   err_s  status
+         1598      1611    0.5    2.40         -       -  clean
+         2403      2409    0.2    1.96         -       -  clean
+         5162      5127    1.4       -         -       -  partial_start_excluded
+         6950      6917    1.3       -         -       -  partial_start_excluded
+         9183      9149    1.4       -         -       -  partial_start_excluded
+        11109     11081    1.1    1.72         -       -  clean
+        20511     20425    3.4    2.08         -       -  disputed_anchor_excluded
+        21460     21425    1.4       -         -       -  complex_excluded
+
+  UNMATCHED emissions: f3275(-s), f12335(-s), f15365(-s), f16869(-s), f18497(-s), f19247(-s), f22059(-s), f22945(-s), f25875(-s)
