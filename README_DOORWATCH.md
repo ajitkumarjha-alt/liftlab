@@ -415,3 +415,110 @@ What is blocked and on what:
 
 Nothing deployed. No acceptance criterion weakened; the bar remains 3013116 with DECISION 1 travel
 rules, and h3 has not been measured against it because it has not been written.
+
+---
+
+## CLEAN-CORPUS REVALIDATION — TEST A passes harder, TEST B fails for a new reason
+
+Everything below is on the clean corpus (`ch27_clean.mp4` 70260f @24.8910fps, `ch30_peak.mp4`
+27257f @24.9945fps), frame-anchored truth, templates rebuilt from clean-corpus closed frames on a
+train/test split, and TEST A labels derived from the truth rather than from my eye.
+
+### TEST A — STATE: PASS on both, more strongly than before
+
+Labels are now truth-derived: **closed** = door-closed windows (test split; the template is built
+from the disjoint train split), **open** = the frames just before each clean close's `start_f`,
+where the door is open and not yet moving. No eyeballing.
+
+| | ch30 63064cb | ch30 clean | ch27 63064cb | ch27 clean |
+|---|---:|---:|---:|---:|
+| `ncc_top` AUC | 1.000 | 0.958 | 1.000 | **1.000** |
+| `ncc_top` LOO acc | 95.8% | 89.6% | 95.7% | **99.1%** |
+| template LOO NCC (median) | 0.791 | **0.992** | 0.996 | **0.997** |
+| labels | 24 eyeball | 48 truth-derived | 24 eyeball | 108 truth-derived |
+
+**TEST A: PASS, ch27 and ch30.** ch30's clean template is transformed (0.791 -> 0.992): the dirty
+template was diluted by passengers standing in the ROI. Its LOO accuracy reads lower than 63064cb's
+only because the label set changed — truth-derived open labels sit at the moment of first motion,
+which is genuinely the hardest instant to call, where the old eyeball labels were sampled at a
+broken signal's confident extremes. The two numbers are not comparable and the clean one is the
+honest one.
+
+Two candidate reversals worth recording: `top_motion` now PASSES on ch30 (AUC 0.979, LOO 95.8%)
+where it failed at 79.2% on the dirty corpus, because clean door-closed windows have genuinely zero
+motion; and `roi_mean`/`bright_128` collapse to chance (AUC 0.50-0.55) on both cameras, so the
+brightness family is dead on ch27 *and* ch30 once the labels are honest.
+
+### TEST B — TRAVEL: FAIL on both, and the reason is not tuning
+
+| | ch27 | ch30 |
+|---|---:|---:|
+| timed truth closes | 11 | 4 |
+| detected / travels produced | 10 | 3 |
+| within +/-0.4s | **1** | **2** |
+| DECISION 1 (>=4 in-band AND all produced in-band) | **FAIL** | **FAIL** |
+
+Four estimator families, run side by side by `tools/travel_estimators.py`:
+
+| family | ch27 in-band | mean abs err | max abs err | bias | ch30 in-band |
+|---|---:|---:|---:|---:|---:|
+| level (near_open->close_th) | 1/10 | 1.85 | 5.83 | +0.33 | 2/3 |
+| r1090 (the literal spec) | 1/10 | 1.97 | 5.43 | -0.08 | 2/3 |
+| **foot (derivative ramp foot)** | **2/10** | **0.68** | **0.93** | **-0.12** | 2/3 |
+| motion (top-band motion duration) | 0/10 | 1.84 | 2.24 | -0.76 | 0/3 |
+
+**Closest family: `foot`** — lowest spread by a wide margin (max error 0.93s vs level's 5.83s) and
+near-zero bias. It still fails.
+
+**The reason is not calibration.** On ch27's n=10, every family's estimate is *anti*-correlated with
+hand travel — Pearson r = -0.83 (level), -0.82 (r1090), -0.57 (foot), -0.62 (motion); Spearman
+-0.29 to -0.47. The closes the signal calls long are the ones the hand called short. A signal that
+ranks its own measurements backwards is not carrying travel information, and no affine correction
+recovers it.
+
+**And the acceptance criterion cannot see this.** Fitting the best affine correction to `level`
+yields "10/10 within +/-0.4s" — but with slope **-0.104**, i.e. a disguised constant. The hand
+travels span only 1.56-2.40s with sd 0.28s, so the +/-0.4s tolerance is **1.4x the truth's own
+standard deviation**:
+
+> **A constant predictor that ignores the video entirely and always answers 2.03s scores 11/13
+> (85%) within +/-0.4s.**
+
+So `>=4 of 15 in tolerance` is passed by a stopped clock. The binding clause in DECISION 1 is
+"all produced values in tolerance", and the only reason the engine fails it is that its estimates
+are noisy, not that they are uninformative — a constant would pass more easily than a real
+measurement. This is a defect in the test, not only in the signal, and it should be fixed before
+the next attempt: either tighten the tolerance to well under 0.28s, or hand-time closes with real
+travel spread (the current set is nearly constant), or score correlation rather than a per-row band.
+
+### Why the signal cannot time travel: the top band saturates
+
+Concrete instance, ch30 truth close 20459->20511. `ncc_top` crosses into closed at frame **20420**,
+39 frames *before* the truth's `start_f`, holds ~0.96-0.98 across the entire hand-timed close, and
+crosses again at 20508 — 3 frames from `close_full`. The state machine, already closed since 20420,
+never re-arms, so the close is scored as not detected.
+
+The top band was chosen precisely because passengers do not occlude it (5e58211). But the leaf
+covers a band above head height **before** it finishes covering the doorway below. So `ncc_top`
+reaches its final value early and its remaining motion is asymptotic — excellent for *state*, which
+is why TEST A passes at AUC 1.000, and structurally unable to time the *end* of a close. That is one
+mechanism producing both the anti-correlation and ch27's systematic +10..+58 frame lag in
+`close_full`.
+
+### Verdict
+
+**h3 is not built. TEST B fails on both cameras with n=15 on clean, continuous, frame-anchored
+data — this is a real signal limitation, as anticipated, and the run stops here as instructed.**
+
+What the next attempt needs, in order:
+1. **Fix the acceptance test.** A criterion a constant passes cannot validate a measurement.
+2. **A position proxy that does not saturate.** The top band is the wrong place to time a close even
+   though it is the right place to detect one. A band at or below mid-door height, or the NCC
+   *residual* against both an open and a closed template, would keep moving through the whole
+   descent. State and travel may simply need different regions — nothing requires one signal to do
+   both, and TEST A's result says the state half is solved.
+3. **Hand travels with real spread.** Ten closes between 1.56s and 2.40s cannot discriminate
+   estimators; deliberately include slow/obstructed closes.
+
+Not deployed. No acceptance criterion weakened — the criterion is reported as too weak, which is the
+opposite, and the h3 travel path stays blocked on both cameras.
