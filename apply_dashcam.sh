@@ -72,6 +72,9 @@ grep -q 'if(m)trCam=m\[1\]' /tmp/.dp && say "  served page seeds trCam from the 
 grep -q 'door CYCLES' /tmp/.dp && say "  served page labels stops as door cycles" \
   || say "  WARNING: chart label not found in served HTML"
 # Report the known-broken endpoint's state so the deploy log carries it, without gating on it.
-TR=$(curl -s -o /dev/null -w '%{http_code} in %{time_total}s' --max-time 60 "http://127.0.0.1:9090/dash/$GW/trends?cam=ch27" || echo "no response")
+TR=$(curl -s -o /dev/null -w '%{http_code} in %{time_total}s' --max-time 60 "http://127.0.0.1:9090/dash/$GW/trends?cam=ch27")
+# curl exits non-zero on timeout AND still prints its -w line, so `|| echo ...` appended a second
+# message to the first: "000 in 60.0sno response". Report the code; 000 already means no response.
+[ -n "$TR" ] || TR="no response at all"
 say "  (pre-existing, NOT gated) /dash/$GW/trends?cam=ch27 -> $TR"
 say "RESULT: PASS — dash_api updated. Backup *.bak.$STAMP"
