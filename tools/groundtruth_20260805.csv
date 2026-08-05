@@ -1,23 +1,45 @@
-cam,close_end_osd,travel_s,travel_err_s,status
-ch30,12:04:57,2.6,0.25,clean
-ch30,12:05:49,,,occluded
-ch30,12:07:39,,,occluded
-ch30,12:08:16,,,boundary
-ch30,12:08:55,2.1,0.15,clean
-ch30,12:10:48,,,clean_untimed
-ch30,12:11:32,,,complex
-ch30,12:12:16,2.2,0.15,clean
-ch30,12:12:47,,,clean_untimed
-ch30,12:13:28,,,clean_untimed
-ch30,12:14:53,2.5,0.3,clean
-ch30,12:15:46,,,truncated
-ch27,12:08:00,,,clean_untimed
-ch27,12:08:52,,,clean_untimed
-ch27,12:10:03,2.8,0.4,clean
-ch27,12:11:01,,,clean_untimed
-ch27,12:11:39,3.2,0.3,clean
-ch27,12:12:08,,,clean_untimed
-ch27,12:13:13,,,clean_untimed
-ch27,12:13:50,,,clean_untimed
-ch27,12:14:07,,,clean_untimed
-ch27,12:15:43,,,truncated
+cam,file,start_f,end_f,travel_s,status
+# CLEAN-CORPUS ground truth. Corpus: ch27_clean.mp4 (OSD = video_t + 16:05:33) and
+# ch30_peak.mp4 (OSD = video_t + 16:59:30), both verified continuous. start_f/end_f are frame
+# numbers in those files; travel endpoint-verified by eye.
+#
+# SUPERSEDES the dirty-corpus table previously in this file (ch27_full.mp4 / ch30_full.mp4,
+# OSD bases 12:04:36 / 12:04:48). That corpus contained segment splices and a concat inversion,
+# and BOTH of its hand-timed travel sets are VOID — the ch30 n=1 relied on in the h2 baseline and
+# 4e3b797, and the 6-travel set used for door signal v2's TEST B in 63064cb. Any result derived
+# from them is void with them; see README_DOORWATCH.md. Git history holds the old content.
+#
+# SCHEMA CHANGED. Was: cam,close_end_osd,travel_s,travel_err_s,status (wall-clock anchored,
+# with a per-row hand-timing error bar). Now: frame-anchored, no error bar. Every tool that read
+# close_end_osd or travel_err_s needs porting before it can consume this file.
+#
+# NOT YET VERIFIABLE ON THIS BOX: ch27_clean.mp4 is not present (only ch27_full.mp4 /
+# ch30_full.mp4 in ~/dwrec/rec, plus ch30_peak.mp4 in the repo root). ch30_peak.mp4 checks out:
+# 27257 frames @ 24.9945fps, 704x576, so all ch30 rows below are in range. The ch27 rows,
+# including the 46263 reference, are unverified until the file lands.
+#
+# ONE ROW IS INTERNALLY INCONSISTENT, recorded as given rather than silently corrected:
+# ch27 6332-6385 is 53 frames = 2.12s at 25fps, but travel_s says 2.20 (implies 24.09fps).
+# Every other row matches 25fps exactly. Worth a re-check of that row's endpoints before it is
+# used in a +/-0.4s test.
+ch27,ch27_clean.mp4,6332,6385,2.20,clean
+ch27,ch27_clean.mp4,8452,8504,2.08,clean
+ch27,ch27_clean.mp4,10555,10595,1.60,clean
+ch27,ch27_clean.mp4,11634,11677,1.72,clean
+ch27,ch27_clean.mp4,16067,16127,2.40,clean
+ch27,ch27_clean.mp4,17873,17912,1.56,clean
+ch27,ch27_clean.mp4,20539,20592,2.12,clean
+ch27,ch27_clean.mp4,21198,21317,4.76,complex_excluded
+ch27,ch27_clean.mp4,29048,29104,2.24,clean
+ch27,ch27_clean.mp4,37616,37672,2.24,clean
+ch27,ch27_clean.mp4,38288,38342,2.16,clean
+ch27,ch27_clean.mp4,43149,43203,2.16,clean
+ch27,ch27_clean.mp4,46106,46263,6.28,complex_excluded
+ch30,ch30_peak.mp4,1538,1598,2.40,clean
+ch30,ch30_peak.mp4,2354,2403,1.96,clean
+ch30,ch30_peak.mp4,11066,11109,1.72,clean
+ch30,ch30_peak.mp4,20459,20511,2.08,clean
+ch30,ch30_peak.mp4,5130,5162,,partial_start_excluded
+ch30,ch30_peak.mp4,6918,6950,,partial_start_excluded
+ch30,ch30_peak.mp4,9139,9183,,partial_start_excluded
+ch30,ch30_peak.mp4,21345,21460,,complex_excluded
