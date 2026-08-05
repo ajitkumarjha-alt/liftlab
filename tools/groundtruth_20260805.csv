@@ -23,6 +23,21 @@ cam,file,start_f,end_f,travel_s,status
 # CORRECTED: ch27 6332-6385 travel_s was 2.20, a transcription error (the endpoint re-check moved
 # start to 6332 but the travel field kept the pre-revision value). 53 frames = 2.12s. No other
 # row adjusted.
+#
+# EXCLUDED 2026-08-05: ch30 20459-20511, status clean -> disputed_anchor_excluded. A sequential
+# frame-by-frame re-read (tools/band_evidence/ch30_truthrow_20459_frames.png) shows the leaf all
+# but shut by f20420 and closed by f20430, so this row's anchor sits ~40-80 frames after the
+# physical close. The anchor and the duration came from the same keyframe-snapped extraction, so
+# neither survives: the re-read implies ~1.1s travel, which contradicts every other close in the
+# corpus (1.56-2.40s) and is not adopted without eyes-on sequential verification. start_f/end_f
+# and travel_s are LEFT AS RECORDED — the status is what excludes them; do not read the numbers
+# as corrected. This is also the row whose displacement ncc_top and the position proxy both
+# independently flagged (668cf46), and the row a re-read was said to have cleared in the other
+# direction; the frames are in the repo so the disagreement is checkable rather than argued.
+#
+# CONSEQUENCE: 14 timed travels, not 15 (ch27 11, ch30 3). The row still counts as a real close
+# for DETECTION scoring — it is excluded from travel, not from the corpus. ch30-alone travel
+# verdicts are n=3 and insufficient; pooled n=14 is the primary reading.
 ch27,ch27_clean.mp4,6332,6385,2.12,clean
 ch27,ch27_clean.mp4,8452,8504,2.08,clean
 ch27,ch27_clean.mp4,10555,10595,1.60,clean
@@ -39,7 +54,7 @@ ch27,ch27_clean.mp4,46106,46263,6.28,complex_excluded
 ch30,ch30_peak.mp4,1538,1598,2.40,clean
 ch30,ch30_peak.mp4,2354,2403,1.96,clean
 ch30,ch30_peak.mp4,11066,11109,1.72,clean
-ch30,ch30_peak.mp4,20459,20511,2.08,clean
+ch30,ch30_peak.mp4,20459,20511,2.08,disputed_anchor_excluded
 ch30,ch30_peak.mp4,5130,5162,,partial_start_excluded
 ch30,ch30_peak.mp4,6918,6950,,partial_start_excluded
 ch30,ch30_peak.mp4,9139,9183,,partial_start_excluded
