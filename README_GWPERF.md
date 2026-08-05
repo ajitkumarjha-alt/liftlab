@@ -512,3 +512,76 @@ sudo sh -c "rm -f /var/lib/liftlab/reports/*.xlsx"   # glob expands UNDER sudo
 Same shape as the week's other failures: a command that reports success without doing the thing.
 `rm -f` in particular cannot fail, which is exactly why it cannot be trusted as evidence — verify by
 listing afterwards, under the same privilege that could see the files in the first place.
+
+---
+
+# /reports on dev-box — DEPLOYED 2026-08-04
+
+Moved here after the gateway measurement (above). `https://dev.gargi.online/reports`.
+
+## Gate on the target box: 25 passed, 0 failed
+
+Including the five checks the gateway run never reached, and the retention assertion added because a
+cleanup had reported success while deleting nothing:
+
+```
+retention sweep actually deletes the workbook
+  PASS  swept job marked expired (was done)
+  PASS  workbook is GONE from disk (checked by existence, not exit code)
+  PASS  second check: path does not exist
+  PASS  download of an expired job -> 410
+  PASS  410 explains WHY (retention)
+```
+
+## Verification at deploy time
+
+```
+app healthz     : 200
+app /reports    : 200
+public NO auth  : 401        <- Caddy basic_auth, resident data is not public
+existing :8080  : 302        <- the pre-existing dev app, untouched
+refresh timer   : active
+reports service : active
+
+restore_state.json:
+  ok             true
+  restored_at_h  2026-08-04 22:02   (IST)
+  data_max_ts_h  2026-08-04 22:00   (IST)
+  rows           498,163
+```
+
+## Two decisions, stated because they are security choices
+
+**Auth: Caddy `basic_auth` on `/reports*`, reusing the gateway's operator credential.** code-server is
+NOT running on dev-box, so "the existing code-server auth" does not exist. The host served
+`127.0.0.1:8080` with **no authentication at all**, and resident movement data does not go behind
+nothing. The `:8080` route is deliberately left exactly as it was — the reports block is inserted
+ahead of it, not merged with it.
+
+**GCS credential: the user ADC already present on dev-box.** The gateway's
+`/etc/liftlab/backup-key.json` was deliberately NOT copied: that key can **write** to the backup
+bucket, and a dev box must never be able to damage backups. The cost is that the restore is tied to a
+personal account — which is precisely why a failing refresh renders as a red banner rather than a log
+line. **Follow-up worth doing: a dedicated read-only service account.**
+
+## The refresh is also a backup test
+
+Hourly `litestream restore` into `/var/lib/liftlab/gateway.db`. It refuses to publish a restore that
+fails `integrity_check`, has zero rows, or carries data OLDER than what is already present (a
+regressed chain would silently rewind every figure). On any failure the previous database stays and
+the page shows a **backup alarm** with the last good restore point.
+
+On 2026-08-04 the chain was found unrestorable at every timestamp, and nothing noticed because nobody
+had attempted a restore in weeks. Now something attempts one every hour and says so when it fails.
+
+## Locking
+
+`refresh_reports_db.sh` and `report_runner.py` take the same `flock`. The refresh publishes by atomic
+rename; a build straddling the swap would keep reading the old inode and silently report a different
+restore point than the page claims. The runner holds it for the whole build, so a refresh waits.
+
+## Known cosmetic gap
+
+`generation` reads `null` in the state file — the `litestream generations` lookup in the refresh
+script returns nothing on this box (`database path or replica URL required`). It is informational
+only; the restore itself, its verification and the timestamps are all unaffected.
