@@ -6,25 +6,26 @@ cannot grade the engine. Video the engine never saw is the only ground truth ava
 
 ---
 
-## STATUS: NOT ARMED
+## STATUS: ARMED — 2026-08-05, on h3 state-only
 
-**Gate: h3 acceptance.** As of `668cf46` (2026-08-05) h3 is **not built** — TEST B (travel) FAILS on
-both cameras on the clean corpus, TEST A (state) passes. See README_DOORWATCH.md § "TEST B RETRY".
+Armed at `9f79051`, which met the acceptance table in README_DOORWATCH.md § "What h3 must reach":
+ch30 8/8 detected (target >= 7/8), ch27 13/13 (target >= 11/13), phantoms 0 on both (target 0).
 
-This page is written and ready, but the weekly cycle does not start until README_DOORWATCH.md
-§ "THE ACCEPTANCE TABLE — h2 on the CLEAN corpus" / "What h3 must reach" is met by a shipped
-tracker: ch30 >= 7/8 detected, ch27 >= 11/13, phantoms 0 on both. Arm this page by deleting this
-section — nothing else here changes.
+**The engine this page now grades is `h3-state`, and it does not measure travel.** Three passes of
+TEST B failed to validate a travel estimator — most recently `0680e57`, with both mandatory
+implementation fixes in, where the constant-2.03s predictor's MAE (0.23s) beat every real estimator
+by 5-16x. h3 therefore emits `close_travel_s = None` on every cycle with a reason string, by design.
+Alerts 3 and 4 below are written for that: they check that the null is honest and that travel is
+being sampled by hand, NOT that a travel number is accurate. Reinstating a travel-accuracy alert is
+a change to make when a travel estimator passes TEST B, and not before.
 
-What has and has not been executed, so nothing here is taken on trust: **LEG 1's replay commands
-were run on dev-box as written** and the baseline table below is their output. **LEG 2's capture
-command has not been run** — dev-box has no ffmpeg and this page carries no operator password. What
-was checked for it: the playlist URL answers `401` unauthenticated (so basicauth is required and the
-path shape is right), and both corpus files decode as HEVC 704x576 through the same cv2 the harness
-uses. First LEG 2 run should expect to correct a detail in Step 1.
+**h3 is NOT DEPLOYED.** `gpu_door.TRACKER_LOGIC` still reads `h2`; nothing in the worker selects
+h3. Until it is deployed, LEG 1 grades the engine in the repo, not the engine in production — run it
+with `--tracker h2` as well when you want to know what production is doing.
 
-Until then, LEG 1 below is still worth running whenever `gpu_door.py` is touched: it is a
-regression check on the engine, and it does not care whether the engine is h2 or h3.
+What has and has not been executed here, so nothing is taken on trust: **LEG 1's replay commands
+were run on dev-box exactly as written** and the reference table below is their output. **LEG 2's
+capture command has never been run** — see the KNOWN GAP under LEG 2 Step 1.
 
 ---
 
@@ -53,14 +54,18 @@ frame-anchored hand truth. No capture, no hand-timing, no judgement. This is the
 ```bash
 cd /home/ajit_kumarjha_lodhagroup_com/projects/liftlab
 
-python3 tools/doorwatch_replay.py --cam ch30 \
+python3 tools/doorwatch_replay.py --cam ch30 --tracker h3 \
     --video /home/ajit_kumarjha_lodhagroup_com/projects/liftlab/ch30_peak.mp4 \
     --roi 2,2,335,446 --frame-stride 2
 
-python3 tools/doorwatch_replay.py --cam ch27 \
+python3 tools/doorwatch_replay.py --cam ch27 --tracker h3 \
     --video /home/ajit_kumarjha_lodhagroup_com/dwrec/rec/ch27_clean.mp4 \
     --roi 125,3,238,397 --frame-stride 2
 ```
+
+`--tracker h3` is the engine under test. Drop the flag (or pass `--tracker h2`) to grade the
+incumbent instead — worth doing in the same sitting until h3 is actually deployed, because until
+then h2 is what production runs and h3 is what the repo contains.
 
 `--frame-stride 2` is not a speed knob — it is what production runs (`DOOR_STRIDE` defaults to 2 in
 `gpu_analyze.py:110`, ~12.5 fps of the 25 fps decode). If a camera's registry `stride` has been
@@ -77,22 +82,32 @@ ch30 8 (4 with hand travel), ch27 13 (11 with hand travel).
 
 ### Reference numbers
 
-Run on dev-box 2026-08-05, `TRACKER_LOGIC = "h2"` (`gpu_door.py:80`), commit `668cf46`, with the two
-commands exactly as written above. This is the **failing** engine — it is the floor h3 has to clear,
-and it is here to show what the alerts look like when they fire, not as a passing reference.
+Run on dev-box 2026-08-05 at commit `9f79051`, `--tracker h3` (`TRACKER_LOGIC_H3 = "h3-state"`), with
+the two commands exactly as written above. **This is the passing reference.** A week that does not
+reproduce it is the week to investigate.
 
-| | ch30 | ch27 |
-|---|---:|---:|
-| gradable truth closes | 8 | 13 |
-| DETECTED | **5** (62.5 %) | **8** (61.5 %) |
-| MISSED | 3 | 5 |
-| PHANTOM | **1** | **41** |
-| UNMATCHED emissions | 25 | 117 |
-| total emitted | 31 | 166 |
-| travel: n produced / timed truth | **1 / 4** | **1 / 11** |
-| travel bias (mean err) | **+1.12 s** | **-1.52 s** |
+| | ch30 h2 | ch30 **h3** | ch27 h2 | ch27 **h3** |
+|---|---:|---:|---:|---:|
+| gradable truth closes | 8 | 8 | 13 | 13 |
+| DETECTED | 5 (62.5 %) | **8 (8/8)** | 8 (61.5 %) | **13 (13/13)** |
+| MISSED | 3 | **0** | 5 | **0** |
+| PHANTOM | 1 | **0** | 41 | **0** |
+| UNMATCHED emissions | 25 | 9 | 117 | 41 |
+| total emitted | 31 | 17 | 166 | 54 |
+| refractory suppressed | — | **0** | — | **0** |
+| cycles flagged occluded | — | 0 | — | 5 |
+| travel produced | 1 / 4 | **0, by design** | 1 / 11 | **0, by design** |
 
-All four alerts fire on both cameras. That is the expected result for h2 and the reason h3 exists.
+The h2 column is kept alongside because it is what production still runs, and because the delta is
+the argument for deploying h3 at all.
+
+**Two lines in that table are not achievements and must not be read as any.** `refractory
+suppressed = 0` means the refractory window never fired on this corpus — the phantoms died on h3's
+open-plateau precondition instead, so the refractory is untested, not proven. `occluded = 5` on ch27
+is a *negative* result: none of the 5 is a matched cycle, and both hand-labelled extended closes
+(f21317 at 4.76 s, f46263 at 6.28 s) came back unflagged. The occlusion flag misses every event it
+exists to catch. **Do not gate anything on `occluded`,** and do not treat a change in that count as
+signal until there is a hand-labelled occlusion set to validate it against.
 
 **This is now the acceptance table in README_DOORWATCH.md**, where it replaced the dirty-corpus
 baseline (ch30 9/11 detected / 0 phantom, ch27 4/9 / 4 phantom). That older table's phantom counts
@@ -103,13 +118,15 @@ on both cameras**, not 82 % and 44 %, and ch30's `PHANTOM 0` becomes 1. The dirt
 below the new one in that file, not deleted: the delta between them is the evidence for why corpus
 integrity gates every number downstream of it.
 
-Two readings worth carrying into h3's acceptance:
+Two readings from that h2 run, both of which h3 answered:
 
-* **ch27 emits 166 events for 13 real closes, 41 of them inside verified door-closed windows.** The
-  phantom problem is an order of magnitude larger than the dirty-corpus count of 4 suggested.
-* **Travel bias at n=1 is not a bias.** Each camera produced exactly one `close_travel_s` against a
-  timed close, and the two disagree in *sign* (+1.12 s, -1.52 s). Alert 3 is unreadable at this
-  coverage, which is exactly why alert 4 exists and why it is checked first.
+* **ch27 emitted 166 events for 13 real closes, 41 of them inside verified door-closed windows.** The
+  phantom problem was an order of magnitude larger than the dirty-corpus count of 4 suggested. h3
+  emits 54 and 0 respectively.
+* **Travel bias at n=1 was never a bias.** Each camera produced exactly one `close_travel_s` against
+  a timed close and the two disagreed in *sign* (+1.12 s, -1.52 s). h2 was not measuring travel; it
+  was occasionally emitting a number. h3 stops pretending, which is why alerts 3 and 4 are now about
+  the honesty of the null rather than the accuracy of a value.
 
 ---
 
@@ -144,6 +161,21 @@ done
 `-c:v copy` — never transcode. Re-encoding changes the pixels the door engine reads, and the point
 of the capture is to feed the engine the same bytes production feeds it. `-an` because the sub
 stream carries no audio worth muxing.
+
+> **KNOWN GAP — TODO, and the reason LEG 2 has never run.** This command has never been executed.
+> Two things block it, both mechanical:
+> 1. **dev-box has no ffmpeg** (`apt-cache policy ffmpeg` -> candidate `7:6.1.1-3ubuntu5`, installed:
+>    none). Either install it or run this step on the Pi/gateway, which has it.
+> 2. **No operator credential is available to the harness.** An unauthenticated GET of the playlist
+>    returns **401**, so Caddy basicauth is required and is working; what is missing is a credential
+>    this runbook is allowed to carry. Do NOT paste an operator password into this file or into
+>    shell history — put it in a root-readable env file on the capture host and reference it, the
+>    way `/etc/liftlab-agent.env` already holds `GATEWAY_TOKEN` for the relay.
+>
+> Until both are resolved, LEG 2 cannot run, which means **travel has no source at all** now that h3
+> emits none. That makes this gap the single highest-priority item on this page — it is not a
+> convenience, it is the only remaining path to a compliance travel figure. Alert 4 fires every week
+> until it is closed.
 
 Run the two cameras **sequentially, not in parallel**, unless you have checked the uplink headroom
 first: two 1 h pulls compete with the seven live relay streams the Pi is already sustaining, and a
@@ -261,12 +293,18 @@ python3 tools/doorwatch_replay.py --cam ch27 \
 Read them off the printed block. All four are failures; any one of them means the engine does not
 ship this week's numbers unexamined.
 
+Alerts 3 and 4 changed shape when h3 was armed. h2's versions checked whether a travel number was
+*accurate*; h3's check that there is no travel number at all and that a human took the measurement
+instead. That is not a relaxation — a state-only engine that starts emitting travels is a defect,
+and travel with no source is a worse failure than travel with a known bias. Reinstate an accuracy
+alert only when a travel estimator passes TEST B.
+
 | # | Alert | Where to read it | What it means |
 |---|---|---|---|
 | 1 | **detection below bar** — frozen corpus: ch30 < 7/8, ch27 < 11/13. Fresh 1 h capture: < 90 % | `DETECTED n/m` | Real closes the engine never emitted. Riders' journeys are missing from C27, and the loss is silent — nothing downstream can tell an unmade trip from an unmeasured one. |
 | 2 | **PHANTOM > 0** | `PHANTOM n` | An emission inside a verified door-**closed** window. The engine invented a door cycle. Any nonzero count fails; phantoms inside the `[0.5, 30]s` filter reach C27 as fabricated trips. |
-| 3 | **\|travel bias\| > 0.2 s** | `travel error: n=... mean=...` | Systematic clip in `close_travel_s`. The sign matters: the h2 failure mode was a *low* bias, the tracker stamping both ends of a descent it never observed. |
-| 4 | **travel coverage short** | `n=` on the same line, vs timed truth rows | Missing entirely, or `n` below the camera's timed-close count, means the engine declined to measure. Alert 3 cannot fire on values that were never produced, so a silent engine passes it. Check this one first. |
+| 3 | **any `close_travel_s` is non-null** | `engine_s` column — every row must read `-` | h3 does not measure travel and must not appear to. A number here means either the null discipline broke or the engine in the replay is not h3. This alert is INVERTED from a normal accuracy check on purpose: for a state-only engine, an unexpected measurement is the defect. |
+| 4 | **the weekly hand-timed travel sample was not taken** | your own LEG 2 log, not the replay output | Travel now comes from hand-timed video, not from the engine. If nobody sampled it, compliance travel has no source at all this week — the failure is silent and lands outside this harness, which is exactly why it is an alert. |
 
 **Why alert 1 has two forms.** A flat 90 % was the original instruction, and on the frozen corpus's
 small denominators it does not divide sensibly: 90 % of ch30's 8 gradable closes rounds to **8/8**,
@@ -312,9 +350,18 @@ Stated so nobody reads a green week as more than it is.
   hand-timed video exists for them.
 * **One hour of one day.** Peak-hour behaviour, night behaviour and rare mechanical faults are
   outside any corpus this runbook produces.
-* **Detection is graded against hand truth; travel is graded against hand *timing*.** Frame-anchored
-  endpoints carry ~±0.16 s, so a bias threshold of 0.2 s sits close to the instrument's own floor.
-  A pass at 0.19 s is not a measurement of quality, it is a tie with the ruler.
+* **Travel is not covered by this engine at all.** h3 measures door STATE. Every compliance figure
+  that depends on how long a door took to close now rests on LEG 2's hand-timed sample and on
+  nothing else. A green LEG 1 says nothing whatever about travel.
+* **`UNMATCHED` is unexplained, not benign.** h3 emits 41 unmatched on ch27 and 9 on ch30. These are
+  probably real closes nobody hand-timed — the truth holds 13 closes across 47 minutes, far fewer
+  than a working lift performs — but probably is not measured, and a phantom that happens to fall
+  outside a verified-closed window would land in this same bucket. LEG 2 is what would settle it.
+* **The phantom score has no unseen portion.** The closed template is built from the first 40 % of
+  each door-closed window and phantoms are scored inside those same windows. The harness reports
+  train-split and test-split counts separately, but with 0 phantoms both read 0 — the split found
+  nothing because there was nothing to find, which is weaker than a clean test-split number.
+* **The occlusion flag is unvalidated and currently wrong.** See the note under the reference table.
 * **LEG 1 cannot fail for anything but an engine change.** Same video, same truth, every week. A
   green LEG 1 says the engine did not regress; it says nothing about whether the engine still
   matches the building.

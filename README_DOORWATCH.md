@@ -1,5 +1,56 @@
 # h2 BASELINE — door-cycle engine vs hand-timed video (2026-08-05)
 
+## OUTCOME — h3 SHIPS STATE-ONLY (2026-08-05, `9f79051`)
+
+Read this first; the acceptance table below is what it was measured against.
+
+**TEST B failed a third time** (`0680e57`), with both mandatory implementation fixes in — per-camera
+band placement derived from row-wise transition energy (`093340d`) and per-event references
+replacing running ones. Pooled n=14, every family:
+
+| family | n | r | MAE | constMAE | bias | tail | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| pos_plateau | 14/14 | -0.090 | 3.67 | 0.23 | +3.61 | 3/3 | FAIL |
+| pos_1090 | 14/14 | -0.054 | 3.26 | 0.23 | +3.10 | 3/3 | FAIL |
+| pos_foot | 14/14 | -0.365 | 1.16 | 0.23 | -0.80 | 0/3 | FAIL |
+| ncc_level | 14/14 | -0.148 | 2.11 | 0.23 | +1.78 | 2/3 | FAIL |
+
+The decisive number is **constMAE = 0.23s**: the constant-2.03s predictor is 5-16x more accurate
+than every signal-derived estimate on this corpus. Per-event references did not fix the mechanism
+they were introduced to fix — ch27's ramp foot still has sd 63.3 frames (2.54s) against hand travels
+spanning 1.56-2.40s, and pooled r stayed negative on every family. What the fixes DID achieve: the
+proxy now ramps on all 21 anchors with no saturation anywhere, which `ncc_top` could never do. The
+construction is sound; what it produces does not carry travel.
+
+**So h3 ships the validated half and refuses the other.** Detection acceptance, `--tracker h3`:
+
+| | h2 clean | **h3** | target | |
+|---|---:|---:|---:|---|
+| ch30 DETECTED | 5/8 | **8/8** | >= 7/8 | PASS |
+| ch27 DETECTED | 8/13 | **13/13** | >= 11/13 | PASS |
+| ch30 PHANTOM | 1 | **0** | 0 | PASS |
+| ch27 PHANTOM | **41** | **0** | 0 | PASS |
+| total emitted | 31 / 166 | 17 / 54 | — | |
+
+Detection reached 21/21 while emissions fell 197 -> 71. `close_travel_s` is `None` on every cycle
+with a reason string that distinguishes "this engine does not compute it" from h2's "computed,
+implausible, dropped". Travel now comes from the weekly hand-timed sample in
+`tools/weekly_stopwatch.md`, which was armed on this result.
+
+Three things that are NOT achievements, recorded here so the pass is not read as more than it is:
+* **The refractory window never fired** (0 suppressions, both cameras). The phantoms died on the
+  open-plateau precondition — h2 armed closes out of a dead band in stretches where the door never
+  opened. The refractory is untested, not proven.
+* **The occlusion flag misses every event it exists to catch.** ch30 flagged 0/17; ch27 flagged 5/54,
+  none of them a matched cycle, and both hand-labelled extended closes came back clean. Do not gate
+  on `occluded`.
+* **`UNMATCHED` is 41 on ch27 and 9 on ch30** and is unexplained. Probably untimed real closes;
+  probably is not measured.
+
+**h3 is not deployed.** `TRACKER_LOGIC` still reads `h2`.
+
+---
+
 ## THE ACCEPTANCE TABLE — h2 on the CLEAN corpus
 
 **This table is h3's acceptance test.** It supersedes the dirty-corpus table further down, which is
