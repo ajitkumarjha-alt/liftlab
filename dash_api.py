@@ -2438,6 +2438,12 @@ function tier2card(t,cam){
 }
 
 var mode='cams', trCam='', TR=null;
+// SEED FROM THE URL, same parameter the Dash tab reads. These were two independent selectors: ?cam=
+// set `cur` (the Dash tab) and never touched trCam, so /dash?cam=ch27 could render the heatmap for
+// whatever camera was last clicked here — reported 2026-08-05 as ch27 in the URL showing ch29's
+// floor alphabet. Floors are per-shaft, so a mismatched heatmap is not a cosmetic problem: it is a
+// chart of a different building column under the wrong heading.
+(function(){var m=/[?&]cam=([A-Za-z0-9._-]+)/.exec(location.search); if(m)trCam=m[1];})();
 function nav(){
   document.getElementById('nav').innerHTML=
     '<div class="tab'+(mode==='cams'?' on':'')+'" onclick="setMode(\'cams\')">Cameras</div>'
@@ -2698,7 +2704,10 @@ function heatCard(){
   // /data (all-history) copy only bridges the moment between switching cameras and the fetch.
   var trReady=(TR&&trCam&&TR.cam===trCam);
   var t2=trReady?TR.tier2_range:((DATA&&DATA.tier2)?DATA.tier2[trCam]:null);
-  var head='<div class=card><h3>riders &amp; stops per floor, per hour '
+  // The camera goes IN the heading. The tab strip above shows which is active, but a chart whose
+  // title does not name its subject is one glance away from being read as another camera's.
+  var head='<div class=card><h3>riders &amp; stops per floor, per hour — '
+    +'<span style="font-weight:600">'+esc(trCam||'pick a lift')+'</span> '
     +'<button class="tog'+(heatMode==='stops'?' on':'')+'" onclick="setHeat(\'stops\')">stops</button>'
     +'<button class="tog'+(heatMode==='riders'?' on':'')+'" onclick="setHeat(\'riders\')">riders</button></h3>'
     +'<div class=intent>'+(heatMode==='riders'
@@ -2707,7 +2716,12 @@ function heatCard(){
       : 'STOPS: door CYCLES — the door opened and closed at that floor. NOT floor readings: a lift '
         +'passing a floor is not counted here.')+'</div>';
   if(!trCam){
-    return head+'<div class=blank>pick a camera above — floors belong to one lift, so a fleet total would mix shafts</div></div>';
+    return head+'<div class=blank>pick a lift above — floors belong to one shaft, so a fleet total would mix them</div></div>';
+  }
+  if(cur && trCam !== cur){
+    head+='<div class=intent style="color:#8a6100">showing <b>'+esc(trCam)+'</b>, but the dashboard '
+      +'above is on <b>'+esc(cur)+'</b> — these are different lifts with different floors. '
+      +'<a href="#" onclick="trCam=\''+esc(cur)+'\';loadTrends();return false">show '+esc(cur)+' instead</a></div>';
   }
   if(!t2){
     return head+'<div class=blank>no door-engine reads for '+esc(trCam)+' in the current era'
