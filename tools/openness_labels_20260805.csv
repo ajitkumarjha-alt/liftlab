@@ -1,0 +1,55 @@
+cam,id,osd,openness,col,bright_f_128,door_state,note
+# Hand-labelled door state for frames sampled at the TRACKER'S OWN decision extremes.
+# Sampling: openness>=0.95 ("H", tracker says fully open) and openness<=0.05 ("L", tracker says
+# fully closed), spread evenly across each run. Labelled by eye from the ROI crops in
+# scratchpad/<cam>_bandH.png / _bandL.png. door_state is the PHYSICAL door: open = lobby visible
+# through the doorway, closed = leaf fills the doorway. 'uncertain' where a passenger obscures the
+# doorway enough that the state cannot be called honestly.
+ch30,H00,12:04:54,1.000,199.0,0.5631,open,lobby + person in doorway
+ch30,H01,12:06:29,1.000,219.0,0.6105,open,lobby floor visible
+ch30,H02,12:08:13,1.000,215.0,0.5323,open,lobby + people
+ch30,H03,12:08:23,1.000,229.0,0.2587,closed,dark leaf fills ROI; passengers in car
+ch30,H04,12:08:33,0.968,231.5,0.2589,closed,leaf
+ch30,H05,12:08:42,1.000,256.0,0.2662,closed,leaf
+ch30,H06,12:09:03,0.982,244.5,0.2677,closed,leaf + passengers
+ch30,H07,12:09:21,1.000,266.5,0.2900,closed,leaf + passengers
+ch30,H08,12:11:26,1.000,172.5,0.4450,open,lobby
+ch30,H09,12:12:17,1.000,145.0,0.4227,open,lobby
+ch30,H10,12:13:30,1.000,174.0,0.3006,open,lobby + person
+ch30,H11,12:14:50,1.000,183.0,0.4261,open,lobby + person
+ch30,L00,12:04:56,0.025,136.0,0.5515,open,lobby visible
+ch30,L01,12:05:17,0.018,134.0,0.3775,closed,leaf
+ch30,L02,12:05:36,0.035,134.5,0.3774,closed,leaf
+ch30,L03,12:06:57,0.041,132.5,0.4331,closed,leaf
+ch30,L04,12:07:35,0.000,116.5,0.5551,open,lobby + person
+ch30,L05,12:09:37,0.000,132.0,0.2999,closed,leaf + person with phone
+ch30,L06,12:09:53,0.000,129.0,0.3003,closed,leaf + person
+ch30,L07,12:10:22,0.018,133.5,0.4317,closed,leaf
+ch30,L08,12:10:37,0.012,134.0,0.4305,closed,leaf
+ch30,L09,12:12:15,0.000,98.5,0.5755,open,lobby
+ch30,L10,12:13:43,0.000,129.0,0.3816,closed,leaf + person in orange
+ch30,L11,12:14:59,0.026,132.5,0.3700,closed,leaf
+ch27,H00,12:05:14,1.000,137.0,0.5965,closed,leaf
+ch27,H01,12:06:16,1.000,136.0,0.5958,closed,leaf
+ch27,H02,12:06:51,1.000,137.0,0.7231,open,patterned lobby floor
+ch27,H03,12:07:01,0.998,175.0,0.7272,open,lobby
+ch27,H04,12:08:21,0.977,173.0,0.7316,open,lobby
+ch27,H05,12:09:45,1.000,135.0,0.5955,closed,leaf
+ch27,H06,12:10:26,1.000,160.0,0.2993,uncertain,passenger fills doorway
+ch27,H07,12:11:47,0.955,136.0,0.5598,closed,leaf
+ch27,H08,12:12:01,1.000,163.0,0.7687,open,marble lobby
+ch27,H09,12:13:00,1.000,149.0,0.4050,open,lobby + person
+ch27,H10,12:14:02,1.000,196.0,0.6909,open,lobby + person walking
+ch27,H11,12:15:27,1.000,136.0,0.5563,closed,leaf
+ch27,L00,12:05:11,0.000,130.0,0.5958,closed,leaf
+ch27,L01,12:05:56,0.000,129.0,0.5957,closed,leaf
+ch27,L02,12:07:55,0.000,167.0,0.7294,open,patterned lobby floor
+ch27,L03,12:08:07,0.000,134.0,0.5969,closed,leaf
+ch27,L04,12:08:56,0.000,128.0,0.5965,closed,leaf
+ch27,L05,12:09:10,0.023,128.0,0.5931,closed,leaf
+ch27,L06,12:09:40,0.000,127.0,0.5949,closed,leaf
+ch27,L07,12:10:05,0.000,96.0,0.4068,closed,leaf + passenger in car
+ch27,L08,12:11:34,0.000,88.0,0.7702,open,bright lobby + person
+ch27,L09,12:12:58,0.000,95.0,0.3689,open,marble lobby + person
+ch27,L10,12:14:33,0.000,127.0,0.5551,closed,leaf
+ch27,L11,12:14:48,0.000,128.0,0.5559,closed,leaf

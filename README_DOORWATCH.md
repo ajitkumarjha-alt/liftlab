@@ -192,3 +192,113 @@ intermediate positions are recoverable from the ROI at all (edge column mid-desc
 are not, monotonic-traversal gating has nothing to be monotonic over and would reject real closes as
 readily as reflections. That question is answerable from the same corpus by dumping the per-frame
 openness trace across a known real close, and it should be settled before the gate is written.
+
+---
+
+## OPENNESS TRACE: the signal is not a measurement of door position
+
+The trace DECISION 2 asked for, run on ch30 12:08:55 (the correctly-timed cycle) and ch30 12:12:16
+(the collapsed one), same camera, same ROI, same run, stride 2 = the production 12.5 fps. Emission
+counts reproduce the h2 baseline exactly (ch30 38, ch27 30), so the tracker is fed identically —
+only the instrumentation is new.
+
+Tools, all replayable: `tools/openness_trace.py` (per-frame dump of all four stages),
+`tools/openness_validity.py` (the three tests below), `tools/openness_labels_20260805.csv`
+(hand labels). `tools/descent_audit.py` and `tools/anchor_audit.py` are the intermediate
+measurements that failed to discriminate; they are kept because their failure is the reason the
+question had to be re-posed.
+
+### The branch does not resolve to A, B or C
+
+It resolves to a prior question that the h3 design assumed away.
+
+**The good cycle's openness does ramp.** ch30 12:08:50 descends 0.98 → 0.74 → 0.63 → 0.49 → 0.32 →
+0.13 → 0.07 over 26 analyzed frames / 2.16 s, against a hand-timed 2.10 s. It is a clean traversal,
+exactly what a gate would want.
+
+**It is not a close.** Frames sampled every 0.25 s across that cycle show the door *opening* between
+video t=238.50 and 239.00 and standing open through 242.75, with passengers walking out through it.
+The tracker stamps `close_start` at 240.00 and `close_full` at 242.00 — both inside a continuously
+open doorway. The 2.08 s "close travel" is a two-second slice of an open door, and it matched a real
+close 5.0 s away, at the exact edge of the ±5 s tolerance.
+
+So the corpus contains **zero validated engine travels**. The one number that made h2 look
+occasionally right is a coincidence, and 3013116's corrected ch30 line is the more accurate summary
+of the engine than the travel-error row ever was.
+
+### Three tests, none of which the engine produced
+
+**1. openness disagrees with the door at its own thresholds.** 48 frames sampled at `openness>=0.95`
+("fully open") and `<=0.05` ("fully closed"), spread across both runs, hand-labelled from the ROI
+crop:
+
+| | agrees with the door | states the OPPOSITE | uncertain |
+|---|---:|---:|---:|
+| both cameras, 48 frames | 31 (65%) | **16 (33%)** | 1 (2%) |
+
+ch30 `openness=1.00` was a physically closed door in 5 of 12 samples; ch27 in 5 of 12. A coin flip
+scores 50%. `near_open` and `close_th` are exactly where the state machine commits.
+
+**2. The raw edge column is not separable.** Column values for physically-open and physically-closed
+frames overlap over 65% (ch27) and 71% (ch30) of the labelled set. ch27 is the clearest case: at
+12:05:11 col=130 reads `openness=0.00` and at 12:05:14 col=137 reads `openness=1.00` — 3 seconds
+apart, visually identical frames, a 7-pixel difference spanning the tracker's entire range. No
+renormalisation of a column recovers a door position that the column does not encode.
+
+**3. The reference collapses and clips, and the abstain path is dead.**
+
+| | ch30 | ch27 |
+|---|---:|---:|
+| geometric range of col (p2..p98) | 152.0 px | 90.0 px |
+| rolling reference span, median | 43.1 px (28%) | 34.0 px (38%) |
+| frames with span < half geometric | 69% | 81% |
+| frames pinned at exactly 0.0 or 1.0 | 26% | 29% |
+| frames rejected by `min_strength=0.30` | **0 / 7954** | **0 / 7944** |
+
+`strength` is 1.000 on every frame of both runs. `door_edge_column`'s honest-None contract —
+"it either locates the edge or says it couldn't" — never fires, because "row peak beats 3× the row
+mean" is satisfied by any textured row. The function always answers, and what it answers is *where
+the strongest vertical gradient in the ROI is*, which is the leaf only sometimes.
+
+### Why, physically
+
+The cameras are inside the car looking at the doors, and the ROI covers the doorway. Full-frame
+renders show passengers standing in it for long stretches — a person is a far stronger vertical
+gradient than a door leaf. The rolling p10/p90 then normalises against a distribution dominated by
+whoever is standing there, which is why the reference span sits at 28-38% of the geometric range and
+why a 7 px wobble can span the full scale.
+
+### Consequences
+
+**h3 is not implemented, and the traversal gate as designed is not viable on this signal.** A gate
+keyed on monotonic traversal of `openness` would be gating on a quantity that contradicts the door a
+third of the time at its decision points. It would reject real closes and admit reflections on the
+same evidence. This is not a threshold that needs tuning.
+
+**The discretization point DECISION 2 asked for is identified** — the rolling p10/p90 clip in
+`DoorTracker.openness`, 26-29% of frames pinned — but fixing it is not sufficient, because test 2
+shows the underlying column does not carry the state.
+
+**The proposed replacement is a candidate, not a validated signal.** A whole-ROI bright-pixel
+fraction does ramp smoothly (96.8% of ch30 frames land strictly between the thresholds, vs 42.4% for
+openness), which is consistent with the independent frame analysis. But anchoring each close on its
+10→90% crossing did **not** recover hand-timed travel: ch30 mean error +1.85 s (range -0.18 to
++4.94), ch27 mean -1.60 s. A crude global threshold over an ROI full of passengers is not yet a door
+sensor. Calibrated polarity/threshold per camera may fix it; that has to be *shown*, on this corpus,
+before anything keys on it.
+
+**What is actually blocked.** Every door number downstream rests on a signal that has never been
+validated against the door. The next step is not a tracker revision — it is establishing a door-state
+signal that clears test 1, and the ROI placement (passengers occupy the measured region) looks like
+the first thing to change. That likely needs the site visit already flagged in
+`SITE_VISIT_REQUIRED.md`, or at minimum a re-marked ROI validated against hand labels.
+
+### Caveats on this run
+
+* The 48 labels are single-observer, from ROI crops, by one pass of the eye. They are enough to
+  reject "openness measures the door" at 33% opposite, and not enough to grade a replacement.
+* Windows are ±8 s around hand-timed closes and can include adjacent events; ch30's ~4 s
+  segment-overlap drift and the 12:08:18-20 concat inversion (3013116) both sit inside this corpus.
+* 27% (ch30) / 46% (ch27) of analyzed frames are pixel-identical to the previous analyzed frame — a
+  static scene in an H.264 stream, not necessarily corruption, but it means "frames" and
+  "observations" are not the same count.
