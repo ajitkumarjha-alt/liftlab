@@ -144,3 +144,51 @@ alignment silently mis-scores when the corpus timeline is not monotonic. ch30's 
 disappear, they moved — and the harness reported the reassuring number. Any future corpus needs its
 timeline verified as monotonic before its scores mean anything, or the phantom windows need to be
 anchored to something other than OSD.
+
+---
+
+## DECISION 2 diagnosis: why matched closes emit no `close_travel_s`
+
+One run, h2 instrumented to capture the raw `ct = close_full - close_start` that `_emit()` rejects.
+
+```
+reject band: ct < 0.3 or ct > 30.0   (close_th=0.1, near_open=0.9)
+
+ch30, 9 matched cycles          ch27, 4 matched cycles
+  truth     raw ct   hand        truth     raw ct   hand
+12:04:57      0.08    2.6      12:08:52     3.766      -
+12:05:49      0.0       -      12:10:03      0.08    2.8
+12:07:39      0.0       -      12:12:08     0.561      -
+12:08:55      2.08    2.1      12:14:07      0.32      -
+12:11:32      0.32      -
+12:12:16      0.0     2.2      -> kept 3, rejected-low 1, rejected-high 0
+12:12:47      0.16      -
+12:13:28      0.0       -
+12:14:53      0.08    2.5
+-> kept 2, rejected-low 7, rejected-high 0
+```
+
+**Every rejection is sub-minimum. Not one is over-max.** The raw values are 0.0, 0.08, 0.16 s — that
+is **0 to 2 frames** at the 12.5 fps the door pass actually runs. Against those, the hand-timed truth
+for the same cycles is **2.1-2.6 s**.
+
+So `close_start` and `close_full` are being stamped on the same frame, or one frame apart, for closes
+that physically took two and a half seconds. The tracker is not mis-measuring the descent — **it is
+not observing the descent at all.** It sees `open`, then `closed`, and stamps both ends of a
+2.4-second motion inside 80 ms. `_emit()` then correctly refuses to call 0.08 s a close travel, and
+the cycle surfaces with `close_travel_s = None`. The plausibility filter is working exactly as
+designed; what it is protecting against is an openness signal that jumps rather than traverses.
+
+This is the tracker-level view of the fleet-wide finding already recorded in
+`INVESTIGATION_door_cycle_coverage.md` — openness is bimodal with almost no mass between 0.10 and
+0.30 — and it reframes the "clipped travel, ~0.3 s low" description from the video session. On these
+cycles the measured interval does not shrink by 0.3 s, it **collapses to near zero**: 7 of ch30's 9
+matched cycles came in at <=0.16 s.
+
+**What this means for h3.** The traversal gate cannot be validated on a signal that only ever shows
+endpoints. At 12.5 fps a 2.4 s close should present ~30 intermediate leaf positions; these cycles
+present 0-2. So h3's first obligation is not gating but *sampling* — establishing whether the leaf's
+intermediate positions are recoverable from the ROI at all (edge column mid-descent), because if they
+are not, monotonic-traversal gating has nothing to be monotonic over and would reject real closes as
+readily as reflections. That question is answerable from the same corpus by dumping the per-frame
+openness trace across a known real close, and it should be settled before the gate is written.
