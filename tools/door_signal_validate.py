@@ -220,40 +220,44 @@ def main():
     print("=" * 80)
     print(f"TEST A — STATE agreement, {a.cam}")
     print("=" * 80)
-    inv = INVERSION_VT.get(a.cam)
-    used, excl_inv, excl_unc, missing = [], 0, 0, 0
-    for l in labels:
-        if l["door_state"] == "uncertain":
-            excl_unc += 1; continue
-        r = by_frame.get(int(l["frame"]))
-        if r is None:
-            missing += 1; continue
-        if inv and inv[0] <= r["vt"] <= inv[1]:
-            excl_inv += 1; continue
-        used.append((l["door_state"], r))
-    print(f"  {len(used)} labels scored; excluded {excl_unc} uncertain, {excl_inv} inside the "
-          f"concat-inversion zone{f' {inv}' if inv else ''}, {missing} not found in the signal dump")
-    print(f"\n  {'signal':>12} {'AUC':>6} {'best thr':>9} {'acc':>6} {'LOO acc':>8} "
+    import door_signal_v2 as dsv2
+    closed_f = set(dsv2.closed_window_frames(a.cam, "test"))       # held out from the template
+    open_f = set(dsv2.open_frames_from_truth(a.cam))
+    by_frame = {r["frame"]: r for r in sig}
+    used = ([("closed", by_frame[f]) for f in sorted(closed_f) if f in by_frame]
+            + [("open", by_frame[f]) for f in sorted(open_f) if f in by_frame])
+    n_c = sum(1 for s_, _ in used if s_ == "closed")
+    n_o = len(used) - n_c
+    print(f"  labels are TRUTH-DERIVED, not eyeballed:")
+    print(f"    closed  {n_c:4d} frames — door-closed windows, TEST split (the template was built")
+    print(f"                              from the disjoint train split, so this is held out)")
+    print(f"    open    {n_o:4d} frames — the frames just before each clean close's start_f, where")
+    print(f"                              the door is open and not yet moving")
+    print(f"  This replaces 63064cb's 48 single-observer eyeball labels sampled at openness's")
+    print(f"  extremes. Larger, independent of my eye, and drawn from the same scan as the truth.\n")
+    print(f"  {'signal':>12} {'AUC':>6} {'best thr':>9} {'acc':>6} {'LOO acc':>8} "
           f"{'open med':>9} {'closed med':>11}  verdict")
     results = {}
     for k in keys:
-        pos = [r[k] for s, r in used if s == "open"]
-        neg = [r[k] for s, r in used if s == "closed"]
+        pos = [r[k] for s_, r in used if s_ == "open"]
+        neg = [r[k] for s_, r in used if s_ == "closed"]
         if not pos or not neg:
             continue
         A = auc(pos, neg)
-        # a signal can be informative with either polarity; AUC<0.5 means "closed scores higher"
         flip = A < 0.5
         p2, n2 = (neg, pos) if flip else (pos, neg)
         A2 = auc(p2, n2)
-        t, acc = best_threshold(p2, n2)
-        lacc = loo_accuracy(p2, n2)
+        thr, acc = best_threshold(p2, n2)
+        lacc = loo_accuracy(p2, n2) if len(used) <= 200 else acc
         med = lambda v: sorted(v)[len(v) // 2]
-        results[k] = {"auc": A2, "acc": acc, "loo": lacc, "thr": t, "flip": flip}
+        results[k] = {"auc": A2, "acc": acc, "loo": lacc, "thr": thr, "flip": flip}
         verdict = "PASS" if lacc >= PASS_STATE else ("marginal" if lacc >= 0.80 else "fail")
-        print(f"  {k:>12} {A2:>6.3f} {t:>9.4f} {acc:>6.1%} {lacc:>8.1%} "
+        print(f"  {k:>12} {A2:>6.3f} {thr:>9.4f} {acc:>6.1%} {lacc:>8.1%} "
               f"{med(pos):>9.4f} {med(neg):>11.4f}  {verdict}"
               + ("   [closed scores HIGHER]" if flip else ""))
+    if len(used) > 200:
+        print(f"\n  (LOO omitted above {200} labels — with n={len(used)} the threshold is not")
+        print(f"   meaningfully fit to any one point; 'acc' is the in-sample number.)")
 
     print("\n" + "=" * 80)
     print(f"TEST B — TRAVEL against hand-timed closes, {a.cam}")

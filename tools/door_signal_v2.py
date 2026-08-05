@@ -40,6 +40,8 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import truth_io
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 DAY = "2026-08-05"
@@ -47,12 +49,11 @@ DAY = "2026-08-05"
 # Per-camera geometry. door_roi is the calib ROI already in the video's own 704x576 pixels (both
 # cameras' calib frame_wh matches the recording, per README_DOORWATCH). top_band is y-range above
 # head height; its x-range is taken from the door ROI so it spans the doorway and nothing else.
-CAMS = {
-    "ch30": {"video": "~/dwrec/rec/ch30_full.mp4", "roi": (2, 2, 335, 446),
-             "osd_base": "12:04:48", "skip_before": 0.0},
-    "ch27": {"video": "~/dwrec/rec/ch27_full.mp4", "roi": (125, 3, 238, 397),
-             "osd_base": "12:04:36", "skip_before": 30.0},
-}
+# Corpus geometry now comes from truth_io.CORPUS (clean corpus, measured fps). The dirty-corpus
+# entries that used to live here are gone with the corpus.
+CAMS = {c: {"video": truth_io.CORPUS[c]["path"], "roi": truth_io.CORPUS[c]["roi"],
+            "osd_base": truth_io.CORPUS[c]["osd_base"], "skip_before": 0.0}
+        for c in truth_io.CORPUS}
 TOP_BAND_Y = (15, 85)
 TEMPLATE_WH = (96, 128)      # templates are resized to this so NCC cost is fixed and small
 
@@ -124,28 +125,64 @@ def grab_frames(video, indices):
     return got
 
 
-def build_templates(cam, labels_csv, out_dir):
-    """Median CLOSED-door template (full ROI and top band) from hand-labelled closed frames.
+def closed_window_frames(cam, split, n_per_window=12, train_frac=0.4):
+    """Frame indices of known-closed frames, from the door-closed windows in phantom_periods.
+
+    TRAIN/TEST SPLIT MATTERS HERE. The template is built from closed frames and TEST A is scored on
+    closed frames; drawing both from the same pool would score the template against its own input.
+    The first `train_frac` of each window is the train side, the remainder is test, and the two
+    never overlap. Windows are long (2500-7400 frames) so both sides still span real lighting and
+    occupancy variation.
+    """
+    out = []
+    for w in truth_io.load_phantoms(cam):
+        a, b = w["start_f"], w["end_f"]
+        cut = a + int((b - a) * train_frac)
+        lo, hi = (a, cut) if split == "train" else (cut, b)
+        if hi - lo < n_per_window:
+            continue
+        step = (hi - lo) // n_per_window
+        out.extend(lo + i * step for i in range(n_per_window))
+    return out
+
+
+def open_frames_from_truth(cam, lead_lo=3, lead_hi=15):
+    """Frame indices where the door is known OPEN, derived from the ground truth rather than by eye.
+
+    A close runs start_f -> end_f, so a few frames BEFORE start_f the door is open and not yet
+    moving. That makes the open labels as authoritative as the truth itself. Only `clean` rows are
+    used: partial_start_excluded rows have an unreliable start_f, which is exactly the field this
+    depends on.
+    """
+    out = []
+    for t in truth_io.load_truth(cam):
+        if t["status"] != "clean":
+            continue
+        out.extend(range(max(0, t["start_f"] - lead_hi), max(0, t["start_f"] - lead_lo)))
+    return out
+
+
+def build_templates(cam, out_dir, split="train"):
+    """Median CLOSED-door template (full ROI and top band) from clean-corpus closed frames.
 
     The median across many independent closed frames — different floors, different passengers — is
     what makes the template the leaf rather than any one scene behind it.
     """
     import cv2
     spec = CAMS[cam]
-    labs = [l for l in read_labels(labels_csv, cam) if l["door_state"] == "closed"]
-    idx_of = {l["id"]: label_frame_index(l) for l in labs}
-    frames = grab_frames(spec["video"], list(idx_of.values()))
+    idx = closed_window_frames(cam, split)
+    frames = grab_frames(spec["video"], idx)
     x, y, w, h = spec["roi"]
     roi_stack, top_stack, used = [], [], []
-    for lid, fi in sorted(idx_of.items()):
+    for fi in sorted(idx):
         fr = frames.get(fi)
         if fr is None:
             continue
         g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
         roi_stack.append(cv2.resize(g[y:y + h, x:x + w], TEMPLATE_WH))
-        tb = top_band(g, spec["roi"])
-        top_stack.append(cv2.resize(tb, (TEMPLATE_WH[0], max(8, TEMPLATE_WH[1] // 4))))
-        used.append((lid, fi))
+        top_stack.append(cv2.resize(top_band(g, spec["roi"]),
+                                    (TEMPLATE_WH[0], max(8, TEMPLATE_WH[1] // 4))))
+        used.append(fi)
     if len(roi_stack) < 3:
         raise SystemExit(f"{cam}: only {len(roi_stack)} closed frames resolved — refusing to build "
                          f"a template from that")
@@ -154,16 +191,16 @@ def build_templates(cam, labels_csv, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     cv2.imwrite(f"{out_dir}/{cam}_tpl_roi.png", tpl_roi)
     cv2.imwrite(f"{out_dir}/{cam}_tpl_top.png", tpl_top)
-    meta = {"cam": cam, "n_closed_frames": len(roi_stack), "used": used,
-            "roi": spec["roi"], "top_band_y": TOP_BAND_Y, "template_wh": TEMPLATE_WH}
-    json.dump(meta, open(f"{out_dir}/{cam}_tpl.json", "w"), indent=1)
-    # leave-one-out: how well does the template match the frames it was NOT built from?
+    json.dump({"cam": cam, "split": split, "n_closed_frames": len(roi_stack), "used": used,
+               "roi": spec["roi"], "top_band_y": TOP_BAND_Y, "template_wh": TEMPLATE_WH},
+              open(f"{out_dir}/{cam}_tpl.json", "w"), indent=1)
     loo = []
     for k in range(len(roi_stack)):
-        others = np.median(np.stack([r for j, r in enumerate(roi_stack) if j != k]), axis=0).astype(np.uint8)
+        others = np.median(np.stack([r for j, r in enumerate(roi_stack) if j != k]),
+                           axis=0).astype(np.uint8)
         loo.append(ncc(roi_stack[k], others))
-    print(f"  {cam}: template from {len(roi_stack)} closed frames "
-          f"({', '.join(l for l, _ in used)})")
+    print(f"  {cam}: template from {len(roi_stack)} closed frames ({split} split of the "
+          f"door-closed windows)")
     print(f"    leave-one-out NCC on held-out closed frames: "
           f"min={min(loo):.3f} med={sorted(loo)[len(loo)//2]:.3f} max={max(loo):.3f}")
     return tpl_roi, tpl_top
@@ -221,14 +258,13 @@ def dump_signals(cam, tpl_roi, tpl_top, stride, out_csv, limit=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cam", required=True, choices=sorted(CAMS))
-    ap.add_argument("--labels", default="tools/openness_labels_20260805.csv")
     ap.add_argument("--tpl-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--frame-stride", type=int, default=2)
     a = ap.parse_args()
 
     print(f"=== door signal v2: {a.cam} ===")
-    tpl_roi, tpl_top = build_templates(a.cam, a.labels, a.tpl_dir)
+    tpl_roi, tpl_top = build_templates(a.cam, a.tpl_dir)
     dump_signals(a.cam, tpl_roi, tpl_top, a.frame_stride, a.out)
     return 0
 
