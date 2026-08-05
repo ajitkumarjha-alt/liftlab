@@ -635,3 +635,69 @@ Third recurrence this week, and the earlier lesson was incomplete. `pkill -f "[p
 still killed its own shell, because the same command line later referenced
 `/tmp/prove_reports_devbox.sh` — the `[p]` bracket only helps when the plain string appears **nowhere
 else in the command**. Split the kill into its own invocation, or match by pid.
+
+---
+
+# /dash/{gw}/trends?cam= — the islice trap, and what is still unfixed (2026-08-05)
+
+## What it was
+
+`trends?cam=ch27` returned HTTP 500 after 43s, `cam=ch29` did not respond at all within 100s. The
+endpoint feeds the floor heatmap, so its silent failure made the page fall back to the `/dash/data`
+payload — which is how a heatmap ended up rendering another lift's floors with no visible error.
+
+## The cause was NOT the queries
+
+Hypothesis going in was `_tier2` cost on high-row cameras. Measured first, and it was wrong:
+
+```
+ev  (gw_event JOIN gw_source, ch27)       0 rows   0.09s
+tr  (transit_event, ch27)              2,846 rows  0.05s
+_tier2 door rows (era-scoped)        158,710 rows  2.03s
+```
+
+~2.2s of SQL against a 43s request. The cost was one line:
+
+```python
+for nxt in itertools.islice(rows, idx + 1, None):
+```
+
+**`islice` on a list does not seek.** It iterates from the front discarding `idx` items. ch27's
+25,214 door-open transitions each walked ~79,000 rows to reach their starting point — about 2 billion
+wasted steps — while the loop breaks after **six** iterations on average (151,044 total).
+
+```
+islice(rows, idx+1, None)   82.89s
+range(idx+1, len(rows))      0.11s    745x, byte-identical result   (ch29: 13.18s -> 0.07s)
+```
+
+That `islice` was itself a fix, put in to stop `rows[idx+1:]` copying the tail. It removed the
+**allocation** and kept the **quadratic time** — which is why the "islice will fix ch27's 303s"
+prediction recorded earlier this week failed: 303s became ~96s, still broken, and the loop was
+considered done. Three passes, and nobody measured what `islice` does to a list.
+
+**Rule of thumb worth keeping: `islice(seq, n, None)` is O(n) on anything without random access.
+For a list, index.**
+
+## What it is now — better, and STILL NOT ACCEPTABLE
+
+Post-fix, measured on the live gateway (two runs, load ~5.6-5.8):
+
+| camera | run 1 | run 2 |
+|---|---:|---:|
+| ch27 | 200 in 66.0s | 200 in 81.0s |
+| ch29 | 200 in 53.5s | 200 in 43.2s |
+| ch16 | 200 in 19.5s | 200 in 22.7s |
+
+**No more 500s or timeouts — and nowhere near the bar.** Tens of seconds of inline work on the
+request path is exactly the family killed for `/dash` on Monday; this endpoint simply was not part of
+that pass.
+
+The measured components account for ~2.3s of it (2.2s SQL + 0.11s stop loop). **The other ~60s is
+unmeasured**, and after being wrong once already the next step is to measure it on the box rather
+than guess — the remaining candidates inside `_tier2` are the C21/C22 speed loop, the per-floor
+transit join, and the per-camera `_era_for` walk in `dash_trends`, but that is a list of suspects,
+not a finding.
+
+Until it is precomputed or bounded like `/dash/{gw}/data`, this endpoint should be treated as a known
+hazard on a 2-vCPU box.
