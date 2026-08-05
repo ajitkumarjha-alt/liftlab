@@ -731,6 +731,44 @@ Note the direction is inconsistent: the cache has MORE confident_reads and trans
 `eras[0].rows` than the repro. A single "rows arrived since" story does not explain both signs, which
 is precisely why this is not being waved through.
 
-**Do not deploy the cache path until that 0.4% is explained.** A dashboard rendering numbers that
-differ from a fresh derivation, for reasons nobody can state, is the failure mode this project keeps
-paying for.
+**RESIDUAL CLOSED 2026-08-05 — the cause is the compute DURATION, not the data.**
+
+`aggregate_refresh` calls `_window(d)` at the START of the walk but stamps `computed_at` at the END.
+For ch27 that walk takes **621 seconds**, so the window the aggregate actually describes begins at
+`computed_at - 621s - 7d`, not `computed_at - 7d`. Every reconstruction had been asking for a window
+621s too late and therefore missing ~10 minutes of rows at its start — which is exactly why the cache
+showed MORE confident_reads and transits while the all-era census showed fewer rows.
+
+Same-DB A/B on dev-box (restore data to 10:32 IST, aggregate `computed_at` 10:06:17 IST):
+
+| t0 used | differing fields | census | DATA |
+|---|---:|---:|---:|
+| `computed_at - 7d` (the wrong assumption) | 72 | 7 | 65 |
+| `computed_at - dur - 7d` (the walk's real start) | **10** | 7 | **3** |
+
+The three remaining data fields, each a named and verified mechanism:
+
+* `reason_census.no_read` 69922 vs 69921 and `rows_in_era` 179086 vs 179085 — **off by one row**, from
+  the sub-second gap between `_window()` and `t_start` inside `aggregate_refresh`;
+* `transition_census.guard_boundary` cached `2026-07-25T02:13:00Z` vs `None` — `DASH_DOOR_GUARD_TS`
+  is set on the gateway and unset on dev-box. **Config, not data.**
+
+Seven census fields are excluded under the justification already committed (`_era_census` is all-era
+by design, so its row counts grow independently of any window).
+
+**Falsifiers run and killed on the way, recorded so they are not re-run:**
+
+1. *Join-input identity* — `_transits_for_join` vs the `dash_trends` comprehension. Built both on the
+   same DB: after `_tier2`'s internal `[t0,t1)` filter both are **len 3016, symmetric difference 0**.
+   Dead.
+2. *Window-bound closure* — `gw_door_event` and the transit list are both correctly bounded at
+   `computed_at`. The two unbounded inputs are stored tables (`_era_census`, `_alphabet_read`), and
+   the alphabet was derived at 09:55:02, **11.2 min BEFORE** the aggregate, so it cannot have shifted
+   between runs. Dead.
+3. *Late arrivals* — rows with `ts` inside the window but `received_at` after `computed_at`: **0 of
+   178,546**. Dead.
+
+**Gate: MET.** Zero unexplained fields. The cache path is sound.
+
+Optional hardening, not done here (scope): have `aggregate_refresh` store the `t0`/`t1` it used, so
+a future audit reads the window instead of reconstructing it from `computed_at - compute_ms`.
