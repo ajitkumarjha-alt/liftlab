@@ -108,3 +108,39 @@ because an engine that detects a close but cannot time it is its own defect.
   called out for ch30 is visible in that spread.
 * `truncated` rows are excluded from gradable; `boundary`, `occluded`, `complex` and `clean_untimed`
   are included, so "detected" counts cycles that were visible but not hand-timed.
+
+---
+
+## CORRECTION (same run, re-read with the ch30 concat inversion in hand)
+
+The ch30 concat has a segment-ordering inversion around **video t=210-212**, which with
+`--osd-base 12:04:48` maps to **OSD 12:08:18-12:08:20**. Two of ch30's scores are artefacts of it,
+and both were reported above as if they were engine behaviour.
+
+**1. ch30's `PHANTOM 0` is wrong — the true count is 2.**
+The hand-timed window (12:08:20-12:08:40, "closed and crowded") records h2 emitting **0.56 and
+0.72**. The replay emitted travels of exactly **0.56s and 0.72s** — at **12:08:07 and 12:08:09**,
+13-31s *before* the window. Identical values to two decimal places: these are the same two events,
+displaced out of the scoring window by the inversion. They were counted as UNMATCHED rather than
+PHANTOM purely because of a timestamp shift in the corpus.
+
+**2. One of ch30's 2 misses is the inversion, not a miss.**
+The missed close at **12:08:16** is the row already flagged `boundary` in the ground truth, and it
+sits inside the inversion zone. It should not be charged to h2.
+
+Corrected ch30 line, and what h3 is actually measured against:
+
+| | ch30 as first reported | ch30 corrected |
+|---|---:|---:|
+| DETECTED | 9/11 | **9/10** |
+| MISSED | 2 | **1** |
+| PHANTOM | 0 | **2** |
+
+ch27 is unaffected — its mapping is continuous and verified at 60s intervals, with only the stray
+11:36:58 chunk excluded by `--skip-before 30`.
+
+**The general point, worth more than the two numbers:** a scoring window that depends on wall-clock
+alignment silently mis-scores when the corpus timeline is not monotonic. ch30's phantoms did not
+disappear, they moved — and the harness reported the reassuring number. Any future corpus needs its
+timeline verified as monotonic before its scores mean anything, or the phantom windows need to be
+anchored to something other than OSD.
