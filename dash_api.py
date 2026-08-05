@@ -1793,11 +1793,28 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
     if cam:
         cam_filter = " AND s.camera=?"
         args.append(cam)
+    # BOUND IN SQL, not in Python. These three loads previously fetched FULL HISTORY and were
+    # filtered afterwards with _in_range — the same unbounded-work shape that made /dash never
+    # terminate. The rows must never be fetched.
+    #
+    # gw_event stores door_open_start_ts as LOCAL ISO ('2026-07-20T07:16:44.382406+05:30'), so the
+    # bound is a string compare. That is safe here and only here: IST has no DST, so every row
+    # carries the same +05:30 suffix, and _iso_ist emits timespec='seconds' — at an equal second the
+    # stored row's '.' (0x2E) sorts above the bound's '+' (0x2B), so a boundary row is INCLUDED by
+    # >= and EXCLUDED by <, which is exactly the half-open window _in_range applies.
+    ev_w, ev_args = "", []
+    if t0 is not None:
+        ev_w += " AND e.door_open_start_ts >= ?"; ev_args.append(_iso_ist(t0))
+    if t1 is not None:
+        ev_w += " AND e.door_open_start_ts < ?"; ev_args.append(_iso_ist(t1))
     ev = _q(db, "SELECT e.door_open_start_ts os, e.door_open_full_ts of, e.door_close_start_ts cs, "
                 "e.close_travel_s ct, e.quality q, e.boarded b, e.alighted a "
-                "FROM gw_event e JOIN gw_source s ON s.id=e.source_id WHERE s.gateway_id=?" + cam_filter, args)
+                "FROM gw_event e JOIN gw_source s ON s.id=e.source_id WHERE s.gateway_id=?"
+                + cam_filter + ev_w, (*args, *ev_args))
+    tr_w, tr_args = _ts_clause(t0, t1)          # transit_event.ts is epoch — a plain numeric bound
     tr = _q(db, "SELECT ts, direction FROM transit_event WHERE gateway_id=?" +
-            (" AND cam=?" if cam else ""), ([gw, cam] if cam else [gw]))
+            (" AND cam=?" if cam else "") + tr_w,
+            ([gw, cam, *tr_args] if cam else [gw, *tr_args]))
     # GPU DOOR CYCLES. gw_event froze at the Pi-watch retirement (2026-07-21) but this profile kept
     # reading ONLY it, so every post-retirement range showed "0 cycles" while gw_door_event held
     # hundreds (07-30 ch16: 0 shown vs 253 with_travel in the DB — read as data loss, was a view
@@ -1808,9 +1825,13 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
     for c in ([cam] if cam else [x["cam"] for x in _cameras(db, gw)]):
         e, _esrc = _era_for(db, gw, c, era)
         if e:
+            # FLEET CASE: this loop is the per-camera walk, so the bound goes on every camera's
+            # query, not just the single-camera one. Unbounded here meant a fleet request read
+            # every door row this gateway has ever stored, once per camera.
             gpu_cyc += _q(db, "SELECT ts, close_travel_s ct FROM gw_door_event WHERE gateway_id=? "
-                              "AND cam=? AND door_version LIKE ? AND close_travel_s IS NOT NULL",
-                          (gw, c, e + "%"))
+                              "AND cam=? AND door_version LIKE ? AND close_travel_s IS NOT NULL"
+                              + _ts_clause(t0, t1)[0],
+                          (gw, c, e + "%", *_ts_clause(t0, t1)[1]))
     # COUNTING-ERA SPANS, derived from validation_item stamps (first/last episode per version) —
     # never from a hardcoded date. A range that spans more than one era pools transits counted by
     # DIFFERENT logic; the payload names every era in range so the UI can label the pooling, and an
@@ -1826,10 +1847,38 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
     # Range-scoped Tier-2 for the heatmap: the join side reuses the transit rows already loaded
     # above (same cam, same table) instead of re-querying the fleet. Without this the heatmap kept
     # drawing all-history from /data while every other panel obeyed the picker.
-    tier2_range = None
+    # ── TIER-2: CACHE FIRST, never derive on the request path ────────────────────────────
+    # door_aggregate already holds _tier2's output for the default window, written hourly by
+    # precompute_job. The /dash panel was wired to it; trends was missed and kept calling _tier2
+    # inline — 26-51s per request, CPU-bound, on a box with two cores and seven live streams.
+    #
+    # WHEN THE CACHE APPLIES. The stored row is keyed on the CURRENT (counting_version,
+    # door_version) and describes _window(WINDOW_DAYS) — a ROLLING now-7d window with no ceiling.
+    # So it is served only when the caller has not overridden the era and has not asked for a
+    # narrower custom range. Note the windows are not byte-identical: _range_bounds aligns to IST
+    # midnight and 'all' is unbounded, while the aggregate is rolling. That is why the payload
+    # carries tier2_window_days and tier2_computed_at — a 7-day tier2 must never sit silently
+    # under an "all data" label. The rest of the payload still describes the requested range.
+    tier2_range, tier2_source, tier2_meta = None, None, None
     if cam:
-        tjoin = sorted((r["ts"], r["direction"]) for r in tr if r["ts"] is not None)
-        tier2_range = _tier2(db, gw, cam, tjoin, t0, t1, era_override=era)
+        cache_ok = (not era) and (not from_d) and (not to_d) and (period in ("", "all", "week"))
+        if cache_ok:
+            _dg, _t2, _m = _aggregate_read(db, gw, cam, WINDOW_DAYS)
+            if _t2 is not None:
+                tier2_range, tier2_source, tier2_meta = _t2, "cache", _m
+        if tier2_range is None:
+            # No usable aggregate (custom range, era override, or never computed). Derive here —
+            # now with every input bounded in SQL above, which is what makes this affordable.
+            tjoin = sorted((r["ts"], r["direction"]) for r in tr if r["ts"] is not None)
+            tier2_range = _tier2(db, gw, cam, tjoin, t0, t1, era_override=era)
+            tier2_source = "live"
+            if cache_ok and tier2_range is not None:
+                # Cache was eligible but empty: say WHY, so "slow" is attributable rather than a
+                # mystery. NEVER call aggregate_refresh here — that rule is the precompute
+                # docstring's and it is what keeps derivation off the request path.
+                tier2_meta = {"state": (_m or {}).get("state", "no stored aggregate"),
+                              "note": "computed live because no aggregate matched; the precompute "
+                                      "job writes it hourly and is never triggered by a request"}
     db.close()
     if t0 is not None:
         ev = [r for r in ev if _in_range(_epoch(r["os"]), t0, t1)]
@@ -1909,6 +1958,18 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
 
     return JSONResponse({"gw": gw, "cam": cam or "fleet", "n_days": n_days_real, "profile": profile,
                          "windows": windows, "tier2_range": tier2_range,
+                         # WHERE tier2 CAME FROM, and WHAT WINDOW IT DESCRIBES. 'cache' is the
+                         # precomputed aggregate (rolling WINDOW_DAYS, written hourly off the
+                         # request path); 'live' was derived for the requested range just now.
+                         # computed_at exists so the UI can show data-as-of instead of implying the
+                         # numbers are current, and window_days exists because a cached 7-day tier2
+                         # under an "all data" heading would be a wrong answer told confidently.
+                         "tier2_source": tier2_source,
+                         "tier2_computed_at": (tier2_meta or {}).get("computed_at"),
+                         "tier2_age_s": (tier2_meta or {}).get("age_s"),
+                         "tier2_window_days": (WINDOW_DAYS if tier2_source == "cache" else None),
+                         "tier2_cache_state": (tier2_meta or {}).get("state"),
+                         "tier2_cache_note": (tier2_meta or {}).get("note"),
                          "counting_eras": {"in_range": eras_in_range, "crossing": len(eras_in_range) > 1,
                                            "note": "spans derived from validation_item episode stamps; "
                                                    "a crossing range pools transits counted by different logic"},
