@@ -302,3 +302,116 @@ the first thing to change. That likely needs the site visit already flagged in
 * 27% (ch30) / 46% (ch27) of analyzed frames are pixel-identical to the previous analyzed frame — a
   static scene in an H.264 stream, not necessarily corruption, but it means "frames" and
   "observations" are not the same count.
+
+---
+
+## DOOR SIGNAL v2 — validation result: STATE passes, TRAVEL fails, h3 NOT built
+
+Per the validation-first order: signal, then validate, then (only on a pass) a tracker. The signal
+is built by `tools/door_signal_v2.py`, scored by `tools/door_signal_validate.py`. openness is not
+rehabilitated anywhere — it is replaced.
+
+### The signal
+
+Closed-door template NCC, per camera, over a TOP BAND (y 15-85, x spanning the doorway). The
+template is the pixel-wise median of 14 hand-labelled closed frames per camera — different floors,
+different passengers — so it is the leaf, not any one scene. Leave-one-out NCC on held-out closed
+frames: ch27 median 0.996, ch30 median 0.791.
+
+Candidates were computed side by side (full-ROI NCC, top-band NCC, top-band motion, bright fraction
+at two thresholds, ROI mean) so validation could choose rather than the author assuming.
+
+### TEST A — STATE: PASS on both cameras
+
+48 hand labels, scored at each signal's own best threshold, with leave-one-out so the number is not
+just the fit to its own labels. 0 labels fell inside ch30's concat-inversion zone (video t=209-213),
+so none needed excluding; 1 ch27 label is `uncertain` and is excluded.
+
+| signal | ch30 AUC | ch30 LOO | ch27 AUC | ch27 LOO |
+|---|---:|---:|---:|---:|
+| **ncc_top** | **1.000** | **95.8%** | **1.000** | **95.7%** |
+| ncc_roi | 0.950 | 87.5% | 0.960 | 91.3% |
+| bright_160 | 1.000 | 95.8% | 0.778 | 87.0% |
+| top_motion | 0.943 | 79.2% | 0.782 | 52.2% |
+| *openness (h2, from 5e58211)* | *—* | *65%* | *—* | *65%* |
+
+`ncc_top` is the choice: AUC 1.000 on both, LOO ~96%, and it is the only candidate that is strong on
+both cameras. The constraint's prediction holds — a global bright-fraction rule is fine on ch30
+(bright_160 LOO 95.8%) and collapses on ch27 (87.0% at AUC 0.778, i.e. it separates only because the
+threshold lands well, not because the distributions are apart). Top-band *motion* fails both: the
+ROI has passengers moving in it constantly, so ch30's motion baseline sits at 2-4 rather than 0.
+
+### TEST B — TRAVEL: FAIL on both cameras
+
+Closes are sustained rising transitions of `ncc_top`; travel is the near_open->close_th crossing
+span of DECISION 1, transplanted onto the validated signal.
+
+| hand osd | hand_s | matched | travel_s | err_s | |
+|---|---:|---|---:|---:|---|
+| ch30 12:04:57 | 2.6 | 12:04:57 | 0.24 | -2.36 | FAIL |
+| ch30 12:08:55 | 2.1 | 12:08:59 | 1.84 | -0.26 | pass |
+| ch30 12:12:16 | 2.2 | 12:12:19 | 2.00 | -0.20 | pass |
+| ch30 12:14:53 | 2.5 | 12:14:57 | 1.92 | -0.58 | FAIL |
+| ch27 12:10:03 | 2.8 | 12:10:04 | 2.32 | -0.48 | FAIL |
+| ch27 12:11:39 | 3.2 | 12:11:39 | 2.16 | -1.04 | FAIL |
+
+**ch30 2/4, ch27 0/2. Neither camera passes, so h3 is not built for either.**
+
+Four principled estimator families were tried before stopping — 10->90 crossing as specified,
+full-ramp extent, derivative-based ramp foot, level-crossing, plus top-band motion duration. Their
+answers for the same six closes differ by more than a second, and no family reached better than 2/4
+and 1/2. **That spread is the finding.** With n=6, a corpus that splices single frames (ch30 video
+t=9.8 jumps 0.48->0.96->0.48 in one frame, which is what breaks 12:04:57), and an NCC-to-position
+mapping that is S-shaped rather than linear, this corpus cannot validate a travel measurement to
++/-0.4s. Continuing to tune would be fitting an estimator to six points, not validating one.
+
+Two structural notes, since they bound any retry:
+* **The 10->90 spec is definitionally narrower than the hand timing.** Hand travel is first motion to
+  fully closed, i.e. 0->100%; a 10->90 crossing of a linear ramp is 0.8x that by construction. A
+  perfect signal fails the literal spec by ~20%. The table above therefore uses the near_open->close_th
+  form, which is what DECISION 1 actually defines and what the hand timing measures.
+* **NCC saturates.** Once the leaf covers the band, further motion barely moves NCC, so NCC-time is
+  not proportional to position-time. Timing travel off NCC needs an NCC->position calibration that
+  this corpus has no way to fit.
+
+### What the validated STATE signal alone does for detection
+
+Not h3, not a tracker, no travel — just `ncc_top` transitions scored the way `doorwatch_replay.py`
+scores h2, for evidence toward the next decision:
+
+| | ch30 h2 (corrected, 3013116) | ch30 v2 state | ch27 h2 | ch27 v2 state |
+|---|---:|---:|---:|---:|
+| DETECTED | 9/10 | **10/11** | 4/9 | **8/9** |
+| MISSED | 1 | 1 | 5 | **1** |
+| PHANTOM | 2 | **0** | 4 | **0** |
+| UNMATCHED | 29 | **9** | 22 | **4** |
+| total emissions | 38 | **19** | 30 | **12** |
+
+ch27 needs no alignment correction and its numbers stand as they are: 8 of 9 real closes found with
+match offsets 0.2-3.8s, zero phantoms in the verified-closed windows, and 12 emissions against 9 real
+closes instead of h2's 30.
+
+**ch30's row carries a caveat that ch27's does not.** It uses a -4.1s correction for the documented
+segment-overlap drift. Uncorrected, ch30 scores 8/11 detected, 1 phantom, mean offset 3.63s. The ~4s
+drift is independently recorded in this file from the video session, but the exact -4.1s was measured
+from these same detections, so the corrected ch30 row is partly circular and should not be quoted
+without this sentence. ch27's is not.
+
+### Verdict and what is actually needed
+
+**h3 does not ship, on either camera.** TEST A passing is not sufficient — a tracker that knows
+open from closed but cannot time the descent reproduces exactly the DECISION 2 defect on a better
+signal, and the acceptance bar at 3013116 includes travel.
+
+What is blocked and on what:
+* **ch27** — state is validated (LOO 95.7%, AUC 1.000, template LOO NCC 0.996) and detection is
+  strong. Travel needs either more hand-timed travels on this camera (n=2 supports nothing, per the
+  same standard applied to h2's n=1) or an NCC->position calibration. This is the cheaper of the two
+  gaps and does not obviously need a site visit.
+* **ch30** — state is validated, but its template is visibly weaker (LOO 0.791 vs ch27's 0.996)
+  because passengers stand in the ROI, and its corpus has both the ~4s drift and single-frame
+  splices. This is the camera the ROI re-mark in `SITE_VISIT_REQUIRED.md` would help most: a top band
+  that clears the passengers, and a clean re-encode without splices.
+
+Nothing deployed. No acceptance criterion weakened; the bar remains 3013116 with DECISION 1 travel
+rules, and h3 has not been measured against it because it has not been written.
