@@ -1,11 +1,86 @@
 # h2 BASELINE — door-cycle engine vs hand-timed video (2026-08-05)
 
+## THE ACCEPTANCE TABLE — h2 on the CLEAN corpus
+
+**This table is h3's acceptance test.** It supersedes the dirty-corpus table further down, which is
+retained as historical evidence and must not be quoted as a target.
+
+Produced 2026-08-05 on dev-box at commit `668cf46` by `tools/doorwatch_replay.py`, tracker h2
+UNMODIFIED (`TRACKER_LOGIC = "h2"`, `gpu_door.py:80`), over the clean, continuous, frame-anchored
+corpus — `ch30_peak.mp4` 27257f @ 24.9945fps and `ch27_clean.mp4` 70260f @ 24.8910fps, both HEVC
+704x576, truth in `tools/groundtruth_20260805.csv` and `tools/phantom_periods_20260805.csv`:
+
+```bash
+python3 tools/doorwatch_replay.py --cam ch30 --video ch30_peak.mp4 \
+    --roi 2,2,335,446 --frame-stride 2
+python3 tools/doorwatch_replay.py --cam ch27 --video ~/dwrec/rec/ch27_clean.mp4 \
+    --roi 125,3,238,397 --frame-stride 2
+```
+
+| | ch30 | ch27 |
+|---|---:|---:|
+| gradable truth closes | 8 | 13 |
+| DETECTED | **5** (62.5%) | **8** (61.5%) |
+| MISSED | 3 | 5 |
+| PHANTOM (inside verified-closed windows) | **1** | **41** |
+| UNMATCHED emissions | 25 | 117 |
+| total events emitted | 31 | 166 |
+| travel produced / timed truth closes | 1 / 4 | 1 / 11 |
+| travel bias (mean error) | +1.12s | -1.52s |
+
+### What h3 must reach
+
+| | h2 now | h3 ships at |
+|---|---:|---:|
+| ch30 DETECTED | 5/8 | **>= 7/8** |
+| ch27 DETECTED | 8/13 | **>= 11/13** |
+| ch30 PHANTOM | 1 | **0** |
+| ch27 PHANTOM | 41 | **0** |
+
+**ch27's 41 is the number to kill.** 166 emissions against 13 real closes, 41 of them inside windows
+verified to contain no door motion at all. Phantoms landing inside the `[0.5, 30]s` filter reach C27
+as fabricated trips and are indistinguishable downstream from real ones.
+
+Travel is *not* given a detection-style target here because TEST B's criterion is the one in
+`tools/travel_criterion.py` — Pearson r >= +0.70 against hand travel, median |error| <= 0.25s, and
+MAE strictly better than the 2.03s constant predictor — and it is unreachable at present coverage.
+h2 produced **one** travel value per camera against 4 and 11 timed closes, and the two disagree in
+sign (+1.12s, -1.52s). At n=1 a bias figure is not a measurement; coverage has to come first.
+
+### Why the dirty-corpus table below is kept
+
+The delta between the two tables is itself the evidence for why corpus integrity gates everything
+downstream. Same engine, same code, same day — different corpus:
+
+| | ch30 dirty | ch30 clean | ch27 dirty | ch27 clean |
+|---|---:|---:|---:|---:|
+| DETECTED | 9/11 (82%), corrected 9/10 | 5/8 (62.5%) | 4/9 (44%) | 8/13 (61.5%) |
+| PHANTOM | 0, corrected 2 | 1 | 4 | **41** |
+
+The spliced corpus made the two cameras look far apart — one nearly working, one badly broken — when
+on clean data they detect within one percentage point of each other. It reported `PHANTOM 0` on ch30
+for a camera that had phantoms, and it undercounted ch27's phantoms by a factor of ten. Every one of
+those errors flattered the engine. A corpus whose timeline is not verified monotonic does not
+produce noisy scores, it produces *confident wrong* ones.
+
+---
+
+## HISTORICAL — the dirty-corpus baseline (SUPERSEDED, kept as evidence)
+
+**Everything from here through the end of the DOOR SIGNAL v2 section was run on the spliced corpus
+(`ch30_full.mp4` / `ch27_full.mp4`) and is retained for the record only** — the clean-corpus work
+starts at "CLEAN-CORPUS REVALIDATION". Its phantom counts and
+both of its hand-timed travel sets were voided by `9223bbb` / `1719155` when the corpus was replaced;
+its detection row was never re-measured until the clean-corpus run above, which is why it stood
+unchallenged as "h3's acceptance test" longer than it should have. Do not quote any number below as
+a target.
+
 Produced by `tools/doorwatch_replay.py` on dev-box, corpus `stopwatch-2026-08-05`,
 tracker h2 UNMODIFIED. Both videos 704x576 @ ~25fps, ROI scale 1.0 (matches calib
 `frame_wh`). Replayed at `--frame-stride 2` = 12.5fps, which is what production
 actually runs (`DOOR_STRIDE=2`), not 25fps.
 
-## The table (this is h3's acceptance test)
+## The table (was "this is h3's acceptance test" — no longer; see the clean-corpus table above)
 
 | | ch30 | ch27 |
 |---|---:|---:|
