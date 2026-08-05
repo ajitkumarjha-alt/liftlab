@@ -13,16 +13,17 @@ cam,file,start_f,end_f,travel_s,status
 # with a per-row hand-timing error bar). Now: frame-anchored, no error bar. Every tool that read
 # close_end_osd or travel_err_s needs porting before it can consume this file.
 #
-# NOT YET VERIFIABLE ON THIS BOX: ch27_clean.mp4 is not present (only ch27_full.mp4 /
-# ch30_full.mp4 in ~/dwrec/rec, plus ch30_peak.mp4 in the repo root). ch30_peak.mp4 checks out:
-# 27257 frames @ 24.9945fps, 704x576, so all ch30 rows below are in range. The ch27 rows,
-# including the 46263 reference, are unverified until the file lands.
+# BOTH FILES VERIFIED (2026-08-05): ch27_clean.mp4 = 70260 frames @ 24.8910fps, 704x576;
+# ch30_peak.mp4 = 27257 frames @ 24.9945fps, 704x576. All 21 rows below are in range.
 #
-# ONE ROW IS INTERNALLY INCONSISTENT, recorded as given rather than silently corrected:
-# ch27 6332-6385 is 53 frames = 2.12s at 25fps, but travel_s says 2.20 (implies 24.09fps).
-# Every other row matches 25fps exactly. Worth a re-check of that row's endpoints before it is
-# used in a +/-0.4s test.
-ch27,ch27_clean.mp4,6332,6385,2.20,clean
+# travel_s was computed at a nominal 25fps. ch27's true rate is 24.8910, so its travel_s values
+# run ~0.4% short (<=0.03s on the longest row) against a frame-exact reading. The FRAMES are
+# authoritative; the discrepancy is far inside the +/-0.4s criterion and is not corrected here.
+#
+# CORRECTED: ch27 6332-6385 travel_s was 2.20, a transcription error (the endpoint re-check moved
+# start to 6332 but the travel field kept the pre-revision value). 53 frames = 2.12s. No other
+# row adjusted.
+ch27,ch27_clean.mp4,6332,6385,2.12,clean
 ch27,ch27_clean.mp4,8452,8504,2.08,clean
 ch27,ch27_clean.mp4,10555,10595,1.60,clean
 ch27,ch27_clean.mp4,11634,11677,1.72,clean

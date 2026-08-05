@@ -1,4 +1,27 @@
-cam,osd_start,osd_end,note
-ch27,12:05:06,12:06:45,closed and empty; h2 emitted 5 events 1.8-16.6s
-ch30,12:08:20,12:08:40,closed and crowded; h2 emitted 0.56 and 0.72
-ch27,12:13:20,12:13:40,departure sweep after real close; h2 emitted 2.304
+cam,file,start_f,end_f,note
+# CLEAN-CORPUS phantom windows. Frame ranges in ch27_clean.mp4 / ch30_peak.mp4, the same files
+# tools/groundtruth_20260805.csv is anchored to. Any close emission inside one of these is a
+# phantom.
+#
+# SUPERSEDES the dirty-corpus windows previously in this file (OSD-anchored to ch27_full.mp4 /
+# ch30_full.mp4: ch27 12:05:06-12:06:45 and 12:13:20-12:13:40, ch30 12:08:20-12:08:40). Those
+# described a spliced corpus and every phantom count taken on them — including the ch27 PHANTOM 4
+# in the h2 baseline and the corrected ch30 PHANTOM 2 in 3013116 — is void with it.
+#
+# THESE ARE DOOR-STATE WINDOWS, NOT OCCUPANCY-VERIFIED. They are stretches with no door motion,
+# per the motion scan that produced the ground truth. The old windows carried notes like "closed
+# and empty" / "closed and crowded"; these carry no claim about the cabin. An emission inside one
+# is a phantom REGARDLESS of occupancy — a door that is not moving is not closing, whoever is
+# standing in front of it. This matters because the ROI is routinely full of passengers (5e58211),
+# so an occupancy-conditioned window would have excluded exactly the frames where h2 misfires.
+#
+# Coverage: ch27 20500 of 70260 frames (29.2%), ch30 6250 of 27257 (22.9%). No window overlaps
+# any ground-truth close (checked, 0 contradictions) — a "no motion" window containing a close
+# would invalidate both files.
+ch27,ch27_clean.mp4,500,4800,door-closed, no motion
+ch27,ch27_clean.mp4,30000,37400,door-closed, no motion
+ch27,ch27_clean.mp4,56400,59000,door-closed, no motion
+ch27,ch27_clean.mp4,63700,69900,door-closed, no motion
+ch30,ch30_peak.mp4,12400,14900,door-closed, no motion
+ch30,ch30_peak.mp4,22950,25600,door-closed, no motion
+ch30,ch30_peak.mp4,25900,27000,door-closed, no motion
