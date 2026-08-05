@@ -109,12 +109,16 @@ if [ -f "$DB" ]; then
   fi
 fi
 
-GEN=$(litestream generations -config "$CONF" "$DB" 2>/dev/null | awk 'NR==2{print $2}')
-
 # ── publish atomically ───────────────────────────────────────────────────────
 chmod 640 "$TMP"
 mv -f "$TMP" "$DB"
 NOW=$(date +%s)
+
+# AFTER the rename, not before. `litestream generations` resolves the replica via the LOCAL db path
+# in the config, so on a first run — when that path does not exist yet — it fails with "database
+# path or replica URL required" and the field lands null. Harmless, but a null in a state file
+# invites someone to go looking for a fault that is not there.
+GEN=$(litestream generations -config "$CONF" "$DB" 2>/dev/null | awk 'NR==2{print $2}')
 write_state true "" "$NOW" "$DMAX" "$ROWS" "${GEN:--}"
 say "OK: data to $(IST "$DMAX") IST, $ROWS door rows, generation ${GEN:-?}"
 say "  restore point published at $(IST "$NOW") IST"

@@ -138,6 +138,22 @@ _COLS = ("id, requested_from, requested_to, population, status, created_at, star
 # thread takes an exclusive flock and simply does not run if it loses the race.
 _sup_started = False
 _sup_lock = threading.Lock()
+_procs = {}          # job_id -> Popen, so children are reaped rather than left as zombies
+
+
+def _is_dead(pid):
+    """True if the pid is gone OR is a zombie awaiting reaping.
+
+    Reading /proc rather than trusting signal 0: a zombie accepts signals and would otherwise be
+    mistaken for a running export, pinning the queue for everyone behind it."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            # comm can contain spaces and parentheses; state is the field after the last ')'
+            return fh.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
 
 
 def _spawn(job_id):
@@ -196,10 +212,23 @@ def _supervise_once(db):
 
     # 2. reap a job whose process died without recording an outcome (OOM kill, SIGKILL, crash).
     #    Without this the row sits 'running' forever and the queue never moves again.
+    #
+    #    ZOMBIES. os.kill(pid, 0) is NOT a liveness test for our own children. A killed child that
+    #    nobody has wait()ed on stays in the process table as a zombie, keeps its pid, and answers
+    #    signal 0 quite happily — so this check called a dead worker alive and the job sat 'running'
+    #    until the 30-minute timeout. Measured on dev-box 2026-08-05: kill -9 the worker, job stayed
+    #    'running' past 400s. Reap the Popen first (which clears the zombie and yields an exit code),
+    #    and treat state Z as dead for anything we no longer hold a handle to.
+    for jid, proc in list(_procs.items()):
+        rc = proc.poll()
+        if rc is not None:
+            _procs.pop(jid, None)
     for jid, pid, sa in db.execute(
             "SELECT id, pid, started_at FROM report_job WHERE status='running'").fetchall():
         if pid and sa and now - sa > 10:
             try:
+                if _is_dead(pid):
+                    raise ProcessLookupError
                 os.kill(pid, 0)
             except ProcessLookupError:
                 log = REPORTS_DIR / f"job-{jid}.log"
@@ -237,6 +266,7 @@ def _supervise_once(db):
                 return                      # someone else claimed it; nothing to do this tick
             try:
                 proc = _spawn(jid)
+                _procs[jid] = proc          # keep the handle so poll() can reap it
                 db.execute("UPDATE report_job SET pid=? WHERE id=?", (proc.pid, jid))
                 db.commit()
             except Exception as e:
