@@ -1,0 +1,4 @@
+cam,osd_start,osd_end,note
+ch27,12:05:06,12:06:45,closed and empty; h2 emitted 5 events 1.8-16.6s
+ch30,12:08:20,12:08:40,closed and crowded; h2 emitted 0.56 and 0.72
+ch27,12:13:20,12:13:40,departure sweep after real close; h2 emitted 2.304
