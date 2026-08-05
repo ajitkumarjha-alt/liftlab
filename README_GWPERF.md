@@ -585,3 +585,53 @@ restore point than the page claims. The runner holds it for the whole build, so 
 `generation` reads `null` in the state file — the `litestream generations` lookup in the refresh
 script returns nothing on this box (`database path or replica URL required`). It is informational
 only; the restore itself, its verification and the timestamps are all unaffected.
+
+## Acceptance proof on dev-box: 33 passed, 0 failed (2026-08-05)
+
+All seven items, including the five the gateway run never reached and the two that exist only
+because the data source is a restore.
+
+```
+1. ERA-STRADDLING RANGE       4/4  warned pre-submission; COVERAGE & ERAS sheet present
+2. EMPTY RANGE                2/2  no crash; 15 explicit zero-rows statements
+3. REFRESH-vs-EXPORT LOCKING  4/4  refresh blocked; export +240s, refresh +496s
+4. KILL THE WORKER MID-RUN    5/5  failed with a reason; queue still works afterwards
+5. RETENTION SWEEP            6/6  workbook GONE (sudo test -e); 410 explains why
+6. UNAUTHENTICATED ACCESS     5/5  /reports /jobs /download /data-as-of all 401
+7. REFRESH FAILURE SURFACES   7/7  ok=false, real error, previous DB intact, alarm clears
+```
+
+Item 3 was additionally exercised unplanned: the scheduled hourly timer fired mid-run and serialized
+against a running export on its own, which is better evidence than the deliberate race.
+
+Item 7 points the restore at a bucket that does not exist and asserts the box degrades HONESTLY —
+`ok=false` carrying `storage: bucket doesn't exist`, the last good restore point preserved, and the
+previous database intact at 525,473 rows. A failed refresh must become "old but honest data, loudly
+flagged", never a missing file or a silently empty page.
+
+## The bug item 4 found, which the gateway run would never have caught
+
+First run FAILED it: `kill -9` the worker and the job stayed `running` past 400s while the next
+submission queued behind it forever.
+
+`os.kill(pid, 0)` is not a liveness test for your own children. A killed child that nobody
+`wait()`ed on becomes a **zombie** — it keeps its pid and answers signal 0 — so the reaper called a
+dead worker alive. Because the supervisor only spawns when nothing is running, **every queued export
+waited behind a process that no longer existed**, until the 30-minute timeout.
+
+Fixed two ways, both needed:
+* the supervisor keeps each `Popen` and `poll()`s it, which reaps the child and clears the zombie;
+* liveness reads `/proc/<pid>/stat` and treats state `Z` as dead, for handles lost across a restart.
+
+The `/proc` parse splits on the **last** `)` because `comm` can contain spaces and parentheses.
+
+**This bug was equally present on the gateway.** It never surfaced there because that acceptance run
+was stopped after `/ops` degraded — before the kill test. Running the items you did not reach is what
+caught it; the ones that passed did not imply it.
+
+## `pkill -f` self-matching, the sharper version
+
+Third recurrence this week, and the earlier lesson was incomplete. `pkill -f "[p]rove_reports_devbox"`
+still killed its own shell, because the same command line later referenced
+`/tmp/prove_reports_devbox.sh` — the `[p]` bracket only helps when the plain string appears **nowhere
+else in the command**. Split the kill into its own invocation, or match by pid.
