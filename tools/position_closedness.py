@@ -51,10 +51,22 @@ TOP_WH = (TEMPLATE_WH[0], max(8, TEMPLATE_WH[1] // 4))     # (96, 32) — as doo
 # every close is excluded from both references by construction.
 CONF_LO, CONF_HI = 0.15, 0.85
 
-# Running-median reference. Refs are recomputed every REF_STEP frames over a +/-REF_WIN window and
-# linearly interpolated between anchors, so lighting drift across a 47-minute run is tracked without
-# the refs stepping discontinuously mid-close.
+# Running-median reference, two modes.
+#
+#   nearest (default) — the median of the REF_K confident frames NEAREST IN TIME. This is the mode
+#   that works, and the reason is a property of the corpus rather than a tuning preference: the car
+#   changes floor every 20-60s and ch27's lobby changes appearance with it (bright carpet on 43,
+#   dark marble elsewhere, per 63064cb). A reference must therefore track the STOP, not the run.
+#
+#   window — the median over a fixed +/-REF_WIN frame neighbourhood. Kept because the first run of
+#   this tool used it at REF_WIN=3000 (+/-2 min) and that is why ch27 read a close as reaching only
+#   0.64: OPEN_ref was a median blended across several floors, so columns the leaf had already
+#   covered still scored nearer the blend than the leaf. The failure was the window length, not the
+#   method — see README_DOORWATCH. Retained so that claim stays reproducible.
+#
+# Both interpolate linearly between anchors every REF_STEP frames, so refs never step mid-close.
 REF_WIN, REF_STEP, REF_MIN = 3000, 250, 20
+REF_K = 60                # 'nearest' mode: confident frames per reference median
 
 SMOOTH_K = 5              # the ~5-frame kernel the position signal is smoothed with before edge-finding
 
@@ -142,12 +154,13 @@ def confident_masks(state):
     return open_, closed, OP, CL
 
 
-def running_refs(profs, mask, win=REF_WIN, step=REF_STEP, min_n=REF_MIN):
+def running_refs(profs, mask, mode="nearest", win=REF_WIN, step=REF_STEP, min_n=REF_MIN, k=REF_K):
     """Running median of the column profile over frames in `mask`, per column.
 
-    Anchors every `step` samples over a +/-`win` neighbourhood; anchors with fewer than `min_n`
-    contributing frames fall back to the global median over the mask, so a stretch of the run with
-    no confident frames of one class borrows the run-wide reference instead of inventing one.
+    Anchors every `step` samples; anchors with fewer than `min_n` contributing frames fall back to
+    the global median over the mask, so a stretch of the run with no confident frames of one class
+    borrows the run-wide reference instead of inventing one. See the REF_* notes above for why
+    `nearest` is the default.
     """
     n, ncol = profs.shape
     idx = np.flatnonzero(mask)
@@ -157,7 +170,12 @@ def running_refs(profs, mask, win=REF_WIN, step=REF_STEP, min_n=REF_MIN):
     anchors = list(range(0, n, step)) + [n - 1]
     vals, fell_back = [], 0
     for a in anchors:
-        sel = idx[(idx >= a - win) & (idx <= a + win)]
+        if mode == "nearest":
+            j = int(np.searchsorted(idx, a))
+            lo = max(0, min(j - k // 2, len(idx) - k))
+            sel = idx[lo:lo + k]
+        else:
+            sel = idx[(idx >= a - win) & (idx <= a + win)]
         if len(sel) < min_n:
             vals.append(glob)
             fell_back += 1
@@ -184,28 +202,45 @@ def main():
     ap.add_argument("--frame-stride", type=int, default=1)
     ap.add_argument("--limit-frames", type=int, default=None)
     ap.add_argument("--smooth", type=int, default=SMOOTH_K)
+    ap.add_argument("--ref-mode", choices=("nearest", "window"), default="nearest")
+    ap.add_argument("--ref-k", type=int, default=REF_K)
+    ap.add_argument("--ref-win", type=int, default=REF_WIN)
+    ap.add_argument("--cache", default=None,
+                    help=".npz of (frames, profiles, state). Written if absent, reused if present — "
+                         "so a reference change costs seconds instead of a 10-minute re-decode.")
     a = ap.parse_args()
 
     cam = a.cam
     fps = truth_io.CORPUS[cam]["fps"]
     print(f"=== position proxy (column-wise closedness): {cam} ===")
-    frames, crops, profs = scan(cam, a.frame_stride, a.limit_frames)
-    print(f"  decoded {len(frames)} frames (stride {a.frame_stride}), "
-          f"top band y{TOP_BAND_Y[0]}-{TOP_BAND_Y[1]}, {profs.shape[1]} columns")
-
-    tpl, n_tpl = build_top_template(cam, frames, crops)
-    state = ncc_against(crops, tpl)
-    print(f"  ncc_top template from {n_tpl} train-split closed frames")
+    if a.cache and os.path.exists(a.cache):
+        z = np.load(a.cache)
+        frames, profs, state = z["frames"], z["profs"], z["state"]
+        print(f"  reusing cached scan: {len(frames)} frames, {profs.shape[1]} columns "
+              f"({a.cache})")
+    else:
+        frames, crops, profs = scan(cam, a.frame_stride, a.limit_frames)
+        print(f"  decoded {len(frames)} frames (stride {a.frame_stride}), "
+              f"top band y{TOP_BAND_Y[0]}-{TOP_BAND_Y[1]}, {profs.shape[1]} columns")
+        tpl, n_tpl = build_top_template(cam, frames, crops)
+        state = ncc_against(crops, tpl)
+        print(f"  ncc_top template from {n_tpl} train-split closed frames")
+        del crops
+        if a.cache:
+            np.savez(a.cache, frames=frames, profs=profs, state=state)
 
     st_s = smooth_np(state, 3)                      # same 3-kernel door_signal_validate uses
     open_m, closed_m, OP, CL = confident_masks(st_s)
     print(f"  state plateaus: open={OP:.4f} closed={CL:.4f}; "
           f"confident open {int(open_m.sum())} frames, confident closed {int(closed_m.sum())}")
 
-    open_ref, fb_o, na = running_refs(profs, open_m)
-    closed_ref, fb_c, _ = running_refs(profs, closed_m)
+    rk = dict(mode=a.ref_mode, k=a.ref_k, win=a.ref_win)
+    open_ref, fb_o, na = running_refs(profs, open_m, **rk)
+    closed_ref, fb_c, _ = running_refs(profs, closed_m, **rk)
     sep = np.abs(open_ref - closed_ref).mean(axis=0)
-    print(f"  refs: {na} anchors, global fallback on {fb_o} open / {fb_c} closed")
+    print(f"  refs: mode={a.ref_mode} "
+          f"({'k=%d nearest confident frames' % a.ref_k if a.ref_mode == 'nearest' else '+/-%d frames' % a.ref_win})"
+          f", {na} anchors, global fallback on {fb_o} open / {fb_c} closed")
     print(f"  per-column |OPEN_ref - CLOSED_ref|: median {np.median(sep):.2f} gray, "
           f"{int((sep >= 2).sum())}/{len(sep)} columns separated by >=2")
 

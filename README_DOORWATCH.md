@@ -522,3 +522,152 @@ What the next attempt needs, in order:
 
 Not deployed. No acceptance criterion weakened — the criterion is reported as too weak, which is the
 opposite, and the h3 travel path stays blocked on both cameras.
+
+---
+
+## TEST B RETRY — position proxy + repaired criterion: FAIL, and the endpoints say why
+
+Retry with the two things ed42761 said the next attempt needed: a non-saturating position proxy
+(`tools/position_closedness.py`) and an acceptance criterion a constant cannot pass
+(`tools/travel_criterion.py`). Both are here. The proxy is a real improvement on `ncc_top` and it
+still fails TEST B. TEST A is untouched — no state work was done in this run.
+
+### The repaired criterion
+
+The old clause is void: hand travels span 1.56-2.40s with sd 0.28s, so `+/-0.4s` is 1.4x the truth's
+own spread and a constant 2.03s predictor scores 11/13. Replaced by, all three required:
+
+| | clause | why |
+|---|---|---|
+| (a) | Pearson r with hand travels **>= +0.70** | kills anti-correlated families AND the disguised constants — a constant has zero variance, so r is undefined and (a) rejects it |
+| (b) | median absolute error **<= 0.25s** | inside the truth's own sd rather than 1.4x it |
+| (c) | MAE strictly better than the **constant-2.03s** predictor | it must beat the stopped clock it replaces |
+
+### The position proxy, and what it fixes
+
+Same top band as `ncc_top`. Per frame the band is reduced to a column-mean gray profile;
+`OPEN_ref`/`CLOSED_ref` column profiles are running medians over the frames the state signal calls
+confidently open/closed; `position(t)` = fraction of columns nearer `CLOSED_ref` than `OPEN_ref`.
+
+**The band really is swept column by column — this was checked before anything was scored.** Taking
+the local open and closed profiles and computing each column's fractional progress
+`alpha = (p - open)/(closed - open)` mid-close gives a strongly BIMODAL distribution: on ch27 only
+4-13% of columns sit between alpha 0.25 and 0.75 at any instant, while the fraction past 0.75 climbs
+46% -> 62% -> 77% across the close. That is a leaf edge crossing columns, not a band fading
+uniformly. The mechanism the proxy assumes is the mechanism present.
+
+**It removes the saturation that blocked ed42761.** ch30's truth close 20459->20511, which `ncc_top`
+could not detect at all (it had been closed since frame 20420 and never re-armed), is a clean
+full-span traversal here. On ch27 all 11 timed closes produce a full-span traversal (local span
+0.79-0.99). The proxy sees a door move on every close in the corpus; `ncc_top` did not.
+
+**Reference length is a real parameter and the first run got it wrong.** At `+/-3000` frames
+(`--ref-mode window`) ch27's `OPEN_ref` is a median blended across several floors — the car changes
+floor every 20-60s and ch27's lobby flips appearance with it — so columns the leaf had already
+covered still scored nearer the blend, and a close read as reaching only 0.64. The default is now
+`--ref-mode nearest`, the median of the 60 confident frames nearest in time. Both modes are kept and
+both are reported below, because neither rescues the result and the difference is evidence.
+
+### TEST B — FAIL on both cameras, every family, both reference modes
+
+`--ref-mode nearest` (the default; the `window` numbers are in the same table shape and fail too):
+
+| | ch27 n | r | med abs err | MAE | const MAE | bias | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| pos_plateau | 10/11 | -0.426 | 4.33 | 3.56 | 0.24 | +3.40 | **FAIL** |
+| pos_1090 | 10/11 | -0.469 | 2.48 | 2.89 | 0.24 | +2.58 | **FAIL** |
+| pos_foot | 11/11 | +0.290 | 1.52 | 1.37 | 0.23 | -0.92 | **FAIL** |
+| *ncc_level (ed42761's signal, same criterion)* | 11/11 | -0.196 | 1.62 | 2.62 | 0.23 | +2.27 | *FAIL* |
+
+| | ch30 n | r | med abs err | MAE | const MAE | bias | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| pos_plateau | 4/4 | +0.541 | 0.76 | 0.73 | 0.20 | +0.73 | **FAIL** |
+| pos_1090 | 4/4 | +0.157 | 0.36 | 0.33 | 0.20 | +0.33 | **FAIL** |
+| pos_foot | 4/4 | +0.590 | 0.92 | 0.87 | 0.20 | +0.87 | **FAIL** |
+
+Pooled over all 15: best r is `pos_foot` at +0.231. No family passes any of (a), (b), (c) on either
+camera. Under `--ref-mode window` ch27 gets worse (`pos_1090` r = -0.825) and ch30's `pos_1090`
+reaches r +0.869 / med 0.26 / MAE 0.31 — still failing (b) and (c), on n=4.
+
+### Per-close values against hand truth
+
+`d10` = frames from the truth's `start_f` to the proxy's 10%-of-span crossing; `d90` = frames from
+`end_f` to the 90% crossing; `proxy_s` = the traversal the proxy actually measured.
+
+**ch27** — the END endpoint tracks the door, the START does not:
+
+| start_f | end_f | hand_s | d10_f | d90_f | proxy_s |
+|---:|---:|---:|---:|---:|---:|
+| 6332 | 6385 | 2.12 | +30 | +41 | 2.57 |
+| 8452 | 8504 | 2.08 | +52 | +28 | 1.12 |
+| 10555 | 10595 | 1.60 | **-75** | +36 | **6.07** |
+| 11634 | 11677 | 1.72 | +8 | +44 | 3.17 |
+| 16067 | 16127 | 2.40 | +51 | +37 | 1.85 |
+| 17873 | 17912 | 1.56 | **-94** | +55 | **7.55** |
+| 20539 | 20592 | 2.12 | +59 | +99 | 3.74 |
+| 29048 | 29104 | 2.24 | -20 | -12 | 2.57 |
+| 37616 | 37672 | 2.24 | **-93** | +10 | **6.39** |
+| 38288 | 38342 | 2.16 | -5 | +22 | 3.25 |
+| 43149 | 43203 | 2.16 | +40 | +46 | 2.41 |
+| | | | **sd 56.2 f (2.26s)** | **sd 26.5 f (1.07s)** | |
+
+**ch30** — both endpoints move TOGETHER, so the traversal is rigidly displaced, not stretched:
+
+| start_f | end_f | hand_s | d10_f | d90_f | proxy_s |
+|---:|---:|---:|---:|---:|---:|
+| 1538 | 1598 | 2.40 | +7 | +7 | 2.40 |
+| 2354 | 2403 | 1.96 | -14 | +1 | 2.56 |
+| 11066 | 11109 | 1.72 | -52 | -38 | 2.28 |
+| 20459 | 20511 | 2.08 | -98 | -94 | 2.24 |
+
+### What the numbers mean, separated from what they do not
+
+**ch27's failure is the ramp FOOT, and it is not fixable by choosing thresholds.** `d90` has sd 26.5
+frames; `d10` has sd 56.2. On 3 of 11 closes the proxy's foot sits 75-94 frames (3.0-3.8s) before
+the truth's `start_f` and the measured traversal is 6.1-7.6s against a hand travel of 1.56-2.24s. A
+diagnostic that avoids both plateaus entirely — the 25%->75% crossing, reported by
+`travel_criterion.py` as `[diag]iqr` and deliberately excluded from the verdict because it is 0.5x
+the true travel by construction — is r = **-0.315**, 95% CI [-0.77, +0.35]. The CI excludes +0.70.
+So the middle of the ramp does not rank the closes either: this is not endpoint tuning, ch27's
+traversal duration does not carry the hand travel.
+
+**ch30 answers nearly the same number every time.** Its four measured traversals are 2.40 / 2.56 /
+2.28 / 2.24s — sd 0.12s — against hand travels spanning 1.72-2.40s with sd 0.25s. The proxy's spread
+is half the truth's. That is the signature of a near-constant predictor, which is precisely what
+clause (a) exists to catch, and at n=4 clause (a) cannot catch it: r's 95% CI is [-0.90, +0.99].
+**ch30 does not decide TEST B in either direction and should not be quoted as if it did.**
+
+**Two ch30 truth rows are worth re-checking, on independent evidence.** For 11066 and 20459 the
+proxy places the whole close 38-98 frames (1.5-3.9s) earlier than the truth, with both endpoints
+shifted by the same amount — a displaced close, not a mismeasured one. For 20459 this agrees with
+`ncc_top`, which ed42761 recorded as crossing into closed at frame 20420, ~39 frames before the
+truth's `start_f`. Two signals derived differently put that close in the same place, and it is not
+where the truth puts it. Flagged, not resolved — resolving it means re-reading those frames.
+
+### Verdict
+
+**TEST B FAILS. h3 is not built.** The brief's instruction on a fail was to report the per-close
+values and stop, which is what this section is.
+
+What is now established that was not before: the position proxy does ramp, on the mechanism it
+claims (bimodal per-column alpha), and it removes `ncc_top`'s saturation — every timed close in the
+corpus produces a full traversal, including the one `ncc_top` could not detect. So the answer to
+"does the ground-truth method transfer to engine conditions" is **partly**: the column-wise
+measurement transfers, the TIMING of it does not. On ch27 the ramp foot wanders by 2.26s sd, and the
+duration is uncorrelated with the hand travel even measured across the ramp's robust middle.
+
+Two things this run did NOT establish, and neither should be assumed:
+* whether ch30 would pass — n=4 with an r CI of [-0.90, +0.99] cannot answer clause (a), and its
+  measured durations are near-constant.
+* whether the residual disagreement is the signal or the truth. ch30's rigid displacements and the
+  independent `ncc_top` agreement on 20459 point at the truth on at least one row; ch27's wandering
+  foot points at the signal. These are different problems and this corpus cannot separate them.
+
+The corpus limitation ed42761 listed third — "hand travels with real spread" — was **not** addressed
+before this retry and is now the binding one. Eleven ch27 travels between 1.56s and 2.40s make
+clause (c) demand an MAE under 0.23s, which is near the hand timing's own noise floor, and make
+clause (a) depend on ranking differences of a few frames. Deliberately slow or obstructed closes are
+the missing input.
+
+Not deployed. No acceptance criterion weakened — the criterion was tightened as instructed and the
+result got worse, which is the point of tightening it.
