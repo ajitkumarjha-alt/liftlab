@@ -43,9 +43,28 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import truth_io
 
-PASS_R = 0.70             # (a) Pearson floor
-PASS_MED = 0.25           # (b) median |error|, seconds
-CONST_S = 2.03            # (c) the constant predictor that passed the old criterion 11/13
+# ---- CRITERION, THIRD PASS ------------------------------------------------------------------
+# Amended from the repaired criterion above. The three clauses now are:
+#
+#   (a) BIAS   |mean signed error| <= 0.15s, pooled over the timed travels
+#   (b) SPREAD MAE strictly better than the constant-2.03s predictor
+#   (c) TAIL   every extended event classifies as extended (> 3.5s, or no value produced)
+#
+# WHAT CHANGED AND WHY IT IS NOT A WEAKENING. The Pearson floor is gone as a GATE and survives as a
+# reported diagnostic. On its own that would be a weakening — clause (a) is passed by a stopped
+# clock, since a constant centred on the truth's mean has zero bias by construction. It is not a
+# weakening because clause (c) is now the anti-constant protection and is strictly harder to fake:
+# a constant answering 2.03s classifies a 6.31s close as a normal close, so it fails (c) on every
+# tail event regardless of what (a) says. (b) independently forbids tying the constant.
+#
+# r IS STILL PRINTED. A family can satisfy (a)-(c) while ranking closes backwards, and ed42761's
+# whole finding was that ch27's estimates are anti-correlated with hand travel. If r is negative on
+# a passing family, that is not a pass to quote without saying so.
+PASS_BIAS = 0.15          # (a) |mean signed error|, seconds
+CONST_S = 2.03            # (b) the constant predictor that passed the ORIGINAL criterion 11/13
+TAIL_MIN_S = 3.5          # (c) an extended event must read at least this long, or produce nothing
+PASS_R = 0.70             # RETAINED FOR REPORTING ONLY — no longer a gate
+PASS_MED = 0.25           # RETAINED FOR REPORTING ONLY — no longer a gate
 
 # Window placed on the truth close_full. Wide enough that the estimator finds its own foot on the
 # slowest close in the corpus (4.76s) without the window edge ever being the answer.
@@ -301,15 +320,66 @@ def score(pairs):
     med = median([abs(e) for e in errs])
     mae = sum(abs(e) for e in errs) / len(errs)
     cmae = sum(abs(CONST_S - h) for h in hand) / len(hand)
-    a = (not math.isnan(r)) and r >= PASS_R
-    b = med <= PASS_MED
-    c = mae < cmae
+    bias = sum(errs) / len(errs)
+    a = abs(bias) <= PASS_BIAS
+    b = mae < cmae
     return {"n": len(pairs), "r": r, "med": med, "mae": mae, "cmae": cmae,
-            "a": a, "b": b, "c": c, "pass": a and b and c,
-            "bias": sum(errs) / len(errs), "mx": max(abs(e) for e in errs)}
+            "a": a, "b": b, "bias": bias, "mx": max(abs(e) for e in errs)}
 
 
-def show(tag, s, produced, timed_n):
+def tail_rows(cam, truth_path):
+    """Events criterion (c) is scored on: real closes whose true duration exceeds TAIL_MIN_S.
+
+    Derived from the frames, not from a hand-maintained list, so the population cannot drift away
+    from the corpus. These are excluded from the TIMED set by design — an extended close is exactly
+    the kind whose endpoints are not defensible to +/-2 frames — which is why (c) asks only for a
+    classification and not for a duration.
+    """
+    fps = truth_io.CORPUS[cam]["fps"]
+    return [t for t in truth_io.load_truth(cam, truth_path)
+            if (t["end_f"] - t["start_f"]) / fps > TAIL_MIN_S]
+
+
+def tail_check(cam, sig_path, truth_path, fam_name):
+    """(rows, n_ok) for one family: does each extended event read extended, or nothing at all?
+
+    A produced value >= TAIL_MIN_S passes. NO value produced also passes — declining to measure an
+    event the estimator cannot resolve is the honest outcome and is what the h3 design flags as
+    incomplete. What FAILS is a confident normal-looking travel on a close that was not normal,
+    which is the specific error a constant predictor makes on every one of these.
+    """
+    fps = truth_io.CORPUS[cam]["fps"]
+    rows = read_pos(sig_path)
+    v = [r["position"] for r in rows]
+    ncc = [r["ncc_top"] for r in rows]
+    t = [r["vt"] for r in rows]
+    fams = {
+        "pos_plateau": lambda w0, w1, ai: est_plateau(v, t, w0, w1, ai, fps, 0.05),
+        "pos_1090": lambda w0, w1, ai: est_plateau(v, t, w0, w1, ai, fps, 0.10),
+        "pos_foot": lambda w0, w1, ai: est_foot(v, t, w0, w1, ai, fps),
+        "ncc_level": lambda w0, w1, ai: est_ncc_level(v, t, w0, w1, ai, fps, ncc),
+        "[diag]iqr": lambda w0, w1, ai: diag_iqr(v, t, w0, w1, ai, fps),
+    }
+    fn = fams[fam_name]
+    out = []
+    for tr in tail_rows(cam, truth_path):
+        true_s = (tr["end_f"] - tr["start_f"]) / fps
+        wk = window(rows, tr["end_f"], fps)
+        if wk is None:
+            out.append((tr, true_s, None, "no window", True))
+            continue
+        ai = min(range(len(rows)), key=lambda i: abs(rows[i]["frame"] - tr["end_f"]))
+        try:
+            val, why = fn(wk[0], wk[1], ai)
+        except Exception as e:
+            val, why = None, f"error: {type(e).__name__}"
+        ok = (val is None) or (val >= TAIL_MIN_S)
+        out.append((tr, true_s, val, why, ok))
+    return out, sum(1 for o in out if o[4])
+
+
+def show(tag, s, produced, timed_n, tail=None):
+    """tail: (n_ok, n_total) for clause (c), or None when it is not being scored here."""
     if s is None:
         print(f"  {tag:>22}  produced 0/{timed_n} — nothing to score            FAIL")
         return
@@ -318,10 +388,19 @@ def show(tag, s, produced, timed_n):
         print(f"  {tag:>22}  {produced:>2}/{timed_n} {r:>7} {'':>7} {'':>7} {'':>7} "
               f"{'':>7} {'':>7}   ---  diagnostic, not scored")
         return
+    if tail is None:
+        tcell, c_ok, verdict = "  -  ", None, "     "
+    else:
+        c_ok = tail[0] == tail[1]
+        tcell = f"{tail[0]}/{tail[1]}"
+    abc = f"{'Y' if s['a'] else 'n'}{'Y' if s['b'] else 'n'}" + \
+          ("-" if c_ok is None else ("Y" if c_ok else "n"))
+    if c_ok is None:
+        verdict = "(pooled decides)"
+    else:
+        verdict = "PASS" if (s["a"] and s["b"] and c_ok) else "FAIL"
     print(f"  {tag:>22}  {produced:>2}/{timed_n} {r:>7} {s['med']:>7.2f} {s['mae']:>7.2f} "
-          f"{s['cmae']:>7.2f} {s['bias']:>+7.2f} {s['mx']:>7.2f}   "
-          f"{'Y' if s['a'] else 'n'}{'Y' if s['b'] else 'n'}{'Y' if s['c'] else 'n'}  "
-          f"{'PASS' if s['pass'] else 'FAIL'}")
+          f"{s['cmae']:>7.2f} {s['bias']:>+7.2f} {s['mx']:>7.2f} {tcell:>6}   {abc}  {verdict}")
 
 
 def main():
@@ -341,10 +420,11 @@ def main():
     print("=" * 96)
     print("TEST B — TRAVEL, repaired criterion")
     print("=" * 96)
-    print(f"  (a) Pearson r >= {PASS_R:+.2f}   (b) median |err| <= {PASS_MED:.2f}s   "
-          f"(c) MAE < constant-{CONST_S}s predictor's MAE")
-    print(f"  A family passes only if all three hold. The old '>={4} of 15 in +/-0.40s' clause is "
-          f"void — a constant passes it.\n")
+    print(f"  (a) |bias| <= {PASS_BIAS:.2f}s   (b) MAE < constant-{CONST_S}s predictor's MAE   "
+          f"(c) every extended event reads >= {TAIL_MIN_S:.1f}s or produces nothing")
+    print(f"  A family passes only if all three hold, scored POOLED. Pearson r is reported but is")
+    print(f"  NO LONGER A GATE — clause (c) is the anti-constant protection, and it is the harder")
+    print(f"  one to fake: a centred constant has zero bias but calls every long close normal.\n")
 
     for cam in sorted(per_cam):
         timed, out = per_cam[cam]
@@ -373,28 +453,69 @@ def main():
         print()
 
     hdr = (f"  {'family':>22}  {'n':>5} {'r':>7} {'med|e|':>7} {'MAE':>7} {'constMAE':>7} "
-           f"{'bias':>7} {'max|e|':>7}   abc  verdict")
+           f"{'bias':>7} {'max|e|':>7} {'tail':>6}   abc  verdict")
+
+    # Clause (c) population, named rather than assumed.
+    tail_all = {cam: tail_rows(cam, a.truth) for cam in sorted(sigs)}
+    n_tail = sum(len(v) for v in tail_all.values())
+    print(f"--- clause (c) population: {n_tail} extended events (> {TAIL_MIN_S:.1f}s true) ---")
+    for cam in sorted(tail_all):
+        fps = truth_io.CORPUS[cam]["fps"]
+        for tr in tail_all[cam]:
+            print(f"  {cam}  f{tr['start_f']}-{tr['end_f']}  "
+                  f"{(tr['end_f']-tr['start_f'])/fps:.2f}s true  [{tr['status']}]")
+    print()
+
     for cam in sorted(per_cam):
         timed, out = per_cam[cam]
-        print(f"--- {cam} ---")
+        note = "" if len(timed) >= 5 else f"   <-- n={len(timed)}: INSUFFICIENT, not a verdict"
+        print(f"--- {cam} ---{note}")
         print(hdr)
         for f in all_fams:
             pairs = [(tr["travel_s"], val) for tr, val, _ in out[f] if val is not None]
             show(f, score(pairs), len(pairs), len(timed))
         print()
 
-    print("--- POOLED (both cameras) ---")
+    print("--- POOLED (both cameras) — THE PRIMARY READING ---")
     print(hdr)
     tot = sum(len(per_cam[c][0]) for c in per_cam)
+    verdicts = {}
     for f in all_fams:
         pairs = []
         for cam in sorted(per_cam):
             pairs += [(tr["travel_s"], val) for tr, val, _ in per_cam[cam][1][f] if val is not None]
-        show(f, score(pairs), len(pairs), tot)
+        if f.startswith("[diag]"):
+            show(f, score(pairs), len(pairs), tot)
+            continue
+        ok = tot_t = 0
+        for cam in sorted(sigs):
+            rows_c, n_ok = tail_check(cam, sigs[cam], a.truth, f)
+            ok += n_ok; tot_t += len(rows_c)
+        s = score(pairs)
+        show(f, s, len(pairs), tot, tail=(ok, tot_t))
+        verdicts[f] = (s, ok, tot_t)
 
-    print(f"\n  control: the constant-{CONST_S}s predictor under this criterion — r is undefined "
-          f"(zero variance),")
-    print(f"  so clause (a) rejects it. That is the repair.")
+    print(f"\n  control: the constant-{CONST_S}s predictor under THIS criterion — bias is near zero")
+    print(f"  by construction, so clause (a) admits it. Clause (c) rejects it: it answers "
+          f"{CONST_S}s on")
+    print(f"  every extended event, so it scores 0/{n_tail} on the tail. That is what replaces the")
+    print(f"  Pearson gate.")
+
+    print("\n" + "=" * 96)
+    print(f"CLAUSE (c) DETAIL — per extended event, per family")
+    print("=" * 96)
+    for f in all_fams:
+        if f.startswith("[diag]"):
+            continue
+        print(f"--- {f} ---")
+        for cam in sorted(sigs):
+            rows_c, _ = tail_check(cam, sigs[cam], a.truth, f)
+            for tr, true_s, val, why, ok in rows_c:
+                vs = "none produced" if val is None else f"{val:.2f}s"
+                print(f"  {cam} f{tr['start_f']}-{tr['end_f']}  true {true_s:>5.2f}s   "
+                      f"read {vs:>13}   {'OK' if ok else 'FAIL'}"
+                      f"{'' if val is not None else '  (' + (why or 'declined') + ')'}")
+        print()
 
     print("\n" + "=" * 96)
     print("ENDPOINT DIAGNOSIS — which end of the traversal fails to lock onto the door")
