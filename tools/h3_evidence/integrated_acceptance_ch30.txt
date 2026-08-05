@@ -1,0 +1,15 @@
+=== ch30  INTEGRATED  DoorFloorEngine.door_pass  ch30_peak.mp4 ===
+  video 704x576 @ 24.99fps  roi=(2, 2, 335, 446)
+  template 4419213e from ch30_peak.mp4 (36 frames), band y15-85, LOO 0.9775
+  wire door_state values seen: ['None', 'closed', 'closing', 'open']
+  openness range: 0.000..1.000
+  refractory suppressed 0; 0 descents abandoned
+  WIRE VOCAB   OK   (door_event_api accepts {closed,opening,open,closing} or null)
+  NULL TRAVEL  OK   (17 cycles, all close_travel_s must be null)
+  REASON FLAG  OK   not-measured: h3 is a state-only engine; travel is unvalidated (TEST B...
+
+  emitted 17 close events; gradable truth closes: 8
+  DETECTED   8/8
+  MISSED     0
+  PHANTOM    0
+  UNMATCHED  9
