@@ -117,3 +117,37 @@ The heatmap caption now states the attribution rate and says the two charts are 
 cell-for-cell, so a reader does not conclude from dense green against empty blue that the data is
 broken. The corrected reading of those cells is: *the stop happened, at that floor, and the rider
 the counter saw fell outside the window we joined on.*
+
+---
+
+## Discovered while deploying the fix: /dash/{gw}/trends?cam= is broken
+
+Not caused by any change here. Measured on the **unmodified installed version**, after the first
+deploy attempt rolled itself back:
+
+```
+/dash/site-A/trends?cam=ch27  ->  HTTP 500 after 43.2s
+/dash/site-A/trends?cam=ch29  ->  no response at all within 100s
+```
+
+This is the endpoint that feeds the floor heatmap. When it fails the page falls back to
+`DATA.tier2[trCam]` from `/dash/{gw}/data`, so the heatmap silently renders whatever that payload
+holds instead of the range-scoped result the picker asked for — **which compounds the camera bug**:
+a wrong `trCam` plus a failed trends fetch is exactly how a chart ends up showing another lift's
+floors with no visible error.
+
+It needs its own investigation. The likely suspect is `_tier2` on a camera with a large row count —
+ch27 was measured earlier this week at 42.98s for 170,839 all-era rows — but that is a hypothesis,
+not a measurement.
+
+### The gate lesson, again
+
+The first deploy of the camera fix **rolled itself back over this pre-existing failure**. The change
+was good: `/dash`, `/dash/data`, `/reports` and `/ops` were all 200 and the served page already
+carried the fix. My verification asserted `trends?cam=ch27 -> 200`, got `000` (curl's timeout, not an
+app response — the same "000 is refused-or-hung, not a failure" trap already documented in
+`README_GWPERF.md`), and rolled back a working deploy.
+
+**A gate must verify what the change touches.** Asserting an unrelated endpoint that was already
+broken does not make the deploy safer; it makes good changes unshippable and teaches people to
+bypass the gate. The check now reports that endpoint's state in the deploy log without gating on it.
