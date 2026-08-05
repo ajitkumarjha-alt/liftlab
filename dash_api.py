@@ -1793,6 +1793,19 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
     if cam:
         cam_filter = " AND s.camera=?"
         args.append(cam)
+
+    # RANGE FIRST, before anything reads it. This assignment used to sit ~40 lines BELOW the three
+    # queries that bound on it, which is how 23e56aa shipped an UnboundLocalError on t0 that fired
+    # on EVERY call — cache or live, camera or fleet. Pushing the predicates into SQL moved the
+    # first USE of t0 above its definition and nothing caught it, because the equivalence harness
+    # called _tier2/_aggregate_read directly and never executed this function.
+    #
+    # Both branches below therefore share one definition: there is no path through dash_trends on
+    # which t0/t1/range_label are undefined. Door cycles carry a local ISO timestamp and transits an
+    # epoch, so both are normalised to epoch before comparing — mixing the two representations is
+    # how a range quietly drops one series and not the other.
+    t0, t1, range_label = _range_bounds(period, from_d, to_d)
+
     # BOUND IN SQL, not in Python. These three loads previously fetched FULL HISTORY and were
     # filtered afterwards with _in_range — the same unbounded-work shape that made /dash never
     # terminate. The rows must never be fetched.
@@ -1840,10 +1853,6 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                       "FROM validation_item WHERE gateway_id=? AND counting_version IS NOT NULL"
                       + (" AND cam=?" if cam else "") + " GROUP BY counting_version ORDER BY MIN(ts_start)",
                   ([gw, cam] if cam else [gw]))
-    # RANGE FILTER. Door cycles carry a local ISO timestamp and transits an epoch, so both are
-    # normalised to epoch before comparing — mixing the two representations is how a range quietly
-    # drops one series and not the other.
-    t0, t1, range_label = _range_bounds(period, from_d, to_d)
     # Range-scoped Tier-2 for the heatmap: the join side reuses the transit rows already loaded
     # above (same cam, same table) instead of re-querying the fleet. Without this the heatmap kept
     # drawing all-history from /data while every other panel obeyed the picker.
