@@ -701,3 +701,36 @@ not a finding.
 
 Until it is precomputed or bounded like `/dash/{gw}/data`, this endpoint should be treated as a known
 hazard on a 2-vCPU box.
+
+## trends cache path — built, NOT proven (2026-08-05)
+
+Cache path, provenance fields and SQL bounds are committed (`daf0d01`) and **not deployed**. The win
+is real: the stored aggregate for ch27 records `compute_ms = 621,058`; `_aggregate_read` is one
+indexed row read.
+
+**The equivalence proof does not pass, and the residual is not what I first guessed.**
+
+A stored aggregate can never be byte-reproduced later — `aggregate_refresh` uses `_window(7)` which
+returns `(t0, None)`, an OPEN upper bound, so any re-run sees rows that arrived since. Closing the
+bound at `computed_at` still leaves **67 of 865 fields differing by ~0.4%**:
+
+```
+confident_reads              cached 47357   repro 47171
+join_diagnostics.n_transits_in_era  3029          3016
+off_alphabet_rejected               30283         30199
+per_floor[0].alighted                 319           317
+eras[0].rows                       179473        180281
+```
+
+I initially suggested most of this was `_era_census` metadata being miscounted. **That is wrong** —
+only the `eras[].*` fields are census metadata (all-era by design, so their growth is expected).
+`confident_reads`, `join_diagnostics.*`, `per_floor[*]` and `off_alphabet_rejected` are genuine data
+fields and they genuinely differ. Reclassifying the census closes two or three fields, not sixty-seven.
+
+Note the direction is inconsistent: the cache has MORE confident_reads and transits but FEWER
+`eras[0].rows` than the repro. A single "rows arrived since" story does not explain both signs, which
+is precisely why this is not being waved through.
+
+**Do not deploy the cache path until that 0.4% is explained.** A dashboard rendering numbers that
+differ from a fresh derivation, for reasons nobody can state, is the failure mode this project keeps
+paying for.
