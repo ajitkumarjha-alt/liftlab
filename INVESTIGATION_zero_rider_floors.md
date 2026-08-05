@@ -151,3 +151,39 @@ app response — the same "000 is refused-or-hung, not a failure" trap already d
 **A gate must verify what the change touches.** Asserting an unrelated endpoint that was already
 broken does not make the deploy safer; it makes good changes unshippable and teaches people to
 bypass the gate. The check now reports that endpoint's state in the deploy log without gating on it.
+
+
+---
+
+## Second attempt at the offset distribution — ALSO discarded (2026-08-05)
+
+Recorded because two failures of the same shape is a finding about method, not luck.
+
+The task-1 fix made this cheap (the stop loop went 83s -> 0.11s), so the distribution was
+recomputed. It produced **89,226 stops** for ch29 against the **3,016** an earlier run of the same
+logic produced. Cause, confirmed by running both variants side by side:
+
+```
+with  'if st: prev = st'  ->  3,832 open-transitions   (matches the dashboard)
+WITHOUT it                -> 96,185 open-transitions   (the broken run)
+```
+
+One dropped line — the state-tracking assignment at the bottom of the loop — turns every open-state
+ROW into a door-open TRANSITION. The offsets computed on top of that (median -14.6s, "69% before
+open", "±15s would recover 44%") are **not evidence and must not be quoted**.
+
+### Stop hand-rolling `_tier2`
+
+Two independent re-implementations, two different wrong denominators, each superficially plausible
+and each caught only because the stop count was compared against a known-good figure. The loop
+carries state across iterations (`prev`, `last_conf`, the alphabet, the attribution window) and every
+one of those is easy to drop.
+
+**The offset distribution should be measured by instrumenting the real code path, not by copying it**
+— have `_tier2` emit its `stops` list (it already builds exactly this) and compute offsets from that.
+Then the denominator is the dashboard's by construction and cannot silently disagree.
+
+Until that exists, the only defensible statements about these floors remain the ones in the sections
+above: the doors genuinely opened, the floor came from a read inside the cycle, and widening the
+window to ±60s recovers riders at 51, 42 and 56. **The shape of the offset distribution is still
+unknown, so the shape of the fix is still undecided.**
