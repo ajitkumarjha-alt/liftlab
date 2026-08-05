@@ -1303,6 +1303,8 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
     if not rows:
         return None
 
+    n_rows = len(rows)          # hoisted: the stop loop below indexes to the end of this list
+
     # Per-reason census FIRST. If the quality filter matches nothing, this is what tells you it was
     # the FILTER and not the camera — the failure mode that would otherwise look like an empty panel.
     census = {}
@@ -1393,12 +1395,19 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
             end_ts = None
             floor_src = r if (r["floor"] is not None and r["reason"] in DOOR_OK_REASONS
                               and (alphabet is None or str(r["floor"]) in alphabet)) else None
-            # islice, NOT rows[idx+1:]. The slice copied the whole remaining list on EVERY
-            # door-open transition, and the loop below breaks after a handful of rows, so the copy
-            # was pure waste — linear work, quadratic allocation. Measured cost of leaving it in:
-            # ch27's precompute took 303s for 145,828 rows while ch29 took 33s for 78,580 — 1.9x the
-            # rows, 9.2x the time. Same rows, same order, same breaks; no copy.
-            for nxt in itertools.islice(rows, idx + 1, None):
+            # INDEX, not islice, and not rows[idx+1:]. All three visit the same handful of rows —
+            # the loop breaks within ~6 on average — but only indexing STARTS there.
+            #   rows[idx+1:]                copies the tail       O(n) time + O(n) memory
+            #   islice(rows, idx+1, None)   SEEKS by discarding   O(n) time, no memory
+            #   range(idx+1, len(rows))     starts at idx+1       O(1) to begin
+            # islice on a list does not seek: it iterates from the front throwing away idx items, so
+            # replacing the slice with it removed the allocation and kept the quadratic term. That is
+            # why the earlier "islice fixes it" prediction failed — 303s became ~96s, not fast.
+            # Measured on the live snapshot, ch27 158,710 rows / 25,214 transitions:
+            #   islice 82.89s   index 0.11s   -> 745x, byte-identical result (ch29: 13.18s -> 0.07s)
+            # THIS is what made /dash/{gw}/trends?cam= take 43s and then time out entirely.
+            for j in range(idx + 1, n_rows):
+                nxt = rows[j]
                 if (nxt["ts"] or 0) - (r["ts"] or 0) > DOOR_OPEN_MAX_S:
                     break
                 # A confident read from INSIDE the cycle is the best floor evidence: the car is
