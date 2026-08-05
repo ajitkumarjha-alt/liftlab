@@ -106,6 +106,11 @@ def fetch_registry():
             lv = c.get("door_levels") or {}
             out[cam] = {"enabled": bool(c.get("enabled")), "stride": int(c.get("stride") or 2),
                         "analyze_fps": float(c.get("analyze_fps") or 0),
+                        # Which door engine this camera runs. The rollout is per camera and lives in
+                        # the REGISTRY, never in a deploy script — that is what lets ch27/ch30 move
+                        # to h3 while ch16/29/32/34/37 stay on h2 without a code change, and what
+                        # lets the next camera join by editing data. Absent/unknown -> h2.
+                        "door_tracker": str(c.get("door_tracker") or "h2").strip().lower(),
                         # per-camera DoorTracker levels (close_th recalibration). Values only; the
                         # worker validates ranges — the registry already did on the way in.
                         "door_levels": {k: float(v) for k, v in sorted(lv.items())
@@ -120,7 +125,12 @@ def fetch_registry():
 
 def start(cam, cfg):
     env = dict(os.environ, CAM=cam, GW=GW,
-               DOOR_STRIDE=str(cfg["stride"]), PYTHONUNBUFFERED="1")
+               DOOR_STRIDE=str(cfg["stride"]), PYTHONUNBUFFERED="1",
+               # SET EXPLICITLY ON EVERY WORKER, never left to inherit. If this were only set for h3
+               # cameras, a fleet process started with DOOR_TRACKER=h3 in its own environment would
+               # hand h3 to every camera it spawned — including the five with no template, which
+               # would then fall back to h2 and LOOK fine while the registry said otherwise.
+               DOOR_TRACKER=str(cfg.get("door_tracker") or "h2"))
     # Geometry from the registry. Env names are gpu_analyze's own, and an ABSENT key is unset rather
     # than blank: gpu_analyze treats "" as "not configured" and falls back, whereas a stale value
     # inherited from the fleet's environment would silently configure this camera from another
@@ -169,6 +179,8 @@ def start(cam, cfg):
     zones = ("registry" if (geom.get("zone_landing") and geom.get("zone_cabin"))
              else ("builtin-ch29" if cam == "ch29" else "NONE — counting OFF (save zones into roi.json)"))
     lv = cfg.get("door_levels") or {}
+    log(f"{cam}: door_tracker={cfg.get('door_tracker', 'h2')} (registry) — the worker logs which "
+        f"engine it actually resolved, including any fallback to h2")
     log(f"{cam}: started pid={p.pid} stride={cfg['stride']} analyze_fps={cfg['analyze_fps']} "
         f"door={'ON' if env.get('GPU_DOOR') == '1' else 'off (geometry incomplete — draw it at /calib-roi)'} "
         f"zones={zones}"

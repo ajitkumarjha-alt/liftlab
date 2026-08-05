@@ -136,8 +136,7 @@ def replay_h3(cam, video, roi, skip_before, stride):
             "openness_min": round(float(state.min()), 3),
             "openness_max": round(float(state.max()), 3),
             "openness_span": round(float(state.max() - state.min()), 3),
-            "n_template": len(tidx), "suppressed": tr.suppressed,
-            "occluded": sum(1 for e in events if e["raw"].get("occluded"))}
+            "n_template": len(tidx), "suppressed": tr.suppressed, "abandoned": tr.abandoned}
     return events, diag
 
 
@@ -263,7 +262,7 @@ def main():
     if a.tracker == "h3":
         print(f"  state template from {diag['n_template']} train-split closed frames; "
               f"refractory suppressed {diag['suppressed']} emissions; "
-              f"{diag['occluded']} cycles flagged occluded")
+              f"{diag['abandoned']} descents abandoned over max_descent_s")
         # Phantoms scored on the UNSEEN portion of the windows as well as on all of them: the
         # template is built from the first 40% of each window, so the full-window count is partly
         # self-confirming. The test-split count is the honest one.
@@ -289,9 +288,8 @@ def main():
             es = f"{e['close_travel_s']:.2f}" if e["close_travel_s"] is not None else "-"
             er = (f"{e['close_travel_s'] - t['travel_s']:+.2f}"
                   if (t["travel_s"] is not None and e["close_travel_s"] is not None) else "-")
-            occ = "  OCCLUDED" if e.get("raw", {}).get("occluded") else ""
             print(f"  {t['end_f']:>11} {e['close_f']:>9} {d:>6.1f} {hs:>7} {es:>9} {er:>7}  "
-                  f"{t['status']}{occ}")
+                  f"{t['status']}")
         errs = [e["close_travel_s"] - t["travel_s"] for e, t, _ in m
                 if t["travel_s"] is not None and e["close_travel_s"] is not None]
         if errs:

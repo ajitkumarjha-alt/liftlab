@@ -126,6 +126,10 @@ def _db():
         db.execute("ALTER TABLE camera_registry ADD COLUMN floor_range TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass                                      # already there
+    try:                                          # migration: per-camera door engine (2026-08-05)
+        db.execute("ALTER TABLE camera_registry ADD COLUMN door_tracker TEXT DEFAULT 'h2'")
+    except sqlite3.OperationalError:
+        pass                                      # already there
     return db
 
 
@@ -203,8 +207,8 @@ def _safe(*p):
 
 def _rows(db, gw):
     return [dict(r) for r in db.execute(
-        "SELECT cam, enabled, stride, analyze_fps, note, updated_at, door_levels, floor_range "
-        "FROM camera_registry WHERE gateway_id=? ORDER BY cam", (gw,)).fetchall()]
+        "SELECT cam, enabled, stride, analyze_fps, note, updated_at, door_levels, floor_range, "
+        "door_tracker FROM camera_registry WHERE gateway_id=? ORDER BY cam", (gw,)).fetchall()]
 
 
 def _payload(rows, gw):
@@ -219,14 +223,18 @@ def _payload(rows, gw):
             levels = {}
         c = {"cam": r["cam"], "enabled": bool(r["enabled"]), "stride": int(r["stride"] or 2),
              "analyze_fps": float(r["analyze_fps"] or 0), "door_levels": levels,
-             "floor_range": (r.get("floor_range") or "")}
+             "floor_range": (r.get("floor_range") or ""),
+             "door_tracker": (r.get("door_tracker") or "h2")}
         c["geometry"] = _geometry(gw, r["cam"])
         cams.append(c)
     # door_levels is in the hash: a level change must restart that worker (env is read at import),
     # and the worker's fresh door_version era-splits the data from the moment it lands.
+    # door_tracker is in the hash for the same reason and more strongly — it does not adjust the
+    # instrument, it REPLACES it. Switching a camera between h2 and h3 must restart that worker and
+    # must era-split its data, or the pool silently mixes two engines' cycles.
     h = hashlib.sha256(json.dumps(sorted(
         (c["cam"], c["enabled"], c["stride"], c["analyze_fps"],
-         json.dumps(c["door_levels"], sort_keys=True),
+         json.dumps(c["door_levels"], sort_keys=True), c["door_tracker"],
          json.dumps(c["geometry"], sort_keys=True)) for c in cams)).encode()).hexdigest()[:12]
     return cams, h
 
@@ -250,8 +258,8 @@ async def cameras_set(gw: str, cam: str, request: Request):
     _safe(gw, cam)
     d = await request.json()
     db = _db()
-    cur = db.execute("SELECT enabled, stride, analyze_fps, door_levels, floor_range FROM camera_registry "
-                     "WHERE gateway_id=? AND cam=?", (gw, cam)).fetchone()
+    cur = db.execute("SELECT enabled, stride, analyze_fps, door_levels, floor_range, door_tracker "
+                     "FROM camera_registry WHERE gateway_id=? AND cam=?", (gw, cam)).fetchone()
     enabled = bool(d.get("enabled", cur["enabled"] if cur else False))
     stride = int(d.get("stride", (cur["stride"] if cur else 2) or 2))
     afps = float(d.get("analyze_fps", (cur["analyze_fps"] if cur else 0) or 0))
@@ -266,6 +274,17 @@ async def cameras_set(gw: str, cam: str, request: Request):
         floor_range = _parse_floor_range(d["floor_range"])
     else:
         floor_range = (cur["floor_range"] if cur else "") or ""
+    # door_tracker: which door ENGINE this camera runs. Absent = keep stored. The rollout is
+    # per-camera data, so a new camera joins h3 by a POST here rather than by a code change — but
+    # the gateway still refuses to run h3 without a template that loads and verifies, and falls
+    # back to h2 loudly if one is missing. Setting this to h3 is a REQUEST, not a guarantee.
+    if "door_tracker" in d:
+        door_tracker = str(d.get("door_tracker") or "h2").strip().lower()
+        if door_tracker not in ("h2", "h3"):
+            db.close()
+            raise HTTPException(400, "door_tracker must be 'h2' or 'h3'")
+    else:
+        door_tracker = ((cur["door_tracker"] if cur else "") or "h2")
     if not (1 <= stride <= 25):
         db.close()
         raise HTTPException(400, "stride must be 1..25 (frames between door-pass reads)")
@@ -282,13 +301,13 @@ async def cameras_set(gw: str, cam: str, request: Request):
             raise HTTPException(409, f"{n} cameras already enabled (max {MAX_ENABLED} for this GPU) — "
                                      f"disable one first, or raise FLEET_MAX_ENABLED if the box grew")
     db.execute("INSERT INTO camera_registry (gateway_id,cam,enabled,stride,analyze_fps,note,updated_at,"
-               "door_levels,floor_range) "
-               "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(gateway_id,cam) DO UPDATE SET "
+               "door_levels,floor_range,door_tracker) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(gateway_id,cam) DO UPDATE SET "
                "enabled=excluded.enabled, stride=excluded.stride, analyze_fps=excluded.analyze_fps, "
                "note=excluded.note, updated_at=excluded.updated_at, door_levels=excluded.door_levels, "
-               "floor_range=excluded.floor_range",
+               "floor_range=excluded.floor_range, door_tracker=excluded.door_tracker",
                (gw, cam, 1 if enabled else 0, stride, afps, str(d.get("note", ""))[:200], time.time(),
-                levels_json, floor_range))
+                levels_json, floor_range, door_tracker))
     db.commit()
     rows = _rows(db, gw)
     db.close()

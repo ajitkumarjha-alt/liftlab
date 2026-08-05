@@ -19,6 +19,7 @@ tests without OpenCV.
 """
 from __future__ import annotations
 
+import json
 from collections import deque
 
 import numpy as np
@@ -222,9 +223,65 @@ class DoorTracker:
         return cyc
 
 
-# Tracker LOGIC revision for the STATE-ONLY engine. NOT the default: TRACKER_LOGIC above still reads
-# "h2" and nothing in the worker selects this yet. Selecting it is a deploy decision, taken elsewhere.
+# Tracker LOGIC revision for the STATE-ONLY engine. NOT the module default: TRACKER_LOGIC above
+# still reads "h2". h3 is selected PER CAMERA at runtime (DOOR_TRACKER env, from the registry), and
+# door_version stamps whichever one actually ran — see gpu_analyze.build_door_engine.
 TRACKER_LOGIC_H3 = "h3-state"
+
+# h3 emits states h2 never had. The cloud ingest whitelists {closed,opening,open,closing} and 400s
+# anything else (door_event_api.DOOR_STATES), and dash's cycle funnel walks those same four. So the
+# engine's own vocabulary is mapped to the wire vocabulary at the emission boundary rather than
+# widening the wire — no VM deploy is needed to ship h3, and the funnel keeps working.
+#
+# The residual, which is real: h3 has NO 'opening' state (it goes closed -> open directly), so for
+# an h3 camera the funnel's closed->opening and opening->open counts are structurally zero. That is
+# a property of the engine, not a fault, and door_version is what tells the two apart.
+H3_STATE_TO_WIRE = {"closed": "closed", "open": "open", "descending": "closing", "unknown": None}
+
+
+def load_state_template(path):
+    """Load a per-camera closed-door state template artefact. -> (template ndarray, meta dict).
+
+    Raises ValueError with a reason on anything wrong. The caller's contract is that a bad template
+    means THAT CAMERA RUNS h2 — never that it runs h3 against a template it could not verify.
+    """
+    import base64
+    import hashlib
+    import cv2
+    with open(path) as fh:
+        meta = json.load(fh)
+    for k in ("cam", "band_y", "template_wh", "md5", "png_b64", "tracker"):
+        if k not in meta:
+            raise ValueError(f"missing key {k!r}")
+    if meta.get("tracker") != TRACKER_LOGIC_H3:
+        raise ValueError(f"template is for tracker {meta.get('tracker')!r}, not {TRACKER_LOGIC_H3!r}")
+    png = base64.b64decode(meta["png_b64"])
+    got = hashlib.md5(png).hexdigest()
+    if got != meta["md5"]:
+        raise ValueError(f"md5 mismatch: artefact says {meta['md5']}, pixels hash {got}")
+    tpl = cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if tpl is None:
+        raise ValueError("PNG decode failed")
+    wh = tuple(meta["template_wh"])
+    if (tpl.shape[1], tpl.shape[0]) != wh:
+        raise ValueError(f"template is {tpl.shape[1]}x{tpl.shape[0]}, artefact says {wh[0]}x{wh[1]}")
+    return tpl, meta
+
+
+def state_closedness(gray, band_y, roi_x_w, tpl):
+    """NCC of this frame's state band against the closed template. High = closed.
+
+    Identical construction to the offline harness — one function, so the graded engine and the
+    deployed engine cannot drift apart in how they compute the signal they are graded on.
+    """
+    import cv2
+    y0, y1 = band_y
+    x, w = roi_x_w
+    band = gray[y0:y1, x:x + w]
+    if band.size == 0:
+        return None
+    crop_r = cv2.resize(band, (tpl.shape[1], tpl.shape[0]))
+    return ncc(crop_r, tpl)
 
 
 class DoorTrackerH3:
@@ -255,39 +312,39 @@ class DoorTrackerH3:
         opened cannot close, and h2's state machine could re-enter 'closing' from a dead band;
       * hysteresis with a dead band between the plateaus, so noise in the middle advances nothing.
 
-    OCCLUSION is reported, not silently absorbed, and it is measured as REVERSALS rather than as
-    time in the dead band. Every descent spends nearly all its frames in the dead band — that is
-    what a ramp is — so dead-band time flags clean closes and is useless as a signal. What an
-    occlusion actually looks like is the closedness falling back from its running maximum while the
-    leaf keeps shutting: someone stepped through the band. A descent with too many such reversals,
-    or one that takes longer than `max_descent_s`, is emitted with `occluded=True`: the cycle
-    happened, but the engine is telling the consumer it could not see it cleanly.
+    THERE IS NO OCCLUSION FLAG, DELIBERATELY. One was built and removed. It measured reversals — the
+    closedness falling back from its running maximum, as if someone stepped through the band — and on
+    the only labelled evidence available it fired on nothing it should have: 0 of 17 cycles on ch30
+    including the 4.60s complex close, and 5 of 54 on ch27 of which NOT ONE was a matched cycle,
+    while both hand-labelled extended closes (f21317 4.76s, f46263 6.28s) came back unflagged. A
+    field that misses every event it exists to catch is worse than no field, because a consumer will
+    reasonably believe it. This engine emits facts or nothing. The removal is recorded in git; if a
+    corpus with hand-labelled occlusions ever exists, a detector can be built and VALIDATED against
+    it, and this is where it goes.
+
+    `descent_s` IS still emitted, as a measured fact rather than a judgement: it is the observed
+    open->closed wall time, and it is NOT a travel measurement — it is the state machine's own
+    transit, bounded by the debounce and the sampling cadence. Do not feed it to compliance.
     """
 
     def __init__(self, open_th=0.15, closed_th=0.85, ref_window=600, min_span=0.08,
-                 close_debounce_s=0.32, refractory_s=6.0, max_descent_s=12.0,
-                 reversal_drop=0.25, reversal_frac=0.15, min_open_s=0.4):
+                 close_debounce_s=0.32, refractory_s=6.0, max_descent_s=12.0, min_open_s=0.4):
         self.open_th = open_th                  # normalised closedness at/below this = confidently open
         self.closed_th = closed_th              # at/above this = confidently closed
         self.min_span = min_span                # raw p10..p90 span below this = signal not trustworthy
         self.close_debounce_s = close_debounce_s   # closed plateau must hold this long to emit
         self.refractory_s = refractory_s        # no second emission within this of the last one
-        self.max_descent_s = max_descent_s      # longer than this open->closed = flag occluded
-        self.reversal_drop = reversal_drop      # fall from the descent's running max that counts as a reversal
-        self.reversal_frac = reversal_frac      # reversal frames / descent frames above this = occluded
+        self.max_descent_s = max_descent_s      # descents longer than this are abandoned, not flagged
         self.min_open_s = min_open_s            # the open plateau must hold this long to arm a close
         self._vals = deque(maxlen=ref_window)
         self.state = "unknown"                  # unknown | open | descending | closed
         self._open_since = None
         self._desc_from = None
-        self._runmax = 0.0
-        self._reversals = 0
-        self._dead = 0
-        self._nframes = 0
         self._closed_since = None
         self._last_emit_t = None
         self.cycles = []
         self.suppressed = 0                     # emissions withheld by the refractory — counted, not hidden
+        self.abandoned = 0                      # descents dropped for exceeding max_descent_s
 
     def _levels(self):
         if len(self._vals) < 40:
@@ -328,17 +385,18 @@ class DoorTrackerH3:
             if c < self.closed_th:
                 self.state = "descending"
                 self._desc_from = t
-                self._dead, self._nframes = 1, 1
-                self._runmax, self._reversals = c, 0
             return None
 
         if self.state == "descending":
-            self._nframes += 1
-            if c < self._runmax - self.reversal_drop:
-                self._reversals += 1               # fell back while the leaf should be shutting
-            self._runmax = max(self._runmax, c)
             if c < self.closed_th:
-                self._dead += 1
+                if (t - self._desc_from) > self.max_descent_s:
+                    # A descent this long did not observe one close: the signal drifted, or the door
+                    # sat part-open. Abandon rather than emit a cycle whose start is unknown — the
+                    # same discipline h2 applies on a time gap.
+                    self.state = "unknown"
+                    self._desc_from = None
+                    self._open_since = None
+                    self.abandoned += 1
                 return None
             if self._closed_since is None:
                 self._closed_since = t
@@ -353,10 +411,6 @@ class DoorTrackerH3:
 
     def _emit(self, t):
         desc_s = t - self._desc_from if self._desc_from else None
-        dead_frac = (self._dead / self._nframes) if self._nframes else 1.0
-        rev_frac = (self._reversals / self._nframes) if self._nframes else 0.0
-        occluded = bool((desc_s is not None and desc_s > self.max_descent_s)
-                        or rev_frac > self.reversal_frac)
         self.state = "closed"
         self._closed_since = None
         self._desc_from = None
@@ -376,10 +430,8 @@ class DoorTrackerH3:
             "close_travel_s": None,
             "close_quality": ("not-measured: h3 is a state-only engine; travel is unvalidated "
                               "(TEST B failed three passes) and is sampled by hand weekly instead"),
-            "occluded": occluded,
+            # Observed state-machine transit, NOT a travel measurement. See the class docstring.
             "descent_s": None if desc_s is None else round(desc_s, 3),
-            "dead_band_frac": round(dead_frac, 3),
-            "reversal_frac": round(rev_frac, 3),
             "tracker": TRACKER_LOGIC_H3,
         }
         self.cycles.append(cyc)
@@ -959,10 +1011,28 @@ class DoorFloorEngine:
     def __init__(self, templates, door_roi, panels, min_score=0.55, blank_range=40,
                  door_tracker=None, floor_tracker=None, shift_search=2, margin_min=0.05,
                  blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90,
-                 blank_lit_margin=0.15, confuse_band=0.0, disc_min=0.10, valid_floors=None):
+                 blank_lit_margin=0.15, confuse_band=0.0, disc_min=0.10, valid_floors=None,
+                 state_tpl=None, state_meta=None):
         if not panels:
             raise ValueError("DoorFloorEngine needs at least one panel (panel_roi, digit_cells, arrow_cell)")
         self.door_roi = tuple(door_roi)
+        # h3 state template. Present -> door_pass runs the NCC path and `door_tracker` must be a
+        # DoorTrackerH3. Absent -> the edge-column path, unchanged. The band and the ROI x-slice come
+        # from the ARTEFACT, not from a module constant, so the geometry travels with the pixels it
+        # describes and a template can never be applied to a band it was not cut from.
+        self.state_tpl = state_tpl
+        self.state_meta = state_meta or {}
+        if state_tpl is not None:
+            if not isinstance(door_tracker, DoorTrackerH3):
+                raise ValueError("a state template requires an explicit DoorTrackerH3 door_tracker; "
+                                 f"got {type(door_tracker).__name__}")
+            for k in ("band_y", "roi_x_w"):
+                if k not in self.state_meta:
+                    raise ValueError(f"state template meta missing {k!r}")
+            self.state_band_y = tuple(self.state_meta["band_y"])
+            self.state_roi_x_w = tuple(self.state_meta["roi_x_w"])
+        else:
+            self.state_band_y = self.state_roi_x_w = None
         self.valid_floors = set(valid_floors) if valid_floors else None
         self.readers = [(tuple(proi), FloorReader(templates, dcells, acell, min_score=min_score,
                                                   blank_range=blank_range, shift_search=shift_search,
@@ -976,12 +1046,37 @@ class DoorFloorEngine:
         self.floor = floor_tracker if floor_tracker is not None else FloorTracker()
         self.hash = templates_hash(templates)
 
-    def process(self, frame_bgr, t):
-        import cv2
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if frame_bgr.ndim == 3 else frame_bgr
+    def door_pass(self, gray, t):
+        """THE DOOR HALF, isolated. -> (cycle, door_state_wire, openness, edge_strength).
+
+        Both engines run through here and nothing else calls the trackers, so the offline acceptance
+        harness can drive the SAME code the worker runs instead of importing a tracker and
+        re-implementing the plumbing around it. That re-implementation is precisely how a graded
+        engine and a deployed engine come to differ.
+
+        h2 reads an edge column; h3 reads NCC against a closed template. `openness` is reported by
+        both but is not the same instrument: h2's is the normalised edge column (which 5e58211 showed
+        agrees with the physical door only ~65% of the time), h3's is 1 - normalised closedness off
+        the NCC state signal that TEST A validated at AUC 1.000/0.958. It is an exact algebraic
+        restatement of what h3 measures, not an inference — and door_version says which instrument
+        produced any given row.
+        """
+        if self.state_tpl is not None:
+            v = state_closedness(gray, self.state_band_y, self.state_roi_x_w, self.state_tpl)
+            cycle = self.door.update(t, v)
+            c = self.door.closedness(v) if v is not None else None
+            openness = None if c is None else (1.0 - c)
+            strength = 0.0 if v is None else float(v)
+            return cycle, H3_STATE_TO_WIRE.get(self.door.state), openness, strength
         col, strength = door_edge_column(crop(gray, self.door_roi))
         cycle = self.door.update(t, col, strength)          # completed door cycle (close_travel) or None
         openness = self.door.openness(col) if col is not None else None
+        return cycle, self.door.state, openness, strength
+
+    def process(self, frame_bgr, t):
+        import cv2
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if frame_bgr.ndim == 3 else frame_bgr
+        cycle, door_state_wire, openness, strength = self.door_pass(gray, t)
         reads = [rdr.read_panel(crop(gray, proi)) for proi, rdr in self.readers]
         oks = [r for r in reads if r["status"] == "ok"]
         ambigs = [r for r in reads if r["status"] == "ambiguous"]
@@ -1016,7 +1111,7 @@ class DoorFloorEngine:
         # direction field is suppressed above, and this column is what lets a consumer tell
         # "this lift went down" from "this camera can only say down".
         n_arrow_labels = len(self.readers[0][1].arrow_labels) if self.readers else 0
-        out = {"t": t, "floor": floor, "direction": direction, "door_state": self.door.state,
+        out = {"t": t, "floor": floor, "direction": direction, "door_state": door_state_wire,
                "n_arrow_labels": n_arrow_labels,
                "openness": (round(float(openness), 3) if openness is not None else None),
                "read_conf": (round(float(conf), 3) if conf is not None else None),

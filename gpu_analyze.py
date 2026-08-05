@@ -108,6 +108,15 @@ DOOR_BLANK_LIT_MARGIN = float(os.environ.get("DOOR_BLANK_LIT_MARGIN", "0.15"))  
 DOOR_CONFUSE_BAND = float(os.environ.get("DOOR_CONFUSE_BAND", "0"))   # >0 = diff-region tiebreak for close pairs (3/5,8/6)
 DOOR_DISC_MIN = float(os.environ.get("DOOR_DISC_MIN", "0.10"))    # min |diff-region projection| to act on
 DOOR_STRIDE = max(1, int(os.environ.get("DOOR_STRIDE", "2")))   # run the door pass every Nth decoded frame
+# DOOR ENGINE SELECTOR. Per-camera, exactly like DOOR_STRIDE: a worker is one camera, so this env
+# IS the per-camera override, and gpu_fleet sets it from the registry's `door_tracker` field. No
+# camera list is hardcoded anywhere — the ENABLE set lives in the registry, which is what makes
+# "ch27,ch30 today, more later" a data change rather than a deploy.
+#
+# DEFAULT IS h2. A camera reaches h3 only by being configured for it AND having a template that
+# loads and verifies; every other path falls back to h2 and says so at startup.
+DOOR_TRACKER = (os.environ.get("DOOR_TRACKER", "h2") or "h2").strip().lower()
+DOOR_STATE_TPL_DIR = os.environ.get("DOOR_STATE_TPL_DIR", "./door_state_templates")
 DOOR_HB_S = float(os.environ.get("DOOR_HB_S", "60"))           # emit a row at least this often (liveness)
 FLOORCHECK_PER_HR = int(os.environ.get("FLOORCHECK_PER_HR", "30"))   # sampled reads+crop -> /floorcheck
 FLOOR_ORDER = [s.strip() for s in os.environ.get("FLOOR_ORDER", "").split(",") if s.strip()]  # FloorTracker._idx
@@ -490,17 +499,55 @@ def build_door_engine(prefetched_tpl=None):
             mode = ("SINGLE-PANEL (no agree-or-discard) — set PANEL1_DIGIT_CELLS/PANEL1_ARROW_CELL "
                     "from a panel1 anchor read to enable the free confidence check")
         ft = gd.FloorTracker(floor_order=FLOOR_ORDER or None)
-        dtr = gd.DoorTracker(max_gap_s=DOOR_MAX_GAP_S, min_close_s=DOOR_MIN_CLOSE_S,
-                             max_close_s=DOOR_MAX_CLOSE_S,
-                             near_open=DOOR_NEAR_OPEN, close_th=DOOR_CLOSE_TH,
-                             close_start_th=DOOR_CLOSE_START_TH,
-                             close_debounce_s=DOOR_CLOSE_DEBOUNCE_S)
+        # ---- ENGINE SELECTION, per camera, fail-safe toward h2 ----
+        # The rule is absolute: no template that loads AND verifies -> this camera runs h2, logged
+        # once, loudly, at startup. It must never be possible to run h3 against a template that
+        # could not be checked, and it must never be possible for h3 to be silently absent when the
+        # registry says it should be on.
+        state_tpl = state_meta = None
+        resolved_logic = gd.TRACKER_LOGIC
+        if DOOR_TRACKER == "h3":
+            tpl_path = os.path.join(DOOR_STATE_TPL_DIR, f"{CAM}.json")
+            try:
+                state_tpl, state_meta = gd.load_state_template(tpl_path)
+            except FileNotFoundError:
+                log(f"GPU_DOOR ENGINE: DOOR_TRACKER=h3 for {CAM} but no template at {tpl_path} "
+                    f"— FALLING BACK TO h2 (this camera keeps h2's known defects)")
+            except Exception as e:
+                log(f"GPU_DOOR ENGINE: DOOR_TRACKER=h3 for {CAM} but template {tpl_path} is "
+                    f"UNUSABLE ({type(e).__name__}: {str(e)[:100]}) — FALLING BACK TO h2")
+            else:
+                if state_meta.get("cam") != CAM:
+                    log(f"GPU_DOOR ENGINE: template at {tpl_path} is for cam "
+                        f"{state_meta.get('cam')!r}, not {CAM!r} — FALLING BACK TO h2")
+                    state_tpl = state_meta = None
+        elif DOOR_TRACKER not in ("h2", ""):
+            log(f"GPU_DOOR ENGINE: DOOR_TRACKER={DOOR_TRACKER!r} is not a known engine "
+                f"— FALLING BACK TO h2")
+
+        if state_tpl is not None:
+            dtr = gd.DoorTrackerH3()
+            resolved_logic = gd.TRACKER_LOGIC_H3
+            log(f"GPU_DOOR ENGINE: {CAM} running {resolved_logic} — template {state_meta['md5'][:8]} "
+                f"from {state_meta.get('source_file')} ({state_meta.get('n_frames')} closed frames, "
+                f"built {state_meta.get('build_date')}), band y{state_meta['band_y'][0]}-"
+                f"{state_meta['band_y'][1]}, LOO NCC median {state_meta.get('loo_ncc_median')}")
+            log(f"GPU_DOOR ENGINE: {CAM} emits close_travel_s=NULL on every cycle by design — "
+                f"travel is unvalidated (TEST B failed 3 passes) and is hand-sampled weekly")
+        else:
+            dtr = gd.DoorTracker(max_gap_s=DOOR_MAX_GAP_S, min_close_s=DOOR_MIN_CLOSE_S,
+                                 max_close_s=DOOR_MAX_CLOSE_S,
+                                 near_open=DOOR_NEAR_OPEN, close_th=DOOR_CLOSE_TH,
+                                 close_start_th=DOOR_CLOSE_START_TH,
+                                 close_debounce_s=DOOR_CLOSE_DEBOUNCE_S)
+            log(f"GPU_DOOR ENGINE: {CAM} running {resolved_logic}")
         eng = gd.DoorFloorEngine(tpl, droi, panels, min_score=DOOR_MIN_SCORE, blank_range=DOOR_BLANK_RANGE,
                                  floor_tracker=ft, door_tracker=dtr, shift_search=DOOR_SHIFT, margin_min=DOOR_MARGIN,
                                  blank_min=DOOR_BLANK_MIN, shift_floor=DOOR_SHIFT_FLOOR,
                                  lit_range=DOOR_LIT_RANGE, blank_strong=DOOR_BLANK_STRONG,
                                  blank_lit_margin=DOOR_BLANK_LIT_MARGIN, confuse_band=DOOR_CONFUSE_BAND,
-                                 disc_min=DOOR_DISC_MIN, valid_floors=(FLOOR_ALPHABET or None))
+                                 disc_min=DOOR_DISC_MIN, valid_floors=(FLOOR_ALPHABET or None),
+                                 state_tpl=state_tpl, state_meta=state_meta)
     except Exception as e:
         return None, f"geometry/engine error: {type(e).__name__}: {str(e)[:80]}"
     geom_sig = _hash8("|".join([DOOR_ROI_FRAME, PANEL_ROIS, DIGIT_CELLS, ARROW_CELL,
@@ -516,7 +563,18 @@ def build_door_engine(prefetched_tpl=None):
     if (DOOR_NEAR_OPEN, DOOR_CLOSE_TH, DOOR_CLOSE_START_TH, DOOR_CLOSE_DEBOUNCE_S) != DOOR_LEVEL_DEFAULTS:
         levels_tag = "L" + _hash8(f"{DOOR_NEAR_OPEN}|{DOOR_CLOSE_TH}|{DOOR_CLOSE_START_TH}|"
                                   f"{DOOR_CLOSE_DEBOUNCE_S}")[:4]
-    version = f"{eng.hash[:8]}{gd.TRACKER_LOGIC}{levels_tag}+{geom_sig}"
+    # ENGINE RESOLVED PER CAMERA, not read off the module constant. Two cameras on one gateway now
+    # run different engines, so a module-level tag would label ch27's h3 rows as h2 and make the
+    # whole pool uninterpretable. `resolved_logic` is whichever tracker was actually constructed
+    # above, including after a fallback — a camera configured for h3 that fell back to h2 stamps h2,
+    # because what the row says must be what produced it.
+    #
+    # The h3 template rides the ERA PREFIX too. The template IS the engine's zero point: rebuild it
+    # from different frames and the same video yields different cycles, exactly as a levels change
+    # does. Templates therefore move the comparability boundary and must not pool across it.
+    if resolved_logic == gd.TRACKER_LOGIC_H3:
+        levels_tag += "T" + str(state_meta.get("md5", ""))[:6]
+    version = f"{eng.hash[:8]}{resolved_logic}{levels_tag}+{geom_sig}"
     log(f"GPU_DOOR: {len(panels)} panel(s) [{mode}]; templates_hash={eng.hash[:12]}; door_version={version}")
     if FLOOR_ALPHABET:
         log(f"GPU_DOOR floor whitelist: {len(FLOOR_ALPHABET)} valid floors {FLOOR_ALPHABET[:6]}"
