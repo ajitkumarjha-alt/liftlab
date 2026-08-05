@@ -21,6 +21,9 @@ import csv
 import datetime as dt
 import sys
 
+sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+import truth_io
+
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 DAY = "2026-08-05"
 
@@ -108,7 +111,7 @@ def main():
     print(f"    bright_f  (control)           : {n_b:5d}/{t_b} = {100.0*n_b/t_b:5.1f}%")
 
     # ---- per hand-timed close
-    truth = [r for r in csv.DictReader(open(a.truth)) if r["cam"] == a.cam]
+    truth = truth_io.load_truth(a.cam, a.truth)
     print(f"\n  PER HAND-TIMED CLOSE (+/-{a.half:g}s window). 'inter' = analyzed frames in the band;")
     print(f"  a {'travel'} of T seconds should show ~{a.fps:.0f}*T of them.\n")
     print(f"  {'truth osd':>10} {'hand_s':>7} {'expect':>7} | {'col':>5} {'openness':>8} {'bright':>7} "
@@ -117,7 +120,7 @@ def main():
     for t in truth:
         if t["status"] == "truncated":
             continue
-        c = osd_to_epoch(t["close_end_osd"])
+        c = t["end_f"] / truth_io.CORPUS[a.cam]["fps"]
         sel = [r for r in rows if abs(r["epoch"] - c) <= a.half]
         if not sel:
             continue
@@ -125,12 +128,12 @@ def main():
         no = sum(1 for r in sel if r["openness"] is not None and CLOSE_TH < r["openness"] < NEAR_OPEN)
         nb, sb = band_count([r["bright"] for r in sel], None, None)
         rs = [r["ref_span"] for r in sel if r["ref_span"] is not None]
-        hand = float(t["travel_s"]) if t["travel_s"] else None
+        hand = t["travel_s"]
         exp = f"{a.fps*hand:.0f}" if hand else "-"
         if hand:
             tot["expect"] += a.fps * hand
         tot["col"] += nc; tot["openness"] += no; tot["bright"] += nb
-        print(f"  {t['close_end_osd']:>10} {(f'{hand:.1f}' if hand else '-'):>7} {exp:>7} | "
+        print(f"  {t['osd']:>10} {(f'{hand:.1f}' if hand else '-'):>7} {exp:>7} | "
               f"{nc:>5} {no:>8} {nb:>7} | {sc:>8.1f} "
               f"{(sum(rs)/len(rs) if rs else 0):>8.1f} {sb:>10.4f}  {t['status']}")
     print(f"\n  TOTALS over hand-timed closes: raw col {tot['col']} intermediate frames, "

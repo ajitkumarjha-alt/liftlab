@@ -20,6 +20,9 @@ import csv
 import datetime as dt
 import sys
 
+sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+import truth_io
+
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 DAY = "2026-08-05"
 
@@ -100,14 +103,14 @@ def main():
     print(f"  corr(bright_f, raw col) = {r_bc:+.3f}   corr(bright_f, openness) = {r_bo:+.3f}")
     print(f"  -> bright_f {'RISES' if rising else 'FALLS'} as the door closes on this camera\n")
 
-    truth = [r for r in csv.DictReader(open(a.truth)) if r["cam"] == a.cam and r["status"] != "truncated"]
+    truth = truth_io.load_truth(a.cam, a.truth)
     print(f"  Close anchored on bright_f's 10->90% crossing (+/-{a.half:g}s search window).")
     print(f"  'col moved' / 'openness moved' are measured over EXACTLY those frames.\n")
     print(f"  {'truth osd':>10} {'hand_s':>7} {'bright_s':>9} {'frames':>7} | {'col span':>9} "
           f"{'col path':>9} | {'open span':>10} {'pinned':>7} | {'refspan':>8}  status")
     tot_b, tot_h = [], []
     for t in truth:
-        c = osd_to_epoch(t["close_end_osd"])
+        c = t["end_f"] / truth_io.CORPUS[a.cam]["fps"]
         sel = [r for r in rows if abs(r["epoch"] - c) <= a.half]
         if len(sel) < 5:
             continue
@@ -125,11 +128,11 @@ def main():
         path = sum(abs(cvals[i] - cvals[i - 1]) for i in range(1, len(cvals))) if len(cvals) > 1 else 0
         pinned = sum(1 for o in ovals if o in (0.0, 1.0))
         rs = [r["ref_span"] for r in seg if r["ref_span"] is not None]
-        hand = float(t["travel_s"]) if t["travel_s"] else None
+        hand = t["travel_s"]
         dur = abs(t90 - t10)
         if hand:
             tot_b.append(dur); tot_h.append(hand)
-        print(f"  {t['close_end_osd']:>10} {(f'{hand:.1f}' if hand else '-'):>7} {dur:>9.2f} "
+        print(f"  {t['osd']:>10} {(f'{hand:.1f}' if hand else '-'):>7} {dur:>9.2f} "
               f"{len(seg):>7} | {(max(cvals)-min(cvals) if cvals else 0):>9.1f} {path:>9.0f} | "
               f"{(max(ovals)-min(ovals) if ovals else 0):>10.3f} "
               f"{f'{pinned}/{len(ovals)}':>7} | {(sum(rs)/len(rs) if rs else 0):>8.1f}  {t['status']}")

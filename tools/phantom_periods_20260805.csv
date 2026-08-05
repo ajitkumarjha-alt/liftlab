@@ -18,10 +18,10 @@ cam,file,start_f,end_f,note
 # Coverage: ch27 20500 of 70260 frames (29.2%), ch30 6250 of 27257 (22.9%). No window overlaps
 # any ground-truth close (checked, 0 contradictions) — a "no motion" window containing a close
 # would invalidate both files.
-ch27,ch27_clean.mp4,500,4800,door-closed, no motion
-ch27,ch27_clean.mp4,30000,37400,door-closed, no motion
-ch27,ch27_clean.mp4,56400,59000,door-closed, no motion
-ch27,ch27_clean.mp4,63700,69900,door-closed, no motion
-ch30,ch30_peak.mp4,12400,14900,door-closed, no motion
-ch30,ch30_peak.mp4,22950,25600,door-closed, no motion
-ch30,ch30_peak.mp4,25900,27000,door-closed, no motion
+ch27,ch27_clean.mp4,500,4800,door-closed no motion
+ch27,ch27_clean.mp4,30000,37400,door-closed no motion
+ch27,ch27_clean.mp4,56400,59000,door-closed no motion
+ch27,ch27_clean.mp4,63700,69900,door-closed no motion
+ch30,ch30_peak.mp4,12400,14900,door-closed no motion
+ch30,ch30_peak.mp4,22950,25600,door-closed no motion
+ch30,ch30_peak.mp4,25900,27000,door-closed no motion

@@ -20,6 +20,9 @@ import csv
 import datetime as dt
 import sys
 
+sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+import truth_io
+
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 DAY = "2026-08-05"
 CLOSE_TH, NEAR_OPEN = 0.10, 0.90
@@ -98,14 +101,14 @@ def main():
     print(f"    col <= rolling p10 (openness pinned 0.0): {clip_lo:5d} ({100.0*clip_lo/have:.1f}%)")
     print(f"    openness exactly 0.0 or 1.0            : {pinned:5d} ({100.0*pinned/have:.1f}%)")
 
-    truth = [r for r in csv.DictReader(open(a.truth)) if r["cam"] == a.cam and r["status"] != "truncated"]
+    truth = truth_io.load_truth(a.cam, a.truth)
     print(f"\n  DESCENT RECONSTRUCTION (+/-{a.half:g}s around each hand-timed close)")
     print(f"  'frames' = analyzed frames strictly between the last near_open and the first close_th.\n")
     print(f"  {'truth osd':>10} {'hand_s':>7} | {'openness: frames':>17} {'secs':>6} | "
           f"{'rawcol: frames':>15} {'secs':>6} | {'refspan':>8} {'ref_hi':>7} {'colmax':>7}  status")
     agg = []
     for t in truth:
-        c = osd_to_epoch(t["close_end_osd"])
+        c = t["end_f"] / truth_io.CORPUS[a.cam]["fps"]
         sel = [r for r in rows if abs(r["epoch"] - c) <= a.half]
         if not sel:
             continue
@@ -114,12 +117,12 @@ def main():
         rs = [r["ref_span"] for r in sel if r["ref_span"] is not None]
         rh = [r["ref_hi"] for r in sel if r["ref_hi"] is not None]
         cm = max(r["col"] for r in sel if r["col"] is not None)
-        hand = float(t["travel_s"]) if t["travel_s"] else None
+        hand = t["travel_s"]
         fo = f"{d_o[0]}" if d_o else "no descent"
         so = f"{d_o[1]:.2f}" if d_o else "-"
         fc = f"{d_c[0]}" if d_c else "no descent"
         sc = f"{d_c[1]:.2f}" if d_c else "-"
-        print(f"  {t['close_end_osd']:>10} {(f'{hand:.1f}' if hand else '-'):>7} | {fo:>17} {so:>6} | "
+        print(f"  {t['osd']:>10} {(f'{hand:.1f}' if hand else '-'):>7} | {fo:>17} {so:>6} | "
               f"{fc:>15} {sc:>6} | {(sum(rs)/len(rs) if rs else 0):>8.1f} "
               f"{(sum(rh)/len(rh) if rh else 0):>7.1f} {cm:>7.1f}  {t['status']}")
         if hand and d_o and d_c:

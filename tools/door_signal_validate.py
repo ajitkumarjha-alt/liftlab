@@ -25,17 +25,22 @@ claim. Stated here rather than in a footnote because it bounds what a pass means
 import argparse
 import csv
 import datetime as dt
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import truth_io
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 DAY = "2026-08-05"
 
-# ch30's concat inversion (3013116): video t=210-212, +/-1s margin. Labels inside are excluded from
-# TEST A because their OSD-to-video mapping is not monotonic there.
-INVERSION_VT = {"ch30": (209.0, 213.0)}
+# The dirty corpus needed a concat-inversion exclusion here (ch30 video t=210-212). The clean
+# corpus is verified continuous, so there is nothing to exclude and the map is empty.
+INVERSION_VT = {}
 
 PASS_STATE = 0.85          # agreement floor for TEST A
 PASS_TRAVEL = 0.40         # seconds, TEST B tolerance
+MIN_TIMED = 4              # DECISION 1: at least this many timed closes measured in-band
 
 
 def osd_to_epoch(hhmmss, day=DAY):
@@ -202,6 +207,8 @@ def main():
     ap.add_argument("--state-signal", default="ncc_top")
     ap.add_argument("--hi", type=float, required=True, help="closed-plateau threshold")
     ap.add_argument("--lo", type=float, required=True, help="open threshold (hysteresis)")
+    ap.add_argument("--tol-f", type=float, default=90.0,
+                    help="frames within which an emission is the same close as a truth row")
     ap.add_argument("--half", type=float, default=10.0)
     a = ap.parse_args()
 
@@ -251,38 +258,54 @@ def main():
     print("\n" + "=" * 80)
     print(f"TEST B — TRAVEL against hand-timed closes, {a.cam}")
     print("=" * 80)
-    truth = [r for r in csv.DictReader(open(a.truth))
-             if r["cam"] == a.cam and r["travel_s"] and r["status"] != "truncated"]
+    truth = truth_io.load_truth(a.cam, a.truth)
+    timed = [t for t in truth if t["timed"]]
+    fps = truth_io.CORPUS[a.cam]["fps"]
     key = a.state_signal
-    hi_t, lo_t = a.hi, a.lo
-    v, t, ev = detect_closes(sig, key, hi_t, lo_t)
+    v, t, ev = detect_closes(sig, key, a.hi, a.lo)
     CL, OP = pctl(v, 90), pctl(v, 10)
     rng = CL - OP
     near_open, close_th = OP + 0.10 * rng, CL - 0.10 * rng
     print(f"  state signal {key}: open_level={OP:.3f} closed_level={CL:.3f}")
     print(f"  close_start crossing <= {near_open:.3f}, close_full crossing >= {close_th:.3f} "
-          f"(the near_open/close_th shape of DECISION 1)")
-    print(f"  {len(ev)} sustained closes detected across the run; {len(truth)} hand-timed travels; "
-          f"tolerance +/-{PASS_TRAVEL:g}s\n")
+          f"(DECISION 1's near_open/close_th shape)")
+    print(f"  {len(ev)} sustained closes detected; {len(timed)} timed truth closes "
+          f"({len(truth)} total, {len(truth)-len(timed)} excluded by status)")
+    print(f"  tolerance +/-{PASS_TRAVEL:g}s; hand endpoints carry a flat "
+          f"+/-{truth_io.TRAVEL_ERR_S:g}s (frame-anchored, ~2 frames per end)\n")
+
+    # emissions carry the FRAME of close_full, so matching is exact — no clock, no drift
     meas = []
     for i in ev:
         ts, tf, tv = travel_level(v, t, i, near_open, close_th)
-        meas.append({"full": tf, "travel": tv})
-    print(f"  {'hand osd':>10} {'hand_s':>7} {'matched':>9} {'d_s':>6} {'travel_s':>9} {'err_s':>7}  verdict")
-    npass = 0
-    for tr in truth:
-        c = osd_to_epoch(tr["close_end_osd"]); hand = float(tr["travel_s"])
-        b = min(meas, key=lambda o: abs(o["full"] - c)) if meas else None
-        if not b:
+        meas.append({"full_f": sig[i]["frame"], "travel": tv})
+
+    print(f"  {'truth end_f':>11} {'hand_s':>7} {'emit_f':>8} {'d_f':>6} {'travel_s':>9} {'err_s':>7}  verdict")
+    produced, inband = 0, 0
+    for tr in timed:
+        cand = [m for m in meas if abs(m["full_f"] - tr["end_f"]) <= a.tol_f]
+        if not cand:
+            print(f"  {tr['end_f']:>11} {tr['travel_s']:>7.2f} {'-':>8} {'-':>6} {'not detected':>9} "
+                  f"{'-':>7}  no-emission")
             continue
-        err = b["travel"] - hand
+        b = min(cand, key=lambda m: abs(m["full_f"] - tr["end_f"]))
+        produced += 1
+        err = b["travel"] - tr["travel_s"]
         ok = abs(err) <= PASS_TRAVEL
-        npass += ok
-        print(f"  {tr['close_end_osd']:>10} {hand:>7.1f} "
-              f"{dt.datetime.fromtimestamp(b['full'], IST).strftime('%H:%M:%S'):>9} "
-              f"{b['full']-c:>+6.1f} {b['travel']:>9.2f} {err:>+7.2f}  {'pass' if ok else 'FAIL'}")
-    print(f"\n  TRAVEL: {npass}/{len(truth)} within +/-{PASS_TRAVEL:g}s -> "
-          f"{'PASS' if npass == len(truth) else 'FAIL'}")
+        inband += ok
+        print(f"  {tr['end_f']:>11} {tr['travel_s']:>7.2f} {b['full_f']:>8} "
+              f"{b['full_f']-tr['end_f']:>+6d} {b['travel']:>9.2f} {err:>+7.2f}  "
+              f"{'pass' if ok else 'FAIL'}")
+
+    # DECISION 1: at least MIN_TIMED of the timed closes measured within tolerance, AND every
+    # value the engine actually produced within tolerance (it may withhold, it may not be wrong).
+    all_ok = (produced > 0 and inband == produced)
+    enough = inband >= MIN_TIMED
+    print(f"\n  produced {produced} travels for {len(timed)} timed closes; "
+          f"{inband} within +/-{PASS_TRAVEL:g}s")
+    print(f"  DECISION 1: >={MIN_TIMED} timed-and-in-tolerance -> {'yes' if enough else 'NO'}; "
+          f"all produced values in tolerance -> {'yes' if all_ok else 'NO'}")
+    print(f"  TEST B: {'PASS' if (enough and all_ok) else 'FAIL'}")
     return 0
 
 

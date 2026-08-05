@@ -33,6 +33,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import truth_io
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 DAY = "2026-08-05"
@@ -48,20 +50,14 @@ def epoch_to_osd(ep):
 
 
 def load_truth(path, cam):
-    out = []
-    for r in csv.DictReader(open(path)):
-        if r["cam"] != cam:
-            continue
-        out.append({"osd": r["close_end_osd"], "ep": osd_to_epoch(r["close_end_osd"]),
-                    "travel": float(r["travel_s"]) if r["travel_s"] else None,
-                    "err": float(r["travel_err_s"]) if r["travel_err_s"] else None,
-                    "status": r["status"]})
-    return sorted(out, key=lambda x: x["ep"])
+    """Frame-anchored truth. The old wall-clock loader mapped OSD through an --osd-base offset; on
+    ch30 that offset drifted ~4s and inverted at a concat seam, which faked a phantom count
+    (3013116). Frames of a named file have neither problem."""
+    return truth_io.load_truth(cam, path)
 
 
 def load_phantom(path, cam):
-    return [{"a": osd_to_epoch(r["osd_start"]), "b": osd_to_epoch(r["osd_end"]), "note": r["note"]}
-            for r in csv.DictReader(open(path)) if r["cam"] == cam]
+    return truth_io.load_phantoms(cam, path)
 
 
 def replay(video, roi, osd_base_ep, skip_before, stride, roi_scale):
@@ -88,9 +84,9 @@ def replay(video, roi, osd_base_ep, skip_before, stride, roi_scale):
         if stride > 1 and (i % stride):
             continue
         vt = (i - 1) / fps
-        if vt < skip_before:                       # ch27's stray 11:36:58 chunk lives here
+        if vt < skip_before:
             continue
-        t = osd_base_ep + vt                       # video position -> OSD wall clock
+        t = vt                                     # SECONDS INTO THE FILE — the truth's own anchor
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         col, strength = gpu_door.door_edge_column(gray[y:y + h, x:x + w])
         if col is None:
@@ -104,7 +100,8 @@ def replay(video, roi, osd_base_ep, skip_before, stride, roi_scale):
                 ct = c.get("close_travel_s")
                 ce = c.get("close_full_ts") or c.get("close_ts") or c.get("ts") or t
                 events.append({"cam": None, "ts": c.get("ts", ce), "close_ts": ce,
-                               "close_travel_s": ct, "osd": epoch_to_osd(ce), "raw": c})
+                               "close_f": int(round(ce * fps)),
+                               "close_travel_s": ct, "raw": c})
     cap.release()
     ov = [o for o in opens if o is not None]
     diag = {"fps": round(fps, 2), "frames": n, "size": f"{W}x{H}", "roi": (x, y, w, h),
@@ -115,24 +112,30 @@ def replay(video, roi, osd_base_ep, skip_before, stride, roi_scale):
     return events, diag
 
 
-def score(events, truth, phantoms, tol):
-    """Match each emitted close to the nearest unused hand-timed close within tol."""
-    gradable = [t for t in truth if t["status"] not in ("truncated",)]
-    used = set()
-    matches, phantom_hits, unmatched = [], [], []
-    for e in sorted(events, key=lambda x: x["close_ts"]):
-        inside = next((p for p in phantoms if p["a"] <= e["close_ts"] <= p["b"]), None)
+def score(events, truth, phantoms, tol, cam):
+    """Match emissions to truth closes IN FRAMES. `tol` is seconds, converted via the file's own fps.
+
+    A phantom is any emission inside a door-closed window. Those windows are door-state, not
+    occupancy — an emission there is a phantom whoever is standing in the cabin.
+    """
+    fps = truth_io.CORPUS[cam]["fps"]
+    gradable = list(truth)
+    used, matches, phantom_hits, unmatched = set(), [], [], []
+    for e in sorted(events, key=lambda x: x["close_f"]):
+        inside = truth_io.in_phantom(phantoms, e["close_f"])
         if inside:
-            phantom_hits.append((e, inside)); continue
-        best, bd = None, 1e9
+            phantom_hits.append((e, inside))
+            continue
+        best, bd = None, None
         for i, t in enumerate(gradable):
             if i in used:
                 continue
-            d = abs(e["close_ts"] - t["ep"])
-            if d < bd:
+            d = abs(e["close_f"] - t["end_f"])
+            if bd is None or d < bd:
                 best, bd = i, d
-        if best is not None and bd <= tol:
-            used.add(best); matches.append((e, gradable[best], bd))
+        if best is not None and bd <= tol * fps:
+            used.add(best)
+            matches.append((e, gradable[best], bd / fps))
         else:
             unmatched.append(e)
     missed = [t for i, t in enumerate(gradable) if i not in used]
@@ -145,7 +148,6 @@ def main():
     ap.add_argument("--cam", required=True)
     ap.add_argument("--roi", required=True, help="x,y,w,h in the video's own pixels")
     ap.add_argument("--roi-scale", type=float, default=1.0)
-    ap.add_argument("--osd-base", required=True, help="OSD time of video t=0, HH:MM:SS")
     ap.add_argument("--skip-before", type=float, default=0.0)
     ap.add_argument("--frame-stride", type=int, default=1)
     ap.add_argument("--tol", type=float, default=5.0)
@@ -156,8 +158,7 @@ def main():
     roi = [float(v) for v in a.roi.split(",")]
     truth = load_truth(a.truth, a.cam)
     phantoms = load_phantom(a.phantoms, a.cam)
-    ev, diag = replay(a.video, roi, osd_to_epoch(a.osd_base), a.skip_before,
-                      a.frame_stride, a.roi_scale)
+    ev, diag = replay(a.video, roi, 0.0, a.skip_before, a.frame_stride, a.roi_scale)
 
     import gpu_door
     print(f"=== {a.cam}  tracker={gpu_door.TRACKER_LOGIC}  {os.path.basename(a.video)} ===")
@@ -168,7 +169,7 @@ def main():
         print("  video's resolution — a bad ROI yields a flat edge column and silently scores 0/0.")
         return 2
 
-    m, missed, ph, unm, gradable = score(ev, truth, phantoms, a.tol)
+    m, missed, ph, unm, gradable = score(ev, truth, phantoms, a.tol, a.cam)
     print(f"  emitted {len(ev)} close events; hand-timed closes gradable: {len(gradable)}")
     print()
     print(f"  {'DETECTED':<10} {len(m)}/{len(gradable)}")
@@ -177,31 +178,31 @@ def main():
     print(f"  {'UNMATCHED':<10} {len(unm)}  (emitted, no truth within {a.tol:g}s, not in a phantom window)")
     print()
     if m:
-        print(f"  {'osd(truth)':>11} {'osd(emit)':>11} {'d_s':>6} {'hand_s':>7} {'engine_s':>9} {'err_s':>7}  status")
+        print(f"  {'truth end_f':>11} {'emit_f':>9} {'d_s':>6} {'hand_s':>7} {'engine_s':>9} {'err_s':>7}  status")
         for e, t, d in m:
-            hs = f"{t['travel']:.2f}" if t["travel"] is not None else "-"
+            hs = f"{t['travel_s']:.2f}" if t["travel_s"] is not None else "-"
             es = f"{e['close_travel_s']:.2f}" if e["close_travel_s"] is not None else "-"
-            er = (f"{e['close_travel_s'] - t['travel']:+.2f}"
-                  if (t["travel"] is not None and e["close_travel_s"] is not None) else "-")
-            print(f"  {t['osd']:>11} {e['osd']:>11} {d:>6.1f} {hs:>7} {es:>9} {er:>7}  {t['status']}")
-        errs = [e["close_travel_s"] - t["travel"] for e, t, _ in m
-                if t["travel"] is not None and e["close_travel_s"] is not None]
+            er = (f"{e['close_travel_s'] - t['travel_s']:+.2f}"
+                  if (t["travel_s"] is not None and e["close_travel_s"] is not None) else "-")
+            print(f"  {t['end_f']:>11} {e['close_f']:>9} {d:>6.1f} {hs:>7} {es:>9} {er:>7}  {t['status']}")
+        errs = [e["close_travel_s"] - t["travel_s"] for e, t, _ in m
+                if t["travel_s"] is not None and e["close_travel_s"] is not None]
         if errs:
             print(f"    travel error: n={len(errs)} mean={sum(errs)/len(errs):+.2f}s "
                   f"min={min(errs):+.2f}s max={max(errs):+.2f}s")
     if missed:
-        print(f"\n  MISSED: " + ", ".join(f"{t['osd']}({t['status']})" for t in missed))
+        print(f"\n  MISSED: " + ", ".join(f"f{t['end_f']}({t['status']})" for t in missed))
     if ph:
         print(f"\n  PHANTOMS inside verified-closed windows:")
         for e, p in ph:
             ct = f"{e['close_travel_s']:.2f}s" if e["close_travel_s"] is not None else "-"
-            print(f"    {e['osd']}  travel={ct}   [{p['note']}]")
+            print(f"    f{e['close_f']}  travel={ct}   [{p['note']}]")
     if unm:
         def _t(e):
             v = e["close_travel_s"]
             return f"{v:.2f}" if v is not None else "-"
         print("\n  UNMATCHED emissions: " +
-              ", ".join(f"{e['osd']}({_t(e)}s)" for e in unm[:12]) +
+              ", ".join(f"f{e['close_f']}({_t(e)}s)" for e in unm[:12]) +
               (f" ... +{len(unm)-12} more" if len(unm) > 12 else ""))
     return 0
 
@@ -209,15 +210,11 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 
-# ── RUN PARAMETERS for the 2026-08-05 stopwatch corpus ───────────────────────
-# ROIs read from /var/lib/liftlab/calib/site-A/<cam>/roi.json on liftlab-cloud, both marked at
-# frame_wh 704x576. If the mp4 decodes at a different size, pass --roi-scale = video_width/704.
+# -- RUN PARAMETERS for the CLEAN corpus -------------------------------------
+# Truth and phantom windows are frame-anchored to these files, so there is no --osd-base to get
+# wrong. ROIs are unchanged (both calib frame_wh match the 704x576 recordings).
 #
-#   ch27: door_roi_frame [125, 3, 238, 397]   OSD = video_t + 12:04:36, EXCLUDE video_t < 30
-#         (v<30 is a stray 11:36:58 chunk)
-#   ch30: door_roi_frame [2, 2, 335, 446]     OSD = video_t + 12:04:48, ~4s segment-overlap drift
-#
-#   python3 tools/doorwatch_replay.py --cam ch27 --video rec/ch27_full.mp4 \
-#       --roi 125,3,238,397 --osd-base 12:04:36 --skip-before 30
-#   python3 tools/doorwatch_replay.py --cam ch30 --video rec/ch30_full.mp4 \
-#       --roi 2,2,335,446 --osd-base 12:04:48
+#   python3 tools/doorwatch_replay.py --cam ch27 --video ~/dwrec/rec/ch27_clean.mp4 \
+#       --roi 125,3,238,397 --frame-stride 2
+#   python3 tools/doorwatch_replay.py --cam ch30 --video ch30_peak.mp4 \
+#       --roi 2,2,335,446 --frame-stride 2
