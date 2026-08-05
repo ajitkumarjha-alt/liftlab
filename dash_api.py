@@ -1493,6 +1493,10 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
         # C17/C18
         "stops": {"n": len(stops), "up": up_stops, "down": dn_stops, "no_arrow": no_arrow,
                   "unattributed": unattributed},
+        # Stated in the heatmap caption. A cycle whose nearest confident read is older than this is
+        # placed on no floor at all and is invisible in both charts — worth naming, because on some
+        # cameras it is the majority of cycles.
+        "attr_window_s": DOOR_ATTR_S,
         # C21/C22 — separate directions; a lift is not symmetric and averaging them hides that
         "speed_up": dict(_stats(seg_up), unit="floors/s"),
         "speed_down": dict(_stats(seg_dn), unit="floors/s"),
@@ -2697,7 +2701,11 @@ function heatCard(){
   var head='<div class=card><h3>riders &amp; stops per floor, per hour '
     +'<button class="tog'+(heatMode==='stops'?' on':'')+'" onclick="setHeat(\'stops\')">stops</button>'
     +'<button class="tog'+(heatMode==='riders'?' on':'')+'" onclick="setHeat(\'riders\')">riders</button></h3>'
-    +'<div class=intent>which floors are busy, and when — one row per floor, one column per hour</div>';
+    +'<div class=intent>'+(heatMode==='riders'
+      ? 'RIDERS: transits whose timestamp falls inside a door-open window, placed on that stop\'s floor. '
+        +'One row per floor, one column per hour.'
+      : 'STOPS: door CYCLES — the door opened and closed at that floor. NOT floor readings: a lift '
+        +'passing a floor is not counted here.')+'</div>';
   if(!trCam){
     return head+'<div class=blank>pick a camera above — floors belong to one lift, so a fleet total would mix shafts</div></div>';
   }
@@ -2705,13 +2713,39 @@ function heatCard(){
     return head+'<div class=blank>no door-engine reads for '+esc(trCam)+' in the current era'
       +(trReady&&TR.range&&TR.range.label?' within '+esc(TR.range.label):'')+'</div></div>';
   }
-  var note='';
+  // THE CAPTION THAT STOPS THE WRONG CONCLUSION. The two charts count different things and the
+  // rider side is sparse by nature: only ~15-20% of stops have a transit inside their window. A
+  // reader who does not know that sees dense green against near-empty blue and concludes the data
+  // is broken. It is not — but a chart that needs a briefing to read is a chart with a missing label.
+  var totS=0, totR=0, nF=0, zeroF=0;
+  (t2.per_floor||[]).forEach(function(f){
+    var s=0,r=0;
+    (f.stops_by_hour||[]).forEach(function(v){s+=v||0});
+    (f.riders_by_hour||[]).forEach(function(v){r+=v||0});
+    totS+=s; totR+=r; if(s>0){nF++; if(r===0)zeroF++;}
+  });
+  var rate=totS?Math.round(1000*totR/totS)/10:0;
+  var note='<div class=mut style="font-size:11px;margin-top:4px">'
+    +'<b>'+totS+'</b> stops · <b>'+totR+'</b> riders placed &rarr; <b>'+rate+'%</b> of stops have a '
+    +'rider inside their door window. The two charts are NOT comparable cell-for-cell: green counts '
+    +'door cycles, blue counts people, and most cycles carry nobody the counter saw.'
+    +(zeroF?(' <b>'+zeroF+'</b> of '+nF+' floors with stops show zero riders — at this rate that is '
+      +'expected for low-traffic floors, not evidence of missing data.'):'')
+    +'</div>';
   if(heatMode==='riders'){
     var m=t2.transits_matched||0, j=t2.transits_joinable;
-    note='<div class=mut style="font-size:11px;margin-top:4px">riders come from transits joined to a door-open window: <b>'
+    note+='<div class=mut style="font-size:11px;margin-top:2px">transits joined: <b>'
       +m+'</b> of <b>'+(j==null?'?':j)+'</b> joinable in this era'
       +((t2.transits_total!=null&&j!=null&&t2.transits_total>j)?(' (' +t2.transits_total+' lifetime, most predating this era)'):'')
       +'. Unjoined transits are not on any floor and are absent here.</div>';
+  }
+  var unattr=(t2.stops&&t2.stops.unattributed)||0;
+  if(unattr){
+    var placed=(t2.stops&&t2.stops.n)||0;
+    note+='<div class=mut style="font-size:11px;margin-top:2px">'
+      +'<b>'+unattr+'</b> door cycles are on NO floor at all (no confident indicator read within '
+      +(t2.attr_window_s||10)+'s) and appear in NEITHER chart — '
+      +Math.round(1000*unattr/Math.max(unattr+placed,1))/10+'% of all cycles on this lift.</div>';
   }
   return head+svgHeat(t2.per_floor,heatMode)+note
     +'<div class=mut style="font-size:11px">era: '+esc(t2.era_filter||'')
