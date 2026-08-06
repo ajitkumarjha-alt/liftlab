@@ -446,6 +446,86 @@ def _join_diagnostics(stops, transits, matched):
     }
 
 
+def _door_transition_census_h3(db, gw, cam, era, _w, _wargs):
+    """The same funnel for the STATE-ONLY engine, which has a different state machine.
+
+    TWO THINGS DIFFER, and both change the arithmetic:
+
+    1. NULL door_state IS A STATE HERE and the sequence keeps it. h3 maps its internal 'unknown' to
+       NULL and enters it when it ABANDONS a descent past max_descent_s, emitting no cycle. The h2
+       walk drops NULLs and then collapses runs, turning closing -> NULL -> closed into
+       closing -> closed and counting an abandonment as a completed cycle. Measured on the live
+       rows: 25 such patterns on ch27, 13 on ch30. That is why this is a separate function rather
+       than a flag on the old one — the NULL filter is in the h2 SQL itself.
+
+    2. THERE IS NO 'opening' STATE. h3 goes closed -> open directly, so the h2 funnel's first two
+       stages (closed->opening, opening->open) are structurally zero and their yields are
+       meaningless rather than bad. The h3 funnel starts at closed->open.
+
+    A completed cycle is a transition into 'closed' from 'closing' or from 'open' — the same rule as
+    _h3_cycle_ts, deliberately, so the funnel and the cycle count cannot disagree.
+    """
+    rows = _q(db, "SELECT ts, door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                  "AND door_version LIKE ?" + _w + " ORDER BY ts, id",
+              (gw, cam, era + "%", *_wargs))
+    if _GUARD_EPOCH is not None:
+        rows = [r for r in rows if r["ts"] is not None and float(r["ts"]) >= _GUARD_EPOCH]
+    NUL = "~null"
+    seq = []
+    for r in rows:                                   # collapse consecutive identical states
+        st = r["door_state"] if r["door_state"] is not None else NUL
+        if not seq or seq[-1] != st:
+            seq.append(st)
+    trans = {}
+    for a, b in zip(seq, seq[1:]):
+        trans[f"{a}->{b}"] = trans.get(f"{a}->{b}", 0) + 1
+    opened = trans.get("closed->open", 0)
+    began_closing = trans.get("open->closing", 0) + trans.get("closed->closing", 0)
+    completed = trans.get("closing->closed", 0) + trans.get("open->closed", 0)
+    reopened = trans.get("closing->open", 0)
+    abandoned = trans.get(f"closing->{NUL}", 0)
+
+    def _pct(a, b):
+        return round(100.0 * a / b, 1) if b else None
+
+    # CONSERVATION. Every entry into 'closing' must leave it exactly once — to closed, back to open,
+    # or into the abandoned NULL. A mismatch means the walk lost a transition and no number below is
+    # trustworthy, so it is reported rather than silently tolerated.
+    exits = trans.get("closing->closed", 0) + reopened + abandoned
+    balanced = (exits == began_closing)
+    return {
+        "era": era, "engine": "h3-state", "guard_boundary": (DOOR_GUARD_BOUNDARY or None),
+        "state_runs": len(seq), "transitions": trans,
+        "cycle_funnel": {
+            # Keys kept identical to the h2 shape so the UI needs no branch. h3 has no 'opening',
+            # so that stage is reported as its real value — zero — and named in the diagnosis
+            # rather than left to read as a failure to open.
+            "closed->opening": 0, "opening->open": 0,
+            "open->closing": began_closing, "closing->closed (CYCLE)": completed},
+        "losses": {
+            "opening_never_confirmed": 0,
+            "open_never_closed": max(0, opened - began_closing),
+            "closing_never_completed": max(0, began_closing - completed - reopened - abandoned),
+            "reopened_mid_close": reopened,
+            "abandoned_over_max_descent": abandoned},
+        "yield": {
+            "open_confirm_rate_pct": None,                              # no 'opening' stage in h3
+            "close_complete_rate_pct": _pct(completed, began_closing),
+            "cycle_per_open_pct": _pct(completed, opened)},
+        "opened_h3": opened,
+        "conservation_balanced": balanced,
+        "pairing_suspect": (not balanced),
+        "diagnosis": (
+            f"h3 STATE-ONLY: no 'opening' stage exists (closed -> open directly), so the first two "
+            f"funnel numbers are structurally 0, not a fault. {completed} cycles, {reopened} reopens, "
+            f"{abandoned} descents abandoned over max_descent_s. Travel is not measured by this "
+            f"engine." if balanced else
+            f"WALK UNBALANCED: {began_closing} entries into 'closing' but {exits} exits "
+            f"({trans.get('closing->closed', 0)} closed / {reopened} reopened / {abandoned} "
+            f"abandoned) — a transition was lost; treat these numbers as unreliable."),
+    }
+
+
 def _door_transition_census(db, gw, cam, era, t0=None, t1=None):
     """WHERE do this camera's door cycles die — walked from the stored door_state sequence, so it
     works on existing rows with no GPU change. The GPU DoorTracker moves closed -> opening -> open ->
@@ -459,6 +539,8 @@ def _door_transition_census(db, gw, cam, era, t0=None, t1=None):
     SAME state are collapsed here, so a run of identical states counts as one occupancy, not many.
     """
     _w, _wargs = _ts_clause(t0, t1)
+    if _is_h3_era(era):
+        return _door_transition_census_h3(db, gw, cam, era, _w, _wargs)
     rows = _q(db, "SELECT ts, door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
                   "AND door_version LIKE ? AND door_state IS NOT NULL" + _w + " ORDER BY ts, id",
               (gw, cam, era + "%", *_wargs))
