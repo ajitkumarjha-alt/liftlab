@@ -519,6 +519,62 @@ def _door_transition_census(db, gw, cam, era, t0=None, t1=None):
     }
 
 
+def _is_h3_era(era):
+    """Is this era prefix the state-only engine? door_version is '<hash><logic><tags>+<geom>' and
+    _era_for hands back the part before the '+', so the logic tag is a substring test."""
+    return bool(era) and "h3-state" in str(era)
+
+
+H3_TRAVEL_NOTE = "h3: travel unmeasured by design"
+H3_TRAVEL_REASON = (
+    "h3 is a state-only engine — it detects door cycles and does not time them. "
+    "close_travel_s is NULL on every h3 cycle with a reason string, because three passes of TEST B "
+    "failed to validate a travel estimator (README_DOORWATCH.md). Travel for these cameras comes "
+    "from the weekly hand-timed sample, not from the engine.")
+
+
+def _h3_cycle_ts(rows):
+    """Timestamps of COMPLETED CYCLES in the h3 schema, walked from the door_state stream.
+
+    DERIVED FROM THE ROWS, NOT FROM THE EMITTER. h3 writes no cycle marker column — close_travel_s
+    is NULL on every row by design, which is exactly why the h2 rule ("close_travel_s NOT NULL")
+    reports 0 cycles for a healthy engine. What a completed cycle looks like in the data is a
+    transition INTO 'closed' from 'closing' (the normal path) or from 'open' (a close so fast that
+    the emit-on-change gate never posted a 'closing' row).
+
+    NULL door_state IS PART OF THE SEQUENCE AND MUST NOT BE FILTERED OUT. h3 maps its internal
+    'unknown' to NULL on the wire, and it enters 'unknown' when it ABANDONS a descent that ran past
+    max_descent_s — no cycle is emitted. That leaves 'closing' -> NULL -> 'closed' in the rows, and
+    dropping the NULL collapses it to 'closing' -> 'closed', counting an abandoned descent as a
+    cycle. Measured on the live rows for 2026-08-05T22:01 onward: ch27 25 such patterns against 208
+    real cycles, ch30 13 against 176 — a 12% and 7% overcount. The existing funnel at _door_funnel
+    collapses NULLs and has this bug; it is a separate view and is not touched here.
+
+    Conservation check on the same rows, which is why this marker is trusted: exits from 'closing'
+    (closed 208 + reopen 185 + abandoned 25 = 418) exactly equal entries to 'closing' (418) on ch27,
+    and 251 = 251 on ch30. Nothing leaks.
+    """
+    out, prev = [], None
+    for r in rows:
+        st = r["door_state"] if r["door_state"] is not None else None
+        if st == "closed" and prev in ("closing", "open"):
+            out.append(r["ts"])
+        prev = st
+    return out
+
+
+def _h3_reopens(rows):
+    """'closing' -> 'open' transitions: the door started shutting and went back. Available for h3
+    even though travel is not, and it is a real operational number the sheet never contemplated."""
+    n, prev = 0, None
+    for r in rows:
+        st = r["door_state"] if r["door_state"] is not None else None
+        if st == "open" and prev == "closing":
+            n += 1
+        prev = st
+    return n
+
+
 def _door_gpu_by_cam(db, gw, cams, t0=None, t1=None):
     """GPU-era close-travel, from gw_door_event COMPLETED CYCLES (close_travel_s not null), per camera
     and per that camera's own era. This is the live instrument; _door_by_cam is the retired Pi one.
@@ -537,6 +593,38 @@ def _door_gpu_by_cam(db, gw, cams, t0=None, t1=None):
                         "n_cycles": 0, "n": 0}
             continue
         w, wargs = _ts_clause(t0, t1)
+        # NOTE the door_state IS NOT NULL filter below is the h2 path's. The h3 path re-reads
+        # WITHOUT it, because for h3 a NULL state is a meaningful element of the sequence — see
+        # _h3_cycle_ts. Filtering it there would count abandoned descents as cycles.
+        if _is_h3_era(era):
+            h3rows = _q(db, "SELECT ts, door_state, close_travel_s ct FROM gw_door_event "
+                            "WHERE gateway_id=? AND cam=? AND door_version LIKE ?"
+                            + w + " ORDER BY ts, id", (gw, cam, era + "%", *wargs))
+            cyc_ts = _h3_cycle_ts(h3rows)
+            reopens = _h3_reopens(h3rows)
+            spec = DOOR_SPECS.get(cam)
+            # The spec is carried so a spec'd camera still gets its compliance line, but pct_exceed
+            # is None and MUST stay None: there is no travel to exceed a threshold with. A 0 here
+            # would read as "never exceeds", which is a claim this engine cannot make.
+            out[cam] = {
+                "era": era, "era_source": era_src,
+                "instrument": "GPU door engine (gw_door_event) — h3 STATE-ONLY",
+                "n_rows": len(h3rows), "n_cycles": len(cyc_ts), "n": 0,
+                "travel_unmeasured": True, "travel_note": H3_TRAVEL_NOTE,
+                "pool": "completed cycles (state transitions; travel not measured)",
+                "median": None, "p85": None, "min": None, "max": None,
+                "hist": None, "hist_edges": _HIST_EDGES,
+                "spec": ({**spec, "pct_exceed": None} if spec else None),
+                "n_flap_excluded": 0, "n_reopened_excluded": 0,
+                "reopen_rate_pct": (round(100.0 * reopens / (len(cyc_ts) + reopens))
+                                    if (len(cyc_ts) + reopens) else None),
+                "reopened_median": None, "n_reopens": reopens,
+                "measurement_suspect": False, "n_impossible": 0,
+                "plausible_n": 0, "plausible_median": None, "plausible_p85": None,
+                "guard_boundary": None, "n_preguard_excluded": 0,
+                "reason": H3_TRAVEL_REASON,
+            }
+            continue
         rows = _q(db, "SELECT ts, door_state, close_travel_s ct FROM gw_door_event "
                       "WHERE gateway_id=? AND cam=? AND door_version LIKE ? AND door_state IS NOT NULL"
                       + w + " ORDER BY ts, id", (gw, cam, era + "%", *wargs))
@@ -1712,8 +1800,25 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
         spec = g.get("spec") or DOOR_SPECS.get(cam)
         if not spec:
             continue                              # not a compliance-tracked camera
+        # INSTRUMENT INVALIDATED 2026-08-05. Every h2-era GPU close-travel figure on this panel was
+        # produced by an edge-column tracker that offline replay against hand-timed video showed does
+        # not measure door travel: it detects ~62% of real closes, emitted 41 phantom cycles inside
+        # verified door-CLOSED windows on ch27, and produced ONE travel value per camera against 4
+        # and 11 timed closes (README_DOORWATCH.md). The numbers stay VISIBLE — era hygiene is
+        # labelling, not deletion, and deleting them would hide that they were ever quoted — but they
+        # must not read as current measurement. h3 rows carry travel_unmeasured instead and are not
+        # superseded; they never made the claim.
+        superseded = (not g.get("travel_unmeasured")) and (g.get("n") or 0) > 0
         headline.append(dict(spec, cam=cam, median=g["median"], p85=g["p85"], n=g["n"],
-                             instrument="GPU door engine (gw_door_event) — LIVE",
+                             instrument=("GPU door engine (gw_door_event) — h3 STATE-ONLY"
+                                         if g.get("travel_unmeasured")
+                                         else "GPU door engine (gw_door_event) — LIVE"),
+                             travel_unmeasured=g.get("travel_unmeasured", False),
+                             travel_note=g.get("travel_note"),
+                             n_reopens=g.get("n_reopens"),
+                             superseded=superseded,
+                             superseded_note=("SUPERSEDED — instrument invalidated 2026-08-05, "
+                                              "see validation" if superseded else None),
                              era=g["era"], live=True, n_cycles=g["n_cycles"], reason=g.get("reason"),
                              measurement_suspect=g.get("measurement_suspect"),
                              n_impossible=g.get("n_impossible"), plausible_n=g.get("plausible_n"),
@@ -1835,9 +1940,23 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
     # like the panel, era override honoured. The instruments never overlap in time, so the hourly
     # cycle counts can share buckets; close-travel values must NOT pool — see close_instrument.
     gpu_cyc = []
+    h3_cams = []
     for c in ([cam] if cam else [x["cam"] for x in _cameras(db, gw)]):
         e, _esrc = _era_for(db, gw, c, era)
         if e:
+            # PER-ERA CYCLE RULE. h2 marks a completed cycle with a non-null close_travel_s; h3 has
+            # no travel at all, so the same rule reports 0 cycles for a healthy engine — the same
+            # defect class as the July "0 cycles read as data loss" bug this loop already carries a
+            # comment about, one era boundary later. For h3 the cycle is a state transition; see
+            # _h3_cycle_ts for why NULL states are kept in the walk.
+            if _is_h3_era(e):
+                h3_cams.append(c)
+                h3rows = _q(db, "SELECT ts, door_state FROM gw_door_event WHERE gateway_id=? "
+                                "AND cam=? AND door_version LIKE ?" + _ts_clause(t0, t1)[0]
+                                + " ORDER BY ts, id",
+                            (gw, c, e + "%", *_ts_clause(t0, t1)[1]))
+                gpu_cyc += [{"ts": ts, "ct": None} for ts in _h3_cycle_ts(h3rows)]
+                continue
             # FLEET CASE: this loop is the per-camera walk, so the bound goes on every camera's
             # query, not just the single-camera one. Unbounded here meant a fleet request read
             # every door row this gateway has ever stored, once per camera.
@@ -1988,7 +2107,13 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                                    # provenance of the cycle count + which instrument the close
                                    # series uses — a pooled close median would be two instruments
                                    "cycles_pi": len(ev), "cycles_gpu": len(gpu_cyc),
-                                   "close_instrument": close_instrument},
+                                   "close_instrument": close_instrument,
+                                   # h3 cameras produce cycles but NO travel. Without this the
+                                   # close-travel chart draws an empty axis, which reads as "no
+                                   # activity" — the same misreading as the 0-cycles bug, one panel
+                                   # over. The UI labels the chart from these two fields.
+                                   "travel_unmeasured_cams": h3_cams,
+                                   "travel_unmeasured_note": (H3_TRAVEL_NOTE if h3_cams else None)},
                          "boundaries": {"close_travel_max": {"iso": CLOSE_TRAVEL_MAX_BOUNDARY, "epoch": _BOUNDARY_EPOCH,
                                         "note": "CLOSE_TRAVEL_MAX 10->30s; close-travel here uses the post-boundary regime only"}},
                          "data_gaps": [g for g in DATA_GAPS if (cam is None or cam in g.get("cams", []) or not g.get("cams"))]})
@@ -2244,7 +2369,12 @@ function strip(d){
     +kv('running',(g&&g.cams_up&&g.cams_up.length)?esc(g.cams_up.join(', ')):'—')
     +(gd?kv('throughput',(gd.proc_ms==null?'—':Math.round(gd.proc_ms)+'/'+Math.round(gd.budget_ms||2000)+'ms  ('+((gd.proc_ms/(gd.budget_ms||2000)).toFixed(2))+'x)'),(gd.proc_ms/(gd.budget_ms||2000)>=1?'bad':'ok')):'')
     +(gd?kv('drop',(gd.drop_frac==null?'—':(gd.drop_frac*100).toFixed(2)+'%'),(gd.drop_frac>=0.01?'bad':'ok')):'')+'</div>');
-  document.getElementById('strip').innerHTML=h.join('');
+  // Same fixed-scope problem as the compliance panel: the Pi card is the ONE camera the Pi watch
+  // runs, not the selected tab, and the GPU card is gateway-wide. Labelled, not made dynamic.
+  document.getElementById('strip').innerHTML=h.join('')
+    +'<div class=mut style="font-size:11px;flex-basis:100%;margin-top:-2px">Pi card = '
+    +esc((d.pi&&d.pi.camera)||'ch29')+' (reference camera, the Pi watch runs one); '
+    +'Relay and GPU cards are gateway-wide. None of these three follow the camera tabs below.</div>';
 }
 
 function headline(d){
@@ -2253,8 +2383,18 @@ function headline(d){
     var susp=x.measurement_suspect?'<span class="pill bad" style="font-size:10px;margin-right:6px">MEASUREMENT SUSPECT</span>':'';
     var tag='<span class="pill '+(x.live?'ok':'mut')+'" style="font-size:10px;margin-right:6px">'
       +(x.live?'LIVE · GPU · era '+esc((x.era||'').slice(0,8)):'RETIRED · Pi-watch')+'</span>';
+    var sup=x.superseded?'<span class="pill bad" style="font-size:10px;margin-right:6px">SUPERSEDED</span>':'';
     var dl;
-    if(x.median==null){
+    if(x.travel_unmeasured){
+      // h3: cycles ARE measured, travel is NOT. Distinct from "no cycles" — the count is the proof
+      // the engine is working, and stating it here stops the null median reading as a dead camera.
+      dl=x.cam+' door close: <b>travel not measured</b> — state-only engine, '
+        +'<b>'+esc(x.n_cycles)+'</b> completed cycles in range'
+        +(x.n_reopens!=null?(' ('+esc(x.n_reopens)+' reopens)'):'')
+        +' · sheet assumes <b>'+x.sheet_s.toFixed(2)+'s</b>'
+        +' · Bank '+esc(x.bank)+' non-compliant above <b>'+x.compliance_s.toFixed(2)+'s</b>'
+        +' · <span class=mut>no observed travel to compare — see the hand-timed line below</span>';
+    } else if(x.median==null){
       // A GPU-era line with no cycles is the honest "gap is real" signal condition (b) asks for.
       dl=x.cam+' door close: '+(x.reason?('<b class=bad>'+esc(x.reason)+'</b>'):'no clean close measured yet');
     } else if(x.measurement_suspect){
@@ -2270,7 +2410,15 @@ function headline(d){
        +' · Bank '+esc(x.bank)+' non-compliant above <b>'+x.compliance_s.toFixed(2)+'s</b>'
        +' · <b class="'+((x.pct_exceed||0)>=50?'bad':'warn')+'">'+esc(x.pct_exceed)+'%</b> of observed closes exceed '+x.compliance_s.toFixed(2)+'s';
     }
-    var out='<div class="obs mono">'+tag+susp+dl+'</div>';
+    var out='<div class="obs mono">'+tag+sup+susp+dl+'</div>';
+    if(x.superseded){
+      out+='<div class=mut style="font-size:11px;border-left:3px solid #b00;padding-left:6px;margin:2px 0 4px">'
+        +'<b>SUPERSEDED — instrument invalidated 2026-08-05, see validation.</b> This figure came from '
+        +'the h2 edge-column tracker. Offline replay against hand-timed video found it detects ~62% of '
+        +'real closes, emitted 41 phantom cycles inside verified door-CLOSED windows on ch27, and '
+        +'produced one travel value per camera against 4 and 11 timed closes. Kept visible for era '
+        +'hygiene; not a current measurement.</div>';
+    }
     // C26 passenger transfer — beside door-close, same format. PROVISIONAL (transit precision).
     if(x.transfer_sheet_s!=null){
       var tl=(x.transfer_median==null)?(x.cam+' transfer: no counted cycles yet'):
@@ -2281,8 +2429,31 @@ function headline(d){
     }
     return out;
   }).join('<hr style="border:none;border-top:1px solid #eee;margin:8px 0">');
+  // THE VALIDATED LINE. The only close-travel measurement on this page that survived validation is
+  // hand timing off video the engine never saw. It is a THIRD instrument and sits apart from both
+  // engine lines. Assumption beside observation, no verdict — the panel's own rule.
+  var handline='<hr style="border:none;border-top:1px solid #eee;margin:8px 0">'
+    +'<div class="obs mono">'
+    +'<span class="pill ok" style="font-size:10px;margin-right:6px">VALIDATED · hand-timed</span>'
+    +'hand-timed ground truth (2026-08-05): close travel median <b>~2.0–2.2s</b>, n=15, both measured '
+    +'lifts · sheet assumes <b>2.00s</b> · Bank C cliff <b>2.31s</b> NOT exceeded by the median'
+    +'</div>'
+    +'<div class=mut style="font-size:11px">extended-close tail under observation. Frame-anchored '
+    +'endpoints on clean, continuous video; this is the instrument the engines were graded against, '
+    +'not an engine output. It covers two cameras on one day and is not a continuous series — the '
+    +'weekly hand-timed sample is what turns it into one.</div>';
   var note=(d.boundaries&&d.boundaries.doorwatch_retired)?('<div class=mut style="font-size:11px;margin-top:6px">Pi-watch (gw_event) and GPU engine (gw_door_event) are DIFFERENT INSTRUMENTS, split at '+esc(d.boundaries.doorwatch_retired.slice(0,10))+' (Pi door-watch retired). Their close-travel numbers are shown separately and are NOT comparable.</div>'):'';
-  document.getElementById('headline').innerHTML='<div class=headline><h3 class=mut style="margin:0 0 6px;font-size:11px;letter-spacing:.1em;text-transform:uppercase">compliance — assumption beside observation, no verdict</h3>'+h+note+'</div>';
+  note=handline+note;
+  // FIXED SCOPE, LABELLED. This panel is driven by DOOR_SPECS, which contains ch29 only, so it does
+  // NOT follow the camera tab above it — clicking ch27 leaves this showing ch29 and, unlabelled,
+  // that reads as ch27's compliance (reported 2026-08-05). Naming the camera is the fix; making it
+  // follow the tab would need a spec per camera, which is a data question, not a view one.
+  var specCams=[];
+  (d.headline||[]).forEach(function(x){if(specCams.indexOf(x.cam)<0)specCams.push(x.cam)});
+  var scope=specCams.length?(' · '+esc(specCams.join(', '))+' (reference camera'+(specCams.length>1?'s':'')+')'):'';
+  document.getElementById('headline').innerHTML='<div class=headline><h3 class=mut style="margin:0 0 6px;font-size:11px;letter-spacing:.1em;text-transform:uppercase">compliance — assumption beside observation, no verdict'+scope+'</h3>'
+    +'<div class=mut style="font-size:11px;margin:-2px 0 6px">this panel does not follow the camera tabs — it shows the cameras with a compliance spec on file</div>'
+    +h+note+'</div>';
 }
 
 function unavail(d){
@@ -2745,6 +2916,11 @@ function renderTrends(){
   // ERA BOUNDARY: a range spanning >1 counting version pools transits counted by different logic.
   // Labeled every time, never silent — the whole reason the picker can be trusted for the study.
   var eras=((TR.counting_eras||{}).in_range)||[];
+  // h3 STATE-ONLY: cycles exist, travel does not. Drives the close-travel card below, which must
+  // say so rather than draw an empty axis — an empty chart beside a populated demand curve reads
+  // as "the doors stopped closing", which is the same misreading as the 0-cycles bug it sits next to.
+  var TRAVEL_UNMEASURED_CAMS=((TR.range||{}).travel_unmeasured_cams)||[];
+  var TRAVEL_UNMEASURED=TRAVEL_UNMEASURED_CAMS.length>0;
   var erabanner=(TR.counting_eras&&TR.counting_eras.crossing)?('<div class=mut style="font-size:12px;margin:2px 0 6px;padding:4px 8px;border-left:3px solid #b06a00;background:rgba(176,106,0,.07)"><b>ERA BOUNDARY IN RANGE</b> — pools transits counted under '+eras.length+' different counting versions: '
     +eras.map(function(e){return '<b>'+esc(e.version)+'</b> ('+String(e.first_seen||'').slice(0,10)+' → '+String(e.last_seen||'').slice(0,10)+', '+e.n_episodes+' validated eps)'}).join(' · ')
     +'. Hourly totals mix counting logics; validated precision applies per era, never to the pool. Narrow the dates to one era for comparable numbers.</div>'):'';
@@ -2765,9 +2941,19 @@ function renderTrends(){
     +'<div class=card>'+svgBars('riders (boardings+alightings) / hour-of-day',
         'boardings + alightings counted at this door — usage volume, not unique people',
         hours,prof.map(function(p){return p.boarded+p.alighted}),'#2a6db0',null,'','riders')+'</div>'
-    +'<div class=card>'+svgLine('close-travel median / hour-of-day (s)',
+    +'<div class=card>'+(TRAVEL_UNMEASURED
+        ? ('<div class=h>close-travel median / hour-of-day (s)</div>'
+           +'<div class=mut style="font-size:11px">median seconds for the door to close, per hour</div>'
+           +'<div style="padding:18px 10px;border:1px dashed #b06a00;border-radius:6px;margin-top:8px">'
+           +'<b>no travel data (h3: travel unmeasured by design)</b>'
+           +'<div class=mut style="font-size:11px;margin-top:4px">'
+           +esc(TRAVEL_UNMEASURED_CAMS.join(', '))+' run the state-only engine: cycles ARE detected '
+           +'(see the demand curve above) but the door is not timed. An empty chart here would read '
+           +'as no activity; there is activity, and no travel measurement. Travel comes from the '
+           +'weekly hand-timed sample.</div></div>')
+        : svgLine('close-travel median / hour-of-day (s)',
         'median seconds for the door to close, per hour — the 2.31s line is Bank C’s compliance cliff',
-        hours,prof.map(function(p){return p.close_median}),'#b06a00',2.31,'2.31 Bank C','s')+'</div>'))
+        hours,prof.map(function(p){return p.close_median}),'#b06a00',2.31,'2.31 Bank C','s'))+'</div>'))
     +heatCard();
   document.getElementById('trendview').innerHTML=h;
 }
