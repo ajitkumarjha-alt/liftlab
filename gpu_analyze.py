@@ -739,7 +739,9 @@ def main():
     transfer_times = deque(maxlen=60)             # rolling body-transfer ms
     decode_times = deque(maxlen=60)               # rolling HEVC decode ms
     track_times = deque(maxlen=60)                # rolling YOLO track ms         (the only true GPU-compute cost)
-    door_times = deque(maxlen=60)                 # rolling door/floor pass ms (engine + its POSTs) — CPU
+    door_times = deque(maxlen=60)                 # rolling door/floor pass ms (engine + its POSTs)
+    door_cpu_times = deque(maxlen=60)             # ...of which COMPUTE (engine only)
+    door_post_times = deque(maxlen=60)            # ...of which BLOCKING HTTP (door_event/floorcheck)
     last_timing_log = 0.0
     from concurrent.futures import ThreadPoolExecutor
     fetch_ex = ThreadPoolExecutor(max_workers=max(2, PREFETCH_N + 1), thread_name_prefix="prefetch")
@@ -930,7 +932,12 @@ def main():
             # together are ~22% of the total. Mitigation aimed at YOLO would target 12%.
             # These two cover the rest of the frame loop: the door/floor pass (CPU: Sobel +
             # per-cell NCC, DOOR_STRIDE-cadenced) and every HTTP POST made inside the segment.
-            door_ms = 0.0
+            # SPLIT (2026-08-10): door_ms fused CPU compute with synchronous HTTP, so a rise in it
+            # was equally consistent with core contention and with a slow cloud — and those want
+            # opposite fixes (async queue vs cheaper NCC / thread caps). Measured apart, one number
+            # chooses between them.
+            door_cpu_ms = 0.0        # DoorFloorEngine.process only: Sobel, per-cell NCC, trackers
+            door_post_ms = 0.0       # post_door_event + post_floorcheck: blocking HTTP, not compute
             post_ms = 0.0
             if ctr is None and ZONES_SOURCE != "none":
                 H, W = frames[0].shape[:2]
@@ -980,6 +987,7 @@ def main():
                     except Exception as e:
                         drec = None
                         log(f"door process error: {type(e).__name__}: {str(e)[:80]}")
+                    door_cpu_ms += (time.time() - _door_t0) * 1000     # engine only, no I/O
                     if drec is not None:
                         # OUTPUT-ATTEST: a door opening means the lift is in use, so a transit SHOULD
                         # follow. Count opens since the last posted transit; many opens with none posted
@@ -988,13 +996,14 @@ def main():
                             door_opens_since_transit += 1
                         door_prev_state = drec.get("door_state")
                         should, door_prev_key = door_gd.door_event_changed(door_prev_key, drec)
+                        _post_t0 = time.time()
                         if should or (d_off - door_last_emit) >= DOOR_HB_S:
                             post_door_event(drec, door_version, door_thash)
                             door_last_emit = d_off
                         if FLOORCHECK_PER_HR > 0 and (d_off - last_fc_ts) >= (3600.0 / FLOORCHECK_PER_HR):
                             post_floorcheck(drec, fr, panel0_roi, door_version)
                             last_fc_ts = d_off
-                    door_ms += (time.time() - _door_t0) * 1000   # engine + its POSTs, per segment
+                        door_post_ms += (time.time() - _post_t0) * 1000   # blocking HTTP only
                 if ctr is None:
                     continue                      # no zones for this camera — counting OFF (door pass above ran)
                 if i % stride != 0:
@@ -1116,7 +1125,8 @@ def main():
                     log(f"{name}: +{len(ctr.transits)-before} transits (cum boarded={b} alighted={a}, posted={posted})")
             seg_ms = (time.time() - seg_t0) * 1000          # NON-OVERLAPPED wall: max(fetch_wait, 0)+decode+track+post
             proc_times.append(seg_ms); track_times.append(track_ms)
-            door_times.append(door_ms)
+            door_times.append(door_cpu_ms + door_post_ms)
+            door_cpu_times.append(door_cpu_ms); door_post_times.append(door_post_ms)
             fetch_times.append(fetch_ms); decode_times.append(decode_ms)
             headers_times.append(headers_ms); transfer_times.append(transfer_ms)
             if time.time() - last_timing_log > 30 and proc_times:
@@ -1128,6 +1138,8 @@ def main():
                 dfrac = dropped / _tot if _tot else 0.0
                 verdict = "OVER-BUDGET (cannot keep pace)" if ratio > 1.0 else "within budget"
                 om = sum(door_times) / len(door_times) if door_times else 0.0
+                ocm = sum(door_cpu_times) / len(door_cpu_times) if door_cpu_times else 0.0
+                opm = sum(door_post_times) / len(door_post_times) if door_post_times else 0.0
                 # RESIDUAL, NAMED. Everything in the segment's wall time that no counter above
                 # explains: transit/validation POSTs, image capture+b64, counter bookkeeping, and any
                 # blocking fetch wait not overlapped by the prefetch.
@@ -1137,14 +1149,15 @@ def main():
                 # throughput, so it announced "COMPUTE-bound (GPU)" while ~75% of the cost sat
                 # unmeasured. Name the LARGEST measured component instead, and say so explicitly when
                 # the unexplained residual is the biggest thing in the segment.
-                _parts = {"decode": dm, "track(GPU)": tm, "door(CPU)": om, "unexplained": other}
+                _parts = {"decode": dm, "track(GPU)": tm, "door-cpu(CPU)": ocm,
+                          "door-post(HTTP)": opm, "unexplained": other}
                 _big = max(_parts, key=_parts.get)
                 bound = (f"DOMINATED BY {_big} ({_parts[_big]:.0f}ms of {pm:.0f}ms)"
                          + ("" if _big != "unexplained" else
                             " — the biggest cost is NOT measured by this line; instrument before tuning"))
                 # fetch split: headers≈RTT floor when warm (fetch saga verdict: physics, not handshakes); high = cold sockets or server TTFB
                 log(f"seg timing: throughput={pm:.0f}ms (was fetch+track serial) [decode={dm:.0f} track={tm:.0f} "
-                    f"door={om:.0f} other={other:.0f} n={n_fr}fr] "
+                    f"door={om:.0f}(cpu={ocm:.0f} post={opm:.0f}) other={other:.0f} n={n_fr}fr] "
                     f"vs budget={SEG_BUDGET_MS:.0f}ms -> {ratio:.2f}x {verdict}; {bound} "
                     f"fetch={fm:.0f}ms[headers={cm:.0f} transfer={xm:.0f}]; drop_frac={dfrac:.3%} dropped_total={dropped}")
                 last_timing_log = time.time()
