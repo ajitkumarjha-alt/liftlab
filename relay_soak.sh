@@ -91,6 +91,19 @@ SEG_STALL_S="${RELAY_SEG_STALL_S:-60}"         # newest segment older than this 
 CALL_TIMEOUT="${RELAY_CALL_TIMEOUT:-10}"       # cap on any helper shelling out of the loop
 LOOP_STALL_S="${RELAY_LOOP_STALL_S:-120}"      # loop hasn't ticked this long => kill the relay, let systemd restart
 HB_FILE="${RELAY_HB_FILE:-/tmp/relay_soak.hb}" # touched every loop turn; the watchdog reads its mtime
+# ---------- per-channel ffmpeg logs ----------
+# WHY THIS IS A VARIABLE. These were hardcoded to /tmp/relay_soak_chNN.log. On the Pi those files
+# already exist owned by the production user, /tmp is sticky, and fs.protected_regular refuses a
+# different user's open of an existing file there. The smoke test therefore could not create them:
+# every stub ffmpeg died on its failed redirect, every downstream check failed, and the harness
+# blamed a noexec workdir — twice — while the stubs had in fact executed and logged their pids.
+#
+# The default is unchanged for production: STATE_DIR is not set in liftlab-relay.service, so this
+# resolves to /tmp exactly as before and the deployed paths do not move. The smoke sets
+# RELAY_LOG_DIR to its own workdir, so test and production can never contend for one path again.
+LOG_DIR="${RELAY_LOG_DIR:-${STATE_DIR:-/tmp}}"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+ff_log(){ printf '%s/relay_soak_%s.log' "$LOG_DIR" "$1"; }
 HLS_TIME="${RELAY_HLS_TIME:-2}"                # segment seconds
 # Belt-and-suspenders for the RTSP-read stall specifically: abort a socket read that hangs longer than
 # this (microseconds) so ffmpeg EXITS and the DIED path restarts it. Independent of the delivery check
@@ -274,11 +287,17 @@ t=d.get('t') or 0
 print(round(t-last,1) if (last>0 and t>0) else -1)" 2>/dev/null || echo -1; }
 
 launch(){ # $1=slot -> (re)start the direct-PUT ffmpeg for that cam, echo pid
-  local i=$1 ch=${CHANS[$i]} cam=${CAMS[$i]}
+  # Same shape as the restart_stream defect fixed in 57c52b0: `local i=$1 ch=${CHANS[$i]}` expands
+  # ${CHANS[$i]} against the CALLER's `i`, not the one being declared here. It happens to work today
+  # because every caller's `i` is already the slot being launched — start_streams iterates `i`, and
+  # restart_stream passes its own local `i`. That is luck, not correctness, and it is the exact
+  # coincidence that hid the three-day crash. Split so the index is the argument, always.
+  local i=$1 ch cam
+  ch=${CHANS[$i]}; cam=${CAMS[$i]}
   local url="rtsp://${USER_ENC}:${PASS_ENC}@${NVR_HOST}:554/${ch}/${STREAM}?transmode=unicast&profile=vam"
   local base="$CLOUD/api/gw/$GW/live/$cam"
   ffmpeg_args "$url" "$base"
-  ffmpeg "${FFARGS[@]}" >"/tmp/relay_soak_${cam}.log" 2>&1 &
+  ffmpeg "${FFARGS[@]}" >"$(ff_log "$cam")" 2>&1 &
   echo $!
 }
 
@@ -312,10 +331,10 @@ start_streams(){
     say "               -hls_segment_type mpegts -method PUT -http_persistent 1 $MREQ_ARG -headers <auth>"
     say "               -hls_segment_filename $CLOUD/api/gw/$GW/live/${CAMS[0]}/seg%03d.ts .../index.m3u8"
     say "  ffmpeg said:"
-    sed 's/^/    /' "/tmp/relay_soak_${CAMS[0]}.log" 2>/dev/null | head -10
+    sed 's/^/    /' "$(ff_log "${CAMS[0]}")" 2>/dev/null | head -10
     return 1
   fi
-  [ "$alive_now" -lt "$NCH" ] && say "WARN only $alive_now/$NCH streams survived the first 3s — see /tmp/relay_soak_*.log"
+  [ "$alive_now" -lt "$NCH" ] && say "WARN only $alive_now/$NCH streams survived the first 3s — see ${LOG_DIR}/relay_soak_*.log"
   return 0
 }
 stop_streams(){
@@ -440,7 +459,7 @@ restart_stream(){   # $1=slot $2=reason
   # a stream to relaunch, never a reason to kill the supervisor mid-recovery.
   local i=$1 reason=$2 np old
   old=${PIDS[$i]:-}
-  say "RESTART ${CAMS[$i]} — ${reason} (pid ${old:-none}). tail: $(tail -1 "/tmp/relay_soak_${CAMS[$i]}.log" 2>/dev/null)"
+  say "RESTART ${CAMS[$i]} — ${reason} (pid ${old:-none}). tail: $(tail -1 "$(ff_log "${CAMS[$i]}")" 2>/dev/null)"
   [ -n "$old" ] && { kill "$old" 2>/dev/null; sleep 0.5; kill -9 "$old" 2>/dev/null; }
   np=$(launch "$i"); PIDS[$i]=$np; PREVJ[$np]=$(pid_jiffies "$np")
   STALL[$i]=0; LAUNCHED[$i]=$(date +%s); FIRSTSEG_S[$i]=""

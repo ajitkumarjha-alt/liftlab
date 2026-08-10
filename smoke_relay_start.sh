@@ -93,8 +93,14 @@ chmod +x "$BIN"/*
 # Prove the stubs execute before drawing any conclusion from the run. pick_execdir already probed
 # the filesystem, but the stubs are what actually matter, so check one of them directly.
 "$BIN/modinfo" >/dev/null 2>&1
-if [ "$?" = 126 ] || [ "$?" = 127 ]; then
-  echo "SMOKE ABORT: stubs in $BIN will not execute (rc=$?). This directory is noexec."; exit 2
+STUBRC=$?
+# `if [ "$?" = 126 ] || [ "$?" = 127 ]` was wrong twice over: the second $? is the exit status of the
+# FIRST test, and the $? inside the message is the status of the `[` before it. It could report any
+# number. Capture once, then test the captured value.
+if [ "$STUBRC" = 126 ] || [ "$STUBRC" = 127 ]; then
+  echo "SMOKE ABORT: stubs in $BIN will not execute (rc=$STUBRC — 126=not executable, 127=not found)."
+  echo "  fs=$(stat -f -c %T "$TMP" 2>/dev/null)  mount opts: $(findmnt -no OPTIONS --target "$TMP" 2>/dev/null)"
+  exit 2
 fi
 
 run_scenario(){   # $1=label  $2=modinfo exit code (0 = module loadable)
@@ -111,7 +117,7 @@ run_scenario(){   # $1=label  $2=modinfo exit code (0 = module loadable)
   NVR_HOST=127.0.0.1 NVR_USER=u NVR_PASS=p \
   CHANNELS="16 27" \
   RELAY_INTERVAL=2 RELAY_CSV="$TMP/relay.csv" RELAY_HB_FILE="$TMP/hb" \
-  RELAY_STATE_DIR="$TMP/state" LIVE_DIR="$TMP/live" \
+  RELAY_STATE_DIR="$TMP/state" LIVE_DIR="$TMP/live" RELAY_LOG_DIR="$TMP/fflog" \
   RELAY_FLEET_REBOOT=0 \
   HOME="$TMP" \
     timeout --signal=TERM 25 bash "$SRC" > "$out" 2>&1
@@ -141,7 +147,7 @@ run_gate(){   # $1=label — state must already be seeded; reboot ENABLED so the
   NVR_HOST=127.0.0.1 NVR_USER=u NVR_PASS=p \
   CHANNELS="16 27" \
   RELAY_INTERVAL=2 RELAY_CSV="$TMP/relay.gate.csv" RELAY_HB_FILE="$TMP/hb.gate" \
-  RELAY_STATE_DIR="$TMP/state" LIVE_DIR="$TMP/live" \
+  RELAY_STATE_DIR="$TMP/state" LIVE_DIR="$TMP/live" RELAY_LOG_DIR="$TMP/fflog" \
   RELAY_FLEET_REBOOT=1 RELAY_FLEET_DOWN_S=1 \
   HOME="$TMP" \
     timeout --signal=TERM 45 bash "$SRC" > "$out" 2>&1
@@ -171,10 +177,34 @@ explain_exit(){   # $1=rc  $2=output file
     1)  if grep -q 'all .* ffmpeg died within 3s' "$out"; then
           echo "  EXIT PATH: start_streams() -> 'all ffmpeg died within 3s' -> exit 1 (relay_soak.sh ~line 331)."
           echo "  This is BEFORE the supervisor watchdog and the banner, which is why those checks failed."
-          if grep -qi 'permission denied' "$out"; then
-            echo "  CAUSE: the stub ffmpeg could not EXECUTE (Permission denied) — the workdir is noexec."
-            echo "         This is a HARNESS fault, NOT a defect in relay_soak.sh. Set SMOKE_WORKDIR"
-            echo "         to a path that permits execution and re-run."
+          # EVIDENCE, NOT A GUESS. The previous version answered "the workdir is noexec" for ANY
+          # 'permission denied' anywhere in the output, and on the Pi it was wrong twice: the stubs
+          # had executed fine and the real fault was a REDIRECT — /tmp/relay_soak_chNN.log already
+          # existed owned by the production user, /tmp is sticky, and fs.protected_regular refused
+          # the open. A canned diagnosis that names the wrong file burns the deploy and sends the
+          # operator to the wrong place, which is worse than saying "I don't know".
+          #
+          # So: decide from what the run actually recorded. If the script logged the launched pids,
+          # exec worked, full stop — whatever went wrong came after.
+          if grep -q 'launched .* direct-PUT sub relays: [0-9]' "$out"; then
+            echo "  EXEC IS FINE: the script logged launched pids —"
+            grep -m1 'launched .* direct-PUT sub relays:' "$out" | sed 's/^/         /'
+            echo "         so this is NOT a noexec workdir. The stubs ran; something after exec failed."
+            local redir
+            redir=$(grep -m3 -iE 'cannot create|no such file|permission denied|operation not permitted|Read-only file system' "$out")
+            if [ -n "$redir" ]; then
+              echo "  FAILED OPEN/REDIRECT (verbatim from the run):"
+              printf '%s\n' "$redir" | sed 's/^/         /'
+              echo "         Check ownership and sticky/protected_regular on that path. relay_soak.sh"
+              echo "         writes per-channel logs to \$RELAY_LOG_DIR (default \${STATE_DIR:-/tmp});"
+              echo "         this harness sets it to its own workdir so it never contends with prod."
+            else
+              echo "  No open/redirect error was recorded either — see the tail below; this one is likely real."
+            fi
+          elif grep -qi 'permission denied' "$out"; then
+            echo "  CAUSE: permission denied AND no launched-pids line, so exec itself is suspect."
+            echo "         fs=$(stat -f -c %T "$TMP" 2>/dev/null)  opts: $(findmnt -no OPTIONS --target "$TMP" 2>/dev/null)"
+            echo "         If those show noexec, set SMOKE_WORKDIR to a path that permits execution."
           else
             echo "  CAUSE: see the ffmpeg output quoted below — this one is likely real."
           fi
@@ -190,6 +220,10 @@ explain_exit(){   # $1=rc  $2=output file
   tail -18 "$out" | sed 's/^/    /'
   echo "  ---- end ----"
 }
+
+# Timestamp reference for the "nothing landed in /tmp" assertion below. Created before any scenario
+# runs so `find -newer` sees exactly this run's writes.
+TMP_MARK="$TMP/.run_mark"; : > "$TMP_MARK"
 
 echo "== startup smoke: module NOT loadable (this Pi: bcmgenet built into the kernel) =="
 IFS='|' read -r _l rc out <<< "$(run_scenario builtin 1)"
@@ -215,6 +249,28 @@ if [ "$CSVROWS" -ge 2 ]; then echo "  PASS  CSV has a data row (a loop turn real
 # "fleet watchdog: total delivery < 20kbps for 300s = FLEET DOWN", which prints at line 244 —
 # so the old pattern passed on a script that died 90 lines later.
 has "fleet watchdog ran INSIDE the loop" "fleet delivery is ~zero" "$out"
+
+# ── RELAY_LOG_DIR IS HONOURED: nothing of ours lands in /tmp ─────────────────
+# The Pi failure was a hardcoded /tmp path colliding with production's files. Asserting the new
+# variable "works" by reading the script is not evidence; asserting that /tmp gained no
+# relay_soak_ch*.log during the run is. TMP_MARK was created immediately before the first scenario,
+# so -newer finds anything this run wrote there regardless of what pre-existed.
+STRAY=$(find /tmp -maxdepth 1 -name 'relay_soak_ch*.log' -newer "$TMP_MARK" 2>/dev/null | head -5)
+if [ -z "$STRAY" ]; then
+  echo "  PASS  no relay_soak_ch*.log written under /tmp (RELAY_LOG_DIR honoured)"
+else
+  echo "  FAIL  wrote per-channel logs into /tmp despite RELAY_LOG_DIR:"
+  printf '%s\n' "$STRAY" | sed 's/^/          /'
+  fails=$((fails+1))
+fi
+# ...and they went where they were told to go, so this is not passing by writing nothing at all.
+if ls "$TMP/fflog"/relay_soak_ch*.log >/dev/null 2>&1; then
+  echo "  PASS  per-channel logs written under RELAY_LOG_DIR ($TMP/fflog)"
+else
+  echo "  FAIL  no per-channel logs under RELAY_LOG_DIR — the redirect never happened at all"
+  fails=$((fails+1))
+fi
+hasnt "script never printed a /tmp per-channel log path" "/tmp/relay_soak_ch" "$out"
 
 echo
 echo "== startup smoke: module IS loadable (a USB NIC would look like this) =="
