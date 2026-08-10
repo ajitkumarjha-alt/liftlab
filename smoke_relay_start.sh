@@ -77,7 +77,17 @@ exit 0
 STUB
 printf '#!/bin/sh\nexit 1\n' > "$BIN/modprobe"      # built-in module: mirrors the real Pi
 printf '#!/bin/sh\nexit 0\n' > "$BIN/modinfo"       # (overridden per-scenario below)
-printf '#!/bin/sh\nshift 2>/dev/null; exec "$@"\n' > "$BIN/sudo"
+# sudo: passes through to the real command EXCEPT reboot. The old stub was `shift; exec "$@"`, and
+# `sudo -n /sbin/reboot` is an ABSOLUTE path, so $BIN-first PATH could not shadow it — this harness
+# would have executed a real /sbin/reboot the moment a scenario reached stage 3. It never did before
+# because no scenario got that far; the outage scenarios below do.
+cat > "$BIN/sudo" <<'STUB'
+#!/bin/sh
+case "$*" in
+  *reboot*) echo "STUB-SUDO-REBOOT: $*"; exit 0;;
+esac
+shift 2>/dev/null; exec "$@"
+STUB
 printf '#!/bin/sh\nexit 0\n' > "$BIN/systemctl"
 chmod +x "$BIN"/*
 # Prove the stubs execute before drawing any conclusion from the run. pick_execdir already probed
@@ -108,6 +118,40 @@ run_scenario(){   # $1=label  $2=modinfo exit code (0 = module loadable)
   rc=$?
   echo "$label|$rc|$out"
 }
+
+# ── ESCALATION-GATE SCENARIOS ────────────────────────────────────────────────
+# The 2026-08-07..10 incident: the ladder ran stage 1/3 every ~6 minutes for THREE DAYS through a
+# total NVR-leg outage and never reached the gated reboot, because the outage clock restarted with
+# every supervisor restart. These scenarios drive the REAL script against a pre-seeded escalation
+# state file, which is how a 900-second gate is tested without waiting 900 seconds: the clock is a
+# persisted timestamp, so "15 minutes ago" is a value, not a delay.
+#
+# No clock is faked and no function is extracted — same discipline as the startup scenarios above.
+seed_state(){   # $1=stage $2=zero_since_ago $3=last_reboot $4=last_good_ago
+  local now; now=$(date +%s)
+  mkdir -p "$TMP/state"
+  printf '%s %s %s %s %s\n' "$1" "$(( now - $2 ))" "$now" "$3" "$(( now - $4 ))" \
+    > "$TMP/state/fleet_escalation"
+}
+run_gate(){   # $1=label — state must already be seeded; reboot ENABLED so the gate is observable
+  local label=$1 out="$TMP/out.gate.$1"
+  printf '#!/bin/sh\nexit 1\n' > "$BIN/modinfo"; chmod +x "$BIN/modinfo"   # built-in NIC, as on the Pi
+  PATH="$BIN:$PATH" \
+  CLOUD_URL="http://127.0.0.1:9" GATEWAY_TOKEN=stub GW=site-A GATEWAY_ID=site-A \
+  NVR_HOST=127.0.0.1 NVR_USER=u NVR_PASS=p \
+  CHANNELS="16 27" \
+  RELAY_INTERVAL=2 RELAY_CSV="$TMP/relay.gate.csv" RELAY_HB_FILE="$TMP/hb.gate" \
+  RELAY_STATE_DIR="$TMP/state" LIVE_DIR="$TMP/live" \
+  RELAY_FLEET_REBOOT=1 RELAY_FLEET_DOWN_S=1 \
+  HOME="$TMP" \
+    timeout --signal=TERM 45 bash "$SRC" > "$out" 2>&1
+  # 45s, not the 25s the startup scenarios use. A scenario seeded at stage 0 has to walk the whole
+  # ladder — zero detected, fleet-down declared, stage 1's restarts, stage 2, then the gate — and
+  # that is four loop turns after a ~10s startup and a 6s settle. At 25s it was cut off one turn
+  # short and reported a ladder failure that was really a stopwatch failure.
+  echo "$out"
+}
+last_good_field(){ awk '{print $5}' "$TMP/state/fleet_escalation" 2>/dev/null || echo ""; }
 
 fails=0
 check(){ if [ "$2" = "$3" ]; then echo "  PASS  $1"; else echo "  FAIL  $1 (got '$2', want '$3')"; fails=$((fails+1)); fi; }
@@ -179,6 +223,45 @@ explain_exit "$rc2" "$out2"
 check "survived to the timeout" "$rc2" "124"
 hasnt "no unbound-variable crash" "unbound variable" "$out2"
 has  "banner reports a live stage 2" "2) reload" "$out2"
+
+echo
+echo "== escalation gate: TOTAL OUTAGE, 1000s since last good delivery =="
+# The Friday-to-Monday case. Nothing has delivered for >15 min and all streams are down, so the
+# gate must OPEN. Seeded at stage 2 (driver reload already attempted/unavailable) so this pass
+# exercises the gate itself.
+rm -rf "$TMP/state"/* 2>/dev/null; seed_state 2 1000 0 1000
+GOUT=$(run_gate outage)
+has  "reached the reboot gate"                    "reboot gate\|stage 3/3" "$GOUT"
+has  "stage 3 FIRED (gate opened)"                "stage 3/3: REBOOTING" "$GOUT"
+has  "gate reports time since last GOOD DELIVERY" "since the last good delivery\|down [0-9]*s" "$GOUT"
+hasnt "did not refuse for a still-delivering stream" "still delivering" "$GOUT"
+
+echo
+echo "== escalation gate: FLAP — brief delivery 60s ago (Fri 09:44-09:52 pattern) =="
+# A link that recovers briefly between stalls must NEVER accumulate toward a reboot. The clock is
+# last-GOOD-delivery, so a 60s-old recovery leaves 60s on a 900s gate.
+rm -rf "$TMP/state"/* 2>/dev/null; seed_state 2 1000 0 60
+FOUT=$(run_gate flap)
+hasnt "stage 3 did NOT fire on a flapping link"   "stage 3/3: REBOOTING" "$FOUT"
+has  "gate CLOSED and said why"                   "reboot gate CLOSED" "$FOUT"
+
+echo
+echo "== escalation gate: stage-1 restarts do NOT reset the outage clock =="
+# The defect itself. Seeded at stage 0 with a 1000s-old outage: the ladder runs stage 1 (seven
+# restarts) and must still reach the gate, because restarting ffmpeg is not delivery. Before the
+# fix the clock restarted here and 900s was never reachable.
+rm -rf "$TMP/state"/* 2>/dev/null; seed_state 0 1000 0 1000
+SEEDED_LG=$(last_good_field)
+SOUT=$(run_gate stage1)
+has  "ran stage 1 (restart all)"                  "stage 1/3" "$SOUT"
+has  "still escalated to the gate despite stage 1" "stage 3/3: REBOOTING\|reboot gate CLOSED" "$SOUT"
+NOW_LG=$(last_good_field)
+if [ -n "$SEEDED_LG" ] && [ "$NOW_LG" = "$SEEDED_LG" ]; then
+  echo "  PASS  last-good-delivery unchanged by the restarts ($NOW_LG)"
+else
+  echo "  FAIL  last-good-delivery moved: seeded '$SEEDED_LG' -> '$NOW_LG' (a restart is not a delivery)"
+  fails=$((fails+1))
+fi
 
 echo
 if [ "$fails" = 0 ]; then

@@ -419,9 +419,29 @@ set_state(){   # $1=slot $2=new state $3=why
   STATE[$i]=$new
 }
 restart_stream(){   # $1=slot $2=reason
-  local i=$1 reason=$2 old=${PIDS[$i]} np
-  say "RESTART ${CAMS[$i]} — ${reason} (pid ${old}). tail: $(tail -1 "/tmp/relay_soak_${CAMS[$i]}.log" 2>/dev/null)"
-  kill "$old" 2>/dev/null; sleep 0.5; kill -9 "$old" 2>/dev/null
+  # THE THREE-DAY BUG (2026-08-07..10), and it is one line.
+  #
+  # This was `local i=$1 reason=$2 old=${PIDS[$i]} np`. Bash expands EVERY word of a command before
+  # `local` performs any assignment, so `${PIDS[$i]}` did not see the `i` being declared on the same
+  # line — it saw the GLOBAL `i`, left behind by the per-stream sampling loop, which equals NCH once
+  # that loop finishes. PIDS[NCH] is one past the end, so under `set -u` this KILLED THE SUPERVISOR
+  # on its very first call.
+  #
+  # Per-stream stall restarts never hit it, by luck: they are called from inside
+  # `for ((i=0;i<NCH;i++))`, where the global `i` happens to be the slot being restarted. The FLEET
+  # stage-1 loop iterates `k` — so every fleet-wide restart dereferenced PIDS[NCH] and died.
+  #
+  # That is the real reason the ladder ran stage 1/3 every ~6 minutes for three days and never
+  # escalated: fleet-down declared -> stage 1 -> first restart_stream -> crash -> systemd restart ->
+  # 300s to re-declare -> repeat. It never reached stage 2, so it could never reach the gate. The
+  # outage clock mattered too, and is fixed separately, but this is what stopped the ladder dead.
+  #
+  # Split so `i` is assigned before it is used, and default the lookup: a slot with no known PID is
+  # a stream to relaunch, never a reason to kill the supervisor mid-recovery.
+  local i=$1 reason=$2 np old
+  old=${PIDS[$i]:-}
+  say "RESTART ${CAMS[$i]} — ${reason} (pid ${old:-none}). tail: $(tail -1 "/tmp/relay_soak_${CAMS[$i]}.log" 2>/dev/null)"
+  [ -n "$old" ] && { kill "$old" 2>/dev/null; sleep 0.5; kill -9 "$old" 2>/dev/null; }
   np=$(launch "$i"); PIDS[$i]=$np; PREVJ[$np]=$(pid_jiffies "$np")
   STALL[$i]=0; LAUNCHED[$i]=$(date +%s); FIRSTSEG_S[$i]=""
   set_state "$i" "STARTING" "relaunched"
@@ -471,27 +491,65 @@ FLEET_DOWN=0              # 1 once the fleet-down condition has been declared
 FLEET_STAGE=0             # escalation stage reached: 1=restart-all 2=driver reload 3=reboot
 FLEET_LAST_NAG=0
 FLEET_LAST_REBOOT=0       # epoch of the last reboot ATTEMPT (survives the reboot itself)
+FLEET_DELIVERING=0        # streams delivering on the last pass — the reboot gate needs ALL down
+# ── THE OUTAGE CLOCK: LAST GOOD DELIVERY ─────────────────────────────────────
+# 2026-08-07..10 defect: the ladder ran stage 1/3 every ~6 minutes for THREE DAYS through a total
+# NVR-leg outage and never reached the gated reboot. Pi uptime at the manual reboot was 5d18h.
+#
+# The 2026-08-04 fix persisted the stage, and that was necessary but not sufficient, because of WHEN
+# it persisted. Stage 1's seven kill+launch cycles over a wedged NIC take longer than
+# RELAY_LOOP_STALL_S, so the supervisor self-watchdog SIGKILLs the loop — and the kill lands BEFORE
+# `FLEET_STAGE=1; fleet_state_save` at the end of the stage-1 arm. The state file therefore never
+# advanced past 0, and fleet_state_load's `st > 0` guard meant it restored NOTHING on restart:
+# not the stage, and not FLEET_ZERO_SINCE. Every systemd restart began a fresh 300s FLEET_DOWN_S
+# accumulation, so the 900s reboot gate could never open. 300 + ~120 + 15s RestartSec ~= the
+# observed 6-7 minute cadence.
+#
+# FLEET_LAST_GOOD is the fix for the clock half. It is the epoch of the last GOOD DELIVERY —
+# fleet-wide bytes actually advancing — and NOTHING a recovery attempt does may move it. Restarting
+# ffmpeg is not delivery. Being SIGKILLed is not delivery. Only bytes are.
+#
+# It is saved on EVERY PASS, not only on stage change. That is the whole point: a save that only
+# runs at the end of the slow arm is a save the SIGKILL beats, which is exactly how the last fix
+# failed. One small write per RELAY_INTERVAL is the price of a clock that survives.
+FLEET_LAST_GOOD=0         # epoch of the last fleet-wide byte advance; 0 = not yet established
 
 fleet_state_save(){
-  printf '%s %s %s %s\n' "$FLEET_STAGE" "$FLEET_ZERO_SINCE" "$(date +%s)" "$FLEET_LAST_REBOOT" \
-    > "$FLEET_STATE" 2>/dev/null || true
+  printf '%s %s %s %s %s\n' "$FLEET_STAGE" "$FLEET_ZERO_SINCE" "$(date +%s)" "$FLEET_LAST_REBOOT" \
+    "$FLEET_LAST_GOOD" > "$FLEET_STATE" 2>/dev/null || true
 }
 fleet_state_load(){
   [ -r "$FLEET_STATE" ] || return 0
-  local st zs wr rb now age
-  read -r st zs wr rb < "$FLEET_STATE" 2>/dev/null || return 0
+  local st zs wr rb lg now age
+  # 5th field added 2026-08-10. A 4-field file from the previous version leaves `lg` empty, which
+  # falls through to the fresh-start initialisation below rather than reading as epoch 0 — an
+  # inherited 0 would make down_for enormous and open the reboot gate on the first pass.
+  read -r st zs wr rb lg < "$FLEET_STATE" 2>/dev/null || return 0
   now=$(date +%s); age=$(( now - ${wr:-0} ))
   # The reboot timestamp is kept even when the rest expires: the "no reboot in the last hour" gate
   # is about the machine, not about this incident.
   FLEET_LAST_REBOOT=${rb:-0}
-  if [ "${wr:-0}" -gt 0 ] && [ "$age" -le "$FLEET_STATE_TTL" ] && [ "${st:-0}" -gt 0 ]; then
-    FLEET_STAGE=${st:-0}; FLEET_ZERO_SINCE=${zs:-0}
-    [ "$FLEET_ZERO_SINCE" -gt 0 ] && FLEET_DOWN=1
-    say "FLEET: resuming escalation at stage ${FLEET_STAGE} from ${FLEET_STATE} (written ${age}s ago)."
-    say "  The supervisor restarted mid-incident; without this the ladder would start at stage 1 again."
+  if [ "${wr:-0}" -gt 0 ] && [ "$age" -le "$FLEET_STATE_TTL" ]; then
+    # THE CLOCK IS RESTORED INDEPENDENTLY OF THE STAGE. The old guard restored both or neither, so a
+    # supervisor killed before it could record stage 1 also lost the outage clock. The clock is a
+    # measurement of the world; the stage is a record of what we tried. Losing the second must never
+    # silently reset the first.
+    if [ -n "${lg:-}" ] && [ "${lg:-0}" -gt 0 ]; then
+      FLEET_LAST_GOOD=$lg
+      say "FLEET: outage clock restored — last good delivery ${FLEET_LAST_GOOD} ($(( now - FLEET_LAST_GOOD ))s ago), from ${FLEET_STATE}."
+    fi
+    if [ "${st:-0}" -gt 0 ]; then
+      FLEET_STAGE=${st:-0}; FLEET_ZERO_SINCE=${zs:-0}
+      [ "$FLEET_ZERO_SINCE" -gt 0 ] && FLEET_DOWN=1
+      say "FLEET: resuming escalation at stage ${FLEET_STAGE} from ${FLEET_STATE} (written ${age}s ago)."
+      say "  The supervisor restarted mid-incident; without this the ladder would start at stage 1 again."
+    fi
   fi
 }
 fleet_state_load
+# A clock that was never established starts NOW, not at epoch 0. On a genuinely fresh start there is
+# no evidence of an outage, and inheriting 0 would satisfy "down >= 900s" instantly.
+[ "${FLEET_LAST_GOOD:-0}" -gt 0 ] || FLEET_LAST_GOOD=$(date +%s)
 tx_packets(){ cat "/sys/class/net/${IFACE}/statistics/tx_packets" 2>/dev/null || echo 0; }
 
 # ── CAN THE DRIVER BE RELOADED AT ALL? ───────────────────────────────────────
@@ -519,9 +577,9 @@ fi
 # The recovery ladder's REAL shape on THIS machine, stated once at startup rather than left to be
 # inferred from what does or does not appear in the journal during an outage.
 if [ "$NIC_MODULE_LOADABLE" = 1 ]; then
-  say "FLEET ladder: 1) restart all ffmpeg  2) reload ${NIC_MODULE}  3) reboot (gated: down >= ${FLEET_REBOOT_MIN_DOWN_S}s, no reboot within ${FLEET_REBOOT_COOLDOWN_S}s)"
+  say "FLEET ladder: 1) restart all ffmpeg  2) reload ${NIC_MODULE}  3) reboot (gated: ${FLEET_REBOOT_MIN_DOWN_S}s since last GOOD DELIVERY, all ${NCH} down, no reboot within ${FLEET_REBOOT_COOLDOWN_S}s)"
 else
-  say "FLEET ladder: 1) restart all ffmpeg  2) UNAVAILABLE (${NIC_MODULE} is built into the kernel, not a module — cannot be reloaded)  3) reboot (gated: down >= ${FLEET_REBOOT_MIN_DOWN_S}s, no reboot within ${FLEET_REBOOT_COOLDOWN_S}s)"
+  say "FLEET ladder: 1) restart all ffmpeg  2) UNAVAILABLE (${NIC_MODULE} is built into the kernel, not a module — cannot be reloaded)  3) reboot (gated: ${FLEET_REBOOT_MIN_DOWN_S}s since last GOOD DELIVERY, all ${NCH} down, no reboot within ${FLEET_REBOOT_COOLDOWN_S}s)"
   say "  There is NO automatic step between restarting ffmpeg and rebooting on this hardware."
   say "  A USB ethernet adapter would restore stage 2 — its driver IS loadable. See SITE_VISIT_REQUIRED.md."
 fi
@@ -590,7 +648,11 @@ driver_reload(){
 fleet_reboot(){
   local now down_for since_reboot
   now=$(date +%s)
-  down_for=$(( now - FLEET_ZERO_SINCE ))
+  # MEASURED FROM LAST GOOD DELIVERY, not from when this incident's watching began and not from the
+  # last restart attempt. FLEET_ZERO_SINCE restarts with every fresh supervisor; FLEET_LAST_GOOD
+  # does not, because only bytes move it. This single substitution is what lets the ladder escalate
+  # through a restart loop instead of being reset by one.
+  down_for=$(( now - FLEET_LAST_GOOD ))
   since_reboot=$(( now - FLEET_LAST_REBOOT ))
   if [ "$FLEET_REBOOT" != 1 ]; then
     say "FLEET: reboot disabled (RELAY_FLEET_REBOOT=0) — stopping short of a reboot. This needs a human."
@@ -602,8 +664,14 @@ fleet_reboot(){
     say "  this would become a reboot loop. Point RELAY_STATE_DIR at persistent storage to enable it."
     return 1
   fi
+  # FLEET-WIDE means all of them. One stream still delivering is not the NIC-level wedge this rung
+  # exists for, and rebooting would take down six working streams to fix a seventh.
+  if [ "${FLEET_DELIVERING:-0}" -ne 0 ]; then
+    say "FLEET: reboot gate CLOSED — ${FLEET_DELIVERING}/${NCH} streams still delivering; this is not a fleet-wide wedge."
+    return 1
+  fi
   if [ "$down_for" -lt "$FLEET_REBOOT_MIN_DOWN_S" ]; then
-    say "FLEET: reboot gate CLOSED — fleet down ${down_for}s, needs ${FLEET_REBOOT_MIN_DOWN_S}s."
+    say "FLEET: reboot gate CLOSED — ${down_for}s since the last good delivery, needs ${FLEET_REBOOT_MIN_DOWN_S}s."
     return 1
   fi
   if [ "$FLEET_LAST_REBOOT" -gt 0 ] && [ "$since_reboot" -lt "$FLEET_REBOOT_COOLDOWN_S" ]; then
@@ -707,6 +775,7 @@ while :; do
   # 2026-08-01 all seven were individually "alive" and the relay reported healthy for 33 hours
   # while the NIC delivered nothing. The SUM is the only thing that catches it.
   NOWS=$(date +%s)
+  FLEET_DELIVERING=$delivering            # for the reboot gate's fleet-wide test
   if awk "BEGIN{exit !($sumk < $FLEET_MIN_KBPS)}"; then
     [ "$FLEET_ZERO_SINCE" = 0 ] && { FLEET_ZERO_SINCE=$NOWS
       say "WARN fleet delivery is ~zero (${sumk}kbps total, ${alive}/${NCH} alive) — watching for ${FLEET_DOWN_S}s"; }
@@ -723,8 +792,14 @@ while :; do
       # 2026-08-04 defect that kept this ladder pinned at stage 1 for two hours.
       case "$FLEET_STAGE" in
         0) say "FLEET recovery stage 1/3: restarting ALL ${NCH} ffmpeg."
+           # RECORD THE RUNG BEFORE DOING THE WORK. The seven kill+launch cycles below are what
+           # exceeds RELAY_LOOP_STALL_S and gets this supervisor SIGKILLed; a save placed after them
+           # is a save that never runs on the pass that matters, which is how the ladder stayed
+           # pinned at stage 1 for three days. Recording the intent first means a kill mid-restart
+           # resumes at stage 2, not stage 1.
+           FLEET_STAGE=1; fleet_state_save
            for ((k=0;k<NCH;k++)); do restart_stream "$k" "fleet-down stage 1: restart all"; done
-           FLEET_STAGE=1; fleet_state_save ;;
+           fleet_state_save ;;
         1) say "FLEET recovery stage 2: a full restart changed nothing — the pipe is dead, not the processes."
            iface_bounce || true          # cheap, and known not to work on this fault; never gates stage 2
            driver_reload; DR=$?
@@ -765,11 +840,21 @@ while :; do
     if [ "$FLEET_DOWN" = 1 ]; then
       say "FLEET RECOVERED — delivery back to ${sumk}kbps after $(( NOWS - FLEET_ZERO_SINCE ))s down (reached stage ${FLEET_STAGE})."
     fi
+    # THE ONLY PLACE THE OUTAGE CLOCK MOVES. Bytes advanced fleet-wide, so this instant is the last
+    # known good delivery. A recovery attempt reaching this branch means it WORKED; an attempt that
+    # did not deliver never gets here, which is the property the reboot gate depends on. It is also
+    # the anti-flap protection: a brief real recovery between stalls resets the 900s, so a flapping
+    # link keeps failing the gate instead of accumulating toward a reboot.
+    FLEET_LAST_GOOD=$NOWS
     FLEET_ZERO_SINCE=0; FLEET_DOWN=0; FLEET_STAGE=0
     # Clear the persisted stage on recovery. The reboot timestamp is deliberately KEPT (written by
     # fleet_state_save) so the cooldown still applies to the next incident.
     fleet_state_save
   fi
+  # PERSIST EVERY PASS. The clock is only worth what survives a SIGKILL mid-recovery, and the arm
+  # that gets SIGKILLed is the one that used to own the only save. Cheap: one short write per
+  # RELAY_INTERVAL, already on a path we mkdir at startup.
+  fleet_state_save
 
   # ---------- periodic channel re-resolve ----------
   # A registry change should not need a restart. Only acts when the list actually CHANGES, and
