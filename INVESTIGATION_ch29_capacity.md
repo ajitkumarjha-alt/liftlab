@@ -59,49 +59,86 @@ Instrumentation for exactly this shipped with this commit: the seg-timing line n
 `door=` and `other=`, and names the largest measured component instead of a two-way verdict —
 saying explicitly when the unexplained residual is the biggest thing in the segment.
 
-## Why ch29 specifically — NOT ANSWERED, and the measurement to answer it
+## Why ch29 specifically — ANSWERED by the per-camera data (2026-08-10, percam.txt)
 
-I have timing for ch29 only. All seven workers start with `analyze_fps=0.0` (every frame tracked) and
-`stride=2`; ch16/27/29/30 have `door=ON`, ch32/34/37 `door=off`. ch29 additionally carries
-`door_levels={'close_th': 0.2}`, which moves its door era but is not obviously a throughput cost.
+Means over the same window, pid mapped to camera from the fleet's start lines:
 
-One command gives the per-camera table, because worker lines carry a pid and the fleet lines map pid
-to camera:
+| cam | pid | throughput | ratio | decode | track | **residual** | door |
+|---|---|---:|---:|---:|---:|---:|---|
+| ch16 | 865076 | 1545 ms | 0.77x | **320** | 460 | 765 | ON |
+| ch27 | 865077 | 2024 ms | 1.01x | 145 | 485 | **1394** | ON |
+| **ch29** | 865078 | **5311 ms** | **2.66x** | 179 | 597 | **4535** | ON |
+| ch30 | 865079 | 1150 ms | 0.58x | 120 | 430 | 600 | ON |
+| ch32 | 865080 | 1130 ms | 0.57x | 140 | 480 | 510 | off |
+| ch34 | 2963946 | 1100 ms | 0.55x | 140 | 500 | 460 | off |
+| ch37 | 865082 | 1180 ms | 0.59x | 150 | 525 | 505 | off |
 
-```bash
-journalctl -u liftlab-gpu-fleet --since '2026-08-10 05:20' --no-pager \
-  | grep -E 'started pid=|seg timing'
+**ch29's measured components are normal. Its residual is not.**
+
+* `track` 597 ms vs a fleet range of 430–525 — only ~24 % above typical, nowhere near the 4.4x
+  throughput gap. ch29 is *not* doing more YOLO work than the others.
+* `decode` 179 ms is mid-pack; **ch16's decode is nearly double ch29's** (320 ms) and ch16 is fine.
+* `fetch` 477–560 ms is mid-pack; ch16's is higher (579–766 ms) and ch16 is fine.
+* The residual — throughput minus decode minus track — is **4535 ms against a healthy 460–765 ms**,
+  roughly **9x the fleet median**.
+
+**This kills the contention hypothesis.** Six workers share the same L4 and sit at 0.55–1.01x budget.
+If the GPU were saturated, they would all be slow together. They are not; only ch29 is.
+
+**The residual tracks `door=ON`.** Cameras with the door pass off run 460–510 ms of residual; the four
+with it on run 600, 765, 1394 and 4535. ch27 — the second-worst camera and the only other one to
+cross budget — is also the second-highest residual. That is consistent with the door/floor pass and
+its synchronous POSTs being the cost centre, and `coldrestart.txt` shows one directly:
+
+```
+05:47:45  SLOW POST floorcheck: 5237ms (timeout=10s)      <- ch29
+05:47:45  SLOW POST analyzer_status: 5204ms (timeout=10s) <- ch32
 ```
 
-**A caveat that the fleet-wide numbers will still not resolve:** ch29's `track=598 ms` was measured
-*under seven-camera contention*. If the GPU is oversubscribed, that number is partly caused by the
-other six, so "ch29 is intrinsically heavy" and "the fleet is oversubscribed" cannot be separated
-from steady-state logs alone. Separating them needs a controlled run (e.g. ch29 alone for 5 minutes).
+Five-second POSTs are happening, inside the segment loop, on the camera that is 2.7x over budget.
+This is **strong narrowing, not proof** — the `door=`/`other=` split shipped here is what turns it
+into a measurement. But the direction is now settled: the problem is not GPU compute, and the fleet
+is not oversubscribed.
 
-### Fleet headroom, with the same caveat
+## CORRECTION to an earlier claim in this document
 
-At 12.0 ms/frame (598 ms ÷ 50 frames) and 50 frames per 2 s segment, one camera's YOLO alone needs
-**598 ms of a 2000 ms budget — 30 % of real time.** Seven cameras of *tracking alone* is ~2.1x the
-L4's real-time capacity, which puts the ceiling nearer **3–4 cameras** at full frame rate than the
-documented ~5 — before any door pass, POST or decode cost. Measured under contention, so treat as an
-upper bound on badness, not a calibrated ceiling.
+The first version of this document estimated the fleet ceiling at **3–4 cameras**, by taking ch29's
+`track=598 ms` as representative and multiplying by seven against a 2000 ms budget. **The per-camera
+data contradicts that and it should not be quoted.**
+
+Six of seven cameras run at **0.55–1.01x budget** with `track` 430–525 ms each. Seven workers of
+tracking summing to ~3.5 s of wall time per 2 s segment while all seven keep pace means `track_ms` is
+wall time that is largely *not* GPU-busy — Python overhead, transfer, CPU-side ByteTrack — so it
+cannot be summed across processes to derive a GPU ceiling. The arithmetic was wrong in kind, not just
+in value.
+
+What the data supports instead: **the fleet has headroom at seven cameras today.** ch16/30/32/34/37
+sit near half their budget; ch27 is marginal at 1.01x mean and drifts over during busy stretches; ch29
+alone is broken. A ceiling number needs a controlled ramp, not an extrapolation from one sick worker.
 
 ## Mitigation options — proposed, NOT applied. Aj decides.
 
 Numbers are what today's logs support; the door/other split is unmeasured until the new instrumentation
 runs, and **that split determines whether A or C helps at all**.
 
+Re-ranked against the per-camera table. The options that tune YOLO are now the weak ones: ch29's
+`track` is 597 ms of a 5311 ms segment, and six cameras prove the GPU is not the constraint.
+
 | option | mechanism | expected saving on ch29 | confidence |
 |---|---|---:|---|
-| **A. per-camera `ANALYZE_FPS`** | already supported (`gpu_analyze.py:906`); `analyze_fps=12.5` → stride 2 | ~299 ms of a ~3016 ms overrun (**10 %**) | high on the number, low on sufficiency |
-| **B. priority tiers** | ch27/29/30 real-time; ch32/34/37 degraded or off. Frees GPU *and* CPU | unknown until the per-camera table exists | medium |
-| **C. batch inference** | batch frames across cameras in one process | up to ~598 ms if GPU-bound | low — largest change, targets the 12 % |
-| **D. move the door pass off the segment loop** | it is CPU work serialised with GPU work | unknown, possibly large | unknown until `door=` is measured |
+| **D. take the synchronous POSTs off the segment loop** | `post_door_event` / `post_floorcheck` / transit POSTs run inline; a 5237 ms floorcheck POST is in the journal. Queue them to a worker thread | potentially most of the 4535 ms residual | **highest** — but confirm with `door=`/`other=` first |
+| **B. priority tiers** | ch32/34/37 degraded or off | frees CPU and GPU, but the fleet is NOT saturated, so this treats a symptom ch29 does not have | low — the premise it was proposed under has gone |
+| **A. per-camera `ANALYZE_FPS`** | `analyze_fps=12.5` → stride 2 | ~299 ms of a ~3311 ms overrun (**9 %**) | high on the number, **low on relevance** |
+| **C. batch inference** | batch frames across cameras | up to ~597 ms if GPU-bound | **lowest** — largest change, targets 11 % of the problem, and the GPU is not the bottleneck |
 
-**Recommendation: none of them yet.** Ship the instrumentation, take one 10-minute window of the new
-seg-timing line across all seven, then choose. A, C and D each target a different quarter of the
-segment, and today's logs cannot say which quarter is the problem. Option B is the only one that is
-safe to reason about without it, because reducing camera count reduces every component at once.
+**Recommendation: still measure first, but the target has moved.** One 10-minute window of the new
+`door=`/`other=` split on ch29 and ch27 decides between "the door pass is expensive" and "the POSTs
+are blocking". Both point at D, which is a change to *where* work happens rather than *how much* is
+done — no data is lost, unlike A and B.
+
+**ch27 needs watching independently.** At 1.01x mean it is already at the edge with a 1394 ms
+residual, and it crossed budget repeatedly during the window (1.10–1.32x). It is the same defect
+earlier in its progression, not a separate one.
 
 ## Standing items
 
@@ -113,14 +150,33 @@ safe to reason about without it, because reducing camera count reduces every com
    having advanced (frames actually decoded), so the floor's premise means what it says. **Not
    changed here** — it alters the meaning of a file the supervisor judges on, and deserves its own
    change with its own proof.
-2. **Supervisor cold restart at 11:15.** Fleet pid `865073` → `3426561` one second after the floor
-   restarted ch29, with `registry hash None -> d224b489940e` (a cold start, not a reload) re-spawning
-   all seven. ch29 was restarted twice in three seconds. Cause not in the filtered journal; the
-   unfiltered window would show a traceback or a systemd restart:
+2. **Supervisor cold restart at 11:15 — ANSWERED, and it was not a fault.** `coldrestart.txt`:
 
-   ```bash
-   journalctl -u liftlab-gpu-fleet --since '2026-08-10 05:47' --until '2026-08-10 05:49' --no-pager | head -80
    ```
+   05:47:56  [gpu-fleet] signal 15 — stopping 7 worker(s)
+   05:47:56  systemd[1]: Stopping liftlab GPU fleet ...
+   05:47:57  systemd[1]: liftlab-gpu-fleet.service: Deactivated successfully.
+   05:47:57  systemd[1]: Consumed 2h 33min 20.012s CPU time.
+   05:47:57  systemd[1]: Started liftlab GPU fleet ...
+   ```
+
+   A deliberate `systemctl restart` (SIGTERM, clean shutdown, `Deactivated successfully`), not a
+   crash and not a systemd `Restart=` recovery. `registry hash None` is simply a fresh process with
+   no previous hash to compare against. It landed one second after the output floor restarted ch29,
+   which is why ch29 appears to restart twice — the floor's restart, then the unit's.
+
+3. **The supervisor does NOT adopt pre-existing workers.** `_procs` is populated only at
+   `gpu_fleet.py:177`, inside `start()`, from the `Popen` handle; there is no `pgrep`, no `/proc`
+   scan and no adoption path anywhere in the file. ch34's out-of-band pid (2963946 against a
+   865076–865082 batch) is a worker the *same* fleet restarted mid-life — the fleet stopped it
+   cleanly by pid on shutdown, which an unadopted orphan could not have been.
+
+   The deploy hazard is real regardless of mechanism, and it is worse than adoption: if a supervisor
+   ever dies WITHOUT running its shutdown, its `Popen` children are orphaned, a new supervisor starts
+   a second worker per camera, and the orphans keep running the old code with no supervisor tracking
+   them. Same symptom, different cause, and neither is detectable from outside the process. Hence the
+   code-version check below rather than a documented ritual: it is indifferent to why the running
+   code differs from disk.
 
 ## Data integrity — fixed in this commit
 

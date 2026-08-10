@@ -175,7 +175,10 @@ def start(cam, cfg):
         log(f"{cam}: FAILED to start: {e}")
         return
     _procs[cam] = {"proc": p, "started": time.time(), "cfg": dict(cfg),
-                   "restarts": _procs.get(cam, {}).get("restarts", 0), "last_exit": None}
+                   "restarts": _procs.get(cam, {}).get("restarts", 0), "last_exit": None,
+                   # CODE VERSION THIS WORKER IS ACTUALLY RUNNING. Recorded at spawn, because after
+                   # this instant the file on disk can change under us and the process cannot.
+                   "code_md5": _worker_md5()}
     zones = ("registry" if (geom.get("zone_landing") and geom.get("zone_cabin"))
              else ("builtin-ch29" if cam == "ch29" else "NONE — counting OFF (save zones into roi.json)"))
     lv = cfg.get("door_levels") or {}
@@ -215,6 +218,52 @@ def converge(reg):
             log(f"{cam}: config changed {rec['cfg']} -> {cfg} — restarting the worker")
             stop(cam, "config change")
             start(cam, cfg)
+
+
+def _worker_md5():
+    """md5 of the worker script AS IT IS ON DISK RIGHT NOW."""
+    import hashlib
+    try:
+        with open(WORKER_SCRIPT, "rb") as fh:
+            return hashlib.md5(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def cycle_stale_code():
+    """Restart any worker whose running code differs from the file on disk.
+
+    WHY. A worker is a separate process started from WORKER_SCRIPT; replacing that file changes what
+    the NEXT spawn runs and nothing about the ones already running. A deploy that copies the new
+    gpu_analyze.py and restarts only the unit is therefore not guaranteed to replace worker code —
+    on 2026-08-10 a deploy needed stop + pkill + start to actually take effect, and the operator had
+    no way to tell from the outside which binary each worker was executing.
+
+    This closes it from the supervisor side: the md5 each worker was SPAWNED with is recorded, and a
+    mismatch against disk cycles that worker. It is deliberately indifferent to WHY they differ —
+    orphaned children from an unclean supervisor death, a mid-flight deploy, or a hand-edited file
+    all present identically and all want the same action.
+
+    Cameras are cycled ONE PER POLL. Seven simultaneous restarts would drop every stream at once and
+    reload seven TensorRT engines into the same GPU; staggered, the fleet re-deploys itself within a
+    few polls with one camera dark at a time.
+    """
+    disk = _worker_md5()
+    if not disk:
+        return
+    for cam in list(_procs):
+        rec = _procs[cam]
+        if rec["proc"].poll() is not None:
+            continue                              # exited — reap() owns it
+        was = rec.get("code_md5") or ""
+        if was and was != disk:
+            log(f"{cam}: WORKER CODE IS STALE — running {was[:8]}, {WORKER_SCRIPT} on disk is "
+                f"{disk[:8]}. Cycling it so the deployed code is the code that runs. "
+                f"(One camera per poll; the rest follow.)")
+            cfg = rec["cfg"]
+            stop(cam, "stale worker code (deploy)")
+            start(cam, cfg)
+            return                                # one per poll, deliberately
 
 
 def reap():
@@ -331,6 +380,7 @@ def main():
                 last_hash = reg["hash"]
             converge(reg)
         reap()
+        cycle_stale_code()
         output_floor()
         alive = sorted(c for c, r in _procs.items() if r["proc"].poll() is None)
         if int(time.time()) % 300 < POLL_S:
