@@ -25,6 +25,7 @@ from concurrent.futures import TimeoutError as _FuturesTimeout
 import numpy as np
 
 import counting
+import post_queue as _pq_mod
 
 CLOUD = os.environ.get("CLOUD_URL", "https://lift.gargi.online").rstrip("/")
 GW = os.environ.get("GW", "site-A")
@@ -628,7 +629,15 @@ def build_door_engine(prefetched_tpl=None):
     return eng, version
 
 
-def post_door_event(rec, version, thash):
+# ---- async POST queue (2026-08-10) --------------------------------------------------------
+# cpu=53-104ms vs post=274-1323ms: 90-96% of the door pass was BLOCKING HTTP, not compute. The
+# queue takes it off the segment loop. It decouples the worker from the gateway; it does not cure
+# the gateway — slowlog.py on the VM keeps that visible now that we stop feeling it here.
+_PQ = None            # post_queue.PostQueue, created in main()
+_DOOR_SEQ = 0         # per-worker monotonic door_event counter — a GAP IS THE DROP, visible in the DB
+
+
+def post_door_event(rec, version, thash, critical=False):
     payload = {"cam": CAM, "ts": rec["t"], "floor": rec["floor"], "direction": rec["direction"],
                "door_state": rec["door_state"], "openness": rec["openness"], "read_conf": rec["read_conf"],
                "panels_agreed": rec["panels_agreed"], "reason": rec["reason"], "candidates": rec.get("candidates"),
@@ -636,6 +645,18 @@ def post_door_event(rec, version, thash):
                # Age of the floor reading carried on this row, seconds. 0.0 = read from this frame.
                # ADDITIVE — it does not move the door era; it makes an existing lag visible.
                "floor_age_s": rec.get("floor_age_s")}
+    global _DOOR_SEQ
+    _DOOR_SEQ += 1
+    # SEQ IS THE GAP MARKER. A consumer seeing 41, 42, 45 knows two rows are missing for this
+    # camera and can refuse to compute a funnel over that window, instead of averaging across a
+    # hole it cannot see. This is what makes a CRITICAL drop honest rather than silent.
+    payload["seq"] = _DOOR_SEQ
+    if _PQ is not None:
+        # CRITICAL = a state change or a completed cycle. Heartbeat re-emits carry nothing the
+        # previous row did not — that is the emit gate's own justification — so they are droppable.
+        _PQ.put(f"{CLOUD}/api/gw/{GW}/door_event", payload, "door_event",
+                cls=_pq_mod.CRITICAL if critical else _pq_mod.DROPPABLE)
+        return
     try:
         http_post_json(f"{CLOUD}/api/gw/{GW}/door_event", payload, what="door_event")
     except Exception as e:
@@ -657,6 +678,9 @@ def post_floorcheck(rec, frame_bgr, panel0_roi, version):
     payload = {"cam": CAM, "ts": rec["t"], "floor": rec["floor"], "direction": rec["direction"],
                "read_conf": rec["read_conf"], "panels_agreed": rec["panels_agreed"], "reason": rec["reason"],
                "door_version": version, "crop_jpeg_b64": b64}
+    if _PQ is not None:
+        _PQ.put(f"{CLOUD}/api/gw/{GW}/floorcheck", payload, "floorcheck", cls=_pq_mod.DROPPABLE)
+        return
     try:
         http_post_json(f"{CLOUD}/api/gw/{GW}/floorcheck", payload, what="floorcheck")
     except Exception as e:
@@ -674,6 +698,10 @@ def main():
             pass
     log(f"start: {BASE}  model={MODEL} device={DEVICE}  (resume: {len(seen)} segs known)")
 
+    global _PQ
+    _PQ = _pq_mod.PostQueue(http_post_json, log=log).start()
+    log("post queue: door_event state-changes are CRITICAL (never dropped, seq marks any gap); "
+        "heartbeats/floorcheck droppable; analyzer_status coalesced to newest")
     det = counting.YoloDetector(weights=MODEL, conf=CONF, tracker="bytetrack.yaml", device=DEVICE)
     log(f"detector on device={DEVICE} — verify with nvidia-smi (non-zero GPU-Util = actually on the L4)")
     ctr = None                                   # ZoneCounter, built once we know the frame size
@@ -798,8 +826,7 @@ def main():
     def heartbeat():                              # so a DEAD worker is visible on /ops, not silent
         try:
             _tot = segments + dropped
-            http_post_json(f"{CLOUD}/api/gw/{GW}/analyzer_status",
-                           {"cam": CAM, "counting_version": counting.COUNTING_VERSION,
+            _st_payload = {"cam": CAM, "counting_version": counting.COUNTING_VERSION,
                             "zones": ZONES_SOURCE,   # registry | builtin-ch29 | none (counting OFF)
                             "uptime_s": time.time() - started, "segments": segments, "dropped": dropped,
                             "posted": posted, "last_transit_ts": last_transit_ts, "mode": val_state,
@@ -831,8 +858,17 @@ def main():
                             # a per-hour drop rate. dropped mid-close = a lost/wrong door event.
                             "drop_frac": round(dropped / _tot, 4) if _tot else 0.0,
                             "drop_rate_hr": round(dropped / ((time.time() - started) / 3600.0), 2)
-                                            if time.time() - started > 60 else None},
-                           what="analyzer_status")
+                                            if time.time() - started > 60 else None}
+            # COALESCED, not queued: only the newest status is kept. Liveness then lags only while
+            # the worker genuinely cannot reach the gateway — honest "down-ish" — instead of
+            # draining a backlog of stale statuses each claiming to describe now. Safe to drop:
+            # gpu_fleet has no reference to analyzer_status, so no restart path keys on it.
+            if _PQ is not None:
+                _PQ.put(f"{CLOUD}/api/gw/{GW}/analyzer_status", _st_payload, "analyzer_status",
+                        cls=_pq_mod.COALESCE, drop_key="analyzer_status")
+            else:
+                http_post_json(f"{CLOUD}/api/gw/{GW}/analyzer_status", _st_payload,
+                               what="analyzer_status")
         except Exception as e:
             log(f"heartbeat POST failed: {e}")
 
@@ -998,7 +1034,7 @@ def main():
                         should, door_prev_key = door_gd.door_event_changed(door_prev_key, drec)
                         _post_t0 = time.time()
                         if should or (d_off - door_last_emit) >= DOOR_HB_S:
-                            post_door_event(drec, door_version, door_thash)
+                            post_door_event(drec, door_version, door_thash, critical=bool(should))
                             door_last_emit = d_off
                         if FLOORCHECK_PER_HR > 0 and (d_off - last_fc_ts) >= (3600.0 / FLOORCHECK_PER_HR):
                             post_floorcheck(drec, fr, panel0_roi, door_version)
@@ -1159,7 +1195,8 @@ def main():
                 log(f"seg timing: throughput={pm:.0f}ms (was fetch+track serial) [decode={dm:.0f} track={tm:.0f} "
                     f"door={om:.0f}(cpu={ocm:.0f} post={opm:.0f}) other={other:.0f} n={n_fr}fr] "
                     f"vs budget={SEG_BUDGET_MS:.0f}ms -> {ratio:.2f}x {verdict}; {bound} "
-                    f"fetch={fm:.0f}ms[headers={cm:.0f} transfer={xm:.0f}]; drop_frac={dfrac:.3%} dropped_total={dropped}")
+                    f"fetch={fm:.0f}ms[headers={cm:.0f} transfer={xm:.0f}]; drop_frac={dfrac:.3%} dropped_total={dropped}"
+                    + (f"; {_PQ.counters_str()}" if _PQ is not None else ""))
                 last_timing_log = time.time()
             seen.add(name)
             # THE liveness signal: one fully-processed segment (fetched, decoded, tracked, door-passed,

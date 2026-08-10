@@ -1,0 +1,174 @@
+"""Async POST queue — takes blocking HTTP off the segment loop without losing state transitions.
+
+MEASURED JUSTIFICATION. Split instrumentation on 2026-08-10: cpu=53-104ms against
+post=274-1323ms on every camera. 90-96% of the door pass was blocking HTTP to the gateway, not
+compute. This decouples the worker from the gateway; it does NOT cure the gateway, and the
+gateway's own slow-request log (slowlog.py) ships first so that problem stays visible.
+
+THE THING THIS GETS RIGHT, AND WHY IT IS NOT A PLAIN RING BUFFER.
+
+`gw_door_event` is not a set of independent observations. It is a STATE SEQUENCE, and three
+consumers walk it: dash's cycle funnel, `_h3_cycle_ts` (the h3 cycle count IS a transition into
+'closed' — there is no marker column, by design), and the attribution SQL. So dropping a row does
+not thin the data, it REWRITES it:
+
+    dropped 'closed' row   -> the cycle disappears from the h3 count and the funnel
+    dropped 'closing' row  -> closing->closed becomes open->closed; stage counts shift
+    dropped cycle row (h2) -> that cycle's close_travel_s is lost outright
+
+A uniform drop-oldest would therefore make the fleet look like it is doing LESS work under load,
+exactly when it is doing more. Hence two classes:
+
+    CRITICAL   door_event carrying a STATE CHANGE or a completed cycle   -> never dropped
+    DROPPABLE  door_event heartbeats, floorcheck, analyzer_status        -> dropped, counted
+
+Dropping a heartbeat is safe BY CONSTRUCTION: the emit gate re-sends an unchanged key purely for
+liveness, so it carries nothing the previous row did not. That is the same statement the gate
+already makes; a drop here just makes it again.
+
+analyzer_status is COALESCED rather than queued: only the newest is kept, replace-in-place. Liveness
+then lags only while the worker genuinely cannot reach the gateway — honest "down-ish" — instead of
+draining a backlog of stale statuses that each claim to describe now.
+
+WHEN THE CRITICAL QUEUE OVERFLOWS, the row is dropped and `seq` makes it VISIBLE IN THE DATABASE.
+Every door_event carries a per-camera monotonic counter, so a consumer seeing 41, 42, 45 knows two
+are missing and can refuse to compute a funnel over that window rather than averaging across a hole
+it cannot see. Blocking the frame loop instead would restore the exact stall being removed.
+
+ORDER IS PRESERVED: one sender thread, FIFO. `dash_api` walks `ORDER BY ts, id`, so ts order and
+insert order must not diverge.
+
+TIMESTAMPS ARE STAMPED AT CAPTURE, NEVER AT SEND. The payload is built by the caller and enqueued
+whole; this module never writes a `ts`. That is load-bearing for era and join integrity, and a queue
+is exactly where a well-meaning `ts=time.time()` gets added later.
+"""
+from __future__ import annotations
+
+import threading
+import time
+from collections import deque
+
+CRITICAL = "critical"
+DROPPABLE = "droppable"
+COALESCE = "coalesce"
+
+
+class PostQueue:
+    """Bounded, single-sender, class-aware POST queue.
+
+    `sender(url, payload, what)` is injected so this module owns no HTTP and can be tested without
+    a network: the worker passes its existing http_post_json.
+    """
+
+    def __init__(self, sender, max_critical=512, max_droppable=128, log=print):
+        self._sender = sender
+        self._log = log
+        self._crit = deque()
+        self._drop = deque()
+        self._coalesced = {}                 # what -> (url, payload); newest only
+        self._max_crit = max_critical
+        self._max_drop = max_droppable
+        self._cv = threading.Condition()
+        self._stop = False
+        self._t = None
+        # Counters. Reported in the seg-timing line and reset when read, so each line describes the
+        # interval it covers rather than all of history.
+        self.dropped = {"critical": 0, "heartbeat": 0, "floorcheck": 0, "status": 0, "other": 0}
+        self.sent = 0
+        self.failed = 0
+
+    # ---- producer side (called from the frame loop; must never block) ----
+    def put(self, url, payload, what, cls=DROPPABLE, drop_key=None):
+        with self._cv:
+            if cls == COALESCE:
+                key = drop_key or what
+                if key in self._coalesced:
+                    self.dropped["status" if "status" in what else "other"] += 1
+                self._coalesced[key] = (url, payload, what)
+            elif cls == CRITICAL:
+                if len(self._crit) >= self._max_crit:
+                    # The only place a state transition is ever lost. Loud, counted, and visible in
+                    # the DB through the seq gap the caller stamped on the payload.
+                    self._crit.popleft()
+                    self.dropped["critical"] += 1
+                    self._log(f"POST QUEUE OVERFLOW: dropped a CRITICAL {what} — the door state "
+                              f"sequence now has a gap and seq will show it. Gateway is not keeping "
+                              f"up ({len(self._crit)} queued).")
+                self._crit.append((url, payload, what))
+            else:
+                if len(self._drop) >= self._max_drop:
+                    _u, _p, w = self._drop.popleft()
+                    k = ("floorcheck" if "floorcheck" in w else
+                         "heartbeat" if "door_event" in w else "other")
+                    self.dropped[k] += 1
+                self._drop.append((url, payload, what))
+            self._cv.notify()
+
+    # ---- consumer side ----
+    def _next(self):
+        """CRITICAL first, then coalesced, then droppable. Starving droppable under sustained
+        pressure is correct: the rows that change derived counts go first."""
+        if self._crit:
+            return self._crit.popleft()
+        if self._coalesced:
+            _k = next(iter(self._coalesced))
+            return self._coalesced.pop(_k)
+        if self._drop:
+            return self._drop.popleft()
+        return None
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while not self._stop and not (self._crit or self._drop or self._coalesced):
+                    self._cv.wait(timeout=1.0)
+                if self._stop and not (self._crit or self._drop or self._coalesced):
+                    return
+                item = self._next()
+            if item is None:
+                continue
+            url, payload, what = item
+            try:
+                self._sender(url, payload, what=what)
+                self.sent += 1
+            except Exception as e:                    # a dead gateway must not kill the sender
+                self.failed += 1
+                self._log(f"POST {what} failed: {type(e).__name__}: {str(e)[:120]}")
+
+    def start(self):
+        if self._t is None:
+            self._t = threading.Thread(target=self._run, name="post-queue", daemon=True)
+            self._t.start()
+        return self
+
+    def stop(self, drain_s=5.0):
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+        if self._t:
+            self._t.join(timeout=drain_s)
+
+    # ---- reporting ----
+    def depth(self):
+        with self._cv:
+            return len(self._crit), len(self._drop), len(self._coalesced)
+
+    def drain_counters(self):
+        """Counts since the last call, and the current depths. Reset-on-read so a seg-timing line
+        describes its own interval."""
+        with self._cv:
+            d = dict(self.dropped)
+            for k in self.dropped:
+                self.dropped[k] = 0
+            sent, failed = self.sent, self.failed
+            self.sent = self.failed = 0
+            return {"dropped": d, "sent": sent, "failed": failed,
+                    "depth": (len(self._crit), len(self._drop), len(self._coalesced))}
+
+    def counters_str(self):
+        c = self.drain_counters()
+        nc, nd, nq = c["depth"]
+        d = c["dropped"]
+        return (f"posts=q:{nc}c/{nd}d/{nq}s sent={c['sent']} failed={c['failed']} "
+                f"dropped=critical:{d['critical']} heartbeat:{d['heartbeat']} "
+                f"floorcheck:{d['floorcheck']} status:{d['status']}")
