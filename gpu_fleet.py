@@ -111,6 +111,9 @@ def fetch_registry():
                         # to h3 while ch16/29/32/34/37 stay on h2 without a code change, and what
                         # lets the next camera join by editing data. Absent/unknown -> h2.
                         "door_tracker": str(c.get("door_tracker") or "h2").strip().lower(),
+                        # Floor-OCR cadence in frames, 0 = every door pass (current behaviour).
+                        # Per camera because the cost scales with that camera's alphabet size.
+                        "floor_stride": int(c.get("floor_stride") or 0),
                         # per-camera DoorTracker levels (close_th recalibration). Values only; the
                         # worker validates ranges — the registry already did on the way in.
                         "door_levels": {k: float(v) for k, v in sorted(lv.items())
@@ -130,7 +133,8 @@ def start(cam, cfg):
                # cameras, a fleet process started with DOOR_TRACKER=h3 in its own environment would
                # hand h3 to every camera it spawned — including the five with no template, which
                # would then fall back to h2 and LOOK fine while the registry said otherwise.
-               DOOR_TRACKER=str(cfg.get("door_tracker") or "h2"))
+               DOOR_TRACKER=str(cfg.get("door_tracker") or "h2"),
+               FLOOR_STRIDE=str(cfg.get("floor_stride") or 0))
     # Geometry from the registry. Env names are gpu_analyze's own, and an ABSENT key is unset rather
     # than blank: gpu_analyze treats "" as "not configured" and falls back, whereas a stale value
     # inherited from the fleet's environment would silently configure this camera from another

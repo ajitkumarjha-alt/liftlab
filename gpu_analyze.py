@@ -108,6 +108,21 @@ DOOR_BLANK_LIT_MARGIN = float(os.environ.get("DOOR_BLANK_LIT_MARGIN", "0.15"))  
 DOOR_CONFUSE_BAND = float(os.environ.get("DOOR_CONFUSE_BAND", "0"))   # >0 = diff-region tiebreak for close pairs (3/5,8/6)
 DOOR_DISC_MIN = float(os.environ.get("DOOR_DISC_MIN", "0.10"))    # min |diff-region projection| to act on
 DOOR_STRIDE = max(1, int(os.environ.get("DOOR_STRIDE", "2")))   # run the door pass every Nth decoded frame
+# FLOOR OCR CADENCE, separate from the door pass (2026-08-10). The door state machine is cheap
+# and order-critical; the floor OCR is expensive and order-tolerant, and on ch29 it was 2963-3338ms
+# of a 4192-4531ms segment against a 2000ms budget. The car dwells at a floor for SECONDS, so
+# reading the panel on every door pass (25x per 2s segment) is ~10x oversampling.
+#
+# 0 = read the floor on every door pass — EXACTLY today's behaviour, so this ships inert and a
+# camera only changes when its registry row says so. Expressed in FRAMES like DOOR_STRIDE; a
+# floor read can only happen on a door-pass frame, so a value that is not a multiple of
+# DOOR_STRIDE would read erratically and is rounded UP to the next multiple, loudly.
+FLOOR_STRIDE = max(0, int(os.environ.get("FLOOR_STRIDE", "0") or 0))
+if FLOOR_STRIDE and FLOOR_STRIDE % DOOR_STRIDE:
+    _fs_old = FLOOR_STRIDE
+    FLOOR_STRIDE = ((FLOOR_STRIDE // DOOR_STRIDE) + 1) * DOOR_STRIDE
+    print(f"[gpu-analyze] FLOOR_STRIDE {_fs_old} is not a multiple of DOOR_STRIDE {DOOR_STRIDE} — "
+          f"rounded up to {FLOOR_STRIDE} so floor reads land on door-pass frames", flush=True)
 # DOOR ENGINE SELECTOR. Per-camera, exactly like DOOR_STRIDE: a worker is one camera, so this env
 # IS the per-camera override, and gpu_fleet sets it from the registry's `door_tracker` field. No
 # camera list is hardcoded anywhere — the ENABLE set lives in the registry, which is what makes
@@ -617,7 +632,10 @@ def post_door_event(rec, version, thash):
     payload = {"cam": CAM, "ts": rec["t"], "floor": rec["floor"], "direction": rec["direction"],
                "door_state": rec["door_state"], "openness": rec["openness"], "read_conf": rec["read_conf"],
                "panels_agreed": rec["panels_agreed"], "reason": rec["reason"], "candidates": rec.get("candidates"),
-               "close_travel_s": rec.get("close_travel_s"), "door_version": version, "templates_hash": thash}
+               "close_travel_s": rec.get("close_travel_s"), "door_version": version, "templates_hash": thash,
+               # Age of the floor reading carried on this row, seconds. 0.0 = read from this frame.
+               # ADDITIVE — it does not move the door era; it makes an existing lag visible.
+               "floor_age_s": rec.get("floor_age_s")}
     try:
         http_post_json(f"{CLOUD}/api/gw/{GW}/door_event", payload, what="door_event")
     except Exception as e:
@@ -953,8 +971,12 @@ def main():
                     _door_t0 = time.time()
                     d_off = seg_wall - ((rel[-1] - rel[i]) if rel else 0.0)
                     wd_phase(f"door-pass {name} fr{i}")
+                    # FLOOR_STRIDE=0 -> every door pass (today). Otherwise every FLOOR_STRIDE
+                    # frames; the door half runs regardless and the floor is carried forward with
+                    # its age in floor_age_s.
+                    _do_floor = (FLOOR_STRIDE <= 0) or (i % FLOOR_STRIDE == 0)
                     try:
-                        drec = door_eng.process(fr, d_off)
+                        drec = door_eng.process(fr, d_off, do_floor=_do_floor)
                     except Exception as e:
                         drec = None
                         log(f"door process error: {type(e).__name__}: {str(e)[:80]}")

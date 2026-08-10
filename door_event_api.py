@@ -134,6 +134,10 @@ def _db():
         db.execute("ALTER TABLE gw_door_event ADD COLUMN n_arrow_labels INTEGER")
     except sqlite3.OperationalError:
         pass                                                    # already present
+    try:                                          # migration: floor reading age (2026-08-10)
+        db.execute("ALTER TABLE gw_door_event ADD COLUMN floor_age_s REAL")
+    except sqlite3.OperationalError:
+        pass
     db.execute("""CREATE TABLE IF NOT EXISTS floor_sample (
       id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT, ts REAL,
       floor TEXT, direction TEXT, read_conf REAL, panels_agreed INTEGER, reason TEXT,
@@ -211,12 +215,12 @@ async def door_event_ingest(gw: str, request: Request, authorization: str = Head
     nal = d.get("n_arrow_labels")
     db.execute("INSERT INTO gw_door_event (gateway_id,cam,ts,floor,direction,door_state,openness,read_conf,"
                "panels_agreed,reason,close_travel_s,door_version,templates_hash,candidates,"
-               "n_arrow_labels,received_at) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               "n_arrow_labels,floor_age_s,received_at) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (gw, cam, float(d.get("ts", time.time())), floor, direction, ds, _f(d.get("openness")),
                 _f(d.get("read_conf")), 1 if d.get("panels_agreed") else 0, str(d.get("reason", "")),
                 _f(d.get("close_travel_s")), str(d.get("door_version", "")), str(d.get("templates_hash", "")),
-                cand, (int(nal) if nal is not None else None), time.time()))
+                cand, (int(nal) if nal is not None else None), _f(d.get("floor_age_s")), time.time()))
     db.commit()
     db.close()
     return {"ok": True}

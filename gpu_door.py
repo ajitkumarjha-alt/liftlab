@@ -1045,6 +1045,7 @@ class DoorFloorEngine:
         self.door = door_tracker if door_tracker is not None else DoorTracker()
         self.floor = floor_tracker if floor_tracker is not None else FloorTracker()
         self.hash = templates_hash(templates)
+        self._last_floor = None      # most recent REAL panel read, carried between floor passes
 
     def door_pass(self, gray, t):
         """THE DOOR HALF, isolated. -> (cycle, door_state_wire, openness, edge_strength).
@@ -1073,10 +1074,21 @@ class DoorFloorEngine:
         openness = self.door.openness(col) if col is not None else None
         return cycle, self.door.state, openness, strength
 
-    def process(self, frame_bgr, t):
-        import cv2
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if frame_bgr.ndim == 3 else frame_bgr
-        cycle, door_state_wire, openness, strength = self.door_pass(gray, t)
+    def floor_pass(self, gray, t):
+        """THE FLOOR HALF, isolated: panel OCR + reconcile + FloorTracker. -> a read dict.
+
+        WHY IT IS SEPARABLE FROM THE DOOR HALF. Measured on ch29 2026-08-10: this pass is
+        2963-3338ms of a 4192-4531ms segment against a 2000ms budget, while the door state machine
+        beside it is cheap. The cost is FloorReader scoring EVERY template in the camera's alphabet
+        with a shift search, so it scales with alphabet size — ch16 (small alphabet) spends 153ms per
+        segment on the whole door pass, ch29 (~70 floors) spends twenty times that.
+
+        The two halves also have opposite requirements. The door state machine is stateful and
+        order-critical: it emits cycles and must see its frames in order. A floor read is independent
+        of the read before it, and the car dwells at a floor for seconds. So the door half stays on
+        every DOOR_STRIDE frame and the floor half gets its own, slower cadence — the caller decides
+        via `do_floor` on process(); nothing here changes what a single read COMPUTES.
+        """
         reads = [rdr.read_panel(crop(gray, proi)) for proi, rdr in self.readers]
         oks = [r for r in reads if r["status"] == "ok"]
         ambigs = [r for r in reads if r["status"] == "ambiguous"]
@@ -1106,18 +1118,48 @@ class DoorFloorEngine:
         # this does NOT move the door era.
         if candidates is None and reads and reads[0].get("cells"):
             candidates = {"cells": reads[0]["cells"], "shift": reads[0].get("shift")}
+        # FloorTracker sees ONLY real reads. Feeding it a carried-forward value would invent dwell
+        # it never observed — the same class of fabrication the episode evidence gate refuses.
         stop = self.floor.update(t, floor, direction) if floor else None
         # n_arrow_labels: how many DISTINCT arrows this camera's reader can name at all. Below 2 the
         # direction field is suppressed above, and this column is what lets a consumer tell
         # "this lift went down" from "this camera can only say down".
         n_arrow_labels = len(self.readers[0][1].arrow_labels) if self.readers else 0
-        out = {"t": t, "floor": floor, "direction": direction, "door_state": door_state_wire,
-               "n_arrow_labels": n_arrow_labels,
+        return {"floor": floor, "direction": direction, "conf": conf, "agreed": agreed,
+                "reason": reason, "candidates": candidates, "stop": stop,
+                "n_arrow_labels": n_arrow_labels, "shift": reads[0].get("shift"), "t": t}
+
+    def process(self, frame_bgr, t, do_floor=True):
+        """One frame. `do_floor=False` runs the door half only and CARRIES FORWARD the last floor read.
+
+        The carried read is reported with `floor_age_s` — the age of the reading, in seconds, at this
+        frame's timestamp. It is 0.0 on a frame that actually read the panel. Assumed lag is exactly
+        the class of silent instrument change this project keeps paying for, so the lag is a COLUMN,
+        not a footnote: a consumer can see how stale the floor on any row is and decide for itself.
+
+        `stop` is only ever emitted from a real read; a carried-forward frame reports stop=None.
+        """
+        import cv2
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if frame_bgr.ndim == 3 else frame_bgr
+        cycle, door_state_wire, openness, strength = self.door_pass(gray, t)
+        if do_floor or self._last_floor is None:
+            fr_ = self.floor_pass(gray, t)
+            self._last_floor = fr_
+            floor_age = 0.0
+            stop = fr_["stop"]
+        else:
+            fr_ = self._last_floor
+            floor_age = max(0.0, t - fr_["t"])
+            stop = None                                     # a stop is an observation, not a carry
+        out = {"t": t, "floor": fr_["floor"], "direction": fr_["direction"],
+               "door_state": door_state_wire,
+               "n_arrow_labels": fr_["n_arrow_labels"],
                "openness": (round(float(openness), 3) if openness is not None else None),
-               "read_conf": (round(float(conf), 3) if conf is not None else None),
-               "panels_agreed": agreed, "reason": reason, "n_panels": len(self.readers),
+               "read_conf": (round(float(fr_["conf"]), 3) if fr_["conf"] is not None else None),
+               "panels_agreed": fr_["agreed"], "reason": fr_["reason"], "n_panels": len(self.readers),
                "edge_strength": round(float(strength), 3), "cycle": cycle, "stop": stop,
-               "candidates": candidates, "shift": reads[0].get("shift")}
+               "candidates": fr_["candidates"], "shift": fr_["shift"],
+               "floor_age_s": round(float(floor_age), 3)}
         if cycle:
             out["close_travel_s"] = cycle.get("close_travel_s")
         return out
