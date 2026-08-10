@@ -342,6 +342,33 @@ def post_episode(ep, reason=""):
         log(f"episode closed EMPTY (0 transits, {reason}) — not posting")
         return
     dc = ep.get("det_counts") or []
+    # ── EVIDENCE GATE (2026-08-10) ───────────────────────────────────────────
+    # A LOST TRANSIT IS HONEST; AN INVENTED ONE IS NOT.
+    #
+    # 05:24:41 on ch29 posted a transit — machine_alighted=1 — from an episode with NO evidence
+    # whatsoever behind it:
+    #     episode attempt (gap-between-segments): boarded=0 alighted=1 imgs=0 span=0s
+    #     episode dets: per-frame max=0 mean=0.0 over 0 frames; distinct track_ids=0; conf 0.00/0.00/0.00
+    #     episode POST -> HTTP 200
+    # Zero frames analysed, zero distinct tracks, zero detections, zero span — and it landed in
+    # validation_item as a real observation, indistinguishable downstream from a counted one.
+    #
+    # HOW IT HAPPENS. Under sustained over-budget churn the segment clock keeps gapping, which
+    # rebuilds the tracker and counter and drops the open episode ("reset #2/#3/#4" in the same
+    # journal, every ~2 min). A transit already latched in the counter is then flushed into a
+    # freshly-opened episode that never saw a frame. The count is a residue of the destroyed state,
+    # not a measurement of this episode.
+    #
+    # This gate does NOT try to fix the churn — that is a capacity problem and a restart cannot fix
+    # throughput. It makes the data honest while the capacity work happens: an episode with no frames
+    # and no tracks cannot have observed a boarding, so it is refused and counted, never posted.
+    n_ids_gate = len(ep.get("ids") or ())
+    if not dc or n_ids_gate == 0:
+        log(f"episode REFUSED ({reason}): claims boarded={ep['b']} alighted={ep['a']} but has "
+            f"{len(dc)} analysed frames and {n_ids_gate} distinct track_ids — no evidence behind the "
+            f"count, so it is NOT posted. This is the churn signature (tracker rebuilt mid-episode); "
+            f"the transit is LOST, which is honest. Fix the throughput, not this gate.")
+        return
     det_max = max(dc) if dc else 0                          # most people YOLO saw in any single frame
     det_mean = sum(dc) / len(dc) if dc else 0.0
     n_ids = len(ep.get("ids") or ())                        # distinct tracks the tracker established
@@ -694,6 +721,7 @@ def main():
     transfer_times = deque(maxlen=60)             # rolling body-transfer ms
     decode_times = deque(maxlen=60)               # rolling HEVC decode ms
     track_times = deque(maxlen=60)                # rolling YOLO track ms         (the only true GPU-compute cost)
+    door_times = deque(maxlen=60)                 # rolling door/floor pass ms (engine + its POSTs) — CPU
     last_timing_log = 0.0
     from concurrent.futures import ThreadPoolExecutor
     fetch_ex = ThreadPoolExecutor(max_workers=max(2, PREFETCH_N + 1), thread_name_prefix="prefetch")
@@ -877,6 +905,15 @@ def main():
                 seen.add(name); continue
             segments += 1
             track_ms = 0.0
+            # UNATTRIBUTED-TIME INSTRUMENTATION (2026-08-10). The seg-timing line reported
+            # decode+track+fetch ~= 1.3s against a measured 5.0s throughput on ch29 — 75% of the
+            # per-segment cost was not measured by the line being used to diagnose it, and its
+            # "COMPUTE-bound (GPU)" verdict is a two-way compare between fetch and track that
+            # together are ~22% of the total. Mitigation aimed at YOLO would target 12%.
+            # These two cover the rest of the frame loop: the door/floor pass (CPU: Sobel +
+            # per-cell NCC, DOOR_STRIDE-cadenced) and every HTTP POST made inside the segment.
+            door_ms = 0.0
+            post_ms = 0.0
             if ctr is None and ZONES_SOURCE != "none":
                 H, W = frames[0].shape[:2]
                 ctr = make_counter(W, H)
@@ -913,6 +950,7 @@ def main():
                 # runs even when counting subsamples. Cheap (Sobel + small-cell NCC) vs YOLO. Emits the
                 # gw_door_event stream on state-change (+ liveness heartbeat); samples N/hr to /floorcheck.
                 if door_eng is not None and i % DOOR_STRIDE == 0:
+                    _door_t0 = time.time()
                     d_off = seg_wall - ((rel[-1] - rel[i]) if rel else 0.0)
                     wd_phase(f"door-pass {name} fr{i}")
                     try:
@@ -934,6 +972,7 @@ def main():
                         if FLOORCHECK_PER_HR > 0 and (d_off - last_fc_ts) >= (3600.0 / FLOORCHECK_PER_HR):
                             post_floorcheck(drec, fr, panel0_roi, door_version)
                             last_fc_ts = d_off
+                    door_ms += (time.time() - _door_t0) * 1000   # engine + its POSTs, per segment
                 if ctr is None:
                     continue                      # no zones for this camera — counting OFF (door pass above ran)
                 if i % stride != 0:
@@ -1055,6 +1094,7 @@ def main():
                     log(f"{name}: +{len(ctr.transits)-before} transits (cum boarded={b} alighted={a}, posted={posted})")
             seg_ms = (time.time() - seg_t0) * 1000          # NON-OVERLAPPED wall: max(fetch_wait, 0)+decode+track+post
             proc_times.append(seg_ms); track_times.append(track_ms)
+            door_times.append(door_ms)
             fetch_times.append(fetch_ms); decode_times.append(decode_ms)
             headers_times.append(headers_ms); transfer_times.append(transfer_ms)
             if time.time() - last_timing_log > 30 and proc_times:
@@ -1065,9 +1105,24 @@ def main():
                 _tot = segments + dropped
                 dfrac = dropped / _tot if _tot else 0.0
                 verdict = "OVER-BUDGET (cannot keep pace)" if ratio > 1.0 else "within budget"
-                bound = "FETCH-bound" if fm > tm else "COMPUTE-bound (GPU)"
+                om = sum(door_times) / len(door_times) if door_times else 0.0
+                # RESIDUAL, NAMED. Everything in the segment's wall time that no counter above
+                # explains: transit/validation POSTs, image capture+b64, counter bookkeeping, and any
+                # blocking fetch wait not overlapped by the prefetch.
+                other = max(0.0, pm - dm - tm - om)
+                # The old verdict was `"FETCH-bound" if fm > tm else "COMPUTE-bound (GPU)"` — a
+                # two-way compare between components that on ch29 were together ~22% of the measured
+                # throughput, so it announced "COMPUTE-bound (GPU)" while ~75% of the cost sat
+                # unmeasured. Name the LARGEST measured component instead, and say so explicitly when
+                # the unexplained residual is the biggest thing in the segment.
+                _parts = {"decode": dm, "track(GPU)": tm, "door(CPU)": om, "unexplained": other}
+                _big = max(_parts, key=_parts.get)
+                bound = (f"DOMINATED BY {_big} ({_parts[_big]:.0f}ms of {pm:.0f}ms)"
+                         + ("" if _big != "unexplained" else
+                            " — the biggest cost is NOT measured by this line; instrument before tuning"))
                 # fetch split: headers≈RTT floor when warm (fetch saga verdict: physics, not handshakes); high = cold sockets or server TTFB
-                log(f"seg timing: throughput={pm:.0f}ms (was fetch+track serial) [decode={dm:.0f} track={tm:.0f} n={n_fr}fr] "
+                log(f"seg timing: throughput={pm:.0f}ms (was fetch+track serial) [decode={dm:.0f} track={tm:.0f} "
+                    f"door={om:.0f} other={other:.0f} n={n_fr}fr] "
                     f"vs budget={SEG_BUDGET_MS:.0f}ms -> {ratio:.2f}x {verdict}; {bound} "
                     f"fetch={fm:.0f}ms[headers={cm:.0f} transfer={xm:.0f}]; drop_frac={dfrac:.3%} dropped_total={dropped}")
                 last_timing_log = time.time()
