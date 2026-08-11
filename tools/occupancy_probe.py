@@ -17,6 +17,8 @@ def main():
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--model", default=os.environ.get("MODEL", "yolo11n.pt"))
     ap.add_argument("--conf", type=float, default=0.35)
+    ap.add_argument("--device", default=None,
+                    help="cuda for the production TensorRT engine; omit for CPU")
     a = ap.parse_args()
 
     import cv2, counting
@@ -25,7 +27,7 @@ def main():
     if not (zl and zc):
         raise SystemExit("roi.json has no zone_landing/zone_cabin — occupancy needs the cabin zone")
     ctr = counting.ZoneCounter(zone_landing=zl, zone_cabin=zc)
-    det = counting.YoloDetector(weights=a.model, conf=a.conf, tracker="bytetrack.yaml", device=None)
+    det = counting.YoloDetector(weights=a.model, conf=a.conf, tracker="bytetrack.yaml", device=a.device)
 
     cap = cv2.VideoCapture(a.video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
