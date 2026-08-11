@@ -278,9 +278,15 @@ def cameras_get(gw: str, authorization: str = Header("")):
     rows = _rows(db, gw)
     db.close()
     cams, h = _payload(rows, gw)
+    # NO-STORE. The fleet acts on this body, and a cached copy is indistinguishable from an
+    # unchanged registry — a POST at 06:48 on 2026-08-11 went unseen by the running supervisor for
+    # four consecutive polls. `t` is what lets the client PROVE the body is fresh rather than
+    # replayed; the header is what stops anything in between replaying it in the first place.
     return JSONResponse({"gateway": gw, "cameras": cams, "hash": h, "t": time.time(),
                          "enabled_count": sum(1 for c in cams if c["enabled"]),
-                         "max_enabled": MAX_ENABLED})
+                         "max_enabled": MAX_ENABLED},
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                                 "Pragma": "no-cache"})
 
 
 @camera_registry_router.post("/api/gw/{gw}/cameras/{cam}")

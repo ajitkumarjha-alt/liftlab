@@ -79,12 +79,20 @@ def log(m):
 _procs = {}          # cam -> {proc, started, cfg, restarts, last_exit}
 _last_good = None    # the last SUCCESSFULLY read registry — the only thing we ever act on
 _hb = [time.monotonic()]
+HASH_HEARTBEAT_POLLS = int(os.environ.get("FLEET_HASH_HEARTBEAT_POLLS", "10"))  # ~5 min at 30s
+_SELF_MD5 = ""       # md5 of this file AS LOADED, filled at startup
+_SELF_WARNED = False
 
 
 def fetch_registry():
     """The registry, or None. None means 'do not act' — every failure mode returns it."""
+    # NO-CACHE, EXPLICITLY. urllib does not cache, but nothing between here and the app is
+    # guaranteed not to. A stale body is indistinguishable from an unchanged registry unless we
+    # both forbid caching and CHECK — see the freshness test in the poll loop.
     req = urllib.request.Request(f"{CLOUD}/api/gw/{GW}/cameras",
-                                 headers={"Authorization": "Bearer " + TOKEN})
+                                 headers={"Authorization": "Bearer " + TOKEN,
+                                          "Cache-Control": "no-cache, no-store, max-age=0",
+                                          "Pragma": "no-cache"})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as r:
             import json
@@ -123,7 +131,9 @@ def fetch_registry():
                         "geometry": {k: str(v) for k, v in sorted(g.items()) if k in
                                      ("door_roi_frame", "panel_rois", "digit_cells", "arrow_cell",
                                       "zone_landing", "zone_cabin", "zone_frame")}}
-    return {"cams": out, "hash": d.get("hash")}
+    # `t` is the SERVER's stamp on this response (camera_registry_api.cameras_get). It was being
+    # discarded, and it is the one field that can prove a body is fresh rather than replayed.
+    return {"cams": out, "hash": d.get("hash"), "t": d.get("t")}
 
 
 def start(cam, cfg):
@@ -222,6 +232,32 @@ def converge(reg):
             log(f"{cam}: config changed {rec['cfg']} -> {cfg} — restarting the worker")
             stop(cam, "config change")
             start(cam, cfg)
+
+
+def _self_md5():
+    """md5 of THIS file on disk. cycle_stale_code covers the WORKERS; nothing covers the
+    supervisor, so a gpu_fleet.py deployed without a unit restart keeps running the old code
+    indefinitely and silently — which is exactly how a supervisor can be blind to registry fields
+    it was never taught to parse."""
+    import hashlib
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.md5(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def check_self_stale():
+    """Loud, once per transition. This process CANNOT safely restart itself — systemd owns that —
+    so the honest action is to be unmissable in the journal rather than to act."""
+    global _SELF_WARNED
+    disk = _self_md5()
+    if disk and _SELF_MD5 and disk != _SELF_MD5 and not _SELF_WARNED:
+        _SELF_WARNED = True
+        log(f"SUPERVISOR CODE IS STALE — running {_SELF_MD5[:8]}, {os.path.abspath(__file__)} on "
+            f"disk is {disk[:8]}. cycle_stale_code covers the workers, NOT this process. A registry "
+            f"field added in the newer code is INVISIBLE to the running supervisor until "
+            f"`systemctl restart liftlab-gpu-fleet`.")
 
 
 def _worker_md5():
@@ -354,7 +390,12 @@ def main():
     if not TOKEN:
         log("no ANALYSIS_TOKEN/GATEWAY_TOKEN in env — cannot read the registry; refusing to start")
         return 2
+    global _SELF_MD5
+    _SELF_MD5 = _self_md5()
     log(f"fleet up: {CLOUD}/api/gw/{GW}/cameras every {POLL_S:.0f}s; worker={WORKER_SCRIPT}")
+    log(f"supervisor code {_SELF_MD5[:8]} ({os.path.abspath(__file__)}); worker code "
+        f"{_worker_md5()[:8]}. The workers are cycled on a code change; THIS process is not — "
+        f"a gpu_fleet.py deploy needs a unit restart and will be flagged if one is missed.")
     log("SAFETY: a failed or empty poll changes NOTHING — the running set is only ever altered by a "
         "registry that was read successfully and is non-empty.")
     floor_desc = ("OFF" if FLOOR_S <= 0 else
@@ -373,17 +414,46 @@ def main():
     threading.Thread(target=watchdog, args=(os.getpid(),), name="fleet-watchdog", daemon=True).start()
 
     last_hash = None
+    last_srv_t = None
+    unchanged_polls = 0
     while True:
         _hb[0] = time.monotonic()
         reg = fetch_registry()
         if reg is not None:
             _last_good = reg
+            # ── REGISTRY FRESHNESS. Silence was the defect: only CHANGES were logged, so a
+            # supervisor being served a stale body looked exactly like a quiet registry, and a
+            # change made at 06:48 went unseen across four polls with nothing in the journal.
+            # Two independent checks, both loud, because "no news" must never mean "no evidence".
+            now_t = time.time()
+            srv_t = reg.get("t")
+            if srv_t is None:
+                log("REGISTRY RESPONSE HAS NO SERVER TIMESTAMP — cannot prove it is fresh. The API "
+                    "is older than the freshness check; treat hash stability as unverified.")
+            elif last_srv_t is not None and srv_t <= last_srv_t:
+                # The server stamps t on every response. Identical or going backwards means we were
+                # handed a REPLAYED body — a cache between us and the app, not a quiet registry.
+                log(f"STALE REGISTRY RESPONSE — server timestamp {srv_t:.0f} did not advance since "
+                    f"the last poll ({last_srv_t:.0f}). Something is serving a CACHED body; the "
+                    f"registry may have changed without us seeing it. hash={reg['hash']}")
+            last_srv_t = srv_t if srv_t is not None else last_srv_t
+
             if reg["hash"] != last_hash:
                 enabled = sorted(c for c, v in reg["cams"].items() if v["enabled"])
                 log(f"registry hash {last_hash} -> {reg['hash']}; enabled: {enabled or 'NONE'}")
                 last_hash = reg["hash"]
+                unchanged_polls = 0
+            else:
+                unchanged_polls += 1
+                # POSITIVE EVIDENCE ON A SCHEDULE. A periodic "still X, as of server time T" line is
+                # what distinguishes "nothing changed" from "we stopped seeing changes".
+                if unchanged_polls % HASH_HEARTBEAT_POLLS == 0:
+                    age = (now_t - srv_t) if srv_t else float("nan")
+                    log(f"registry unchanged for {unchanged_polls} polls: hash={reg['hash']} "
+                        f"(server t={srv_t:.0f}, {age:.1f}s ago) — poll is LIVE, not stuck")
             converge(reg)
         reap()
+        check_self_stale()
         cycle_stale_code()
         output_floor()
         alive = sorted(c for c, r in _procs.items() if r["proc"].poll() is None)
