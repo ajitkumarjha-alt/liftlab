@@ -118,6 +118,9 @@ DOOR_STRIDE = max(1, int(os.environ.get("DOOR_STRIDE", "2")))   # run the door p
 # camera only changes when its registry row says so. Expressed in FRAMES like DOOR_STRIDE; a
 # floor read can only happen on a door-pass frame, so a value that is not a multiple of
 # DOOR_STRIDE would read erratically and is rounded UP to the next multiple, loudly.
+# Peak-occupancy coverage guard: a peak computed while the worker was dropping this fraction of
+# segments is flagged rather than quietly reported over thin coverage.
+OCC_DEGRADED_DROP_FRAC = float(os.environ.get("OCC_DEGRADED_DROP_FRAC", "0.20"))
 FLOOR_STRIDE = max(0, int(os.environ.get("FLOOR_STRIDE", "0") or 0))
 if FLOOR_STRIDE and FLOOR_STRIDE % DOOR_STRIDE:
     _fs_old = FLOOR_STRIDE
@@ -379,11 +382,25 @@ def post_episode(ep, reason=""):
     # throughput. It makes the data honest while the capacity work happens: an episode with no frames
     # and no tracks cannot have observed a boarding, so it is refused and counted, never posted.
     n_ids_gate = len(ep.get("ids") or ())
-    if not dc or n_ids_gate == 0:
-        log(f"episode REFUSED ({reason}): claims boarded={ep['b']} alighted={ep['a']} but has "
-            f"{len(dc)} analysed frames and {n_ids_gate} distinct track_ids — no evidence behind the "
-            f"count, so it is NOT posted. This is the churn signature (tracker rebuilt mid-episode); "
-            f"the transit is LOST, which is honest. Fix the throughput, not this gate.")
+    n_frames = int(ep.get("frames", 0))
+    # THE DENOMINATOR IS `frames`, NOT det_counts. det_counts and ids are collected only while
+    # VALIDATING (see the guard at the detection audit), so a live episode legitimately has neither
+    # — and the first version of this gate, shipped in aa39eb0, therefore refused EVERY live
+    # episode and silently stopped the live audit trail. `frames` counts analysed frames in both
+    # modes, which is what "did we look at anything" actually means.
+    if n_frames == 0:
+        log(f"episode REFUSED ({reason}): claims boarded={ep['b']} alighted={ep['a']} over ZERO "
+            f"analysed frames — no evidence behind the count, so it is NOT posted. This is the "
+            f"churn signature (tracker rebuilt mid-episode); the transit is LOST, which is honest. "
+            f"Fix the throughput, not this gate.")
+        return
+    if dc and n_ids_gate == 0:
+        # Validating mode DID collect a detection audit and it found no track at all. Frames were
+        # analysed, so this is not the churn case — it is a real episode the tracker could not
+        # resolve, and a counted transit with no track behind it is still not evidence.
+        log(f"episode REFUSED ({reason}): claims boarded={ep['b']} alighted={ep['a']} over "
+            f"{n_frames} analysed frames but ZERO distinct track_ids across {len(dc)} audited "
+            f"frames — counted without a track. NOT posted.")
         return
     det_max = max(dc) if dc else 0                          # most people YOLO saw in any single frame
     det_mean = sum(dc) / len(dc) if dc else 0.0
@@ -393,7 +410,10 @@ def post_episode(ep, reason=""):
     c_mean = sum(cf) / len(cf) if cf else 0.0
     c_max = max(cf) if cf else 0.0
     log(f"episode attempt ({reason}): boarded={ep['b']} alighted={ep['a']} imgs={len(ep['imgs'])} "
-        f"span={ep['ts_end'] - ep['ts_start']:.0f}s")
+        f"span={ep['ts_end'] - ep['ts_start']:.0f}s frames={ep.get('frames', 0)}")
+    log(f"episode occupancy: peak {ep.get('occ_max', 0)} MEASURED MINIMUM in cabin over "
+        f"{ep.get('occ_frames', 0)} analysed frames"
+        + (" — DEGRADED (>20% segment drop; thin coverage)" if ep.get("occ_degraded") else ""))
     # DETECTION AUDIT: the counted transits can only be as good as what YOLO+tracker saw. If a crowd of
     # five shows det_max=2, the people were never detected (occlusion); if det_max=5 but distinct_ids=2,
     # the tracker merged them. Either way it's a detection problem, not a guard-tuning one. The conf range
@@ -407,6 +427,15 @@ def post_episode(ep, reason=""):
                              "det_max": det_max, "det_mean": round(det_mean, 1), "distinct_ids": n_ids,
                              "det_frames": len(dc), "conf_min": round(c_min, 2),
                              "conf_mean": round(c_mean, 2), "conf_max": round(c_max, 2),
+                             # PEAK CAR OCCUPANCY — a MEASURED MINIMUM, never "the occupancy".
+                             # occupancy_frames is its evidence denominator, same philosophy as the
+                             # gate above: a peak means nothing without the coverage it was taken
+                             # over. occupancy_degraded marks a peak computed while the worker was
+                             # dropping >20% of segments, i.e. over thin coverage.
+                             "occupancy_max": int(ep.get("occ_max", 0)),
+                             "occupancy_frames": int(ep.get("occ_frames", 0)),
+                             "occupancy_degraded": int(bool(ep.get("occ_degraded"))),
+                             "analysed_frames": int(ep.get("frames", 0)),
                              "counting_version": counting.COUNTING_VERSION},  # verdict is valid only for this logic
                             what="validation_item")
         log(f"episode POST -> HTTP {st}")
@@ -901,6 +930,8 @@ def main():
                 log(f"templates refetch failed: {e}")
         if not new:
             if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
+                _tot_d = segments + dropped
+                episode["occ_degraded"] = bool(_tot_d and (dropped / _tot_d) > OCC_DEGRADED_DROP_FRAC)
                 post_episode(episode, "gap"); episode = None
             # STARVATION IS NOT A HANG. The playlist fetch above returned, so the loop is turning and
             # the network works — there is simply nothing upstream to process. Refresh the watchdog:
@@ -1100,6 +1131,17 @@ def main():
                         episode["det_counts"].append(len(dets))
                         episode["ids"].update(ids)
                         episode["confs"].extend(cfs)
+                # PEAK CAR OCCUPANCY + the analysed-frame denominator. Both are counted on EVERY
+                # analysed frame regardless of validation mode: the detection audit above is a
+                # validating-only luxury, but "how many frames did we actually look at" must exist
+                # for a live episode too, or an episode has no evidence denominator at all.
+                if episode is not None:
+                    episode["frames"] += 1
+                    if ctr is not None:
+                        _cab = len(ctr.cabin_ids(dets))
+                        if _cab > episode["occ_max"]:
+                            episode["occ_max"] = _cab
+                        episode["occ_frames"] += 1
                 pre = len(ctr.transits)
                 pre_rej = len(ctr.rejections)
                 ctr.update(dets, offset_s=frame_off)         # real per-frame wall time (see decode_segment rel)
@@ -1140,6 +1182,8 @@ def main():
                     now = t.offset_s
                     if episode and (now - episode["ts_end"] > EPISODE_GAP_S
                                     or now - episode["ts_start"] > EPISODE_MAX_S):
+                        _tot_d = segments + dropped
+                        episode["occ_degraded"] = bool(_tot_d and (dropped / _tot_d) > OCC_DEGRADED_DROP_FRAC)
                         post_episode(episode, "gap/max"); episode = None
                     if episode is None:
                         _validating = val_state == "validating"
@@ -1147,7 +1191,11 @@ def main():
                                    # seed the detection audit from the run-up frames — validating only
                                    "det_counts": [n for n, _, _ in recent_dets] if _validating else [],
                                    "ids": set(i for _, idt, _ in recent_dets for i in idt) if _validating else set(),
-                                   "confs": [c for _, _, cfs in recent_dets for c in cfs] if _validating else []}
+                                   "confs": [c for _, _, cfs in recent_dets for c in cfs] if _validating else [],
+                                   # MODE-INDEPENDENT EVIDENCE. det_counts/ids above are collected
+                                   # ONLY when validating, so they cannot be the denominator for a
+                                   # LIVE episode — see the gate in post_episode.
+                                   "frames": 0, "occ_max": 0, "occ_frames": 0}
                         log(f"episode opened at {now:.0f} ({val_state})")
                     episode["ts_end"] = now
                     episode["b" if t.direction == "in" else "a"] += 1
@@ -1253,12 +1301,16 @@ def main():
                 os._exit(1)
         # close a stale validation episode (door shut) + refresh this cam's mode periodically
         if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
+            _tot_d = segments + dropped
+            episode["occ_degraded"] = bool(_tot_d and (dropped / _tot_d) > OCC_DEGRADED_DROP_FRAC)
             post_episode(episode, "gap-between-segments"); episode = None
         if time.time() - last_val_poll > VAL_POLL_S:
             ns = get_val_state()
             if ns != val_state:
                 log(f"validation mode: {val_state} -> {ns}")
                 if ns == "live" and episode:
+                    _tot_d = segments + dropped
+                    episode["occ_degraded"] = bool(_tot_d and (dropped / _tot_d) > OCC_DEGRADED_DROP_FRAC)
                     post_episode(episode, "mode->live flush"); episode = None
             val_state = ns
             last_val_poll = time.time()

@@ -218,6 +218,19 @@ class ZoneCounter:
             return "landing"
         return None
 
+    def cabin_ids(self, dets: list[Detection]) -> set:
+        """Distinct track_ids whose FOOT is inside zone_cabin on this frame.
+
+        This is the per-frame input to PEAK CAR OCCUPANCY. It reuses _zone_of, so occupancy and
+        counting agree by construction about what "in the cabin" means — two definitions of the
+        same boundary would eventually disagree and nobody would know which was right.
+
+        IT IS A FLOOR, NOT A COUNT. A person the detector missed — occluded behind another body,
+        which is exactly what happens in a full car — is not here. Every consumer of this number
+        must say "measured minimum".
+        """
+        return {d.track_id for d in dets if self._zone_of(d) == "cabin"}
+
     def _flush_attempt(self, tid: int) -> None:
         """A crossing attempt ended (track left the zones or vanished) without being counted.
         Record WHY and how far it got, so rejected crossings become data, not silence."""
