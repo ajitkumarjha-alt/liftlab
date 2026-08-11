@@ -18,4 +18,9 @@ reports/
 # Local virtualenvs
 .venv/
 venv/
+# Video corpus. A LITERAL name was the only rule here, so the three Tuesday captures that
+# landed on 2026-08-11 were committable and one `git add -A` from staging 105MB. Keep the
+# literal as well: it is harmless, and removing it would rely on the glob having been read
+# correctly by whoever edits this next.
+*.mp4
 ch30_peak.mp4
