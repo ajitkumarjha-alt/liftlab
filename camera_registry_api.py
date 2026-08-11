@@ -111,32 +111,58 @@ def _geometry(gw, cam):
 camera_registry_router = APIRouter()
 
 
+
+# ---- schema init: ONCE, not per request -------------------------------------------------
+# _db() ran CREATE TABLE IF NOT EXISTS plus every ALTER TABLE migration on EVERY request, and the
+# ALTERs each RAISE and are caught once the column exists. Measured 0.39ms median / 7.78ms max per
+# call on an idle box — small, but it sat inside the window that blocked the event loop, and it is
+# pure waste on the hot ingest path. Run it once at import; connections after that just connect.
+#
+# busy_timeout is set EXPLICITLY. The default is 0: a writer that meets a held lock gives up
+# immediately rather than waiting. Under WAL with a long-running dashboard read or a checkpoint in
+# flight that is the difference between a slow write and a failed one. reports_api and report_runner
+# already set 30000; the ingest path never did.
+_SCHEMA_READY = False
+
+
+def _init_schema():
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    db = sqlite3.connect(DB_PATH)
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS camera_registry (
+          gateway_id TEXT, cam TEXT, enabled INTEGER DEFAULT 0, stride INTEGER DEFAULT 2,
+          analyze_fps REAL DEFAULT 0, note TEXT, updated_at REAL,
+          PRIMARY KEY (gateway_id, cam))""")
+        try:                                          # migration: pre-door_levels tables lack the column
+            db.execute("ALTER TABLE camera_registry ADD COLUMN door_levels TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass                                      # already there
+        try:                                          # migration: per-camera floor range (2026-07-30)
+            db.execute("ALTER TABLE camera_registry ADD COLUMN floor_range TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass                                      # already there
+        try:                                          # migration: per-camera door engine (2026-08-05)
+            db.execute("ALTER TABLE camera_registry ADD COLUMN door_tracker TEXT DEFAULT 'h2'")
+        except sqlite3.OperationalError:
+            pass                                      # already there
+        try:                                          # migration: per-camera floor-OCR cadence (2026-08-10)
+            db.execute("ALTER TABLE camera_registry ADD COLUMN floor_stride INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass                                      # already there
+        db.commit()
+    finally:
+        db.close()
+    _SCHEMA_READY = True
+
+
 def _db():
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
-    db.execute("""CREATE TABLE IF NOT EXISTS camera_registry (
-      gateway_id TEXT, cam TEXT, enabled INTEGER DEFAULT 0, stride INTEGER DEFAULT 2,
-      analyze_fps REAL DEFAULT 0, note TEXT, updated_at REAL,
-      PRIMARY KEY (gateway_id, cam))""")
-    try:                                          # migration: pre-door_levels tables lack the column
-        db.execute("ALTER TABLE camera_registry ADD COLUMN door_levels TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass                                      # already there
-    try:                                          # migration: per-camera floor range (2026-07-30)
-        db.execute("ALTER TABLE camera_registry ADD COLUMN floor_range TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass                                      # already there
-    try:                                          # migration: per-camera door engine (2026-08-05)
-        db.execute("ALTER TABLE camera_registry ADD COLUMN door_tracker TEXT DEFAULT 'h2'")
-    except sqlite3.OperationalError:
-        pass                                      # already there
-    try:                                          # migration: per-camera floor-OCR cadence (2026-08-10)
-        db.execute("ALTER TABLE camera_registry ADD COLUMN floor_stride INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass                                      # already there
+    db.execute("PRAGMA busy_timeout=30000")
+    _init_schema()
     return db
-
-
 def _parse_floor_range(v):
     """Canonical 'lo-hi' from operator input, or '' to clear. OPERATOR-ENTERED from the tower
     fact sheet, never derived from observed reads — deriving from reads would bless the

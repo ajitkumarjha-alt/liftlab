@@ -24,6 +24,7 @@ import time
 
 import nav_common as nc
 from fastapi import APIRouter, Header, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 # NO relative default (2026-07-30): "./gateway.db" under a service WorkingDirectory silently
@@ -108,6 +109,71 @@ def _admit_floor(gw, cam, floor, reason):
 door_event_router = APIRouter()
 
 
+
+# ---- schema init: ONCE, not per request -------------------------------------------------
+# _db() ran CREATE TABLE IF NOT EXISTS plus every ALTER TABLE migration on EVERY request, and the
+# ALTERs each RAISE and are caught once the column exists. Measured 0.39ms median / 7.78ms max per
+# call on an idle box — small, but it sat inside the window that blocked the event loop, and it is
+# pure waste on the hot ingest path. Run it once at import; connections after that just connect.
+#
+# busy_timeout is set EXPLICITLY. The default is 0: a writer that meets a held lock gives up
+# immediately rather than waiting. Under WAL with a long-running dashboard read or a checkpoint in
+# flight that is the difference between a slow write and a failed one. reports_api and report_runner
+# already set 30000; the ingest path never did.
+_SCHEMA_READY = False
+
+
+def _init_schema():
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    db = sqlite3.connect(DB_PATH)
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS gw_door_event (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT, ts REAL,
+          floor TEXT, direction TEXT, door_state TEXT, openness REAL, read_conf REAL,
+          panels_agreed INTEGER, reason TEXT, close_travel_s REAL,
+          door_version TEXT, templates_hash TEXT, received_at REAL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS ix_door_event ON gw_door_event (gateway_id,cam,ts)")
+        try:
+            db.execute("ALTER TABLE gw_door_event ADD COLUMN candidates TEXT")   # reason='ambiguous' top-2 [[lab,score],..]
+        except sqlite3.OperationalError:
+            pass                                                    # already present
+        try:
+            # How many DISTINCT arrows the reader could name when this row was produced. Below 2 the
+            # engine suppresses `direction` entirely, because a single-class classifier cannot be wrong
+            # and therefore cannot be evidence: ch27 reported 100% down and ch30 83% up / 0% down purely
+            # because their calibration samples only ever labelled one arrow. NULL on rows written
+            # before 2026-08-04 — unknown, not zero, and not backfilled.
+            db.execute("ALTER TABLE gw_door_event ADD COLUMN n_arrow_labels INTEGER")
+        except sqlite3.OperationalError:
+            pass                                                    # already present
+        try:                                          # migration: floor reading age (2026-08-10)
+            db.execute("ALTER TABLE gw_door_event ADD COLUMN floor_age_s REAL")
+        except sqlite3.OperationalError:
+            pass
+        try:                                          # migration: per-camera emit sequence (2026-08-10)
+            # A GAP IN seq IS A DROPPED ROW. The worker's async POST queue drops a state transition only
+            # under sustained gateway pressure, and seq is how that becomes visible HERE rather than only
+            # in a journal nobody greps: a consumer seeing 41,42,45 knows the sequence is incomplete and
+            # can refuse to compute a funnel over that window instead of averaging across the hole.
+            db.execute("ALTER TABLE gw_door_event ADD COLUMN seq INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        db.execute("""CREATE TABLE IF NOT EXISTS floor_sample (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT, ts REAL,
+          floor TEXT, direction TEXT, read_conf REAL, panels_agreed INTEGER, reason TEXT,
+          door_version TEXT, crop_jpeg BLOB, received_at REAL)""")
+        try:
+            db.execute("ALTER TABLE floor_sample ADD COLUMN reviewed_label TEXT")   # operator-confirmed truth -> foldback
+        except sqlite3.OperationalError:
+            pass
+        db.commit()
+    finally:
+        db.close()
+    _SCHEMA_READY = True
+
+
 def _db():
     if not DB_PATH or not os.path.isabs(DB_PATH):
         raise RuntimeError(f"GATEWAY_DB must be an ABSOLUTE path (got {DB_PATH!r}) — a relative "
@@ -115,48 +181,9 @@ def _db():
                            "unit Environment (the live value is /var/lib/liftlab/gateway.db)")
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
-    db.execute("""CREATE TABLE IF NOT EXISTS gw_door_event (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT, ts REAL,
-      floor TEXT, direction TEXT, door_state TEXT, openness REAL, read_conf REAL,
-      panels_agreed INTEGER, reason TEXT, close_travel_s REAL,
-      door_version TEXT, templates_hash TEXT, received_at REAL)""")
-    db.execute("CREATE INDEX IF NOT EXISTS ix_door_event ON gw_door_event (gateway_id,cam,ts)")
-    try:
-        db.execute("ALTER TABLE gw_door_event ADD COLUMN candidates TEXT")   # reason='ambiguous' top-2 [[lab,score],..]
-    except sqlite3.OperationalError:
-        pass                                                    # already present
-    try:
-        # How many DISTINCT arrows the reader could name when this row was produced. Below 2 the
-        # engine suppresses `direction` entirely, because a single-class classifier cannot be wrong
-        # and therefore cannot be evidence: ch27 reported 100% down and ch30 83% up / 0% down purely
-        # because their calibration samples only ever labelled one arrow. NULL on rows written
-        # before 2026-08-04 — unknown, not zero, and not backfilled.
-        db.execute("ALTER TABLE gw_door_event ADD COLUMN n_arrow_labels INTEGER")
-    except sqlite3.OperationalError:
-        pass                                                    # already present
-    try:                                          # migration: floor reading age (2026-08-10)
-        db.execute("ALTER TABLE gw_door_event ADD COLUMN floor_age_s REAL")
-    except sqlite3.OperationalError:
-        pass
-    try:                                          # migration: per-camera emit sequence (2026-08-10)
-        # A GAP IN seq IS A DROPPED ROW. The worker's async POST queue drops a state transition only
-        # under sustained gateway pressure, and seq is how that becomes visible HERE rather than only
-        # in a journal nobody greps: a consumer seeing 41,42,45 knows the sequence is incomplete and
-        # can refuse to compute a funnel over that window instead of averaging across the hole.
-        db.execute("ALTER TABLE gw_door_event ADD COLUMN seq INTEGER")
-    except sqlite3.OperationalError:
-        pass
-    db.execute("""CREATE TABLE IF NOT EXISTS floor_sample (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT, ts REAL,
-      floor TEXT, direction TEXT, read_conf REAL, panels_agreed INTEGER, reason TEXT,
-      door_version TEXT, crop_jpeg BLOB, received_at REAL)""")
-    try:
-        db.execute("ALTER TABLE floor_sample ADD COLUMN reviewed_label TEXT")   # operator-confirmed truth -> foldback
-    except sqlite3.OperationalError:
-        pass
+    db.execute("PRAGMA busy_timeout=30000")
+    _init_schema()
     return db
-
-
 def _auth(gw, authorization):
     tok = (authorization or "").removeprefix("Bearer ").strip()
     if tok and (GATEWAY_TOKENS.get(gw) == tok or ANALYSIS_TOKENS.get(gw) == tok):
@@ -204,6 +231,15 @@ def _reject_unknown_cam(gw, cam):
 async def door_event_ingest(gw: str, request: Request, authorization: str = Header("")):
     _auth(gw, authorization)
     d = await request.json()
+    # BLOCKING WORK OFF THE EVENT LOOP. This handler is `async def`, so everything below
+    # used to run ON the loop: sqlite connect, the admission reads, INSERT and commit().
+    # While any one of them ran, EVERY other in-flight request was frozen, which is why
+    # slow requests arrive in same-second clusters. Same pattern as live_api.live_put.
+    return await run_in_threadpool(_door_event_write, gw, d)
+
+
+def _door_event_write(gw, d):
+
     cam = str(d.get("cam", ""))
     if not _SAFE.match(cam):
         raise HTTPException(400, "bad cam")
@@ -240,6 +276,15 @@ async def door_event_ingest(gw: str, request: Request, authorization: str = Head
 async def floorcheck_ingest(gw: str, request: Request, authorization: str = Header("")):
     _auth(gw, authorization)
     d = await request.json()
+    # BLOCKING WORK OFF THE EVENT LOOP. This handler is `async def`, so everything below
+    # used to run ON the loop: sqlite connect, the admission reads, INSERT and commit().
+    # While any one of them ran, EVERY other in-flight request was frozen, which is why
+    # slow requests arrive in same-second clusters. Same pattern as live_api.live_put.
+    return await run_in_threadpool(_floorcheck_write, gw, d)
+
+
+def _floorcheck_write(gw, d):
+
     cam = str(d.get("cam", ""))
     if not _SAFE.match(cam):
         raise HTTPException(400, "bad cam")

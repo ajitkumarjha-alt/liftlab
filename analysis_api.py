@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
 DB_PATH = os.environ.get("GATEWAY_DB", "./gateway.db")
@@ -208,6 +209,15 @@ def _backfill_gw_event(db, gw, cam, ts, track_id, direction, ts_bucket):
 async def transit_ingest(gw: str, request: Request, authorization: str = Header("")):
     _auth_rw(gw, authorization)
     d = await request.json()
+    # BLOCKING WORK OFF THE EVENT LOOP. This handler is `async def`, so everything below
+    # used to run ON the loop: sqlite connect, the admission reads, INSERT and commit().
+    # While any one of them ran, EVERY other in-flight request was frozen, which is why
+    # slow requests arrive in same-second clusters. Same pattern as live_api.live_put.
+    return await run_in_threadpool(_transit_write, gw, d)
+
+
+def _transit_write(gw, d):
+
     cam = str(d.get("cam", ""))
     direction = str(d.get("direction", ""))
     if not _SAFE.match(cam) or direction not in ("in", "out"):
@@ -232,6 +242,15 @@ async def transit_ingest(gw: str, request: Request, authorization: str = Header(
 async def analyzer_status_ingest(gw: str, request: Request, authorization: str = Header("")):
     _auth_rw(gw, authorization)
     d = await request.json()
+    # BLOCKING WORK OFF THE EVENT LOOP. This handler is `async def`, so everything below
+    # used to run ON the loop: sqlite connect, the admission reads, INSERT and commit().
+    # While any one of them ran, EVERY other in-flight request was frozen, which is why
+    # slow requests arrive in same-second clusters. Same pattern as live_api.live_put.
+    return await run_in_threadpool(_status_write, gw, d)
+
+
+def _status_write(gw, d):
+
     db = _db()
     db.execute(
         "INSERT INTO analyzer_status (gateway_id,cam,ts,counting_version,uptime_s,segments,dropped,"
