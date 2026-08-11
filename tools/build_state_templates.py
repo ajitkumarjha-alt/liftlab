@@ -49,17 +49,51 @@ TOP_WH = (TEMPLATE_WH[0], max(8, TEMPLATE_WH[1] // 4))     # (96, 32)
 BUILDER = "tools/build_state_templates.py"
 
 
-def build(cam, split="train"):
+def sample_windows(windows, n_per_window, split, train_frac=0.4):
+    """Frame indices sampled EVENLY WITHIN EACH WINDOW, capped per window.
+
+    The cap is the point: one 4950-frame window would otherwise dominate a median built across
+    seventeen, and the template would describe that window's lighting rather than the camera's.
+    Every window contributes the same number of frames, long or short, so the template spans the
+    lighting states the day actually contained.
+    """
+    out = []
+    for (a_, b_) in windows:
+        cut = a_ + int((b_ - a_) * train_frac)
+        lo, hi = (a_, cut) if split == "train" else (cut, b_)
+        if hi - lo < 2:
+            continue
+        step = max(1, (hi - lo) // n_per_window)
+        out.extend(lo + k * step for k in range(min(n_per_window, (hi - lo) // step)))
+    return sorted(set(out))
+
+
+def build_explicit(cam, video, band_y, band_x, windows, n_per_window, split, osd_base, out_dir):
+    """Template from an EXPLICIT band and window list, bypassing truth_io/phantom_periods.
+
+    ch29 needs this: its door-state band was localized by open/closed frame differencing at the
+    substream's own 704x576 framing, and the registry's 1920x1080 geometry does NOT scale onto it.
+    Passing the derived coordinates in directly is the only way to build a template for a band that
+    no stored geometry describes.
+    """
     import cv2
-    spec = truth_io.CORPUS[cam]
-    x, _, w, _ = spec["roi"]
-    y0, y1 = TOP_BAND_Y
-    want = sorted(set(closed_window_frames(cam, split)))
+    y0, y1 = band_y
+    x0, x1 = band_x
+    x, w = x0, x1 - x0
+    want = sample_windows(windows, n_per_window, split)
+    return _build_from(cam, video, (y0, y1), (x, w), want, split, osd_base, out_dir, windows)
+
+
+def _build_from(cam, video, band_y, roi_x_w, want, split, osd_base, out_dir, windows):
+    import cv2
+    y0, y1 = band_y
+    x, w = roi_x_w
     if len(want) < 3:
         raise SystemExit(f"{cam}: only {len(want)} closed frames available — refusing to build")
-    cap = cv2.VideoCapture(truth_io.video_path(cam))
+    cap = cv2.VideoCapture(os.path.expanduser(video))
     if not cap.isOpened():
-        raise SystemExit(f"cannot open {truth_io.video_path(cam)}")
+        raise SystemExit(f"cannot open {video}")
+    fps_meas = cap.get(cv2.CAP_PROP_FPS) or 25.0
     got, i, mx = {}, 0, max(want)
     while True:
         ok, fr = cap.read()
@@ -96,11 +130,14 @@ def build(cam, split="train"):
         "schema": 1,
         "cam": cam,
         "tracker": "h3-state",
-        "band_y": list(TOP_BAND_Y),
+        "band_y": [int(y0), int(y1)],
         "roi_x_w": [int(x), int(w)],
         "template_wh": list(TOP_WH),
-        "source_file": spec["file"],
-        "source_fps": spec["fps"],
+        "source_file": os.path.basename(video),
+        "source_fps": round(float(fps_meas), 4),
+        "osd_base": osd_base,
+        "n_windows": len(windows),
+        "windows": [list(wv) for wv in windows],
         "split": split,
         "n_frames": len(used),
         "source_frames": used,
@@ -113,15 +150,54 @@ def build(cam, split="train"):
     }
 
 
+def build(cam, split="train"):
+    """The corpus path (ch27/ch30): band and windows come from truth_io + phantom_periods."""
+    spec = truth_io.CORPUS[cam]
+    x, _, w, _ = spec["roi"]
+    want = sorted(set(closed_window_frames(cam, split)))
+    wins = [[p["start_f"], p["end_f"]] for p in truth_io.load_phantoms(cam)]
+    return _build_from(cam, truth_io.video_path(cam), tuple(TOP_BAND_Y), (x, w), want, split,
+                       spec.get("osd_base"), None, wins)
+
+
+def _pair(v, sep=","):
+    return tuple(int(n) for n in v.split(sep))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cam", action="append", choices=sorted(truth_io.CORPUS))
+    ap.add_argument("--cam", action="append")
     ap.add_argument("--out-dir", default="door_state_templates")
     ap.add_argument("--split", default="train", choices=("train", "test"))
+    # EXPLICIT path — for a camera whose band is not described by any stored geometry.
+    ap.add_argument("--video")
+    ap.add_argument("--band-y", help="y0,y1")
+    ap.add_argument("--band-x", help="x0,x1")
+    ap.add_argument("--windows", help="a-b,c-d,... closed-door frame ranges")
+    ap.add_argument("--per-window", type=int, default=6)
+    ap.add_argument("--osd-base", default=None)
     a = ap.parse_args()
-    cams = a.cam or sorted(truth_io.CORPUS)
     os.makedirs(a.out_dir, exist_ok=True)
     print("=== building h3 state templates ===")
+
+    if a.video:
+        cam = (a.cam or ["cam"])[0]
+        wins = [tuple(int(n) for n in wv.split("-")) for wv in a.windows.split(",")]
+        meta = build_explicit(cam, a.video, _pair(a.band_y), _pair(a.band_x), wins,
+                              a.per_window, a.split, a.osd_base, a.out_dir)
+        path = os.path.join(a.out_dir, f"{cam}.json")
+        with open(path, "w") as fh:
+            json.dump(meta, fh, indent=1, sort_keys=True)
+        print(f"  {cam}: {meta['n_frames']} closed frames from {meta['source_file']} "
+              f"({meta['split']} split of {meta['n_windows']} windows)")
+        print(f"      band y{meta['band_y'][0]}-{meta['band_y'][1]} "
+              f"x{meta['roi_x_w'][0]}-{meta['roi_x_w'][0] + meta['roi_x_w'][1]}")
+        print(f"      LOO NCC median {meta['loo_ncc_median']:.4f} min {meta['loo_ncc_min']:.4f}; "
+              f"md5 {meta['md5']}")
+        print(f"      -> {path}")
+        return 0
+
+    cams = a.cam or sorted(truth_io.CORPUS)
     for cam in cams:
         meta = build(cam, a.split)
         path = os.path.join(a.out_dir, f"{cam}.json")

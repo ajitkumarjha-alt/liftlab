@@ -1,0 +1,203 @@
+{
+ "band_y": [
+  15,
+  130
+ ],
+ "build_date": "2026-08-11",
+ "builder": "tools/build_state_templates.py",
+ "cam": "ch29",
+ "loo_ncc_median": 0.9895,
+ "loo_ncc_min": 0.8943,
+ "md5": "5471cbd98a8f2efe046ca68a0fb26c6b",
+ "n_frames": 102,
+ "n_windows": 17,
+ "osd_base": "08:37:16",
+ "png_b64": "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",
+ "roi_x_w": [
+  260,
+  210
+ ],
+ "schema": 1,
+ "source_file": "ch29_tue.mp4",
+ "source_fps": 24.7788,
+ "source_frames": [
+  1275,
+  1372,
+  1469,
+  1566,
+  1663,
+  1760,
+  3190,
+  3227,
+  3264,
+  3301,
+  3338,
+  3375,
+  6205,
+  6326,
+  6447,
+  6568,
+  6689,
+  6810,
+  8515,
+  8561,
+  8607,
+  8653,
+  8699,
+  8745,
+  9470,
+  9512,
+  9554,
+  9596,
+  9638,
+  9680,
+  10270,
+  10326,
+  10382,
+  10438,
+  10494,
+  10550,
+  12235,
+  12307,
+  12379,
+  12451,
+  12523,
+  12595,
+  14160,
+  14204,
+  14248,
+  14292,
+  14336,
+  14380,
+  15765,
+  15801,
+  15837,
+  15873,
+  15909,
+  15945,
+  21725,
+  22055,
+  22385,
+  22715,
+  23045,
+  23375,
+  27065,
+  27115,
+  27165,
+  27215,
+  27265,
+  27315,
+  28100,
+  28133,
+  28166,
+  28199,
+  28232,
+  28265,
+  29170,
+  29285,
+  29400,
+  29515,
+  29630,
+  29745,
+  31510,
+  31558,
+  31606,
+  31654,
+  31702,
+  31750,
+  32630,
+  32676,
+  32722,
+  32768,
+  32814,
+  32860,
+  34640,
+  34683,
+  34726,
+  34769,
+  34812,
+  34855,
+  35515,
+  35550,
+  35585,
+  35620,
+  35655,
+  35690
+ ],
+ "split": "train",
+ "template_wh": [
+  96,
+  32
+ ],
+ "tracker": "h3-state",
+ "windows": [
+  [
+   1275,
+   2735
+  ],
+  [
+   3190,
+   3755
+  ],
+  [
+   6205,
+   8020
+  ],
+  [
+   8515,
+   9215
+  ],
+  [
+   9470,
+   10105
+  ],
+  [
+   10270,
+   11115
+  ],
+  [
+   12235,
+   13320
+  ],
+  [
+   14160,
+   14820
+  ],
+  [
+   15765,
+   16310
+  ],
+  [
+   21725,
+   26675
+  ],
+  [
+   27065,
+   27815
+  ],
+  [
+   28100,
+   28605
+  ],
+  [
+   29170,
+   30905
+  ],
+  [
+   31510,
+   32235
+  ],
+  [
+   32630,
+   33330
+  ],
+  [
+   34640,
+   35295
+  ],
+  [
+   35515,
+   36045
+  ]
+ ]
+}
