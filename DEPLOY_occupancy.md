@@ -61,7 +61,7 @@ sudo -u liftlab sqlite3 /var/lib/liftlab/gateway.db \
 
 | box | path | md5 |
 |---|---|---|
-| VM | `dash_api.py` | `cd7eecf8572655289e7617ae4516b297` |
+| VM | `dash_api.py` | `5cfae4bd1536855c542a248f9bc4e6ce` |
 | VM | `lift_capacity.json` | `ad58ef45a9291f042921dc3e496e30ff` |
 | VM | `liftlab_report/cli.py` | `d3d28d5365cecfc820ddef2cdae74117` |
 | VM | `liftlab_report/eras.py` | `af9e07702337bb71cd3887d31f1740c5` |
@@ -72,7 +72,7 @@ sudo -u liftlab sqlite3 /var/lib/liftlab/gateway.db \
 
 ```bash
 curl -fsSL "$B/dash_api.py" -o /tmp/dash_api.py
-md5sum /tmp/dash_api.py              # cd7eecf8572655289e7617ae4516b297
+md5sum /tmp/dash_api.py              # 5cfae4bd1536855c542a248f9bc4e6ce
 sudo install -o liftlab -g liftlab -m 644 /tmp/dash_api.py "$APP/dash_api.py"
 
 for f in cli.py eras.py model.py reader.py workbook.py fixtures.py; do
@@ -189,6 +189,13 @@ The one outstanding decision, and it is not a code change:
 
 Until then CAR LOADING says exactly what is missing, and the measured occupancy is already usable in
 absolute people.
+
+## 5b. dash_api.py also carries the health banner
+
+`dash_api.py` at `5cfae4bd…` is the version that includes BOTH the occupancy panels and the health
+banner (`d91c7bf`). It supersedes `cd7eecf8…`, which carried occupancy only. If you have already
+installed `cd7eecf8…`, installing this one is the whole of the health-line dashboard change —
+`apply_health.sh` performs it and verifies the banner is present before touching the service.
 
 ## 6. Rollback
 
