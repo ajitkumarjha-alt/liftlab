@@ -275,6 +275,37 @@ Write `tools/phantom_periods_YYYYMMDD.csv`, schema `cam,file,start_f,end_f,note`
 phantom whoever is standing in the cabin. Verify no window overlaps a truth close; a "no motion"
 window containing a close invalidates both files.
 
+### Step 4b — HAND-COUNT THE CAR, on the same closes
+
+**This is the only route from "measured minimum" to a number anyone can divide by capacity.** The
+engine reports peak car occupancy as the largest number of people it RESOLVED at once inside the
+cabin — a floor, not a count. On the one scene it has been checked against (ch30 f5350-5650) it
+reported **3 against 5-7 people visible in frame**, so roughly half. That is `n=1`, on one camera,
+at one crowding level, and it is quoted everywhere with its `n=1` for exactly that reason. Only
+paired hand counts can turn it into a correction factor, and only if they span several lifts and
+several crowding levels.
+
+While you are hand-timing a close, count the people in the car **at the fullest moment of the
+door-open**, and write it in the same row:
+
+`tools/groundtruth_YYYYMMDD.csv` gains one optional column, appended at the end so old files still
+parse: `cam,file,start_f,end_f,travel_s,status,peak_occupancy`.
+
+* `peak_occupancy` — whole people in the CAR at the busiest instant while the door was open.
+  Someone standing in the doorway counts if their feet are inside the car. Leave the field EMPTY,
+  never `0`, if you did not count: an empty field is "not counted" and a `0` is "an empty car", and
+  the workbook treats them completely differently.
+* Count from the video, not from memory, and count at the fullest frame — the engine's figure is a
+  peak, so a count taken at a different instant is not comparable to it.
+* Do it on the crowded closes especially. A car with two people in it cannot discriminate a working
+  detector from a broken one; the undercount only shows up under crowding, which is where it also
+  matters most.
+
+Where the counts land: the gateway carries them in `validation_item.human_occupancy`, and the
+workbook's **CAR LOADING** sheet pairs each hand count against the machine peak for the same
+episode and prints the ratio per pair. It deliberately does not average them into a single factor
+until there are enough pairs to justify one.
+
 ### Step 5 — score
 
 Same commands as LEG 1, with the new video and the new CSVs:
@@ -290,8 +321,9 @@ python3 tools/doorwatch_replay.py --cam ch27 \
 
 ## The alerts
 
-Read them off the printed block. All four are failures; any one of them means the engine does not
-ship this week's numbers unexamined.
+Read them off the printed block. Alerts 1-4 are failures; any one of them means the engine does not
+ship this week's numbers unexamined. Alert 5 is a failure to COLLECT rather than a failure of the
+engine, and it is listed with them because its cost is invisible in any single week.
 
 Alerts 3 and 4 changed shape when h3 was armed. h2's versions checked whether a travel number was
 *accurate*; h3's check that there is no travel number at all and that a human took the measurement
@@ -305,6 +337,7 @@ alert only when a travel estimator passes TEST B.
 | 2 | **PHANTOM > 0** | `PHANTOM n` | An emission inside a verified door-**closed** window. The engine invented a door cycle. Any nonzero count fails; phantoms inside the `[0.5, 30]s` filter reach C27 as fabricated trips. |
 | 3 | **any `close_travel_s` is non-null** | `engine_s` column — every row must read `-` | h3 does not measure travel and must not appear to. A number here means either the null discipline broke or the engine in the replay is not h3. This alert is INVERTED from a normal accuracy check on purpose: for a state-only engine, an unexpected measurement is the defect. |
 | 4 | **the weekly hand-timed travel sample was not taken** | your own LEG 2 log, not the replay output | Travel now comes from hand-timed video, not from the engine. If nobody sampled it, compliance travel has no source at all this week — the failure is silent and lands outside this harness, which is exactly why it is an alert. |
+| 5 | **no hand COUNT taken on a crowded close** — zero rows with a non-empty `peak_occupancy` where the car held 4+ people | your `groundtruth_YYYYMMDD.csv` | Peak car occupancy ships as a measured minimum calibrated on ONE scene. Every LEG 2 without a paired count leaves it there. This is the only alert whose fix accumulates: it is not that this week's number is wrong, it is that the number stays uncorrectable. Not applicable if the week's capture genuinely contained no crowded close — record that, rather than leaving the field blank. |
 
 **Why alert 1 has two forms.** A flat 90 % was the original instruction, and on the frozen corpus's
 small denominators it does not divide sensibly: 90 % of ch30's 8 gradable closes rounds to **8/8**,
