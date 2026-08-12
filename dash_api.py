@@ -1862,6 +1862,35 @@ def _validations(db, gw):
     return out
 
 
+def _health(db, gw):
+    """The most recent recorded health check — READ ONLY, never computed here.
+
+    health_check.py runs on a timer and writes health_status. The dashboard displays what was
+    recorded and NEVER re-evaluates: a banner derived on the request path would disagree with the
+    line that was actually sent, and the whole point of the feature is that one sentence exists in
+    one place. A missing table means the checker has never run, which is itself worth saying —
+    "no health check has ever run" is a different fact from "everything is fine".
+    """
+    try:
+        r = db.execute("SELECT ts, ok, n_cams, n_bad, line, sent, delivered, delivery_error "
+                       "FROM health_status WHERE gateway_id=? ORDER BY ts DESC LIMIT 1",
+                       (gw,)).fetchone()
+    except sqlite3.OperationalError:
+        return {"state": "never_run", "note": "health_status table does not exist — "
+                                              "liftlab-health has never run on this gateway"}
+    if not r:
+        return {"state": "never_run", "note": "no health check recorded for this gateway yet"}
+    age = time.time() - (r["ts"] or 0)
+    return {"state": ("ok" if r["ok"] else "breach"),
+            "ts": r["ts"], "age_s": round(age, 1),
+            # A CHECKER THAT STOPPED RUNNING IS ITSELF A FAULT, and it is the one failure the
+            # checker cannot report about itself. Anything older than an hour is stale by the
+            # 10-minute cadence, so say so instead of showing an old verdict as current.
+            "stale": age > 3600,
+            "n_cams": r["n_cams"], "n_bad": r["n_bad"], "line": r["line"],
+            "delivered": r["delivered"] or None, "delivery_error": r["delivery_error"] or None}
+
+
 def _latest(db, table, gw):
     rows = _q(db, f"SELECT * FROM {table} WHERE gateway_id=? ORDER BY id DESC LIMIT 1", (gw,))
     return dict(rows[0]) if rows else None
@@ -1923,6 +1952,7 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
     val = _validations(db, gw)
     w = _latest(db, "watch_status", gw)
     r = _latest(db, "relay_status", gw)
+    health = _health(db, gw)
 
     # ---- top strip: PI ----
     pi = None
@@ -2063,6 +2093,7 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
                              "oldest_age_s": (round(now - min(agg_computed_at), 1)
                                               if agg_computed_at else None),
                              "source": "door_aggregate (precomputed off the request path)"},
+                         "health": health,
                          "pi": pi, "relay": relay, "gpu": gpu,
                          # The calibration travels WITH the data, not only in the page that draws it,
                          # so any consumer of this endpoint gets the number and its limits together.
@@ -2395,6 +2426,28 @@ def _csv(rows, header, name):
                              "Cache-Control": "no-store"})
 
 
+@dash_router.get("/dash/{gw}/health")
+def dash_health(gw: str):
+    """The one sentence, as plain text. Exit-code-able by anything that can curl.
+
+    Deliberately NOT re-evaluated here — it returns what health_check.py last recorded, so this
+    endpoint, the dashboard banner and whatever was pushed to a phone can never say three different
+    things about the same fleet.
+    """
+    db = _db()
+    h = _health(db, gw)
+    db.close()
+    if h.get("state") == "never_run":
+        body = f"UNKNOWN — {h.get('note')}\n"
+    else:
+        body = (f"{_iso_ist(h['ts'])}  {h['line']}\n"
+                + (f"NOTE: this check is {round(h['age_s'] / 3600, 1)}h old — the checker itself "
+                   f"has stopped running\n" if h.get("stale") else "")
+                + (f"DELIVERY: {h['delivery_error']}\n" if h.get("delivery_error") else ""))
+    return Response(body, media_type="text/plain; charset=utf-8",
+                    headers={"Cache-Control": "no-store"})
+
+
 @dash_router.get("/dash/{gw}/cams")
 def dash_cams(gw: str):
     """Just the camera list — for the switcher on every per-camera page. Deliberately NOT
@@ -2599,6 +2652,7 @@ table.t2 td{text-align:right;padding:2px 6px;border-bottom:1px solid #f2f5f7;fon
 __NAV__
 <h1 style="padding:0 2px">liftlab · dash <span class=mut id=stamp></span></h1>
 <div class=tabs id=nav></div>
+<div id=healthbar></div>
 <div class=strip id=strip></div>
 <div id=headline></div>
 <div id=unavail></div>
@@ -2618,6 +2672,39 @@ function age(s){return s==null?'—':(s<90?Math.round(s)+'s':Math.round(s/60)+'m
 function kv(k,v,c){return '<div class=kv><span class=mut>'+k+'</span><b class="'+(c||'')+'">'+v+'</b></div>'}
 function staleCls(s,lim){return s==null?'stale':(s>lim?'stale':'ok')}
 
+// ── DAILY HEALTH LINE ────────────────────────────────────────────────────────────────────
+// The first thing on the page, above every panel, because it is the one line that answers "is
+// anything silently missing". It is DISPLAYED, never derived here — health_check.py records it on a
+// timer and this shows what was recorded, so the banner and whatever was pushed cannot disagree.
+function healthbar(d){
+  var el=document.getElementById('healthbar'); if(!el)return;
+  var h=d.health;
+  if(!h){el.innerHTML='';return;}
+  function box(bg,bd,html){return '<div style="margin:4px 0 8px;padding:6px 10px;border-left:4px solid '
+    +bd+';background:'+bg+';font-size:13px">'+html+'</div>';}
+  if(h.state==='never_run'){
+    // NOT the same as healthy. An absent checker must never render as a clean bill of health.
+    el.innerHTML=box('rgba(176,106,0,.07)','#b06a00',
+      '<b>HEALTH CHECK HAS NEVER RUN</b> — '+esc(h.note||'')
+      +'. Nothing is watching for a silent camera; the absence of an alert means nothing yet.');
+    return;
+  }
+  var extra='';
+  // A STALE CHECK IS ITS OWN FAULT, and the one thing the checker cannot report about itself.
+  if(h.stale)extra+=' <b class=bad>· this verdict is '+(h.age_s/3600).toFixed(1)+'h old — the CHECKER'
+    +' has stopped running, so it is not evidence about now</b>';
+  // No push channel means the only place this line exists is the screen you are looking at.
+  if(h.delivery_error)extra+=' <span class=warn>· '+esc(h.delivery_error)+'</span>';
+  if(h.state==='ok'){
+    el.innerHTML=box('rgba(18,122,61,.06)','#127a3d',
+      '<b class=ok>ALL '+h.n_cams+' CAMERAS POSTING</b> <span class=mut>checked '+age(h.age_s)
+      +' ago</span>'+extra);
+  } else {
+    el.innerHTML=box('rgba(176,0,0,.07)','#b00',
+      '<b class=bad>'+h.n_bad+' OF '+h.n_cams+' CAMERAS SILENT</b> — '+esc(h.line||'')
+      +' <span class=mut>(checked '+age(h.age_s)+' ago)</span>'+extra);
+  }
+}
 function strip(d){
   var p=d.pi,r=d.relay,g=d.gpu,h=[];
   // PI
@@ -3362,7 +3449,7 @@ function loadTrends(){
   fetch('/dash/'+GW+'/trends?'+trQuery()).then(function(r){return r.json()}).then(function(t){TR=t;renderTrends();}).catch(function(){});
 }
 
-function render(){ if(!DATA)return; nav(); strip(DATA); headline(DATA); unavail(DATA); if(mode==='cams'){tabs(DATA); panel(DATA);} }
+function render(){ if(!DATA)return; nav(); healthbar(DATA); strip(DATA); headline(DATA); unavail(DATA); if(mode==='cams'){tabs(DATA); panel(DATA);} }
 
 /* ── DATA REFRESH: one in flight, bounded failures, backoff ────────────────────
    This was `load(); setInterval(load, 15000);` — a fixed timer with NO in-flight guard and no
