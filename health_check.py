@@ -219,9 +219,11 @@ def evaluate(db, gw, now=None):
         # camera — i.e. on exactly the cameras a breach line is about.
         ps = prev_seg.get(cam)
         if hb_ts is None:
-            reasons.append("no heartbeat ever")
+            reasons.append("no heartbeat ever — no analyzer_status row for this camera, so its "
+                           "worker has never reported to the gateway (check the fleet supervisor)")
         elif hb_age > HB_STALE_S:
-            reasons.append(f"worker silent {_age_phrase(hb_age)} (since {_hhmm(hb_ts, now)})")
+            reasons.append(f"worker silent {_age_phrase(hb_age)} (since {_hhmm(hb_ts, now)}) — the "
+                           f"analyzer heartbeat stopped; the camera itself may be fine")
         else:
             # Only meaningful while the heartbeat is FRESH: a stale heartbeat carries a stale
             # counter, and reporting "processing nothing" about a worker that is not running at all
@@ -239,9 +241,10 @@ def evaluate(db, gw, now=None):
         # lift", which are different errands.
         quiet_offhours = False
         klass = None
+        transit_breach = False
         if tr_ts is None:
             reasons.append("no transit ever recorded")
-            klass = "no transit ever recorded"
+            klass, transit_breach = "no transit ever recorded", True
         elif tr_age > TRANSIT_STALE_S:
             seg_moved = (ps is not None and segments is not None and segments != ps)
             if hb_ts is None or (hb_age or 0) > HB_STALE_S:
@@ -253,6 +256,7 @@ def evaluate(db, gw, now=None):
             else:
                 klass = "segments frozen too = upstream/relay class"
             if _active(now):
+                transit_breach = True
                 reasons.append(f"no transit in {_age_phrase(tr_age)} (last {_hhmm(tr_ts, now)}) "
                                f"[{klass}]")
             else:
@@ -266,6 +270,7 @@ def evaluate(db, gw, now=None):
         detail[cam] = {
             "ok": not reasons, "reasons": reasons, "segments": segments,
             "klass": klass, "quiet_offhours": quiet_offhours,
+            "transit_breach": transit_breach,
             "silent_since": tr_ts,
             "hb_ts": hb_ts, "hb_age_s": None if hb_age is None else round(hb_age, 1),
             "transit_ts": tr_ts, "transit_age_s": None if tr_age is None else round(tr_age, 1),
@@ -299,8 +304,23 @@ def evaluate(db, gw, now=None):
     else:
         parts = []
         for c in bad:
-            since = detail[c].get("silent_since") or detail[c]["bad_since"]
-            parts.append(f"{c} silent since {_hhmm(since, now)} ({detail[c]['klass']})")
+            # BUILT FROM THE ACTUAL REASONS, not from an assumption about which one fired.
+            #
+            # This used to render EVERY breach as transit silence: "{cam} silent since {last
+            # transit} ({klass})". For a camera that breached on its HEARTBEAT while its transits
+            # were flowing, that printed the last-transit time under the word "silent" — a camera
+            # posting three seconds ago described as silent — and "(None)", because klass is only
+            # assigned in the transit branch. Live first run, 2026-08-12 20:07: "ch29 silent since
+            # 20:07 (None)" while ch29 had just posted. The check was right; the sentence was false.
+            #
+            # A monitor whose one line can misdescribe the fault is worse than a quiet one: it sends
+            # the reader to the wrong box, and the first thing they learn is not to trust it.
+            d = detail[c]
+            if d.get("klass") and d.get("transit_breach"):
+                # the specified format, for the case it was specified for
+                parts.append(f"{c} silent since {_hhmm(d.get('silent_since'), now)} ({d['klass']})")
+            else:
+                parts.append(f"{c} {'; '.join(d['reasons'])}")
         parts += infra
         line = f"LiftLab health {hhmm} BREACH: " + " · ".join(parts)
     # Cameras quiet outside active hours: REPORTED, never alarmed. Carried on the payload so the

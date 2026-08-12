@@ -8,9 +8,9 @@ hashing the working tree.
 
 | box | path | md5 |
 |---|---|---|
-| VM | `health_check.py` | `b46c6aa3af093667c0d3662413083db5` |
+| VM | `health_check.py` | `8241c98b63bd11807c3fa583998f1f5a` |
 | VM | `dash_api.py` | `e897b861181817535ff97719906f5e38` |
-| VM | `apply_health.sh` | `6162789c3f89a72bfc0f13d93c68a443` |
+| VM | `apply_health.sh` | `8cf696500320f15c80c9925658ec12c4` |
 
 `dash_api.py` here **supersedes** both `cd7eecf8…` (occupancy) and `5cfae4bd…` (health banner): it is
 those plus the render-audit fixes. Install this one and every other note's dash step is satisfied.
@@ -25,15 +25,22 @@ for f in health_check.py dash_api.py apply_health.sh; do
   curl -fsSL "$B/$f" -o "/tmp/$f"
 done
 md5sum /tmp/health_check.py /tmp/dash_api.py /tmp/apply_health.sh
-#   b46c6aa3af093667c0d3662413083db5  health_check.py
+#   8241c98b63bd11807c3fa583998f1f5a  health_check.py
 #   e897b861181817535ff97719906f5e38  dash_api.py
-#   6162789c3f89a72bfc0f13d93c68a443  apply_health.sh
+#   8cf696500320f15c80c9925658ec12c4  apply_health.sh
 
 sudo bash /tmp/apply_health.sh
 ```
 
 The script **runs the check in the foreground before installing the timer** and aborts if it
 crashes. A monitor that is installed but broken is worse than none — its silence reads as health.
+
+> **First live run, 2026-08-12 20:07, found three defects — all now fixed.** The install decision
+> captured `$?` inside `if ! cmd`, where it is the status of the *negation* and therefore always 0:
+> every breach aborted with the self-contradicting `failed with exit 0`, and a genuine crash reported
+> the same. And the breach line rendered every fault through the transit-silence format, so a camera
+> that breached on its heartbeat while posting normally printed as `ch29 silent since 20:07 (None)`.
+> The check was right; the sentence was false. Both have regression tests (§11b, §11c).
 
 It treats **exit 1 as a finding, not a failure**: exit 1 means a camera is currently silent, which is
 the condition the monitor exists to report, and blocking the install on it would be backwards. The
@@ -153,6 +160,23 @@ camera's own median for that hour-of-day is ~0 — that halves it to **1.6/day**
 the replay is a genuine outage. It is deliberately **not** shipped: it is a second threshold to
 reason about, and the rule as specified is the one to judge from real weeks rather than from a
 replay of a period containing two multi-day outages.
+
+## 4b. Re-running the proof against the LIVE database
+
+The harness's §12 runs against whatever real database it is pointed at. On the gateway, point it at a
+**copy** of the live one — never the live file itself, because the check writes `health_status`:
+
+```bash
+sudo cp /var/lib/liftlab/gateway.db /tmp/gw_copy.db
+sudo chown "$USER" /tmp/gw_copy.db
+HEALTH_TEST_DB=/tmp/gw_copy.db python3 tools/test_health_check.py
+```
+
+It silences one camera by deleting its last two hours, leaves everything else untouched, and asserts
+the breach line names the camera and the class. Run it once on the box before trusting the timer:
+the earlier snapshot replay passed while the live run failed, which meant the proof was not testing
+what production runs. §11b now carries the live shape that gap allowed through — a camera bad for a
+non-transit reason while its transits are flowing.
 
 ## 5. What this cannot see
 

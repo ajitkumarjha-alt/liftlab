@@ -42,16 +42,24 @@ say "installed health_check.py"
 # the first run happens here, its output is shown, and a crash aborts the install.
 say "first run (this also creates health_status) ..."
 T0=$(date +%s%N)
-if ! sudo -u "$OWNER" env GATEWAY_DB="$DB" GATEWAY_ID="$GW" \
-       $(systemctl show "$SVC" -p Environment --value | tr ' ' '\n' | grep -E '^HEALTH_[A-Z_]+=' | tr '\n' ' ') \
-       $PY "$APP/health_check.py" "$GW"; then
-  RC=$?
-  # EXIT 1 IS A BREACH, NOT A CRASH. The script reports fleet state through its exit code, so a
-  # non-zero here is only fatal if it is not 1 — otherwise installing would be blocked by exactly
-  # the condition the monitor exists to report.
-  [ "$RC" = 1 ] || { say "ABORT: health_check.py failed with exit $RC — nothing else installed"; exit 1; }
-  say "(exit 1 = at least one camera is currently silent — that is a fleet fault, not an install fault)"
+# CAPTURE THE STATUS DIRECTLY. This was `if ! cmd; then RC=$?` — and inside `if !`, `$?` is the
+# status of the NEGATION, which is 0 whenever the command failed. So RC was ALWAYS 0, the
+# `[ "$RC" = 1 ]` test could never pass, and every breach aborted the install with the
+# self-contradicting message "failed with exit 0". Live first run, 2026-08-12 20:07. A genuine
+# crash reported the same 0, so the abort has never once said what actually happened.
+sudo -u "$OWNER" env GATEWAY_DB="$DB" GATEWAY_ID="$GW" \
+     $(systemctl show "$SVC" -p Environment --value | tr ' ' '\n' | grep -E '^HEALTH_[A-Z_]+=' | tr '\n' ' ') \
+     $PY "$APP/health_check.py" "$GW"
+RC=$?
+# EXIT 1 IS A BREACH, NOT A CRASH. The script reports fleet state through its exit code, so a
+# non-zero here is only fatal if it is not 1 — otherwise installing would be blocked by exactly the
+# condition the monitor exists to report.
+if [ "$RC" -ne 0 ] && [ "$RC" -ne 1 ]; then
+  say "ABORT: health_check.py crashed with exit $RC — no units installed, dash_api.py untouched."
+  say "       ($APP/health_check.py WAS copied; it is inert without the timer.)"
+  exit 1
 fi
+[ "$RC" = 1 ] && say "(exit 1 = at least one camera is currently silent — a fleet fault, not an install fault)"
 MS=$(( ($(date +%s%N) - T0) / 1000000 ))
 say "first run took ${MS}ms"
 if [ "$MS" -gt 5000 ]; then

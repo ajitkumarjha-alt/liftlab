@@ -12,6 +12,7 @@ the fact that a run with no delivery channel records that fact rather than passi
 """
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -321,6 +322,62 @@ def main():
         fails.append(f"off-hours silence was not REPORTED: {resn['quiet_offhours']}")
     if "reported, not alarmed" not in resn["line"]:
         fails.append("the line does not say the off-hours quiet was reported rather than alarmed")
+
+    print("\n=== 11b. LIVE SHAPE: bad for a NON-transit reason while transits are FLOWING ===")
+    # THE CASE THE SNAPSHOT REPLAY NEVER PRODUCED, and the one that broke on the first live run.
+    # Every §12-style test silenced a camera's transits, so the transit branch always ran and always
+    # set a class. A camera that breaches on its HEARTBEAT while posting normally took the same code
+    # path and rendered as "ch29 silent since <last transit> (None)" — a camera that had posted
+    # three seconds earlier, described as silent, with an empty class. The check was right and the
+    # sentence was false, which is worse than no sentence.
+    lpath = os.path.join(tmp, "liveshape.db")
+    t_live = datetime(2026, 8, 12, 20, 7, tzinfo=IST).timestamp()
+    build(lpath, t_live)
+    con = sqlite3.connect(lpath)
+    con.execute("DELETE FROM analyzer_status WHERE cam='ch29'")      # worker never reported
+    con.execute("INSERT INTO transit_event (gateway_id,cam,ts,direction,track_id) "
+                "VALUES ('site-A','ch29',?,'in',9)", (t_live - 3,))  # ...but transits are flowing
+    con.commit(); con.close()
+    dbl = H._db(lpath)
+    try:
+        rl = H.evaluate(dbl, "site-A", now=t_live)
+    finally:
+        dbl.close()
+    print(f"  {rl['line'][:190]}")
+    dl = rl["detail"]["ch29"]
+    print(f"  transit_age={dl['transit_age_s']}s  reasons={dl['reasons'][:1]}")
+    if "ch29" not in rl["bad"]:
+        fails.append("a camera with no analyzer_status row at all was reported healthy")
+    if "(None)" in rl["line"]:
+        fails.append("the breach line prints '(None)' as a class — it is rendering a non-transit "
+                     "breach through the transit format")
+    if "silent since" in rl["line"]:
+        fails.append("the line calls a camera SILENT while its transits are 3 s old — the breach "
+                     "was about the heartbeat, and saying 'silent' sends the reader to the wrong box")
+    if "no heartbeat" not in rl["line"]:
+        fails.append(f"the line does not state the actual reason: {rl['line'][:150]!r}")
+    if dl["transit_age_s"] > 60:
+        fails.append("fixture error: transits were supposed to be flowing")
+
+    print("\n=== 11c. apply_health.sh: the install decision, all three exit paths ===")
+    # `if ! cmd; then RC=$?` captures the status of the NEGATION (always 0), never the command's.
+    # That made every breach abort with "failed with exit 0", and a genuine crash report the same.
+    sh = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                           "apply_health.sh")).read()
+    if re.search(r"if\s*!\s*sudo[^\n]*\n(?:[^\n]*\n)*?\s*RC=\$\?", sh):
+        fails.append("apply_health.sh still captures $? inside `if !` — it can only ever see 0")
+    import subprocess as _sp
+    probe = os.path.join(tmp, "probe.sh")
+    open(probe, "w").write(
+        'set -uo pipefail\n'
+        'run(){ bash -c "exit $1"; RC=$?;'
+        ' if [ "$RC" -ne 0 ] && [ "$RC" -ne 1 ]; then echo "ABORT:$RC"; return 9; fi;'
+        ' echo "INSTALL:$RC"; return 0; }\n'
+        'run 0; run 1; run 3\n')
+    got = _sp.run(["bash", probe], capture_output=True, text=True).stdout.split()
+    print(f"  healthy/breach/crash -> {got}")
+    if got != ["INSTALL:0", "INSTALL:1", "ABORT:3"]:
+        fails.append(f"the corrected install decision is wrong: {got}")
 
     print("\n=== 12. a silent camera simulated against a COPY OF THE REAL DATABASE ===")
     # A synthetic fixture proves the logic; a real database proves it against the shapes the
