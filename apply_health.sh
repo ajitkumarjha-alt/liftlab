@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Install the DAILY HEALTH LINE on the VM: health_check.py + a 10-minute timer.
+# Install the DAILY HEALTH LINE on the VM: health_check.py + a 15-minute timer.
 #
-# WHY A 10-MINUTE TIMER FOR A DAILY LINE. The daily 08:30 line is the heartbeat of the monitor
+# WHY A 15-MINUTE TIMER FOR A DAILY LINE. The daily 08:30 line is the heartbeat of the monitor
 # itself; "immediately on breach" is the part that needs a short cadence. The check is a handful of
 # indexed MAX() queries — measured below before the timer is installed — so the cadence costs
 # effectively nothing on a 2-vCPU box, unlike the precompute job that shares it.
@@ -18,7 +18,7 @@ PY=$APP/.venv/bin/python
 SVC=liftlab-cloud
 OWNER=liftlab
 GW="${GW:-site-A}"
-EVERY="${EVERY:-10min}"
+EVERY="${EVERY:-15min}"
 say(){ echo "[health] $*"; }
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0"; exit 2; }
 for f in health_check.py dash_api.py; do

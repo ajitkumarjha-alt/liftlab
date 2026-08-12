@@ -33,6 +33,8 @@ CREATE TABLE transit_event (id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEX
   ts REAL, direction TEXT, track_id INTEGER);
 CREATE TABLE gw_door_event (id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT,
   ts REAL, door_state TEXT, door_version TEXT);
+CREATE TABLE relay_status (id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, ts REAL,
+  sum_delivered_mbps REAL, streams_alive INTEGER, streams_delivering INTEGER);
 """
 CAMS = ["ch16", "ch27", "ch29", "ch30", "ch32", "ch34", "ch37"]
 
@@ -51,6 +53,8 @@ def build(path, now):
                     "VALUES ('site-A',?,?, 'in', 1)", (c, now - 3000))
         con.execute("INSERT INTO gw_door_event (gateway_id,cam,ts,door_state) "
                     "VALUES ('site-A',?,?, 'open')", (c, now - 2900))
+    con.execute("INSERT INTO relay_status (gateway_id,ts,streams_alive) VALUES ('site-A',?,7)",
+                (now - 30,))
     con.commit()
     con.close()
 
@@ -63,6 +67,8 @@ def step(H, path, now, advance_segments=True, quiet_cams=(), dead_cams=()):
             continue                                   # heartbeat frozen: worker gone
         seg = "segments = segments + 5" if (advance_segments and c not in quiet_cams) else "segments = segments"
         con.execute(f"UPDATE analyzer_status SET ts=?, {seg} WHERE cam=?", (now - 20, c))
+    con.execute("INSERT INTO relay_status (gateway_id,ts,streams_alive) VALUES ('site-A',?,7)",
+                (now - 30,))
     con.commit()
     con.close()
     db = H._db(path)
@@ -135,7 +141,8 @@ def main():
     fails = []
     tmp = tempfile.mkdtemp()
     path = os.path.join(tmp, "gw.db")
-    # Anchor at 09:00 IST so the daily-line logic is past its 08:30 trigger deterministically.
+    # 09:00 IST: past the 08:30 daily trigger AND inside the 07:00-23:00 active window, so the
+    # transit rule is armed. A test anchored outside active hours would pass while proving nothing.
     base = datetime(2026, 8, 12, 9, 0, tzinfo=IST).timestamp()
     build(path, base)
     os.environ["GATEWAY_DB"] = path
@@ -151,32 +158,32 @@ def main():
         fails.append(f"FALSE ALARM on a healthy fleet: {res['bad']} — {res['detail']}")
     if res["n_cams"] != 7:
         fails.append(f"expected 7 cameras from the registry, got {res['n_cams']}")
-    if "YES" not in res["line"]:
-        fails.append("a healthy fleet did not say YES")
+    print(f"  litestream: {res['litestream_ok']} ({res['litestream_note']}); "
+          f"pi_age={res['pi_age_s']}s")
+    if res["litestream_ok"] is not None:
+        fails.append("a host with no litestream unit must report UNKNOWN, not a verdict — "
+                     "reporting a missing unit as a broken backup cries wolf on every dev box")
+    if not res["line"].startswith("LiftLab health ") or "— OK" not in res["line"]:
+        fails.append(f"the healthy line does not match the specified format: {res['line']!r}")
 
-    print("\n=== 2. THE FALSE ALARM THAT MUST NOT HAPPEN: 3h with no transit anywhere ===")
-    # No new transits at all; heartbeats fresh, segments advancing. Real, common, and healthy:
-    # ch29's busiest day ever had three such hours.
-    t = base + 3 * 3600
+    print("\n=== 2. >60 min silent INSIDE active hours IS a breach, and names the class ===")
+    t = base + 2 * 3600
     res, send, why, ch, err = step(H, path, t)
-    print(f"  {res['line'][:150]}")
-    if not res["ok"]:
-        fails.append("a 3h transit-quiet period raised an alarm — this is the measured normal case "
-                     "(51-55% of live daytime hours carry zero transits)")
-    if send:
-        fails.append(f"sent a message on an unchanged healthy state ({why}) — edge-triggering broken")
-
-    print("\n=== 3. beyond 6h with no transit — the derived threshold — now it IS an alarm ===")
-    t = base + 6 * 3600 + 600
-    res, send, why, ch, err = step(H, path, t)
-    print(f"  {res['line'][:200]}")
-    print(f"  sent={send} ({why}) channel={ch} err={(err or '')[:60]}")
+    print(f"  {res['line'][:220]}")
+    print(f"  sent={send} ({why}) channel={ch} err={(err or '')[:50]}")
     if res["ok"]:
-        fails.append("7h of fleet-wide transit silence did not alarm")
+        fails.append("2h of active-hours silence did not breach the 60-minute rule")
+    if not res["line"].startswith("LiftLab health "):
+        fails.append(f"line does not match the specified format: {res['line'][:60]!r}")
+    if "BREACH:" not in res["line"]:
+        fails.append("a breach line does not say BREACH")
+    if "silent since" not in res["line"]:
+        fails.append("the breach line does not say when the camera went silent")
+    # segments were advancing in step(), so this is the worker-stall class
+    if "segments flowing = worker stall class" not in res["line"]:
+        fails.append(f"the breach line does not name the stall class: {res['line'][:200]!r}")
     if not send or why != "breach":
         fails.append(f"a breach edge did not send (send={send} why={why})")
-    if ch is not None:
-        fails.append(f"no channel is configured, so nothing should have been delivered: {ch}")
     if not err or "no push channel" not in err:
         fails.append("a run with no delivery channel must RECORD that fact, not pass quietly")
 
@@ -297,7 +304,85 @@ def main():
                 if u in html:
                     fails.append(f"health banner state {i} wrongly prints {u!r}")
 
-    print("\n=== 11. the state table is the audit trail ===")
+    print("\n=== 11. quiet OUTSIDE active hours is reported, never alarmed ===")
+    # OWN DATABASE, on purpose: this scenario sits at 02:00 and the timeline above ends at 09:00+.
+    # Sharing one DB would run the clock backwards, and _prev() reads the newest row — every later
+    # comparison would then be against a future it had not reached yet.
+    npath = os.path.join(tmp, "night.db")
+    t_night = datetime(2026, 8, 13, 2, 0, tzinfo=IST).timestamp()
+    build(npath, t_night - 3 * 3600)          # last transit three hours ago, at 23:00
+    resn, sendn, whyn, chn, errn = step(H, npath, t_night)
+    print(f"  {resn['line'][:160]}")
+    print(f"  active_hours={resn['active_hours']} quiet_offhours={resn['quiet_offhours']}")
+    if not resn["ok"]:
+        fails.append(f"alarmed outside active hours: {resn['bad']} — a residential lift at 02:00 "
+                     "carries nobody, and a rule that fires then teaches the reader to ignore it")
+    if len(resn["quiet_offhours"]) != len(CAMS):
+        fails.append(f"off-hours silence was not REPORTED: {resn['quiet_offhours']}")
+    if "reported, not alarmed" not in resn["line"]:
+        fails.append("the line does not say the off-hours quiet was reported rather than alarmed")
+
+    print("\n=== 12. a silent camera simulated against a COPY OF THE REAL DATABASE ===")
+    # A synthetic fixture proves the logic; a real database proves it against the shapes the
+    # gateway actually holds — seven cameras, real registry rows, real analyzer_status, real
+    # transit history with its real quiet spells. The DB is COPIED first: this test must never be
+    # able to touch a live gateway, and health_check writes health_status.
+    import shutil as _sh
+    src = os.environ.get("HEALTH_TEST_DB") or os.path.expanduser("~/gateway-snapshot.db")
+    if not os.path.exists(src):
+        print(f"  SKIPPED — no real DB at {src}. The synthetic sections above still ran; this one "
+              f"did not, so nothing here has been checked against real data.")
+    else:
+        real = os.path.join(tmp, "real_copy.db")
+        _sh.copy(src, real)
+        con = sqlite3.connect(real)
+        # Anchor "now" just after the copy's newest transit so the fleet reads healthy, then take
+        # ONE camera silent by deleting its last two hours. Everything else is untouched.
+        newest = con.execute("SELECT MAX(ts) FROM transit_event").fetchone()[0]
+        victim = "ch29"
+        con.execute("DELETE FROM transit_event WHERE cam=? AND ts > ?", (victim, newest - 7200))
+        # Make the world consistent at that instant: fresh heartbeats, fresh Pi telemetry, and
+        # segments ADVANCING (so the class must come out as the worker-stall class, not upstream).
+        now_r = newest + 300
+        con.execute("UPDATE analyzer_status SET ts=?", (now_r - 20,))
+        try:
+            con.execute("INSERT INTO relay_status (gateway_id,ts) VALUES ('site-A',?)", (now_r - 30,))
+        except sqlite3.OperationalError:
+            pass
+        con.commit(); con.close()
+
+        dbr = H._db(real)
+        try:
+            r1 = H.evaluate(dbr, "site-A", now=now_r)          # first run: no previous segment sample
+            H.record(dbr, r1, None, None, sent=False)
+            con = sqlite3.connect(real)
+            con.execute("UPDATE analyzer_status SET ts=?, segments=segments+40", (now_r + 580,))
+            con.commit(); con.close()
+            r2 = H.evaluate(dbr, "site-A", now=now_r + 600)    # second run: segments have advanced
+        finally:
+            dbr.close()
+        print(f"  cameras in the real registry: {r2['n_cams']} (from {r2['cam_source']})")
+        print(f"  {r2['line'][:230]}")
+        active = H._active(now_r + 600)
+        print(f"  the copy's clock lands in active hours: {active}")
+        if not active:
+            print("  (the snapshot's newest transit is outside 07:00-23:00 IST, so the transit rule "
+                  "is correctly disarmed here — the class assertion below is skipped, not passed)")
+        else:
+            if victim not in r2["bad"]:
+                fails.append(f"the simulated silent camera {victim} was not detected against real "
+                             f"data: bad={r2['bad']}")
+            if victim not in r2["line"]:
+                fails.append(f"the breach line does not NAME the camera: {r2['line'][:160]!r}")
+            klass = (r2["detail"].get(victim) or {}).get("klass")
+            print(f"  class for {victim}: {klass}")
+            if klass != "segments flowing = worker stall class":
+                fails.append(f"the breach line does not name the right class for a stalled worker "
+                             f"with segments flowing: {klass!r}")
+            if "silent since" not in r2["line"]:
+                fails.append("the breach line does not say when the camera went silent")
+
+    print("\n=== 13. the state table is the audit trail ===")
     con = sqlite3.connect(path)
     n, nbad = con.execute("SELECT COUNT(*), SUM(ok=0) FROM health_status").fetchone()
     print(f"  {n} checks recorded, {nbad} of them breaches")
@@ -310,8 +395,9 @@ def main():
         for f in fails:
             print(f"FAIL: {f}")
         return 1
-    print("OK — quiet hours do not alarm, 6h+ silence does, dead workers and wedged feeds are "
-          "distinguished, breaches are edge-triggered, and an unconfigured channel says so")
+    print("OK — off-hours quiet is reported not alarmed, >60min in active hours breaches and names "
+          "its class, dead workers and wedged feeds are distinguished, breaches are edge-triggered, "
+          "and an unconfigured channel says so")
     return 0
 
 

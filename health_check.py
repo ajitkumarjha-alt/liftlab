@@ -60,7 +60,17 @@ DB_PATH = os.environ.get("GATEWAY_DB", "/var/lib/liftlab/gateway.db")
 
 # ── Thresholds. Every one of these is derived; see the module docstring. ──────────────────────
 HB_STALE_S = float(os.environ.get("HEALTH_HB_STALE_S", "900"))        # 15 min: survives a restart
-TRANSIT_STALE_S = float(os.environ.get("HEALTH_TRANSIT_STALE_S", str(6 * 3600)))
+TRANSIT_STALE_S = float(os.environ.get("HEALTH_TRANSIT_STALE_S", "3600"))     # 60 min, spec
+# ACTIVE HOURS. Outside them a silent camera is REPORTED and does not alarm — a residential lift at
+# 03:00 carries nobody, and a rule that fires then trains the reader to ignore the one that matters.
+ACTIVE_FROM = int(os.environ.get("HEALTH_ACTIVE_FROM", "7"))          # 07:00 IST inclusive
+ACTIVE_TO = int(os.environ.get("HEALTH_ACTIVE_TO", "23"))             # 23:00 IST exclusive
+# Pi telemetry: relay_status posts every ~36 s (measured, 720 rows over 7.2 h in the restored
+# snapshot), so 10 min is ~16 missed posts. Deliberately relay_status and NOT watch_status: the Pi
+# door-watch was RETIRED 2026-07-21 and its table has been frozen ever since, so keying on it would
+# breach permanently and for the wrong reason.
+PI_STALE_S = float(os.environ.get("HEALTH_PI_STALE_S", "600"))
+LITESTREAM_UNIT = os.environ.get("HEALTH_LITESTREAM_UNIT", "litestream")
 # A camera is expected to be posting only if the registry says it is enabled. The denominator comes
 # from the REGISTRY, never from "cameras that happen to have rows" — a camera that vanished entirely
 # would otherwise drop out of the count and the line would cheerfully report all-of-nothing healthy.
@@ -111,6 +121,51 @@ def _age_phrase(sec):
     return f"{sec / 3600:.1f}h"
 
 
+def _one(db, sql, args=()):
+    r = db.execute(sql, args).fetchone()
+    return r[0] if r else None
+
+
+def _active(now):
+    """Is `now` inside the active hours the transit rule alarms in (IST)."""
+    h = datetime.fromtimestamp(now, IST).hour
+    return ACTIVE_FROM <= h < ACTIVE_TO
+
+
+def _litestream():
+    """(active?, note). None = could not determine, which is NOT the same as broken.
+
+    Runs on the VM that litestream runs on, so `systemctl is-active` is the direct observation
+    rather than an inference. A box without systemd, or a unit that is not installed, reports
+    unknown — an unknown must never be rendered as a breach, or the line cries wolf on every
+    development box.
+    """
+    import shutil
+    import subprocess
+    if not shutil.which("systemctl"):
+        return None, "not checked (no systemctl on this host)"
+    try:
+        # LOADSTATE FIRST. `is-active` returns "inactive" for a unit that was never installed, which
+        # is indistinguishable from one that died — and reporting a missing unit as a broken backup
+        # makes the line cry wolf on every box that is not the gateway. A unit that does not exist
+        # is UNKNOWN; only a loaded unit can be judged.
+        ld = subprocess.run(["systemctl", "show", "-p", "LoadState", "--value", LITESTREAM_UNIT],
+                            capture_output=True, text=True, timeout=10)
+        load = (ld.stdout or "").strip()
+        if load != "loaded":
+            return None, f"not checked ({LITESTREAM_UNIT} unit is {load or 'absent'} on this host)"
+        r = subprocess.run(["systemctl", "is-active", LITESTREAM_UNIT],
+                           capture_output=True, text=True, timeout=10)
+        state = (r.stdout or "").strip() or (r.stderr or "").strip()
+    except Exception as e:
+        return None, f"not checked ({type(e).__name__})"
+    if state == "active":
+        return True, "active"
+    if state in ("inactive", "failed", "activating", "deactivating"):
+        return False, f"unit is {state}"
+    return None, f"not checked (unit {state or 'unknown'})"
+
+
 def expected_cams(db, gw):
     """The cameras that SHOULD be posting, and where that list came from."""
     rows = db.execute("SELECT cam FROM camera_registry WHERE gateway_id=? AND enabled=1 "
@@ -159,6 +214,10 @@ def evaluate(db, gw, now=None):
         tr_age = (now - tr_ts) if tr_ts else None
 
         reasons = []
+        # Hoisted: the transit-class logic below needs the previous segment sample whether or not the
+        # heartbeat is fresh. Left inside the else-branch it was a NameError on every stale-heartbeat
+        # camera — i.e. on exactly the cameras a breach line is about.
+        ps = prev_seg.get(cam)
         if hb_ts is None:
             reasons.append("no heartbeat ever")
         elif hb_age > HB_STALE_S:
@@ -167,21 +226,47 @@ def evaluate(db, gw, now=None):
             # Only meaningful while the heartbeat is FRESH: a stale heartbeat carries a stale
             # counter, and reporting "processing nothing" about a worker that is not running at all
             # would name the wrong fault and send someone to the wrong box.
-            ps = prev_seg.get(cam)
             if (ps is not None and segments is not None and segments == ps
                     and prev and (now - prev["ts"]) > 120):
                 reasons.append(f"alive but processing nothing — segments stuck at {segments} "
                                f"since {_hhmm(prev['ts'], now)} (no video reaching the worker)")
+        # ── TRANSIT SILENCE, and WHICH CLASS OF SILENCE it is ────────────────────────────────
+        # The class is the whole value of the line. Three states share one symptom (no transits):
+        #   segments FROZEN   -> the worker is stalled; the stream may be fine (the resume stall)
+        #   segments FLOWING  -> video is being processed and nothing is being counted
+        #   heartbeat STALE   -> the worker is not running at all, already named above
+        # Naming it turns "ch29 is quiet" into "go and look at the worker" or "go and look at the
+        # lift", which are different errands.
+        quiet_offhours = False
+        klass = None
         if tr_ts is None:
             reasons.append("no transit ever recorded")
+            klass = "no transit ever recorded"
         elif tr_age > TRANSIT_STALE_S:
-            reasons.append(f"no transit in {_age_phrase(tr_age)} (last {_hhmm(tr_ts, now)})")
+            seg_moved = (ps is not None and segments is not None and segments != ps)
+            if hb_ts is None or (hb_age or 0) > HB_STALE_S:
+                klass = "worker not running"
+            elif ps is None:
+                klass = "segments unknown = first check"       # no previous sample to compare
+            elif seg_moved:
+                klass = "segments flowing = worker stall class"
+            else:
+                klass = "segments frozen too = upstream/relay class"
+            if _active(now):
+                reasons.append(f"no transit in {_age_phrase(tr_age)} (last {_hhmm(tr_ts, now)}) "
+                               f"[{klass}]")
+            else:
+                # OUTSIDE ACTIVE HOURS: reported, never alarmed. A residential lift at 03:00 carries
+                # nobody, and a rule that fires then teaches the reader to ignore the one that does.
+                quiet_offhours = True
 
         bad_since = prev_ok_since.get(cam) if reasons else None
         if reasons and not bad_since:
             bad_since = now                      # first check that saw it — the honest "since"
         detail[cam] = {
             "ok": not reasons, "reasons": reasons, "segments": segments,
+            "klass": klass, "quiet_offhours": quiet_offhours,
+            "silent_since": tr_ts,
             "hb_ts": hb_ts, "hb_age_s": None if hb_age is None else round(hb_age, 1),
             "transit_ts": tr_ts, "transit_age_s": None if tr_age is None else round(tr_age, 1),
             "door_ts": dr_ts, "mode": (h["mode"] if h else None),
@@ -190,21 +275,44 @@ def evaluate(db, gw, now=None):
         if reasons:
             bad.append(cam)
 
-    ok = not bad
+    # ── INFRASTRUCTURE, not cameras: the two failures that make every camera figure meaningless ──
+    infra = []
+    pi_ts = _one(db, "SELECT MAX(ts) FROM relay_status WHERE gateway_id=?", (gw,))
+    pi_age = (now - pi_ts) if pi_ts else None
+    if pi_ts is None:
+        infra.append("Pi telemetry: relay_status has never reported")
+    elif pi_age > PI_STALE_S:
+        infra.append(f"Pi telemetry {_age_phrase(pi_age)} old (last {_hhmm(pi_ts, now)}) — the relay "
+                     f"is not reporting, so every camera figure below may be describing a dead feed")
+    ls_active, ls_note = _litestream()
+    if ls_active is False:
+        infra.append(f"litestream {ls_note} — the gateway DB is NOT being replicated. On 2026-08-04 "
+                     f"the backup chain was found unrestorable at every timestamp because nobody had "
+                     f"tried in weeks; silence is how that happened")
+
+    ok = not bad and not infra
     n = len(cams)
+    hhmm = datetime.fromtimestamp(now, IST).strftime("%H:%M")
     if ok:
-        line = (f"all {n} cameras posting: YES — "
-                + ", ".join(f"{c} {_age_phrase(detail[c]['transit_age_s'])}" for c in cams)
-                + " since last transit")
+        act = "within the hour" if _active(now) else "as expected for the hour"
+        line = f"LiftLab health {hhmm}: all {n} cameras posted {act} — OK"
     else:
-        parts, res_now = [], now
+        parts = []
         for c in bad:
-            since = detail[c]["bad_since"]
-            parts.append(f"{c} {'; '.join(detail[c]['reasons'])}"
-                         + (f" [breach first seen {_hhmm(since, res_now)}]" if since else ""))
-        line = f"all {n} cameras posting: NO — " + " · ".join(parts)
+            since = detail[c].get("silent_since") or detail[c]["bad_since"]
+            parts.append(f"{c} silent since {_hhmm(since, now)} ({detail[c]['klass']})")
+        parts += infra
+        line = f"LiftLab health {hhmm} BREACH: " + " · ".join(parts)
+    # Cameras quiet outside active hours: REPORTED, never alarmed. Carried on the payload so the
+    # dashboard and the daily line can show them without the word BREACH attached.
+    quiet = [c for c in cams if detail[c].get("quiet_offhours")]
+    if quiet and ok:
+        line += f" (outside active hours: {', '.join(quiet)} quiet — reported, not alarmed)"
     return {"gw": gw, "ts": now, "ok": ok, "cams": cams, "cam_source": cam_source,
-            "n_cams": n, "bad": bad, "detail": detail, "line": line,
+            "n_cams": n, "bad": bad, "detail": detail, "line": line, "infra": infra,
+            "quiet_offhours": quiet, "active_hours": _active(now),
+            "pi_age_s": (None if pi_age is None else round(pi_age, 1)),
+            "litestream_ok": ls_active, "litestream_note": ls_note,
             "prev_ok": (None if prev is None else prev["ok"])}
 
 

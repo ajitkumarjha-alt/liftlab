@@ -3,18 +3,17 @@
 One script, one timer, one dashboard banner. Nothing on the GPU box, nothing on the Pi, no registry
 change. The check is read-only over every table it judges and writes only its own `health_status`.
 
-**md5s as published on `pi-scripts` at `d91c7bf`** — verified by fetching them back from raw, not by
+**md5s as published on `pi-scripts`** — verified by fetching them back from raw, not by
 hashing the working tree.
 
 | box | path | md5 |
 |---|---|---|
-| VM | `health_check.py` | `959172c42ae923fa47dd7a99df5ba70b` |
-| VM | `dash_api.py` | `5cfae4bd1536855c542a248f9bc4e6ce` |
-| VM | `apply_health.sh` | `62ae4cdc6ee2de70e29ce6f7cc7cfddc` |
+| VM | `health_check.py` | `b46c6aa3af093667c0d3662413083db5` |
+| VM | `dash_api.py` | `e897b861181817535ff97719906f5e38` |
+| VM | `apply_health.sh` | `6162789c3f89a72bfc0f13d93c68a443` |
 
-`dash_api.py` here **supersedes** the `cd7eecf8…` in `DEPLOY_occupancy.md`: it is that file plus the
-health banner and `/dash/{gw}/health`. Install this one and the occupancy deploy's dash step is also
-satisfied.
+`dash_api.py` here **supersedes** both `cd7eecf8…` (occupancy) and `5cfae4bd…` (health banner): it is
+those plus the render-audit fixes. Install this one and every other note's dash step is satisfied.
 
 ---
 
@@ -26,9 +25,9 @@ for f in health_check.py dash_api.py apply_health.sh; do
   curl -fsSL "$B/$f" -o "/tmp/$f"
 done
 md5sum /tmp/health_check.py /tmp/dash_api.py /tmp/apply_health.sh
-#   959172c42ae923fa47dd7a99df5ba70b  health_check.py
-#   5cfae4bd1536855c542a248f9bc4e6ce  dash_api.py
-#   62ae4cdc6ee2de70e29ce6f7cc7cfddc  apply_health.sh
+#   b46c6aa3af093667c0d3662413083db5  health_check.py
+#   e897b861181817535ff97719906f5e38  dash_api.py
+#   6162789c3f89a72bfc0f13d93c68a443  apply_health.sh
 
 sudo bash /tmp/apply_health.sh
 ```
@@ -44,12 +43,12 @@ show as a failed unit and bury the real signal.
 ## 2. What runs afterwards
 
 ```
-liftlab-health.timer     every 10 min (override: sudo EVERY=5min bash /tmp/apply_health.sh)
+liftlab-health.timer     every 15 min (override: sudo EVERY=5min bash /tmp/apply_health.sh)
 liftlab-health.service   oneshot, Nice=10, idle I/O
 ```
 
 It sends on a **breach edge**, on **recovery**, and **once a day past 08:30 IST**. A camera down for
-three days produces one message plus one line each morning — not 432.
+three days produces one message plus one line each morning — not 288.
 
 ```bash
 systemctl list-timers liftlab-health --no-pager
@@ -60,14 +59,18 @@ curl -fsS -u "$OPERATOR" https://lift.gargi.online/dash/site-A/health
 The line reads either
 
 ```
-all 7 cameras posting: YES — ch16 12m, ch27 4m, ... since last transit
+LiftLab health 08:30: all 7 cameras posted within the hour — OK
+LiftLab health 09:15 BREACH: ch29 silent since 06:12 (segments flowing = worker stall class)
 ```
 
-or
+The parenthesised class is the useful half. Three states share one symptom — no transits — and they
+send you to different boxes:
 
-```
-all 7 cameras posting: NO — ch29 worker silent 41m (since 04:12) [breach first seen 04:27]
-```
+* `segments flowing = worker stall class` — video is being processed and nothing is being counted;
+* `segments frozen too = upstream/relay class` — the worker is fine and there is no video;
+* `worker not running` — the heartbeat is stale; it is not a counting problem at all.
+
+Outside 07:00–23:00 IST a silent camera is **reported, not alarmed**, and the OK line says so.
 
 ## 3. DELIVERY — read this before assuming you will be told
 
@@ -123,16 +126,33 @@ sudo -u liftlab sqlite3 /var/lib/liftlab/gateway.db \
 
 | signal | threshold | env | basis |
 |---|---|---|---|
+| no transit, **active hours only** | 60 min, 07:00–23:00 IST | `HEALTH_TRANSIT_STALE_S`, `HEALTH_ACTIVE_FROM/TO` | as specified |
 | heartbeat stale | 15 min | `HEALTH_HB_STALE_S` | long enough to survive a worker restart (~30 s) without flapping |
 | segments frozen | any check ≥2 min apart with no change | — | the counter advances every segment; frozen + fresh heartbeat = no video reaching a live worker |
-| no transit | 6 h | `HEALTH_TRANSIT_STALE_S` | 14 of 16,753 historical gaps exceed it (0.08%), and those coincide with the declared outages |
+| Pi telemetry stale | 10 min | `HEALTH_PI_STALE_S` | `relay_status` posts every ~36 s (measured: 720 rows over 7.2 h), so 10 min is ~16 missed posts |
+| litestream | unit not active | `HEALTH_LITESTREAM_UNIT` | a unit that is *absent* reports UNKNOWN, never a breach |
 
-**An hourly transit check was specified and is not what shipped.** Measured on the restored snapshot,
-51-55% of daytime hours on days a camera was demonstrably live contain zero transits, and ch29's
-busiest day ever still held three empty hours. That alarm would have fired on a healthy camera more
-than half the time. Transit age is still *reported* for every camera on every line — it is simply not
-the trigger. If you want the stricter rule anyway, `HEALTH_TRANSIT_STALE_S=3600` restores it without
-a code change.
+**Pi telemetry is `relay_status`, deliberately not `watch_status`.** The Pi door-watch was retired
+2026-07-21 and its table has been frozen ever since; keying on it would breach permanently and for
+the wrong reason.
+
+### The measured alert rate of the 60-minute rule
+
+Replayed over the restored snapshot (16.5 days, 14,432 active-hour gaps), the specified rule fires
+**60 times — about 3.6 alerts/day fleet-wide.** Most are real: the top twelve are 3.9 h–53 h and
+line up with the declared outages (the Jul 19–20 relay stall, the Jul 31 fleet outage where five
+cameras breach within ten minutes of each other). The remainder are 1–4 h quiet spells on lifts that
+are genuinely quiet at that hour.
+
+Two things already blunt this: breaches are **edge-triggered**, so a standing fault sends once and
+is then restated only in the daily line; and one fleet outage arrives as one message naming several
+cameras.
+
+If it still reads as noisy after a week, the measured refinement is to suppress a breach when the
+camera's own median for that hour-of-day is ~0 — that halves it to **1.6/day** and every survivor in
+the replay is a genuine outage. It is deliberately **not** shipped: it is a second threshold to
+reason about, and the rule as specified is the one to judge from real weeks rather than from a
+replay of a period containing two multi-day outages.
 
 ## 5. What this cannot see
 
