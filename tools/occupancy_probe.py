@@ -48,6 +48,9 @@ def main():
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--model", default=os.environ.get("MODEL", "yolo11n.pt"))
     ap.add_argument("--conf", type=float, default=0.35)
+    ap.add_argument("--anchor", default="both", choices=("foot", "center", "both"),
+                    help="membership point for cabin occupancy; 'both' compares them on the SAME "
+                         "detections in one pass (exact comparison, one decode)")
     ap.add_argument("--device", default=None,
                     help="cuda for the production TensorRT engine; omit for CPU")
     a = ap.parse_args()
@@ -78,8 +81,12 @@ def main():
             if a.to_frame and i > a.to_frame: break
             if i < a.from_frame or (i % a.stride): continue
             dets = det.track(fr)
-            n = len(ctr.cabin_ids(dets))
-            per.append((i, n, len(dets)))
+            # BOTH ANCHORS OFF THE SAME DETECTIONS. Running the probe twice would compare two
+            # tracker states as well as two anchors; this compares only what is being tested.
+            nf = len(ctr.cabin_ids(dets, anchor="foot"))
+            nc = len(ctr.cabin_ids(dets, anchor="center"))
+            n = nf if a.anchor in ("foot", "both") else nc
+            per.append((i, nf, nc, len(dets)))
             if n > peak:
                 peak, peak_first, peak_last = n, i, i
             elif n == peak:
@@ -90,7 +97,7 @@ def main():
         raise SystemExit("no frames analysed in that range")
     ns = sorted(x[1] for x in per)
     q = lambda p: ns[int(p * (len(ns) - 1))]
-    tot = sorted(x[2] for x in per)
+    tot = sorted(x[3] for x in per)
     print(f"=== cabin occupancy, {os.path.basename(a.video)} f{a.from_frame}-{a.to_frame} "
           f"(stride {a.stride}, {len(per)} analysed frames) ===")
     # DECODE HEALTH FIRST. A run over corrupt frames must not be able to print a confident number
@@ -107,11 +114,34 @@ def main():
         print(f"  decoder: no error lines (sequential decode from frame 1, no seek)")
     span = "" if peak_first == peak_last else f"..{peak_last}"
     print(f"  PEAK cabin occupancy (MEASURED MINIMUM): {peak}  first at frame {peak_first}{span}")
-    print(f"  cabin per-frame   p50 {q(.5)}  p90 {q(.9)}  max {ns[-1]}")
+    print(f"  cabin per-frame   p50 {q(.5)}  p90 {q(.9)}  max {ns[-1]}   "
+          f"(anchor={a.anchor if a.anchor != 'both' else 'foot, headline'})")
     print(f"  all detections    p50 {tot[len(tot)//2]}  max {tot[-1]}   (whole frame, both zones + outside)")
     hist = collections.Counter(x[1] for x in per)
     print("  distribution:", " ".join(f"{k}:{v}" for k, v in sorted(hist.items())))
-    sustained = sum(1 for _f, n, _t in per if n >= max(1, peak - 1))
+
+    # ---- THE PAIR TEST -------------------------------------------------------------------
+    if a.anchor == "both":
+        fs = sorted(x[1] for x in per); cs = sorted(x[2] for x in per)
+        qq = lambda v, p: v[int(p * (len(v) - 1))]
+        print()
+        print(f"  {'anchor':>8} {'peak':>5} {'p50':>4} {'p90':>4} {'mean':>6}   distribution")
+        for lab, v in (("foot", fs), ("center", cs)):
+            h = collections.Counter(v)
+            print(f"  {lab:>8} {max(v):>5} {qq(v,.5):>4} {qq(v,.9):>4} {sum(v)/len(v):>6.2f}   "
+                  + " ".join(f"{k}:{n}" for k, n in sorted(h.items())))
+        gain = max(cs) - max(fs)
+        print(f"  center - foot at peak: {gain:+d}   (per-frame mean "
+              f"{sum(cs)/len(cs) - sum(fs)/len(fs):+.2f})")
+        # A centroid can only ADD members relative to a foot for the same box when the box bottom
+        # falls outside and the middle inside. If center ever reports FEWER, the polygon geometry is
+        # not what either anchor assumes and neither number should be trusted.
+        worse = sum(1 for _f, nf, nc, _t in per if nc < nf)
+        if worse:
+            print(f"  !! center reported FEWER than foot on {worse}/{len(per)} frames — the cabin "
+                  f"polygon does not sit where a body's middle is above its feet. Check the zone "
+                  f"against a frame before reading either column.")
+    sustained = sum(1 for _f, n, _c, _t in per if n >= max(1, peak - 1))
     print(f"  frames at >= peak-1 ({max(1, peak-1)}): {sustained}/{len(per)} "
           f"({100.0*sustained/len(per):.0f}%) — a peak seen on one frame is an artefact candidate")
     if peak == ns[0]:

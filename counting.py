@@ -53,6 +53,18 @@ class Detection:
         threshold far more cleanly than a box centroid."""
         return ((self.x1 + self.x2) / 2.0, self.y2)
 
+    @property
+    def center(self) -> tuple[float, float]:
+        """Box centroid. NOT a floor contact point and NOT for counting.
+
+        Offered for OCCUPANCY only. In a crowded cabin the feet are the first thing occluded, and a
+        truncated box's bottom edge sits wherever the visible body ends — often outside the floor
+        polygon — so a foot anchor undercounts exactly when the count matters most. A centroid
+        survives lower-body occlusion. It also floats toward the camera for anyone merely NEAR the
+        polygon, which is why it must never be used for a transit: direction semantics depend on a
+        point that crosses the threshold cleanly, and this one does not."""
+        return ((self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0)
+
 
 class Detector(Protocol):
     def track(self, frame: np.ndarray) -> list[Detection]: ...
@@ -218,7 +230,7 @@ class ZoneCounter:
             return "landing"
         return None
 
-    def cabin_ids(self, dets: list[Detection]) -> set:
+    def cabin_ids(self, dets: list[Detection], anchor: str = "foot") -> set:
         """Distinct track_ids whose FOOT is inside zone_cabin on this frame.
 
         This is the per-frame input to PEAK CAR OCCUPANCY. It reuses _zone_of, so occupancy and
@@ -228,8 +240,20 @@ class ZoneCounter:
         IT IS A FLOOR, NOT A COUNT. A person the detector missed — occluded behind another body,
         which is exactly what happens in a full car — is not here. Every consumer of this number
         must say "measured minimum".
+
+        `anchor` selects the membership POINT, not the polygon. 'foot' matches the counting path
+        exactly. 'center' exists because a foot anchor loses occluded people in a crowd — the
+        failure mode measured on ch30_full f5350-5650, where YOLO saw 5-7 of six people but only
+        three had a foot inside the polygon. COUNTING NEVER USES 'center'.
         """
-        return {d.track_id for d in dets if self._zone_of(d) == "cabin"}
+        if anchor == "foot":
+            return {d.track_id for d in dets if self._zone_of(d) == "cabin"}
+        if anchor == "center":
+            # DELIBERATELY NOT _zone_of: that function is the counting path's definition of "where
+            # is this person", and transit direction semantics depend on it. Occupancy may use a
+            # different membership point; counting may not.
+            return {d.track_id for d in dets if in_poly(d.center, self.zone_cabin)}
+        raise ValueError(f"anchor must be 'foot' or 'center', got {anchor!r}")
 
     def _flush_attempt(self, tid: int) -> None:
         """A crossing attempt ended (track left the zones or vanished) without being counted.
