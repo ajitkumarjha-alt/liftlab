@@ -59,6 +59,7 @@ CLOSE_TRAVEL_MAX_BOUNDARY = "2026-07-16T11:48:11+00:00"   # CLOSE_TRAVEL_MAX 10-
 # like the other three; the compliance panel labels every close-travel stat with its instrument.
 DOORWATCH_RETIRED_BOUNDARY = "2026-07-21T00:00:00+00:00"   # d7a7a49; Pi gw_event frozen, GPU gw_door_event live
 _BOUNDARY_EPOCH = datetime.fromisoformat(CLOSE_TRAVEL_MAX_BOUNDARY).timestamp()
+_RETIRED_EPOCH = datetime.fromisoformat(DOORWATCH_RETIRED_BOUNDARY).timestamp()
 # 5f1488a's DoorTracker TIME GUARDS (max_gap 15s, plausible close 0.3-30s) changed what gets
 # EMITTED without changing the era (templates/geometry untouched), so an era-filtered close-travel
 # pool mixes pre-guard mispairings (0.08s / 4641s cycles) with clean rows — 115/154 impossible
@@ -629,6 +630,8 @@ def _is_h3_era(era):
 
 
 H3_TRAVEL_NOTE = "h3: travel unmeasured by design"
+UNCALIBRATED_NOTE = ("no door calibration on this camera — door cycles and close-travel are "
+                     "UNAVAILABLE, not zero, until it is calibrated")
 H3_TRAVEL_REASON = (
     "h3 is a state-only engine — it detects door cycles and does not time them. "
     "close_travel_s is NULL on every h3 cycle with a reason string, because three passes of TEST B "
@@ -2167,8 +2170,18 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
     # cycle counts can share buckets; close-travel values must NOT pool — see close_instrument.
     gpu_cyc = []
     h3_cams = []
+    uncal_cams = []          # no door engine has EVER posted for these — not calibrated, not idle
     for c in ([cam] if cam else [x["cam"] for x in _cameras(db, gw)]):
         e, _esrc = _era_for(db, gw, c, era)
+        if not e:
+            # WHICH KIND OF ABSENCE. A camera with no era either (a) has never had a door engine run
+            # against it — no calibration, so door cycles and close-travel are not merely missing but
+            # UNAVAILABLE — or (b) has history in some other era. Only the first is "uncalibrated",
+            # and the difference decides whether the page says "no cycles" or "cannot measure cycles".
+            # Rendering both as an empty axis with a 0 beside it says the lift stood still all week.
+            _any = _q(db, "SELECT 1 FROM gw_door_event WHERE gateway_id=? AND cam=? LIMIT 1", (gw, c))
+            if not _any:
+                uncal_cams.append(c)
         if e:
             # PER-ERA CYCLE RULE. h2 marks a completed cycle with a non-null close_travel_s; h3 has
             # no travel at all, so the same rule reports 0 cycles for a healthy engine — the same
@@ -2215,6 +2228,11 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                   ([gw, cam, *occ_args] if cam else [gw, *occ_args]))
     occ_rows = [r for r in occ_rows
                 if not occ_ver.get(r["cam"]) or r["counting_version"] == occ_ver.get(r["cam"])]
+    # The first episode that EVER carried occupancy coverage for this selection, ignoring the range.
+    _ofr = _q(db, "SELECT MIN(ts_start) mn FROM validation_item WHERE gateway_id=? "
+                  "AND occupancy_frames > 0" + (" AND cam=?" if cam else ""),
+              ([gw, cam] if cam else [gw]))
+    occ_first_ts = (_ofr[0]["mn"] if _ofr else None)
 
     # Range-scoped Tier-2 for the heatmap: the join side reuses the transit rows already loaded
     # above (same cam, same table) instead of re-querying the fleet. Without this the heatmap kept
@@ -2332,9 +2350,29 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
         bo = sum(prof[h]["boarded"] for h in hrs); al = sum(prof[h]["alighted"] for h in hrs)
         span = max(1, len(hrs))
         oc = sorted(v for h in hrs for v in prof[h]["occ"])
+        # C26 TRANSFER IS A PI-ERA METRIC, FULL STOP. It needs door_open_full and door_close_start,
+        # which only gw_event carries — the Pi door-watch, frozen at its retirement. gw_door_event has
+        # no equivalent pair, so there is no live source and there has not been one since 2026-07-21.
+        #
+        # Rendering it as a bare number made the metric switch instruments between tabs: a lift with
+        # Pi history (ch29) showed a July figure beside GPU-era demand, while a lift without one
+        # (ch27) showed "(n=0)" — two different KINDS of statement under one label, and neither said
+        # which instrument it came from. The tag travels with the number now, and `applies` is False
+        # when the selected range lies entirely after the retirement, where a value could not have
+        # come from the range being displayed even if the pool is non-empty.
+        xf_applies = (t0 is None) or (t0 < _RETIRED_EPOCH)
         return {"from": lo, "to": hi, "cycles": cyc, "cycles_per_hr": round(cyc / (span * ndays), 2),
                 "boarded": bo, "alighted": al, "riders_per_hr": round((bo + al) / (span * ndays), 2),
-                "close": _stats(closes), "transfer": {**_stats(xfer), "provisional": True},
+                "close": _stats(closes),
+                "transfer": {**_stats(xfer), "provisional": True,
+                             "instrument": "pi_watch",
+                             "instrument_note": "Pi door-watch (gw_event), RETIRED "
+                                                + DOORWATCH_RETIRED_BOUNDARY[:10],
+                             "applies_to_range": xf_applies,
+                             "reason": (None if xf_applies else
+                                        "the selected range is entirely after the Pi door-watch was "
+                                        "retired; C26 has no live source, so no value can come from "
+                                        "these dates")},
                 # NOT per-hour and NOT averaged: a peak divided by hours is not a quantity anyone can
                 # use. This is the max and the p95 of the per-episode peaks in the window, with n.
                 "occupancy": {"peak": (oc[-1] if oc else None),
@@ -2362,9 +2400,16 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                          # computed_at exists so the UI can show data-as-of instead of implying the
                          # numbers are current, and window_days exists because a cached 7-day tier2
                          # under an "all data" heading would be a wrong answer told confidently.
+                         # first_ts is ALL-TIME, not range-scoped, on purpose: it is what lets the UI
+                         # say "these hours predate the measurement" instead of printing a bare dash
+                         # that reads as "the car was empty". A dash with no reason is the same
+                         # failure as the 0-cycles bug two panels over.
                          "occupancy_note": {"label": OCC_LABEL, "calibration": OCC_CALIBRATION,
                                             "anchor": OCC_ANCHOR_NOTE,
-                                            "n_episodes": len(occ_rows)},
+                                            "n_episodes": len(occ_rows),
+                                            "first_ts": occ_first_ts,
+                                            "first_ist": (_iso_ist(occ_first_ts) if occ_first_ts
+                                                          else None)},
                          "tier2_source": tier2_source,
                          "tier2_computed_at": (tier2_meta or {}).get("computed_at"),
                          "tier2_age_s": (tier2_meta or {}).get("age_s"),
@@ -2386,7 +2431,13 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                                    # activity" — the same misreading as the 0-cycles bug, one panel
                                    # over. The UI labels the chart from these two fields.
                                    "travel_unmeasured_cams": h3_cams,
-                                   "travel_unmeasured_note": (H3_TRAVEL_NOTE if h3_cams else None)},
+                                   "travel_unmeasured_note": (H3_TRAVEL_NOTE if h3_cams else None),
+                                   # Cameras with NO door engine history at all. Their door-derived
+                                   # series are unavailable, not zero, and the difference is the
+                                   # whole point: an empty cycles chart beside "cycles/hr 0" reads
+                                   # as a lift that never moved.
+                                   "uncalibrated_cams": uncal_cams,
+                                   "uncalibrated_note": (UNCALIBRATED_NOTE if uncal_cams else None)},
                          "boundaries": {"close_travel_max": {"iso": CLOSE_TRAVEL_MAX_BOUNDARY, "epoch": _BOUNDARY_EPOCH,
                                         "note": "CLOSE_TRAVEL_MAX 10->30s; close-travel here uses the post-boundary regime only"}},
                          "data_gaps": [g for g in DATA_GAPS if (cam is None or cam in g.get("cams", []) or not g.get("cams"))]})
@@ -2828,18 +2879,36 @@ function unavail(d){
 }
 
 function tabs(d){
-  cur=cur||(d.cameras[0]&&d.cameras[0].cam);
+  if(!cur){ cur = (d.cameras[0]&&d.cameras[0].cam)||''; }
+  if(!trCam){ trCam = cur; }                 // default once, through the same value as the tab
+  if(cur && trCam && cur !== trCam){ trCam = cur; }   // belt and braces: they can never diverge
   document.getElementById('tabs').innerHTML=d.cameras.map(function(c){
     var live=c.snap&&!c.snap.stale, dot=live?'#127a3d':(c.snap?'#b06a00':'#ccc');
     return '<div class="tab'+(c.cam===cur?' on':'')+'" onclick="pick(\''+c.cam+'\')">'
       +'<span class=dot style="background:'+dot+'"></span>'+esc(c.cam)+(c.label?' '+esc(c.label):'')+'</div>';
   }).join('');
 }
-function pick(cam){
-  cur=cam;
-  try{history.replaceState(null,'', '/dash?cam='+encodeURIComponent(cam));}catch(e){}
+// THE ONE SELECTOR. There used to be two — `cur` for the Dash tab and `trCam` for Trends — both
+// seeded from ?cam= and then free to drift, because pick() wrote `cur` and the trends tab strip
+// wrote `trCam`, and neither wrote the other or the URL. A single page could therefore show ch32 in
+// the URL, ch27 highlighted, and ch16's per-floor panel, which is not a cosmetic problem: floors
+// belong to one shaft, so a mismatched panel is a chart of a different building column under the
+// wrong heading. Seeding both from the URL (the earlier partial fix) only made them agree at load.
+//
+// Everything that selects a camera goes through here, and nothing else assigns `cur` or `trCam`.
+function selectCam(cam, opts){
+  opts = opts || {};
+  if(!cam) return;
+  cur = cam; trCam = cam;
+  try{history.replaceState(null,'','/dash?cam='+encodeURIComponent(cam)
+      +(mode==='trends'?'&view=trends':''));}catch(e){}
   render();
+  // Trends holds its own fetched payload, so it must be re-fetched for the new camera — but only
+  // when it is the visible view or already loaded, so switching camera on the Dash tab does not
+  // fire a trends request nobody asked for.
+  if(!opts.noTrends && (mode==='trends' || TR)) loadTrends();
 }
+function pick(cam){ selectCam(cam); }
 
 function bars(door){
   if(!door||!door.n){return '';}
@@ -3082,7 +3151,9 @@ var mode='cams', trCam='', TR=null;
 // whatever camera was last clicked here — reported 2026-08-05 as ch27 in the URL showing ch29's
 // floor alphabet. Floors are per-shaft, so a mismatched heatmap is not a cosmetic problem: it is a
 // chart of a different building column under the wrong heading.
-(function(){var m=/[?&]cam=([A-Za-z0-9._-]+)/.exec(location.search); if(m)trCam=m[1];})();
+// trCam is seeded from `cur` (which reads ?cam= above) by tabs(), and thereafter only ever written
+// by selectCam. It is deliberately NOT parsed from the URL a second time: two independent readers of
+// one parameter is how they drifted in the first place.
 function nav(){
   document.getElementById('nav').innerHTML=
     '<div class="tab'+(mode==='cams'?' on':'')+'" onclick="setMode(\'cams\')">Cameras</div>'
@@ -3214,13 +3285,44 @@ document.addEventListener('pointerover',tipOn);
 document.addEventListener('pointerdown',tipOn);
 window.addEventListener('scroll',function(){var e=document.getElementById('tip');if(e)e.style.display='none';},true);
 
-function winCard(name,w){
+function winCard(name,w,travelUnmeasured,uncalibrated){
   if(!w)return '';
   var ratio=(w.demand_ratio_vs_allday!=null)?('  <b class="'+(w.demand_ratio_vs_allday>=1.3?'bad':'')+'">'+w.demand_ratio_vs_allday+'× all-day</b>'):'';
+  // A BARE DASH IS NOT A REASON. These boxes printed "—/— (n=0)" while the chart six inches below
+  // explained that h3 does not measure travel at all. The reader who stops at the summary boxes —
+  // which is most readers — saw a missing number and no cause, which reads as broken data rather
+  // than as a deliberate design. The explanation belongs where the dash is, not only where the
+  // chart is.
+  // UNCALIBRATED beats every other explanation: without a door engine there are no cycles to have,
+  // so "cycles/hr 0" is not a small number, it is a category error. n/a says which kind of absence.
+  var cycTxt=uncalibrated
+    ? '<span class=mut>n/a — uncalibrated</span>'
+    : (w.cycles_per_hr+ratio);
+  var closeTxt;
+  if(uncalibrated){
+    closeTxt='<span class=mut>n/a — no door calibration on this camera</span>';
+  } else if(w.close.median==null && travelUnmeasured){
+    closeTxt='<span class=mut>not measured — h3 state-only engine, travel is NULL by design</span>';
+  } else if(w.close.median==null){
+    closeTxt='<span class=mut>— no completed close in this window</span>';
+  } else {
+    closeTxt=w.close.median+'s / '+(w.close.p85==null?'—':w.close.p85+'s')+' (n='+w.close.n+')';
+  }
+  // The transfer metric carries its INSTRUMENT. Without it, a lift with Pi history showed a July
+  // figure beside GPU-era demand while a lift without one showed "(n=0)" — the same label over two
+  // different kinds of statement, silently switching eras between tabs.
+  var xf=w.transfer, xfTxt;
+  if(xf.applies_to_range===false){
+    xfTxt='<span class=mut>not measured in this range — '+esc(xf.instrument_note||'')+'</span>';
+  } else if(xf.median==null){
+    xfTxt='<span class=mut>— no Pi-era cycles for this lift ('+esc(xf.instrument_note||'')+')</span>';
+  } else {
+    xfTxt=xf.median+' s/pp (n='+xf.n+') * <span class=mut>· '+esc(xf.instrument_note||'')+'</span>';
+  }
   return '<div class=card><h3>'+esc(name)+' <span class=mut>'+w.from+':00–'+w.to+':00</span></h3>'
-    +kv('cycles/hr',w.cycles_per_hr+ratio)
-    +kv('close med / p85',(w.close.median==null?'—':w.close.median+'s')+' / '+(w.close.p85==null?'—':w.close.p85+'s')+' (n='+w.close.n+')')
-    +kv('transfer',(w.transfer.median==null?'—':w.transfer.median+' s/pp')+' (n='+w.transfer.n+') *')
+    +kv('cycles/hr',cycTxt)
+    +kv('close med / p85',closeTxt)
+    +kv('transfer',xfTxt)
     +kv('riders/hr',w.riders_per_hr)
     // Peak occupancy is NOT divided by hours — a max per hour is not a quantity. The label carries
     // "min" on the number itself so the figure cannot be lifted out of this card and read as a count.
@@ -3233,7 +3335,7 @@ function trCams(){
   var cams=(DATA&&DATA.cameras)?DATA.cameras.map(function(c){return c.cam}):[];
   return '<div class=tabs style="margin-bottom:6px">'
     +['',].concat(cams).map(function(c){var lbl=c||'fleet';
-       return '<div class="tab'+(trCam===c?' on':'')+'" onclick="trCam=\''+c+'\';loadTrends()">'+esc(lbl)+'</div>';}).join('')+'</div>';
+       return '<div class="tab'+(trCam===c?' on':'')+'" onclick="selectCam(\''+c+'\')">'+esc(lbl)+'</div>';}).join('')+'</div>';
 }
 // ---- period picker + explicit date range + table view + CSV (operator batch) ----
 // A picked date pair OVERRIDES the period buttons (the server prefers from_d/to_d too); picking a
@@ -3289,6 +3391,18 @@ function exportBar(){
     +dl('episodes','episodes + occupancy')+allEras
     +'<span class=mut style="font-size:11px">CSV — the rows behind these charts, same range'+(trCam?'':' (fleet)')+'</span></div>';
 }
+// A BARE DASH DOES NOT SAY WHICH ABSENCE IT IS. Peak occupancy only began being recorded when the
+// field was deployed; every hour before that has no measurement and never will. Printing "—" there,
+// in the same glyph used for "this hour had no episodes", invites the reader to average across a
+// boundary that does not exist — and a dash in an occupancy column reads as an empty car.
+function occCell(p){
+  if(p.occ_peak!=null) return p.occ_peak;
+  var note=(TR&&TR.occupancy_note)||{};
+  if(!note.first_ts) return '<span class=mut title="peak car occupancy has never been recorded for '
+    +'this selection">no coverage</span>';
+  if(!note.n_episodes) return '<span class=mut>no coverage in range</span>';
+  return '<span class=mut>no episodes</span>';       // measured elsewhere, just not in this hour
+}
 function trTableHtml(prof,W){
   var head='<tr><th>hour</th><th>cycles</th><th>boarded</th><th>alighted</th><th>riders</th>'
     +'<th>close med (s)</th><th>close p85</th><th>n</th><th>peak occ ≥</th><th>occ n</th></tr>';
@@ -3296,7 +3410,7 @@ function trTableHtml(prof,W){
     return '<tr><td>'+pad2(p.hour)+':00</td><td>'+p.cycles+'</td><td>'+p.boarded+'</td><td>'+p.alighted
       +'</td><td>'+(p.boarded+p.alighted)+'</td><td>'+(p.close_median==null?'—':p.close_median)
       +'</td><td>'+(p.close_p85==null?'—':p.close_p85)+'</td><td>'+(p.close_n||0)
-      +'</td><td>'+(p.occ_peak==null?'—':p.occ_peak)+'</td><td>'+(p.occ_n||0)+'</td></tr>';}).join('');
+      +'</td><td>'+occCell(p)+'</td><td>'+(p.occ_n||0)+'</td></tr>';}).join('');
   var tot=prof.reduce(function(a,p){a.c+=p.cycles;a.b+=p.boarded;a.a+=p.alighted;
     if(p.occ_peak!=null&&p.occ_peak>a.o)a.o=p.occ_peak; a.on+=(p.occ_n||0); return a;},
     {c:0,b:0,a:0,o:null,on:0});
@@ -3321,6 +3435,17 @@ function renderTrends(){
   // as "the doors stopped closing", which is the same misreading as the 0-cycles bug it sits next to.
   var TRAVEL_UNMEASURED_CAMS=((TR.range||{}).travel_unmeasured_cams)||[];
   var TRAVEL_UNMEASURED=TRAVEL_UNMEASURED_CAMS.length>0;
+  // UNCALIBRATED: no door engine has ever posted for this camera. Its door-derived charts have no
+  // axis to draw, and drawing one anyway — an empty grid with the 2.31s Bank C line ruled across
+  // nothing — states a compliance comparison about a lift that was never measured.
+  var UNCAL_CAMS=((TR.range||{}).uncalibrated_cams)||[];
+  var UNCALIBRATED=UNCAL_CAMS.length>0 && (!trCam || UNCAL_CAMS.indexOf(trCam)>=0);
+  function absent(title,intent,head,body){
+    return '<div class=card><div class=h>'+title+'</div>'
+      +'<div class=mut style="font-size:11px">'+intent+'</div>'
+      +'<div style="padding:18px 10px;border:1px dashed #b06a00;border-radius:6px;margin-top:8px">'
+      +'<b>'+head+'</b><div class=mut style="font-size:11px;margin-top:4px">'+body+'</div></div></div>';
+  }
   var erabanner=(TR.counting_eras&&TR.counting_eras.crossing)?('<div class=mut style="font-size:12px;margin:2px 0 6px;padding:4px 8px;border-left:3px solid #b06a00;background:rgba(176,106,0,.07)"><b>ERA BOUNDARY IN RANGE</b> — pools transits counted under '+eras.length+' different counting versions: '
     +eras.map(function(e){return '<b>'+esc(e.version)+'</b> ('+String(e.first_seen||'').slice(0,10)+' → '+String(e.last_seen||'').slice(0,10)+', '+e.n_episodes+' validated eps)'}).join(' · ')
     +'. Hourly totals mix counting logics; validated precision applies per era, never to the pool. Narrow the dates to one era for comparable numbers.</div>'):'';
@@ -3332,12 +3457,23 @@ function renderTrends(){
     +exportBar()
     +gapbanner
     +erabanner
-    +'<div class=strip>'+winCard('all-day',W.all_day)+winCard('AM peak',W.am_peak)+winCard('PM peak',W.pm_peak)+'</div>'
+    +'<div class=strip>'+winCard('all-day',W.all_day,TRAVEL_UNMEASURED,UNCALIBRATED)
+        +winCard('AM peak',W.am_peak,TRAVEL_UNMEASURED,UNCALIBRATED)
+        +winCard('PM peak',W.pm_peak,TRAVEL_UNMEASURED,UNCALIBRATED)+'</div>'
     +'<div class=mut style="font-size:11px;margin:2px 0 8px">* transfer PROVISIONAL (transit precision, re-validating). <b>THE PEAK TRAP</b>: the sheet coefficients describe a PEAK design condition, not an all-day average — peak &amp; all-day are shown SEPARATELY; the ratio is itself a finding.</div>'
     +(trTable?trTableHtml(prof,W):(''
-    +'<div class=card>'+svgBars('cycles / hour-of-day — the demand curve',
+    +(UNCALIBRATED
+      ? absent('cycles / hour-of-day — the demand curve',
+               'how often this lift’s doors operate — the work rate',
+               'no door calibration on '+esc(UNCAL_CAMS.join(', '))+' — door cycles UNAVAILABLE',
+               'This camera has never had a door engine run against it, so there are no cycles to '
+               +'count. An empty chart here with “cycles/hr 0” beside it would say the lift stood '
+               +'still; it says nothing of the kind. Unavailable until the camera is calibrated '
+               +'(site visit scheduled). Occupancy and transit counts on this camera are '
+               +'unaffected — they come from the counting path, not the door path.')
+      : '<div class=card>'+svgBars('cycles / hour-of-day — the demand curve',
         'how often this lift’s doors operate — the work rate',
-        hours,prof.map(function(p){return p.cycles}),'#127a3d',null,'','cycles')+'</div>'
+        hours,prof.map(function(p){return p.cycles}),'#127a3d',null,'','cycles')+'</div>')
     +'<div class=card>'+svgBars('riders (boardings+alightings) / hour-of-day',
         'boardings + alightings counted at this door — usage volume, not unique people',
         hours,prof.map(function(p){return p.boarded+p.alighted}),'#2a6db0',null,'','riders')+'</div>'
@@ -3352,10 +3488,25 @@ function renderTrends(){
       +'<div class=mut style="font-size:11px;margin-top:4px">'
       +((TR.occupancy_note&&TR.occupancy_note.n_episodes)
         ? (TR.occupancy_note.n_episodes+' episode(s) with coverage in range · <b>'
-           +esc(TR.occupancy_note.calibration)+'</b> · '+esc(TR.occupancy_note.anchor))
-        : 'no episodes carry occupancy coverage in this range — bars are absent, NOT zero')
+           +esc(TR.occupancy_note.calibration)+'</b> · '+esc(TR.occupancy_note.anchor)
+           +((TR.occupancy_note.first_ist)
+             ? ' · first recorded '+esc(String(TR.occupancy_note.first_ist).slice(0,16))
+               +' — anything earlier has NO coverage, which is not the same as an empty car'
+             : ''))
+        : ((TR.occupancy_note&&TR.occupancy_note.first_ist)
+           ? ('no episodes carry occupancy coverage in this range — bars are absent, NOT zero. '
+              +'The measurement begins '+esc(String(TR.occupancy_note.first_ist).slice(0,16))+'.')
+           : 'peak car occupancy has never been recorded for this selection — no coverage, '
+             +'which is not a measurement of zero'))
       +'</div></div>'
-    +'<div class=card>'+(TRAVEL_UNMEASURED
+    +(UNCALIBRATED
+      ? absent('close-travel median / hour-of-day (s)',
+               'median seconds for the door to close, per hour',
+               'no door calibration — close-travel UNAVAILABLE',
+               'The 2.31s Bank C compliance line is deliberately NOT drawn: ruling a threshold '
+               +'across an empty axis states a compliance comparison about a lift that was never '
+               +'measured. Unavailable until this camera is calibrated.')
+      : '<div class=card>'+(TRAVEL_UNMEASURED
         ? ('<div class=h>close-travel median / hour-of-day (s)</div>'
            +'<div class=mut style="font-size:11px">median seconds for the door to close, per hour</div>'
            +'<div style="padding:18px 10px;border:1px dashed #b06a00;border-radius:6px;margin-top:8px">'
@@ -3367,7 +3518,7 @@ function renderTrends(){
            +'weekly hand-timed sample.</div></div>')
         : svgLine('close-travel median / hour-of-day (s)',
         'median seconds for the door to close, per hour — the 2.31s line is Bank C’s compliance cliff',
-        hours,prof.map(function(p){return p.close_median}),'#b06a00',2.31,'2.31 Bank C','s'))+'</div>'))
+        hours,prof.map(function(p){return p.close_median}),'#b06a00',2.31,'2.31 Bank C','s'))+'</div>')))
     +heatCard();
   document.getElementById('trendview').innerHTML=h;
 }
@@ -3400,7 +3551,7 @@ function heatCard(){
   if(cur && trCam !== cur){
     head+='<div class=intent style="color:#8a6100">showing <b>'+esc(trCam)+'</b>, but the dashboard '
       +'above is on <b>'+esc(cur)+'</b> — these are different lifts with different floors. '
-      +'<a href="#" onclick="trCam=\''+esc(cur)+'\';loadTrends();return false">show '+esc(cur)+' instead</a></div>';
+      +'<a href="#" onclick="selectCam(\''+esc(cur)+'\');return false">show '+esc(cur)+' instead</a></div>';
   }
   if(!t2){
     return head+'<div class=blank>no door-engine reads for '+esc(trCam)+' in the current era'
