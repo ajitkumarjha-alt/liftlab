@@ -260,17 +260,17 @@ except Exception:
 _KA_PROBED = [False]
 
 
-def http_get(url, timeout=15):
-    return http_get_timed(url, timeout)[0]
+def http_get(url, timeout=15, headers=None):
+    return http_get_timed(url, timeout, headers)[0]
 
 
-def http_get_timed(url, timeout=15):
+def http_get_timed(url, timeout=15, headers=None):
     """Fetch bytes + split the cost: (body, headers_ms, transfer_ms). headers_ms = time to response
     headers (TCP+TLS+TTFB) — named for what it measures; it drops to the path-RTT floor on a reused
     connection; transfer_ms = body read. Non-2xx -> urllib.error.HTTPError so the caller's 404 path is unchanged."""
     if _HAS_SESSION:
         t0 = time.time()
-        r = _SESSION.get(url, timeout=timeout, stream=True)   # returns once headers are in
+        r = _SESSION.get(url, timeout=timeout, stream=True, headers=headers)  # returns once headers are in
         t1 = time.time()
         if not _KA_PROBED[0]:   # PROVE client-vs-server ONCE: does the server keep the connection alive?
             _KA_PROBED[0] = True
@@ -290,7 +290,7 @@ def http_get_timed(url, timeout=15):
         t2 = time.time()
         return body, (t1 - t0) * 1000, (t2 - t1) * 1000
     t0 = time.time()
-    req = urllib.request.Request(url, headers=HDRS)
+    req = urllib.request.Request(url, headers={**HDRS, **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as r:   # no pooling: whole fetch counts as transfer
         body = r.read()
     return body, 0.0, (time.time() - t0) * 1000
@@ -444,13 +444,32 @@ def post_episode(ep, reason=""):
 
 
 def playlist_segments():
-    """Segment filenames currently in the cloud's live playlist (ordered)."""
+    """(segment filenames in playlist order, media_sequence, ok).
+
+    MEDIA SEQUENCE IS THE STREAM'S OWN CLOCK, and it is the only thing in the playlist that can tell
+    a RESTARTED upstream from a stalled one. The relay runs ffmpeg with
+    `-hls_segment_filename .../seg%03d.ts` and NO `-start_number`, so every restart begins again at
+    seg000.ts — the names REWIND while the video is perfectly fresh. `#EXT-X-MEDIA-SEQUENCE` rewinds
+    with them, which is what makes the rewind detectable rather than merely suspected.
+
+    ok=False means the FETCH itself failed. That is different from an empty playlist and must not be
+    read as "upstream has nothing": a network failure and an idle lift look identical in a bare list
+    and lead to opposite actions.
+    """
     try:
-        m = http_get(f"{BASE}/index.m3u8").decode("utf-8", "ignore")
+        m = http_get(f"{BASE}/index.m3u8", headers={"Cache-Control": "no-cache"}).decode("utf-8", "ignore")
     except Exception as e:
         log(f"playlist fetch failed: {e}")
-        return []
-    return [ln.strip() for ln in m.splitlines() if ln.strip().endswith(".ts")]
+        return [], None, False
+    seq = None
+    for ln in m.splitlines():
+        if ln.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            try:
+                seq = int(ln.split(":", 1)[1].strip())
+            except ValueError:
+                seq = None
+            break
+    return [ln.strip() for ln in m.splitlines() if ln.strip().endswith(".ts")], seq, True
 
 
 def scale_zone(poly, sx, sy):
@@ -726,6 +745,15 @@ def main():
         except Exception:
             pass
     log(f"start: {BASE}  model={MODEL} device={DEVICE}  (resume: {len(seen)} segs known)")
+    # Stream-restart bookkeeping. last_media_seq is the playlist's own counter at the previous poll;
+    # last_pl_key is the segment-name tuple, for the case where the counter is absent.
+    seen_order = []            # processed names in order, for a cursor that means "most recent"
+    last_media_seq = None
+    last_pl_key = None
+    stream_epoch = 0
+    idle_since = None          # when the CURRENT run of "nothing new" began; None while flowing
+    last_idle_seq = None       # upstream's position when this idle run started / last advanced
+    last_idle_key = None
 
     global _PQ
     _PQ = _pq_mod.PostQueue(http_post_json, log=log).start()
@@ -910,8 +938,51 @@ def main():
 
     while True:
         wd_phase("playlist")
-        segs = playlist_segments()
+        segs, media_seq, pl_ok = playlist_segments()
+        # ── UPSTREAM RESTART DETECTION ───────────────────────────────────────────────────────
+        # THE THREE-DAY STALL (ch29 04:38Z, ch27 05:35Z, ch30 06:45Z, staggered, all before any
+        # deploy). The relay restarts ONE camera at a time (relay_soak.sh restart_stream, per-stream
+        # stall strikes), and its ffmpeg carries `-hls_segment_filename .../seg%03d.ts` with NO
+        # `-start_number` and no `+append_list`. So a restarted stream emits seg000.ts again — names
+        # this worker put in `seen` hours ago. Every name in the fresh playlist then looks OLD,
+        # `new` is empty forever, and the idle branch below REFRESHES the watchdog because "the
+        # playlist fetch returned, so upstream must just be quiet". Worker alive, supervisor content,
+        # unit active, segments provably fresh gateway-side, zero output until someone bounces it.
+        #
+        # The stall lasts as long as it takes the new run to climb back past the highest sequence the
+        # PREVIOUS run reached — i.e. roughly the previous run's uptime. That is why these were hours,
+        # not seconds.
+        #
+        # MEDIA SEQUENCE GOING BACKWARDS IS THE PROOF, not an inference from names: it is the
+        # stream's own monotonic counter, and only a restarted encoder rewinds it.
+        if pl_ok and media_seq is not None and last_media_seq is not None and media_seq < last_media_seq:
+            log(f"UPSTREAM RESTARTED: media sequence rewound {last_media_seq} -> {media_seq} "
+                f"({len(seen)} known segment names discarded). The relay's ffmpeg restarts numbering "
+                f"at seg000, so every name in the new playlist would otherwise read as already-seen "
+                f"and this worker would sit idle while the stream ran fine. Resuming at the live edge.")
+            seen, seen_order = set(), []
+            stream_epoch += 1
+            try:
+                os.remove(cursor_path)      # the cursor describes a stream that no longer exists
+            except OSError:
+                pass
+        if pl_ok and media_seq is not None:
+            last_media_seq = media_seq
         new = [s for s in segs if s not in seen]
+        # A name-collision rewind with NO media-sequence line to prove it (an older relay, or a
+        # playlist without the tag): the playlist is non-empty, nothing in it is new, and the set of
+        # names has CHANGED since the last poll — meaning upstream is producing, and only our own
+        # bookkeeping says otherwise. Belt and braces for the same fault when the proof is missing.
+        pl_key = tuple(segs)
+        if pl_ok and segs and not new and pl_key != last_pl_key:
+            log(f"PLAYLIST ADVANCING BUT NOTHING IS NEW TO US: {len(segs)} segs, all already in a "
+                f"{len(seen)}-name seen-set, yet the playlist CHANGED since the last poll. That is a "
+                f"name rewind without a media-sequence to prove it. Discarding the seen-set.")
+            seen, seen_order = set(), []
+            stream_epoch += 1
+            new = list(segs)
+        if pl_ok:
+            last_pl_key = pl_key
         if time.time() - last_hb > HEARTBEAT_S:   # heartbeat even when idle (no traffic != dead)
             heartbeat(); last_hb = time.time()
         # GPU_DOOR: re-pull the templates periodically; reload the engine ONLY if the content hash
@@ -933,16 +1004,51 @@ def main():
                 _tot_d = segments + dropped
                 episode["occ_degraded"] = bool(_tot_d and (dropped / _tot_d) > OCC_DEGRADED_DROP_FRAC)
                 post_episode(episode, "gap"); episode = None
-            # STARVATION IS NOT A HANG. The playlist fetch above returned, so the loop is turning and
-            # the network works — there is simply nothing upstream to process. Refresh the watchdog:
-            # restarting cannot conjure segments, and a restart-loop through a relay outage would bury
-            # the real signal (upstream) under a fake one (worker). Log it so idleness stays VISIBLE
-            # rather than silent — silence is what cost us 5h44m.
-            if _wd is not None:
-                _wd.progress("idle(no new segs)")
+            # STARVATION IS NOT A HANG — BUT ONLY WHEN UPSTREAM IS ACTUALLY STOPPED.
+            #
+            # This branch used to refresh the watchdog unconditionally, on the reasoning that
+            # "restarting cannot conjure segments". That reasoning holds for a relay outage and is
+            # exactly backwards for a name rewind: there the stream is fine, the worker is the broken
+            # thing, and this line is the worker telling the watchdog it is healthy. Combined with the
+            # output-floor checks living inside the per-segment block — unreachable at zero segments —
+            # it made a stuck worker invisible to every guard the process has. Three cameras, three
+            # separate days.
+            #
+            # THE DISCRIMINATOR IS UPSTREAM'S OWN MOTION, and it costs nothing: if the media sequence
+            # (or failing that, the segment-name set) has not moved either, upstream really is
+            # stopped and there is nothing to restart into. If it HAS moved while we consider nothing
+            # new, that is our fault and the watchdog must be allowed to convict.
+            upstream_moving = pl_ok and (
+                (media_seq is not None and last_idle_seq is not None and media_seq != last_idle_seq)
+                or (media_seq is None and last_idle_key is not None and pl_key != last_idle_key))
+            # FROZEN AT THE START OF THE IDLE RUN, never updated while it lasts. The question this
+            # answers is "has upstream advanced since we got stuck", which is monotone; re-baselining
+            # it on every observed move turns it into "did upstream advance since the last poll",
+            # which flickers false on alternating polls — and on every false poll the worker would go
+            # back to attesting its own health. The frozen baseline is the difference between a guard
+            # that fires and one that merely usually fires.
+            if idle_since is None:
+                idle_since = time.time()
+                last_idle_seq, last_idle_key = media_seq, pl_key
+            idle_for = time.time() - idle_since
+            if _wd is not None and not upstream_moving:
+                _wd.progress("idle(no new segs, upstream stopped too)")
             if segs and time.time() - last_idle_log > 60:
-                log(f"idle: playlist has {len(segs)} segs, none new (upstream not advancing?)")
+                log(f"idle {idle_for:.0f}s: playlist has {len(segs)} segs, none new; "
+                    f"media_seq={media_seq} upstream_moving={upstream_moving}"
+                    + ("" if upstream_moving else " — upstream is stopped too, so this is starvation,"
+                                                  " not a wedge"))
                 last_idle_log = time.time()
+            # NO BESPOKE WEDGE-EXIT HERE, DELIBERATELY. The first version of this fix added one —
+            # "upstream advancing + zero segments for 300s -> dump and exit" — and the simulation
+            # showed it could never fire: the name-set fallback above converts exactly that state
+            # into progress before any timer reaches it. A guard that cannot fire is worse than no
+            # guard, because it reads as coverage.
+            #
+            # Not attesting health is sufficient and is the whole fix. WD_STALL_S (120s with no
+            # segment processed) already dumps stacks and exits; it never fired through three stalls
+            # for one reason only — this branch kept telling it everything was fine. Remove the lie
+            # and the existing guard does its job, with one timer instead of two.
             time.sleep(POLL_S)
             continue
         # STAY NEAR LIVE: if we've fallen behind, skip the old queued segments (they're about to be
@@ -1247,12 +1353,18 @@ def main():
                     + (f"; {_PQ.counters_str()}" if _PQ is not None else ""))
                 last_timing_log = time.time()
             seen.add(name)
+            seen_order.append(name)
+            if len(seen_order) > 4000:            # bound both: `seen` grew for the life of the run
+                for _old in seen_order[:2000]:
+                    seen.discard(_old)
+                seen_order = seen_order[2000:]
             # THE liveness signal: one fully-processed segment (fetched, decoded, tracked, door-passed,
             # posted). Placed here and nowhere else on purpose — an idle poll, a 404 skip, or a loop
             # spinning without doing work must NOT look like health, or the watchdog re-learns the same
             # lie systemd told us.
             if _wd is not None:
                 _wd.progress(name)
+            idle_since = None                     # flow resumed: the idle run is over
             wd_phase("loop")
             # OUTPUT-ATTESTING WEDGE CHECK. Streams are fresh (we just processed a segment) and the door
             # pass shows the lift IN USE, yet no transit has posted for TRANSIT_STALL_S across
@@ -1314,10 +1426,16 @@ def main():
                     post_episode(episode, "mode->live flush"); episode = None
             val_state = ns
             last_val_poll = time.time()
-        # persist cursor (rolling: keep the last ~40 seg names)
+        # PERSIST CURSOR — the last ~40 names IN THE ORDER THEY WERE PROCESSED.
+        #
+        # This was `sorted(seen)[-40:]`, a LEXICOGRAPHIC sort of a set. seg9.ts sorts above seg10.ts,
+        # so the "last 40" were the 40 alphabetically-largest names the worker had ever seen — an
+        # arbitrary set, typically the highest-numbered ones from hours earlier. On restart the worker
+        # resumed against names that had nothing to do with where the stream actually was, which is
+        # the same rewind hazard as the relay's, arriving from our own side.
         try:
             with open(cursor_path, "w") as f:
-                f.write(" ".join(sorted(seen)[-40:]))
+                f.write(" ".join(seen_order[-40:]))
         except Exception:
             pass
         # bound in-memory transit list (they're durable in the cloud now)

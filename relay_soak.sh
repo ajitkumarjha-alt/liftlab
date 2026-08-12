@@ -139,6 +139,12 @@ command -v ffmpeg >/dev/null || { say "ffmpeg missing"; exit 1; }
 ffmpeg_args(){   # $1=input url  $2=output base url  -> sets FFARGS[]
   FFARGS=(-nostdin -hide_banner -loglevel error
           -rtsp_transport tcp $RWTO_ARG -i "$1" -an -c:v copy
+          # START NUMBER = EPOCH SECONDS, so segment names NEVER rewind across a restart.
+          # ffmpeg defaults to 0, so every restart re-emitted seg000.ts — names the GPU worker had
+          # already recorded, which made a healthy restarted stream look like "nothing new" and
+          # stalled three cameras for hours on three separate days. Evaluated per call, so each
+          # relaunch of each stream gets its own monotonically increasing base.
+          -start_number "$(date +%s)"
           -f hls -hls_time "$HLS_TIME" -hls_list_size 5
           -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts
           -method PUT -http_persistent 1 $MREQ_ARG
@@ -327,7 +333,7 @@ start_streams(){
   if [ "$alive_now" = 0 ]; then
     say "FATAL: all $NCH ffmpeg died within 3s of launch — this is a COMMAND error, not the network."
     say "  command was: ffmpeg -nostdin -hide_banner -loglevel error -rtsp_transport tcp $RWTO_ARG -i <rtsp-url> -an -c:v copy"
-    say "               -f hls -hls_time $HLS_TIME -hls_list_size 5 -hls_flags delete_segments+omit_endlist"
+    say "               -start_number <epoch> -f hls -hls_time $HLS_TIME -hls_list_size 5 -hls_flags delete_segments+omit_endlist"
     say "               -hls_segment_type mpegts -method PUT -http_persistent 1 $MREQ_ARG -headers <auth>"
     say "               -hls_segment_filename $CLOUD/api/gw/$GW/live/${CAMS[0]}/seg%03d.ts .../index.m3u8"
     say "  ffmpeg said:"

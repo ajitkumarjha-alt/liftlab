@@ -110,6 +110,7 @@ run_mode(){
   ffmpeg -nostdin -hide_banner -loglevel warning -stats \
     -rtsp_transport tcp -i "$RTSP_URL" -an $args \
     -g $((SEG_T*15)) -sc_threshold 0 \
+    -start_number "$(date +%s)" \
     -f hls -hls_time "$SEG_T" -hls_list_size 5 \
     -hls_flags delete_segments+omit_endlist+program_date_time \
     -hls_segment_type mpegts -method PUT -http_persistent 1 \

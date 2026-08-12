@@ -137,6 +137,7 @@ launch_stream(){ # $1=idx  -> starts ffmpeg copy relay, echoes pid
   local base="$CLOUD/api/gw/$GW/live/$cam" log="/tmp/relay8_${i}_${cam}.log"
   ffmpeg -nostdin -hide_banner -loglevel warning -stats \
     -rtsp_transport tcp -i "$url" -an -c:v copy \
+    -start_number "$(date +%s)" \
     -f hls -hls_time "$SEG_T" -hls_list_size 5 \
     -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts \
     -method PUT -http_persistent 1 -headers "Authorization: Bearer ${GATEWAY_TOKEN}"$'\r\n' \
