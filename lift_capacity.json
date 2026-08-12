@@ -1,0 +1,21 @@
+{
+  "_README": [
+    "Car capacity in PERSONS, and the BASIS those persons are counted on.",
+    "Ships DELIBERATELY EMPTY. Until 'basis' and 'basis_confirmed_by' are filled in, the workbook's",
+    "CAR LOADING sheet prints measured peak occupancy in absolute people and WITHHOLDS the loading",
+    "factor. That is the intended state, not a broken config: a percentage whose denominator has no",
+    "stated basis is not a provisional answer, it is a wrong one that looks finished.",
+    "",
+    "basis            one of: nameplate_persons | design_persons_mep02",
+    "basis_confirmed_by  who confirmed it and from WHICH document (a name alone is not provenance)",
+    "sheet_basis      the basis MEP-02 v28's 80% loading assumption is written on. If this differs",
+    "                 from 'basis', the workbook prints its own figure and withholds the comparison:",
+    "                 same arithmetic, different car.",
+    "persons          {cam: whole persons}. PERSONS, never kg — a kg rating divided by an assumed",
+    "                 body mass is a different number with a different error."
+  ],
+  "basis": "",
+  "basis_confirmed_by": "",
+  "sheet_basis": "",
+  "persons": {}
+}

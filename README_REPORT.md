@@ -48,6 +48,7 @@ liftlab-report --from <ISO ts> --to <ISO ts> [--out <path>]
                [--peak-window auto|HH:MM-HH:MM] [--population N]
                [--min-close 0.5]
                [--db <path>] [--gateway site-A] [--banks lift_banks.json]
+               [--capacity lift_capacity.json]
 ```
 
 * `--from` / `--to` — range (end exclusive). Naive timestamps are read as
@@ -139,6 +140,7 @@ Two guards follow from it, both reported rather than applied silently:
 | **PEAK ANALYSIS** | Per day: worst 5-min boarding window (or the fixed window), peak:average ratio, peak-demand % when `--population` given; coefficients inside peak windows vs all-day, per era. |
 | **RAW** | Row-level era-tagged export — the audit trail. Every row carries instrument, counting_version, era, precision-at-time, and an in-declared-gap flag. |
 | **COVERAGE & ERAS** | Boundaries crossed with row counts each side, gap windows excluded, per-channel coverage % and row counts by era. A channel with zero rows is listed, not omitted. |
+| **CAR LOADING** | **Measured** peak car occupancy per door-open episode, per lift per counting era: peak / p95 / median, the episodes that carried NO coverage, the degraded ones, and the LEG 2 hand counts paired against the machine peak. Every figure is a **measured minimum** and is labelled as one. The loading factor — occupancy as a share of capacity — is **withheld** until the capacity basis is confirmed; see Capacity below. Not to be confused with the crossing-derived occupancy that FLOOR ATTRIBUTION reports as a rejected method: different instrument, and the two are never combined. |
 | **TIER-2 EVIDENCE** | Floor attribution as it really is. Read quality per camera **per era** (a rebuild is a different instrument); floors-per-second between consecutive confident reads with n; the arrow-direction distribution; and a verdict per coefficient naming **its own** blocker. Was titled TIER-2 BLOCKED and reported zero confident reads fleet-wide — see the correction below. |
 
 Charts are native Excel charts. Every one gets visible tick labels on **both**
@@ -313,6 +315,33 @@ with `comment='#'`; a spreadsheet shows them as text rows above the header.
 
 `lift_banks.json` maps channels to banks. All channels default to blank /
 UNKNOWN and **the tool never guesses** — populate the file and re-run.
+
+## Capacity — and why the loading factor may not print
+
+`lift_capacity.json` carries car capacity in **PERSONS** (never kg: a kg rating
+divided by an assumed body mass is a different number with a different error),
+and the **basis** those persons are counted on — `nameplate_persons` or
+`design_persons_mep02`.
+
+It ships empty, and that is the intended state rather than an unfinished
+config. A loading factor is occupancy ÷ capacity: 5 of 13 nameplate persons and
+5 of 13 design persons are different claims about the building even when the
+arithmetic is identical, and only one of them can be checked against MEP-02's
+80 %. So with no confirmed basis the CAR LOADING sheet prints measured occupancy
+in **absolute people** and prints no percentage anywhere — not a provisional one,
+not a greyed-out one, not one in a footnote. There is no such thing as a
+provisional denominator. The sheet lists exactly what is missing.
+
+Two gates, reported separately because different people fix them:
+
+* **`can_print_loading`** — is *this workbook's* basis confirmed (basis, who
+  confirmed it and from which document, and persons per car);
+* **`can_compare_sheet`** — does that basis **match** the one MEP-02's 80 % is
+  written on. A mismatch is not a smaller version of the first failure: both
+  sides are internally consistent and are describing different cars, so the
+  figure prints and the *comparison* is withheld.
+
+The sidecar is read per run, so filling it in needs no restart — only a re-export.
 
 ## Tests
 
