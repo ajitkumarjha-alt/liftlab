@@ -102,6 +102,27 @@ for _g in DATA_GAPS:
 # condition, not an all-day average — report both separately; the ratio is itself a finding.
 PEAK_WINDOWS = {"am_peak": (8, 10), "pm_peak": (18, 20)}
 
+# ── PEAK CAR OCCUPANCY — what the number is, stated wherever it appears ──────────────────────
+# occupancy_max is the largest number of DISTINCT TRACKS simultaneously inside the cabin zone during
+# one door-open episode. It is a FLOOR, not a count: anyone the detector missed, anyone occluded
+# behind another body, and anyone whose foot point fell outside the cabin polygon is absent from it.
+#
+# The 0.5x figure is measured, and its provenance is deliberately part of the sentence. On ch30
+# f5350-5650 the probe reported a cabin peak of 3 against 5-7 people visible in frame. That is ONE
+# scene on ONE camera, so it calibrates the direction and the rough size of the undercount and
+# nothing more; quoting it without "n=1" would turn a single observation into a correction factor.
+#
+# The membership point is the FOOT anchor — the same point the transit counter uses. A box-CENTER
+# anchor was tested live against it and reported FEWER people, not more, on 117/151 crowd frames and
+# 63/63 boarding frames, because zone_cabin is a FLOOR polygon: a body's middle sits above it. Foot
+# also showed zero lobby bleed while the door was open (a constant 2 of 63 frames). Recovering the
+# undercount needs occupancy-specific body-volume zones, which is backlog, not a label change.
+OCC_CALIBRATION = ("measured minimum; ~0.5x at heavy crowding (n=1 scene, ch30); "
+                   "undercount grows with crowding")
+OCC_LABEL = "peak car occupancy (measured minimum)"
+OCC_ANCHOR_NOTE = ("foot anchor — the same membership point as the transit counter; a centre anchor "
+                   "measured LOWER against a floor polygon, so it is not the fix")
+
 # Fixed lift-camera fallback if channel_map is empty (the set the operator named).
 FALLBACK_CHANNELS = [16, 27, 29, 30, 32, 34, 37]
 
@@ -1741,6 +1762,87 @@ def _transit_by_cam(db, gw):
             for r in rows}
 
 
+def _occupancy_by_cam(db, gw, t0=None, t1=None):
+    """Per-camera PEAK CAR OCCUPANCY over the window, from the door-open episodes in validation_item.
+
+    THE EVIDENCE RULE, same one the episode gate enforces at the worker: an episode counts only if
+    `occupancy_frames > 0`. A NULL means a worker that predates the feature; a 0 means the episode
+    was posted with no analysed frames behind the peak. Neither is "the cabin was empty", and
+    treating them as 0 would pull every fleet figure down with observations that were never made.
+    Those episodes are reported as `n_no_evidence` rather than dropped silently — a small headline n
+    beside a large episode count is the honest shape of thin coverage.
+
+    ERA SCOPING. Occupancy is a product of the COUNTING logic (the cabin polygon and the anchor live
+    in counting.py), so it is scoped by counting_version exactly as precision is. Peaks counted under
+    a different zone are not comparable to these, so they are excluded from the stats and named in
+    `versions_seen` — visible, never pooled.
+
+    DEGRADED episodes are INCLUDED. occupancy_max is a floor; thin coverage can only make it lower,
+    never higher, so including them cannot inflate the number it can only understate it. The count is
+    carried so a peak resting mostly on degraded episodes can be seen for what it is.
+    """
+    w, wargs = "", []
+    if t0 is not None:
+        w += " AND ts_start >= ?"; wargs.append(t0)
+    if t1 is not None:
+        w += " AND ts_start < ?"; wargs.append(t1)
+    rows = _q(db, "SELECT cam, ts_start, occupancy_max, occupancy_frames, occupancy_degraded, "
+                  "analysed_frames, counting_version FROM validation_item "
+                  "WHERE gateway_id=?" + w + " ORDER BY ts_start", (gw, *wargs))
+    # The version each camera is CURRENTLY counting under — the same source _validations reads. A
+    # camera with no row yet falls back to the newest version its own episodes carry.
+    cur_ver = {r["cam"]: r["counting_version"] for r in
+               _q(db, "SELECT cam, counting_version FROM camera_validation WHERE gateway_id=?", (gw,))}
+    today = _ist_today_epoch()
+    by = {}
+    for r in rows:
+        b = by.setdefault(r["cam"], {"peaks": [], "today": [], "n_episodes": 0, "n_no_evidence": 0,
+                                     "n_degraded": 0, "frames": 0, "last_ts": None,
+                                     "versions_seen": {}, "off_era": 0})
+        b["n_episodes"] += 1
+        v = r["counting_version"]
+        b["versions_seen"][v] = b["versions_seen"].get(v, 0) + 1
+        want = cur_ver.get(r["cam"]) or None
+        if want and v != want:
+            b["off_era"] += 1
+            continue                                   # counted under a different cabin zone
+        if not (r["occupancy_frames"] or 0) > 0:
+            b["n_no_evidence"] += 1                    # no coverage behind the peak -> not evidence
+            continue
+        p = int(r["occupancy_max"] or 0)
+        b["peaks"].append(p)
+        b["frames"] += int(r["occupancy_frames"] or 0)
+        if r["occupancy_degraded"]:
+            b["n_degraded"] += 1
+        if (r["ts_start"] or 0) >= today:
+            b["today"].append(p)
+        b["last_ts"] = r["ts_start"]
+    out = {}
+    for cam, b in by.items():
+        pk = sorted(b["peaks"])
+        out[cam] = {
+            "n": len(pk),                              # episodes with evidence — the real denominator
+            "n_episodes": b["n_episodes"],             # episodes seen in the window, evidence or not
+            "n_no_evidence": b["n_no_evidence"],
+            "n_off_era": b["off_era"],
+            "n_degraded": b["n_degraded"],
+            "peak": pk[-1] if pk else None,            # window max — the headline
+            "p95": _pctl(pk, 0.95) if pk else None,
+            "median": _pctl(pk, 0.5) if pk else None,
+            "today_peak": max(b["today"]) if b["today"] else None,
+            "today_n": len(b["today"]),
+            "frames": b["frames"],
+            "last_ts": b["last_ts"],
+            "counting_version": cur_ver.get(cam),
+            "versions_seen": [{"version": k, "n": n} for k, n in sorted(
+                b["versions_seen"].items(), key=lambda kv: -kv[1])],
+            "measured_minimum": True,                  # never a count; see OCC_CALIBRATION
+            "calibration": OCC_CALIBRATION,
+            "anchor_note": OCC_ANCHOR_NOTE,
+        }
+    return out
+
+
 def _analyzers(db, gw):
     rows = _q(db, "SELECT * FROM analyzer_status WHERE gateway_id=?", (gw,))
     now = time.time()
@@ -1810,6 +1912,10 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
     agg_computed_at = [m["computed_at"] for m in agg_meta.values() if m.get("computed_at")]
     _budget_check("transit_by_cam")
     trans = _transit_by_cam(db, gw)
+    # Bounded to the SAME window as every other historical panel. Unbounded here would put an
+    # all-history peak beside a 7-day cycle count under one heading, and the peak would win the
+    # reader's attention while describing a different span.
+    occ = _occupancy_by_cam(db, gw, t0, t1)
     xfer = _transfer_by_cam(db, gw)
     floor_cov = _floor_coverage(db, gw)
     registry = _registry(db, gw)
@@ -1854,6 +1960,7 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
             "snap": _snap(cam, gw),
             "door": door.get(cam),
             "transit": (dict(trans[cam], source=(a or {}).get("counting_version")) if cam in trans else None),
+            "occupancy": occ.get(cam),
             "analyzer": (None if a is None else
                          {"up": a["up"], "age_s": a["age_s"], "mode": a.get("mode"),
                           "counting_version": a.get("counting_version"),
@@ -1957,6 +2064,12 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
                                               if agg_computed_at else None),
                              "source": "door_aggregate (precomputed off the request path)"},
                          "pi": pi, "relay": relay, "gpu": gpu,
+                         # The calibration travels WITH the data, not only in the page that draws it,
+                         # so any consumer of this endpoint gets the number and its limits together.
+                         "occupancy_note": {"label": OCC_LABEL, "calibration": OCC_CALIBRATION,
+                                            "anchor": OCC_ANCHOR_NOTE,
+                                            "basis": "distinct tracks simultaneously inside the cabin "
+                                                     "zone during one door-open episode"},
                          "cameras": out_cams, "headline": headline, "registry": registry,
                          "floor_coverage": floor_cov, "tier2": tier2, "unavailable": unavailable,
                          "door_gpu": door_gpu,
@@ -2054,6 +2167,24 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                       "FROM validation_item WHERE gateway_id=? AND counting_version IS NOT NULL"
                       + (" AND cam=?" if cam else "") + " GROUP BY counting_version ORDER BY MIN(ts_start)",
                   ([gw, cam] if cam else [gw]))
+    # PEAK CAR OCCUPANCY by hour-of-day. One row per door-open episode, bucketed by the hour the
+    # episode STARTED, and only episodes that carry coverage (occupancy_frames > 0) — same evidence
+    # rule as _occupancy_by_cam, so the panel and this chart can never disagree about the denominator.
+    # Era scoping is per camera, from camera_validation, for the same reason precision is.
+    occ_ver = {r["cam"]: r["counting_version"] for r in
+               _q(db, "SELECT cam, counting_version FROM camera_validation WHERE gateway_id=?", (gw,))}
+    occ_w, occ_args = "", []
+    if t0 is not None:
+        occ_w += " AND ts_start >= ?"; occ_args.append(t0)
+    if t1 is not None:
+        occ_w += " AND ts_start < ?"; occ_args.append(t1)
+    occ_rows = _q(db, "SELECT cam, ts_start, occupancy_max, occupancy_frames, occupancy_degraded, "
+                      "counting_version FROM validation_item WHERE gateway_id=? AND occupancy_frames > 0"
+                  + (" AND cam=?" if cam else "") + occ_w,
+                  ([gw, cam, *occ_args] if cam else [gw, *occ_args]))
+    occ_rows = [r for r in occ_rows
+                if not occ_ver.get(r["cam"]) or r["counting_version"] == occ_ver.get(r["cam"])]
+
     # Range-scoped Tier-2 for the heatmap: the join side reuses the transit rows already loaded
     # above (same cam, same table) instead of re-querying the fleet. Without this the heatmap kept
     # drawing all-history from /data while every other panel obeyed the picker.
@@ -2099,7 +2230,8 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                      for e in era_rows if e["lo"] is not None
                      and (t0 is None or (e["lo"] < t1 and e["hi"] >= t0))]
 
-    prof = {h: {"cycles": 0, "boarded": 0, "alighted": 0, "closes": [], "xfer": []} for h in range(24)}
+    prof = {h: {"cycles": 0, "boarded": 0, "alighted": 0, "closes": [], "xfer": [], "occ": [],
+                "occ_degraded": 0} for h in range(24)}
     days = set()
     # ONE instrument per close-travel series: Pi (gw_event) and GPU (gw_door_event) measure the same
     # name with different edges/clocks and must never share a bucket. When the range has any GPU
@@ -2136,6 +2268,16 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
             continue
         days.add(datetime.fromtimestamp(r["ts"], IST).date().isoformat())
         prof[h]["boarded" if r["direction"] == "in" else "alighted"] += 1
+    for r in occ_rows:
+        h = _ist_hour(r["ts_start"])
+        if h is None:
+            continue
+        # Episodes do NOT contribute to `days`. n_days divides the per-hour cycle and rider averages;
+        # occupancy is a MAX and is not averaged over days, so letting an episode-only hour create a
+        # day would change two other denominators to serve a series that does not use them.
+        prof[h]["occ"].append(int(r["occupancy_max"] or 0))
+        if r["occupancy_degraded"]:
+            prof[h]["occ_degraded"] += 1
 
     # Days that actually CONTRIBUTED, reported honestly; the max(1,..) is only the divisor guard.
     # An empty range must read "0 days" rather than silently averaging over a day that had nothing.
@@ -2143,6 +2285,12 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
     ndays = max(1, n_days_real)
     profile = [{"hour": h, "cycles": prof[h]["cycles"],
                 "boarded": prof[h]["boarded"], "alighted": prof[h]["alighted"],
+                # occ_peak is the MAX over the hour's episodes, across every day in range — the
+                # busiest car this hour ever held, as a floor. occ_median gives the typical episode
+                # so a single crowded lift-load cannot be read as the hourly norm.
+                "occ_peak": (max(prof[h]["occ"]) if prof[h]["occ"] else None),
+                "occ_median": (_pctl(sorted(prof[h]["occ"]), 0.5) if prof[h]["occ"] else None),
+                "occ_n": len(prof[h]["occ"]), "occ_degraded": prof[h]["occ_degraded"],
                 **{f"close_{k}": v for k, v in _stats(prof[h]["closes"]).items()}} for h in range(24)]
 
     def window(lo, hi):
@@ -2152,9 +2300,18 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
         xfer = [v for h in hrs for v in prof[h]["xfer"]]
         bo = sum(prof[h]["boarded"] for h in hrs); al = sum(prof[h]["alighted"] for h in hrs)
         span = max(1, len(hrs))
+        oc = sorted(v for h in hrs for v in prof[h]["occ"])
         return {"from": lo, "to": hi, "cycles": cyc, "cycles_per_hr": round(cyc / (span * ndays), 2),
                 "boarded": bo, "alighted": al, "riders_per_hr": round((bo + al) / (span * ndays), 2),
                 "close": _stats(closes), "transfer": {**_stats(xfer), "provisional": True},
+                # NOT per-hour and NOT averaged: a peak divided by hours is not a quantity anyone can
+                # use. This is the max and the p95 of the per-episode peaks in the window, with n.
+                "occupancy": {"peak": (oc[-1] if oc else None),
+                              "p95": (_pctl(oc, 0.95) if oc else None),
+                              "median": (_pctl(oc, 0.5) if oc else None),
+                              "n": len(oc),
+                              "degraded": sum(prof[h]["occ_degraded"] for h in hrs),
+                              "measured_minimum": True},
                 "transits_per_cycle": round((bo + al) / cyc, 2) if cyc else None}
 
     windows = {"all_day": window(0, 24), **{k: window(*v) for k, v in PEAK_WINDOWS.items()}}
@@ -2174,6 +2331,9 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                          # computed_at exists so the UI can show data-as-of instead of implying the
                          # numbers are current, and window_days exists because a cached 7-day tier2
                          # under an "all data" heading would be a wrong answer told confidently.
+                         "occupancy_note": {"label": OCC_LABEL, "calibration": OCC_CALIBRATION,
+                                            "anchor": OCC_ANCHOR_NOTE,
+                                            "n_episodes": len(occ_rows)},
                          "tier2_source": tier2_source,
                          "tier2_computed_at": (tier2_meta or {}).get("computed_at"),
                          "tier2_age_s": (tier2_meta or {}).get("age_s"),
@@ -2211,7 +2371,15 @@ _EXPORT = {
     "transits":    "one row per counted crossing (transit_event)",
     "floor_events": "one row per GPU door/floor read (gw_door_event), era-filtered",
     "per_floor":   "the Tier-2 per-floor aggregate — stops, direction split, riders",
+    "episodes":    "one row per door-open episode (validation_item): peak car occupancy + its coverage",
 }
+
+# WHY OCCUPANCY IS ITS OWN DATASET AND NOT COLUMNS ON door_cycles. door_cycles is gw_event — the Pi
+# door-watch, frozen at its retirement on 2026-07-21. Occupancy begins with the workers deployed
+# 2026-08-11. The two tables do not overlap by a single row, so bolting the columns onto door_cycles
+# would produce a file whose occupancy column is empty on every row it could ever contain, and a
+# reader would take that as "occupancy was zero" rather than "these rows predate the measurement".
+# The episode is the natural grain anyway: one door-open, one peak, one coverage denominator.
 
 
 def _csv(rows, header, name):
@@ -2277,6 +2445,30 @@ def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
         out = [(r["cam"], r["ts"], _iso_ist(r["ts"]), r["direction"], r["track_id"])
                for r in rows if _in_range(r["ts"], t0, t1)]
         return _csv(out, ["cam", "ts_epoch", "ts_ist", "direction", "track_id"], f"{tag}.csv")
+
+    if dataset == "episodes":
+        rows = _q(db, "SELECT cam, ts_start, ts_end, machine_boarded, machine_alighted, "
+                      "occupancy_max, occupancy_frames, occupancy_degraded, analysed_frames, "
+                      "human_occupancy, counting_version, status FROM validation_item "
+                      "WHERE gateway_id=?" + (" AND cam=?" if cam else "") + " ORDER BY ts_start",
+                  ([gw, cam] if cam else [gw]))
+        db.close()
+        # NO evidence filter here, unlike the panel and the chart. This is the raw grain: an episode
+        # with occupancy_frames NULL or 0 stays in the file WITH its empty coverage column, because
+        # dropping it would hide how much of the record carries no measurement. The `evidence` column
+        # states the rule inline so the spreadsheet does not have to re-derive it — and so a filter
+        # applied in Excel is the same filter the dashboard applied.
+        out = [(r["cam"], r["ts_start"], _iso_ist(r["ts_start"]), r["ts_end"],
+                r["machine_boarded"], r["machine_alighted"],
+                r["occupancy_max"], r["occupancy_frames"], r["occupancy_degraded"],
+                r["analysed_frames"], r["human_occupancy"], r["counting_version"], r["status"],
+                1 if (r["occupancy_frames"] or 0) > 0 else 0)
+               for r in rows if _in_range(r["ts_start"], t0, t1)]
+        return _csv(out, ["cam", "ts_start_epoch", "ts_start_ist", "ts_end_epoch",
+                          "machine_boarded", "machine_alighted",
+                          "occupancy_max_MEASURED_MINIMUM", "occupancy_frames", "occupancy_degraded",
+                          "analysed_frames", "human_occupancy", "counting_version", "status",
+                          "evidence"], f"{tag}.csv")
 
     if dataset == "floor_events":
         # Per-camera era, exactly as the panel resolves it — a fleet export spans several cameras
@@ -2611,6 +2803,33 @@ function panel(d){
     +kv('source',esc(t.source||'—'))
   ) : '<div class=blank>no transit counts</div>';
 
+  // PEAK CAR OCCUPANCY — a FLOOR, and the card says so in the first line, not in a footnote. Every
+  // figure here is "at least this many": the detector misses people, bodies occlude each other, and
+  // the foot anchor drops anyone whose feet leave the cabin polygon. Printed without that, a peak of
+  // 3 in a 13-person car reads as a quarter-full lift when the frame showed 5-7 people.
+  var oc=c.occupancy, occCard;
+  if(!oc||!oc.n){
+    occCard='<div class=blank>no episodes with occupancy coverage in this window'
+      +((oc&&oc.n_episodes)?(' — '+oc.n_episodes+' episode(s) present, none carrying occupancy_frames &gt; 0'
+        +(oc.n_off_era?(', '+oc.n_off_era+' counted under a different version'):'')):'')+'</div>';
+  } else {
+    occCard='<div class=mut style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">'
+      +'measured minimum · floor, not a count</div>'
+      +kv('peak today',(oc.today_peak==null?'—':'<b>'+oc.today_peak+'</b> people')
+          +' <span class=mut>(n='+oc.today_n+' episodes)</span>')
+      +kv('peak in window','<b>'+oc.peak+'</b> people <span class=mut>(n='+oc.n+')</span>')
+      +kv('p95 / median',(oc.p95==null?'—':oc.p95)+' / '+(oc.median==null?'—':oc.median))
+      +(oc.n_no_evidence?kv('no coverage','<span class=warn>'+oc.n_no_evidence+'</span> of '
+          +oc.n_episodes+' episodes had no analysed frames — excluded'):'')
+      +(oc.n_degraded?kv('degraded','<span class=warn>'+oc.n_degraded+'</span> of '+oc.n
+          +' episodes measured while dropping &gt;20% of segments'):'')
+      +(oc.n_off_era?kv('other era',oc.n_off_era+' episode(s) counted under a different '
+          +'counting version — excluded, not pooled'):'')
+      +'<div class=mut style="font-size:11px;margin-top:6px;padding:4px 6px;border-left:3px solid #b06a00;background:rgba(176,106,0,.07)">'
+      +'<b>'+esc(oc.peak)+' is a MEASURED MINIMUM</b> — '+esc(oc.calibration)+'. '
+      +esc(oc.anchor_note)+'.</div>';
+  }
+
   // STATE
   var a=c.analyzer, v=c.validation, state;
   if(!a){state='<div class=blank>not analysed — relay only</div>';}
@@ -2644,6 +2863,7 @@ function panel(d){
     +'<div class=detail>'
     +'<div class=card><h3>Door</h3>'+door+'</div>'
     +'<div class=card><h3>Transit</h3>'+trans+'</div>'
+    +'<div class=card><h3>Car occupancy <span class=mut style="font-weight:400">peak per door-open</span></h3>'+occCard+'</div>'
     +'<div class=card><h3>State</h3>'+state+'</div>'
     +'<div class=card><h3>GPU analysis</h3>'+gpuToggle(d,c.cam)+'</div>'
     +'<div class=card><h3>Camera</h3>'+kv('channel',esc(c.channel))+kv('label',esc(c.label||'—'))
@@ -2915,6 +3135,11 @@ function winCard(name,w){
     +kv('close med / p85',(w.close.median==null?'—':w.close.median+'s')+' / '+(w.close.p85==null?'—':w.close.p85+'s')+' (n='+w.close.n+')')
     +kv('transfer',(w.transfer.median==null?'—':w.transfer.median+' s/pp')+' (n='+w.transfer.n+') *')
     +kv('riders/hr',w.riders_per_hr)
+    // Peak occupancy is NOT divided by hours — a max per hour is not a quantity. The label carries
+    // "min" on the number itself so the figure cannot be lifted out of this card and read as a count.
+    +kv('peak occupancy',(!w.occupancy||w.occupancy.peak==null)?'—'
+        :('&ge;<b>'+w.occupancy.peak+'</b> <span class=mut>(p95 '+(w.occupancy.p95==null?'—':w.occupancy.p95)
+          +', n='+w.occupancy.n+' episodes, measured minimum)</span>'))
     +kv('transits/cycle',w.transits_per_cycle==null?'—':w.transits_per_cycle)+'</div>';
 }
 function trCams(){
@@ -2973,19 +3198,25 @@ function exportBar(){
     +(trFrom?('&from_d='+encodeURIComponent(trFrom)):'')+(trTo?('&to_d='+encodeURIComponent(trTo)):'')
     +(trCam?('&cam='+encodeURIComponent(trCam)):'')+'">⤓ floor events — ALL eras, labelled</a>';
   return '<div class=dlbar>'+dl('door_cycles','door cycles')+dl('transits','transits')
-    +dl('floor_events','floor events')+dl('per_floor','per-floor')+allEras
+    +dl('floor_events','floor events')+dl('per_floor','per-floor')
+    +dl('episodes','episodes + occupancy')+allEras
     +'<span class=mut style="font-size:11px">CSV — the rows behind these charts, same range'+(trCam?'':' (fleet)')+'</span></div>';
 }
 function trTableHtml(prof,W){
   var head='<tr><th>hour</th><th>cycles</th><th>boarded</th><th>alighted</th><th>riders</th>'
-    +'<th>close med (s)</th><th>close p85</th><th>n</th></tr>';
+    +'<th>close med (s)</th><th>close p85</th><th>n</th><th>peak occ ≥</th><th>occ n</th></tr>';
   var body=prof.map(function(p){
     return '<tr><td>'+pad2(p.hour)+':00</td><td>'+p.cycles+'</td><td>'+p.boarded+'</td><td>'+p.alighted
       +'</td><td>'+(p.boarded+p.alighted)+'</td><td>'+(p.close_median==null?'—':p.close_median)
-      +'</td><td>'+(p.close_p85==null?'—':p.close_p85)+'</td><td>'+(p.close_n||0)+'</td></tr>';}).join('');
-  var tot=prof.reduce(function(a,p){a.c+=p.cycles;a.b+=p.boarded;a.a+=p.alighted;return a;},{c:0,b:0,a:0});
+      +'</td><td>'+(p.close_p85==null?'—':p.close_p85)+'</td><td>'+(p.close_n||0)
+      +'</td><td>'+(p.occ_peak==null?'—':p.occ_peak)+'</td><td>'+(p.occ_n||0)+'</td></tr>';}).join('');
+  var tot=prof.reduce(function(a,p){a.c+=p.cycles;a.b+=p.boarded;a.a+=p.alighted;
+    if(p.occ_peak!=null&&p.occ_peak>a.o)a.o=p.occ_peak; a.on+=(p.occ_n||0); return a;},
+    {c:0,b:0,a:0,o:null,on:0});
+  // The occupancy total column is a MAX, not a sum — summing per-hour peaks would invent a number
+  // no car ever held. The header says ≥ for the same reason the panel does.
   var foot='<tr class=tot><td>total</td><td>'+tot.c+'</td><td>'+tot.b+'</td><td>'+tot.a+'</td><td>'
-    +(tot.b+tot.a)+'</td><td colspan=3></td></tr>';
+    +(tot.b+tot.a)+'</td><td colspan=3></td><td>'+(tot.o==null?'—':'max '+tot.o)+'</td><td>'+tot.on+'</td></tr>';
   return '<div class=card><h3>hour-of-day table <span class=mut style="font-weight:400">same aggregates as the charts</span></h3>'
     +'<div class=hmwrap><table class=t2>'+head+body+foot+'</table></div></div>';
 }
@@ -3023,6 +3254,20 @@ function renderTrends(){
     +'<div class=card>'+svgBars('riders (boardings+alightings) / hour-of-day',
         'boardings + alightings counted at this door — usage volume, not unique people',
         hours,prof.map(function(p){return p.boarded+p.alighted}),'#2a6db0',null,'','riders')+'</div>'
+    // PEAK CAR OCCUPANCY. Same chart family as riders/hr, deliberately: it is read in the same
+    // glance and must not look like a more precise instrument than it is. An hour with episodes but
+    // no people is a real 0; an hour with no episodes draws nothing, and the n row below says which
+    // is which — the empty-chart-reads-as-no-activity trap this file has now hit twice.
+    +'<div class=card>'+svgBars('peak car occupancy / hour-of-day — MEASURED MINIMUM',
+        'the most people seen inside the cabin at once during any door-open episode in this hour — '
+        +'a floor, not a count',
+        hours,prof.map(function(p){return p.occ_peak}),'#6a3fa0',null,'','people (min)')
+      +'<div class=mut style="font-size:11px;margin-top:4px">'
+      +((TR.occupancy_note&&TR.occupancy_note.n_episodes)
+        ? (TR.occupancy_note.n_episodes+' episode(s) with coverage in range · <b>'
+           +esc(TR.occupancy_note.calibration)+'</b> · '+esc(TR.occupancy_note.anchor))
+        : 'no episodes carry occupancy coverage in this range — bars are absent, NOT zero')
+      +'</div></div>'
     +'<div class=card>'+(TRAVEL_UNMEASURED
         ? ('<div class=h>close-travel median / hour-of-day (s)</div>'
            +'<div class=mut style="font-size:11px">median seconds for the door to close, per hour</div>'
