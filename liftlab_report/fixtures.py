@@ -56,6 +56,15 @@ def _ddl(db):
     CREATE TABLE IF NOT EXISTS channel_map (
         gateway_id TEXT, channel INTEGER, is_lift INTEGER, label TEXT,
         marked_at REAL);
+    CREATE TABLE IF NOT EXISTS validation_item (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT,
+        ts_start REAL, ts_end REAL, machine_boarded INTEGER, machine_alighted INTEGER,
+        human_boarded INTEGER, human_alighted INTEGER, n_images INTEGER,
+        status TEXT DEFAULT 'pending', counting_version TEXT, created_at REAL,
+        det_max INTEGER, det_mean REAL, distinct_ids INTEGER, det_frames INTEGER,
+        conf_min REAL, conf_mean REAL, conf_max REAL,
+        occupancy_max INTEGER, occupancy_frames INTEGER, occupancy_degraded INTEGER,
+        analysed_frames INTEGER, human_occupancy INTEGER);
     CREATE TABLE IF NOT EXISTS analyzer_status (
         gateway_id TEXT, cam TEXT, ts REAL, counting_version TEXT,
         PRIMARY KEY (gateway_id, cam));
@@ -116,6 +125,24 @@ def add_gpu_cycle(db, cam: str, open_dt: datetime, close_travel=2.1,
             (GW, cam, ts, fl, "up" if fl else None, st, None,
              0.9 if fl else None, 1 if fl else 0, "" if fl else "no_read",
              ct, door_version, door_version.split("+")[0], ts))
+
+
+def add_episode(db, cam: str, dt: datetime, occ=None, frames=None, degraded=0,
+                human_occ=None, boarded=2, alighted=1, dwell_s=18.0,
+                counting_version="2026-07-28-registry-zones"):
+    """One door-open episode row, as the worker posts it under LIVE ('auto').
+
+    occ/frames default to None so the fixture can carry the PRE-OCCUPANCY shape — an episode from a
+    worker that predates the feature. That row must never be read as an empty car, and a fixture
+    that only contained measured episodes could not prove it isn't."""
+    ts = dt.timestamp()
+    db.execute(
+        "INSERT INTO validation_item (gateway_id,cam,ts_start,ts_end,machine_boarded,"
+        "machine_alighted,n_images,status,counting_version,occupancy_max,occupancy_frames,"
+        "occupancy_degraded,analysed_frames,human_occupancy,created_at) "
+        "VALUES (?,?,?,?,?,?,0,'auto',?,?,?,?,?,?,?)",
+        (GW, cam, ts, ts + dwell_s, boarded, alighted, counting_version, occ, frames,
+         degraded, frames or 0, human_occ, ts))
 
 
 def add_transit(db, cam: str, dt: datetime, direction="in", track_id=1):
@@ -270,6 +297,19 @@ def make_fixture(path: str, *, with_pi=True, with_gpu=True,
                 db, "ch34", _ist(2026, 7, day, 10, 0), 40,
                 close_s=lambda k: 1.44 + 0.08 * (k % 3), open_s=2.4,
                 door_version="ee55ff66+7788aa99", step_min=5)
+        # ── PEAK CAR OCCUPANCY episodes, 2026-07-30 ──────────────────────────
+        # Shaped so every branch of the evidence rule is present in one fixture:
+        #   ch16  measured episodes, one of them degraded, plus ONE hand count (LEG 2)
+        #   ch29  episodes from a worker that predates the feature — no coverage at all
+        # An episode with no coverage is not an empty car, and the workbook has to say so; that
+        # only gets tested if the fixture contains one.
+        for k in range(8):
+            add_episode(db, "ch16", _ist(2026, 7, 30, 9, 2) + timedelta(minutes=9 * k),
+                        occ=2 + (k % 4), frames=120 + 5 * k, degraded=1 if k == 6 else 0,
+                        human_occ=6 if k == 3 else None)
+        for k in range(3):
+            add_episode(db, "ch29", _ist(2026, 7, 30, 10, 0) + timedelta(minutes=12 * k))
+
     db.commit()
     db.close()
     return path

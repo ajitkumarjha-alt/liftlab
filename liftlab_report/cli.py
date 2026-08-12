@@ -47,7 +47,8 @@ def default_out_dir() -> Path:
 def build_context(db_path: str, gw: str, t0: float, t1: float,
                   peak_window: str = "auto", population: int | None = None,
                   banks_path: str | None = None,
-                  min_close_s: float | None = None) -> dict:
+                  min_close_s: float | None = None,
+                  capacity_path: str | None = None) -> dict:
     """Everything the workbook needs, precomputed. Read-only throughout."""
     if t1 <= t0:
         raise ReportError("--to must be after --from")
@@ -74,6 +75,11 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         # TIER-2 evidence: per camera PER ERA, plus the confident reads the speed walk needs.
         tier2_evidence = reader.fetch_tier2_evidence(db, gw, t0, t1)
         confident_reads = reader.fetch_confident_reads(db, gw, t0, t1)
+        # PEAK CAR OCCUPANCY: measured per door-open episode. Read unfiltered — the evidence rule
+        # is applied in model.measured_occupancy so the workbook can report how many episodes
+        # carried no measurement at all.
+        occ_episodes = reader.fetch_occupancy_episodes(db, gw, t0, t1)
+        occ_feature = reader.occupancy_feature_present(db)
     finally:
         db.close()
 
@@ -93,6 +99,10 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
     # OCCUPANCY: derived, reset at every idle gap, never presented as a measurement.
     occ = model.occupancy_periods(transits, stamps, validation, t0, t1)
     occ_summary = model.occupancy_summary(occ)
+    # MEASURED occupancy — a different instrument from the derived one above, per era.
+    occ_measured = model.measured_occupancy(occ_episodes, stamps, t0, t1)
+    capacity = eras.load_capacity(capacity_path)
+    capacity_st = eras.capacity_status(capacity)
     # The evidence table behind "per-floor is not viable yet". Shipped; the per-floor numbers are not.
     attribution = model.cycle_attribution(gpu_cycles, transits, cams, t0, t1)
     coeff_blockers = model.coefficient_blockers(tier2_evidence, floor_speed, cams)
@@ -221,6 +231,9 @@ def build_context(db_path: str, gw: str, t0: float, t1: float,
         "floor_confidence": floor_conf,
         "tier2_evidence": tier2_evidence, "floor_speed": floor_speed,
         "per_floor_demand": per_floor, "occupancy": occ, "occupancy_summary": occ_summary,
+        "measured_occupancy": occ_measured, "occupancy_episodes": occ_episodes,
+        "occupancy_feature_present": occ_feature,
+        "capacity": capacity, "capacity_status": capacity_st,
         "cycle_attribution": attribution,
         "coefficient_blockers": coeff_blockers,
         "analyzer_versions": analyzer_versions,
@@ -268,6 +281,7 @@ def build_workbook(ctx):
     workbook.sheet_peak(wb, ctx, cd, anchors)
     workbook.sheet_raw(wb, ctx, anchors)
     workbook.sheet_coverage(wb, ctx, cd, anchors)
+    workbook.sheet_car_loading(wb, ctx, anchors)
     workbook.sheet_attribution(wb, ctx, anchors)
     workbook.sheet_tier2(wb, ctx, anchors)
     workbook.sheet_read_this_first(wb, ctx, anchors)
@@ -309,6 +323,11 @@ def run_all(argv=None) -> list:
     ap.add_argument("--gateway", default=os.environ.get("GATEWAY_ID", "site-A"))
     ap.add_argument("--banks", default=None,
                     help="bank sidecar json (default: lift_banks.json beside the module)")
+    ap.add_argument("--capacity", default=None,
+                    help=f"car capacity sidecar json (default: {eras.CAPACITY_SIDECAR_DEFAULT} "
+                         f"beside the module). Must state persons per car AND the BASIS those "
+                         f"persons are counted on; without a confirmed basis the workbook prints "
+                         f"measured occupancy in absolute people and withholds the loading factor")
     args = ap.parse_args(argv)
 
     t0, t1 = parse_ts(args.from_ts), parse_ts(args.to_ts)
@@ -319,7 +338,7 @@ def run_all(argv=None) -> list:
     ctx = build_context(args.db, args.gateway, t0, t1,
                         peak_window=args.peak_window,
                         population=args.population, banks_path=args.banks,
-                        min_close_s=args.min_close)
+                        min_close_s=args.min_close, capacity_path=args.capacity)
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)

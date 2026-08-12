@@ -1652,3 +1652,186 @@ def test_engine_suppresses_direction_below_two_arrow_templates():
     src = open("gpu_door.py").read()
     assert "if len(self.arrow_labels) >= 2:" in src
     assert '"n_arrow_labels": n_arrow_labels' in src
+
+
+# ── CAR LOADING — measured peak occupancy, and the loading factor it refuses ──
+# The refusal is the point of these tests. A percentage whose denominator has no stated basis is
+# not a provisional answer, it is a wrong one that looks finished, so "no number" has to be
+# provable and not merely intended.
+
+def _occ_ctx(fixture_db, capacity_path=None,
+             frm="2026-07-30T00:00:00", to="2026-07-31T00:00:00"):
+    return cli.build_context(fixture_db, "site-A", _ts(frm), _ts(to),
+                             capacity_path=capacity_path)
+
+
+def _cap_file(tmp_path, **over):
+    import json
+    d = {"basis": "nameplate_persons",
+         "basis_confirmed_by": "lift licence photo, 2026-08-01, filed as LIC-ch16",
+         "sheet_basis": "nameplate_persons",
+         "persons": {"ch16": 13, "ch29": 13}}
+    d.update(over)
+    p = tmp_path / "cap.json"
+    p.write_text(json.dumps(d), encoding="utf-8")
+    return str(p)
+
+
+def test_measured_occupancy_applies_the_evidence_rule(fixture_db):
+    """occupancy_frames > 0 or it is not evidence — and the excluded ones stay counted."""
+    ctx = _occ_ctx(fixture_db)
+    occ = ctx["measured_occupancy"]
+    k16 = [k for k in occ if k[0] == "ch16"]
+    assert k16, "fixture has no ch16 episodes in range"
+    b = occ[k16[0]]
+    assert b["n"] == 8 and b["n_episodes"] == 8
+    assert b["peak"] == 5                       # max of 2 + k%4 over k=0..7
+    assert b["n_degraded"] == 1
+    # ch29's episodes predate the feature: present, unmeasured, and NOT zero.
+    k29 = [k for k in occ if k[0] == "ch29"]
+    assert k29, "fixture has no pre-occupancy ch29 episodes"
+    b29 = occ[k29[0]]
+    assert b29["n"] == 0 and b29["n_episodes"] == 3 and b29["n_no_evidence"] == 3
+    assert b29["peak"] is None, "an unmeasured episode must not produce a peak of 0"
+
+
+def test_measured_occupancy_is_not_the_derived_one(fixture_db):
+    """Two instruments, never merged: the derived figure can go negative, this one cannot."""
+    ctx = _occ_ctx(fixture_db)
+    for b in ctx["measured_occupancy"].values():
+        assert b["peak"] is None or b["peak"] >= 0
+    assert "occupancy_summary" in ctx and "measured_occupancy" in ctx
+    assert ctx["measured_occupancy"] is not ctx["occupancy"]
+
+
+def test_loading_factor_is_withheld_without_a_confirmed_basis(fixture_db, tmp_path):
+    from openpyxl import load_workbook
+    ctx = _occ_ctx(fixture_db, capacity_path=str(tmp_path / "missing.json"))
+    assert ctx["capacity_status"]["can_print_loading"] is False
+    wb = cli.build_workbook(ctx)
+    out = tmp_path / "wb.xlsx"
+    wb.save(out)
+    ws = load_workbook(out)["CAR LOADING"]
+    text = "\n".join(str(c) for r in ws.iter_rows(values_only=True) for c in r if c)
+    assert "LOADING FACTOR WITHHELD" in text
+    assert "withheld — capacity basis unconfirmed" in text
+    # The placeholder may be NAMED but must never be APPLIED. Checked on the loading column
+    # itself rather than by scanning the sheet for any small float — the hand-count sheet
+    # legitimately carries a machine/hand ratio, and a test that cannot tell those apart would
+    # pass for the wrong reason the moment the withheld cell started printing.
+    rows = list(ws.iter_rows(values_only=True))
+    hdr = next(i for i, r in enumerate(rows) if r and "loading vs capacity" in [str(c) for c in r])
+    col = [str(c) for c in rows[hdr]].index("loading vs capacity")
+    body = []
+    for r in rows[hdr + 1:]:                    # the table only, stopping at its blank line
+        if not r or not r[0]:
+            break
+        body.append(r[col])
+    assert body, "no occupancy rows on the sheet — the check would pass vacuously"
+    for v in body:
+        assert isinstance(v, str) and "withheld" in v, f"a loading factor was printed: {v!r}"
+    assert "13" in text, "the placeholder capacity should still be visible as a placeholder"
+
+
+def test_loading_factor_prints_once_the_basis_is_confirmed(fixture_db, tmp_path):
+    from openpyxl import load_workbook
+    ctx = _occ_ctx(fixture_db, capacity_path=_cap_file(tmp_path))
+    assert ctx["capacity_status"]["can_print_loading"] is True
+    assert ctx["capacity_status"]["can_compare_sheet"] is True
+    wb = cli.build_workbook(ctx)
+    out = tmp_path / "wb2.xlsx"
+    wb.save(out)
+    ws = load_workbook(out)["CAR LOADING"]
+    vals = [c for r in ws.iter_rows(values_only=True) for c in r]
+    text = "\n".join(str(c) for c in vals if c)
+    assert "LOADING FACTOR WITHHELD" not in text
+    assert any(isinstance(c, float) and abs(c - 5 / 13) < 1e-9 for c in vals), \
+        "the loading factor did not print once the basis was confirmed"
+
+
+def test_a_basis_mismatch_withholds_the_sheet_comparison_not_the_number(fixture_db, tmp_path):
+    """Both bases confirmed but DIFFERENT: the workbook prints its own figure and refuses the
+    comparison. Same arithmetic, different car."""
+    from openpyxl import load_workbook
+    ctx = _occ_ctx(fixture_db,
+                   capacity_path=_cap_file(tmp_path, sheet_basis="design_persons_mep02"))
+    st = ctx["capacity_status"]
+    assert st["can_print_loading"] is True and st["can_compare_sheet"] is False
+    assert "MISMATCH" in st["compare_note"]
+    wb = cli.build_workbook(ctx)
+    out = tmp_path / "wb3.xlsx"
+    wb.save(out)
+    text = "\n".join(str(c) for r in load_workbook(out)["CAR LOADING"].iter_rows(values_only=True)
+                     for c in r if c)
+    assert "SHEET COMPARISON WITHHELD" in text
+    assert str(int(eras.SHEET_LOADING_PCT)) in text
+
+
+def test_car_loading_states_the_calibration_and_matches_the_dashboard(fixture_db, tmp_path):
+    """The floor label travels with the number, and the workbook cannot drift from /dash."""
+    from openpyxl import load_workbook
+    dash_src = open("dash_api.py").read()
+    assert f'OCC_CALIBRATION = ("{eras.OCC_CALIBRATION.split(";")[0]};' in dash_src, \
+        "eras.OCC_CALIBRATION has drifted from dash_api.OCC_CALIBRATION"
+    ctx = _occ_ctx(fixture_db)
+    wb = cli.build_workbook(ctx)
+    out = tmp_path / "wb4.xlsx"
+    wb.save(out)
+    text = "\n".join(str(c) for r in load_workbook(out)["CAR LOADING"].iter_rows(values_only=True)
+                     for c in r if c)
+    assert eras.OCC_CALIBRATION in text
+    assert "MEASURED MINIMUM" in text
+    assert "n=1 scene" in text
+
+
+def test_hand_count_column_pairs_with_the_machine_peak(fixture_db, tmp_path):
+    from openpyxl import load_workbook
+    ctx = _occ_ctx(fixture_db)
+    b = [v for k, v in ctx["measured_occupancy"].items() if k[0] == "ch16"][0]
+    assert b["n_hand"] == 1 and b["n_hand_pairs"] == 1
+    pair = b["hand_pairs"][0]
+    assert pair["human"] == 6 and pair["machine"] == 5      # k=3 -> occ 2+3 = 5
+    assert b["hand_ratio"] == round(5 / 6, 3)
+    wb = cli.build_workbook(ctx)
+    out = tmp_path / "wb5.xlsx"
+    wb.save(out)
+    text = "\n".join(str(c) for r in load_workbook(out)["CAR LOADING"].iter_rows(values_only=True)
+                     for c in r if c)
+    assert "HAND COUNTS (LEG 2)" in text
+
+
+def test_a_gateway_without_the_columns_says_so_rather_than_showing_zero(tmp_path):
+    """Missing FEATURE and empty MEASUREMENT look identical in a spreadsheet and are not."""
+    from openpyxl import load_workbook
+    from liftlab_report.fixtures import make_fixture
+    p = make_fixture(str(tmp_path / "old.db"))
+    db = sqlite3.connect(p)
+    db.execute("DROP TABLE validation_item")
+    db.execute("CREATE TABLE validation_item (id INTEGER PRIMARY KEY, gateway_id TEXT, cam TEXT, "
+               "ts_start REAL, ts_end REAL, counting_version TEXT)")
+    db.commit(); db.close()
+    ctx = _occ_ctx(p)
+    assert ctx["occupancy_feature_present"] is False
+    wb = cli.build_workbook(ctx)
+    out = tmp_path / "wb6.xlsx"
+    wb.save(out)
+    text = "\n".join(str(c) for r in load_workbook(out)["CAR LOADING"].iter_rows(values_only=True)
+                     for c in r if c)
+    assert "CANNOT MEASURE CAR OCCUPANCY" in text
+    assert "does NOT mean the cars were empty" in text
+
+
+def test_the_rejected_derived_figure_now_points_at_car_loading(fixture_db, tmp_path):
+    """FLOOR ATTRIBUTION says no occupancy figure is shipped. With CAR LOADING in the workbook that
+    sentence would be false unless it distinguishes the two instruments."""
+    from openpyxl import load_workbook
+    ctx = _dlog(fixture_db)
+    wb = cli.build_workbook(ctx)
+    out = tmp_path / "wb7.xlsx"
+    wb.save(out)
+    got = load_workbook(out)
+    text = "\n".join(str(c) for r in got["FLOOR ATTRIBUTION"].iter_rows(values_only=True)
+                     for c in r if c)
+    if "ESTIMATED OCCUPANCY" in text:
+        assert "CROSSING-DERIVED" in text
+        assert "CAR LOADING" in text

@@ -1455,6 +1455,187 @@ def sheet_peak(wb, ctx, cd, anchors):
     return ws
 
 
+def sheet_car_loading(wb, ctx, anchors):
+    """CAR LOADING — measured peak occupancy, and the loading factor this workbook REFUSES to print.
+
+    Two things sit on this sheet and they must not be confused:
+
+      * PEAK CAR OCCUPANCY, measured. Distinct tracks simultaneously inside the cabin zone on a
+        single frame, per door-open episode. It never accumulates, so it cannot drift; it is a
+        FLOOR, because everyone the detector missed is absent from it.
+      * THE LOADING FACTOR, occupancy / capacity — NOT PRINTED while the capacity basis is
+        unconfirmed. 5 of 13 nameplate persons and 5 of 13 design persons are different claims about
+        the building, and only one of them can be checked against the sheet's 80%. A percentage
+        whose denominator has no stated basis is not a provisional answer; it is a wrong one that
+        looks finished. So the absolute figure is shown and the quotient is withheld, with the
+        exact list of what would unblock it.
+    """
+    ws = wb.create_sheet("CAR LOADING")
+    row = title(ws, "Car loading — measured peak car occupancy per door-open episode")
+    row += 1
+    occ = ctx.get("measured_occupancy") or {}
+    cap = ctx.get("capacity") or {}
+    st = ctx.get("capacity_status") or {}
+
+    # ── The label, before any number. Everything below is "at least this many".
+    row = banner(ws, row, (
+        f"PEAK CAR OCCUPANCY IS A MEASURED MINIMUM. Every figure on this sheet is the most people "
+        f"SEEN AT ONCE inside the car during one door-open, and the true number is never lower and "
+        f"is often higher: {eras.OCC_CALIBRATION}. Anchor: {eras.OCC_ANCHOR_NOTE}."),
+        fill=FILL_WARN, font=BODY_BOLD, height=58)
+    row += 1
+
+    if not ctx.get("occupancy_feature_present"):
+        row = banner(ws, row, (
+            "THIS GATEWAY CANNOT MEASURE CAR OCCUPANCY. validation_item has no occupancy columns, "
+            "which means the deployment predates the feature — it does NOT mean the cars were "
+            "empty. No occupancy figure is shown for this range, and none should be inferred."),
+            fill=FILL_NA, font=BODY_BOLD, height=44)
+        anchors["car_loading"] = ("CAR LOADING", f"A{row - 1}")
+        style.set_widths(ws, {1: 22, 2: 20, 3: 12, 4: 12, 5: 12, 6: 12, 7: 14, 8: 30})
+        style.print_setup(ws)
+        return ws
+
+    # ── 1. THE CAPACITY BASIS, and the refusal ────────────────────────────────
+    row = section(ws, row, "CAPACITY BASIS — the denominator, and whether it may be used")
+    row = header_row(ws, row, ["item", "value", "state"])
+    basis_rows = [
+        ("basis", st.get("basis_label") or "NOT STATED",
+         "CONFIRMED" if st.get("basis") else "UNCONFIRMED"),
+        ("confirmed by", st.get("basis_confirmed_by") or "nobody — no document named",
+         "CONFIRMED" if st.get("basis_confirmed_by") else "UNCONFIRMED"),
+        ("persons per car", (", ".join(f"{eras.lift_label(c)} {n}"
+                                       for c, n in sorted((cap.get("persons") or {}).items()))
+                             or f"NOT SUPPLIED (placeholder {cap.get('placeholder_persons')} "
+                                f"is carried and is NOT used)"),
+         "SUPPLIED" if cap.get("persons") else "PLACEHOLDER — NOT USED"),
+        (f"{eras.SHEET_NAME} basis", eras.CAPACITY_BASES.get(st.get("sheet_basis") or "",
+                                                             "NOT STATED"),
+         "STATED" if st.get("sheet_basis") else "NOT STATED"),
+        ("declaration source", cap.get("source") or "—", ""),
+    ]
+    for k, v, state in basis_rows:
+        cell(ws, row, 1, k)
+        cell(ws, row, 2, v, wrap=True)
+        cell(ws, row, 3, state,
+             fill=(style.FILL_GOOD if state in ("CONFIRMED", "SUPPLIED", "STATED")
+                   else FILL_WARN if state else None))
+        row += 1
+    anchors["capacity_basis"] = ("CAR LOADING", f"A{row - len(basis_rows)}:C{row - 1}")
+    row += 1
+
+    if not st.get("can_print_loading"):
+        row = banner(ws, row, (
+            "LOADING FACTOR WITHHELD. This workbook will not print car loading as a percentage of "
+            "capacity until the basis of that capacity is confirmed, because the same arithmetic "
+            "on two different bases makes two different claims about the building and only one can "
+            "be checked against " + eras.SHEET_NAME + "'s "
+            f"{eras.SHEET_LOADING_PCT:.0f}%. Missing: "
+            + "; ".join(st.get("missing") or []) + ". Supply them in "
+            + eras.CAPACITY_SIDECAR_DEFAULT + " and re-run; the measured occupancy below is "
+            "unaffected and is already usable in absolute people."),
+            fill=FILL_WARN, font=BODY_BOLD, height=62)
+        anchors["loading_withheld"] = ("CAR LOADING", f"A{row - 1}")
+    elif not st.get("can_compare_sheet"):
+        row = banner(ws, row, "LOADING FACTOR PRINTED, SHEET COMPARISON WITHHELD — "
+                     + (st.get("compare_note") or ""), fill=FILL_WARN, font=BODY_BOLD, height=48)
+    else:
+        row = caption(ws, row, st.get("compare_note") or "")
+    row += 1
+
+    # ── 2. MEASURED OCCUPANCY, per lift per counting era ──────────────────────
+    row = section(ws, row, "MEASURED PEAK OCCUPANCY, per lift per counting era "
+                           "(one row per era — a different cabin zone is a different instrument)")
+    headers = ["lift", "counting era", "episodes with coverage n", "peak (≥ people)",
+               "p95 (≥)", "median (≥)", "loading vs capacity",
+               "episodes with NO coverage", "degraded", "hand counts (LEG 2)"]
+    hdr_row = row
+    row = header_row(ws, row, headers)
+    first_data = row
+    for (cam, ver), b in sorted(occ.items()):
+        cell(ws, row, 1, _lbl(ws, cam))
+        cell(ws, row, 2, ver or "unstamped")
+        cell(ws, row, 3, b["n"], F_INT)
+        cell(ws, row, 4, b["peak"], F_INT)
+        cell(ws, row, 5, b["p95"], F_INT)
+        cell(ws, row, 6, b["median"], F_INT)
+        # THE REFUSAL, enforced in the cell and not only in the banner above. A reader who scrolls
+        # straight to the table must meet it here too, or the withheld figure reads as a gap.
+        persons = (cap.get("persons") or {}).get(cam)
+        if st.get("can_print_loading") and persons and b["peak"] is not None:
+            cell(ws, row, 7, b["peak"] / persons, F_PCT)
+        else:
+            cell(ws, row, 7, "withheld — capacity basis unconfirmed", fill=FILL_NA, wrap=True)
+        cell(ws, row, 8, b["n_no_evidence"], F_INT,
+             fill=FILL_WARN if b["n_no_evidence"] else None)
+        cell(ws, row, 9, b["n_degraded"], F_INT, fill=FILL_WARN if b["n_degraded"] else None)
+        cell(ws, row, 10, b["n_hand"], F_INT)
+        row += 1
+    if row == first_data:
+        cell(ws, row, 1, "no door-open episode in this range carried occupancy coverage — "
+                         "no measurement was taken, which is not a measurement of zero",
+             fill=FILL_NA, wrap=True)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(headers))
+        row += 1
+    anchors["car_loading"] = ("CAR LOADING", _rng(first_data, max(first_data, row - 1), len(headers)))
+    freeze_below(ws, hdr_row)
+    row += 1
+
+    # ── 3. LEG 2 hand counts, the only route to a real calibration ────────────
+    row = section(ws, row, "HAND COUNTS (LEG 2) — the only evidence that can turn a floor into a count")
+    pairs = [(cam, ver, h) for (cam, ver), b in sorted(occ.items()) for h in b["hand_pairs"]]
+    row = header_row(ws, row, ["lift", "counting era", "episode (IST)", "hand count",
+                               "machine peak", "machine / hand"])
+    if pairs:
+        for cam, ver, h in pairs:
+            cell(ws, row, 1, _lbl(ws, cam))
+            cell(ws, row, 2, ver or "unstamped")
+            cell(ws, row, 3, _dt(h["ts"]), F_TS)
+            cell(ws, row, 4, h["human"], F_INT)
+            cell(ws, row, 5, h["machine"], F_INT)
+            cell(ws, row, 6, (h["machine"] / h["human"]) if h["human"] else None, F_RATE)
+            row += 1
+        n_pairs = len(pairs)
+        row = caption(ws, row, (
+            f"{n_pairs} paired observation(s). The undercount factor quoted at the top of this "
+            f"sheet rests on ONE scene on ONE camera; it becomes a usable correction only when "
+            f"these pairs span several lifts and several crowding levels. Until then it calibrates "
+            f"the DIRECTION of the error, not its size."))
+    else:
+        cell(ws, row, 1, "no hand counts recorded yet. tools/weekly_stopwatch.md LEG 2 collects "
+                         "them beside the hand-timed door sample; until it runs, the ~0.5x "
+                         "undercount rests on a single scene and cannot be generalised.",
+             fill=FILL_NA, wrap=True)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+        ws.row_dimensions[row].height = 34
+        row += 1
+    row += 1
+
+    # ── 4. What this is NOT ───────────────────────────────────────────────────
+    row = section(ws, row, "WHAT THIS IS NOT")
+    for line in (
+        "NOT the crossing-derived occupancy. FLOOR ATTRIBUTION carries a separate figure — "
+        "cumulative boarded-minus-alighted — that went NEGATIVE in most periods and is therefore "
+        "reported as a rejected method, not as a number. That one accumulates counting errors; this "
+        "one is a per-frame count that cannot accumulate anything. The two must never be added, "
+        "averaged, or presented as versions of one figure.",
+        "NOT a headcount. It is the number of people the detector RESOLVED at once inside the cabin "
+        "polygon. Occlusion in a crowded car hides people behind other people, and the anchor point "
+        "sits at the feet, so anyone whose feet are outside the polygon is absent from the figure.",
+        f"NOT yet comparable to {eras.SHEET_NAME}. C19 (average passengers per trip) assumes car "
+        f"loading as a share of RATED CAPACITY. This sheet supplies the numerator honestly; the "
+        f"denominator's basis is what is still outstanding.",
+    ):
+        cell(ws, row, 1, line, wrap=True)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=10)
+        ws.row_dimensions[row].height = 46
+        row += 1
+
+    style.set_widths(ws, {1: 20, 2: 24, 3: 20, 4: 16, 5: 12, 6: 13, 7: 26, 8: 20, 9: 12, 10: 18})
+    style.print_setup(ws, repeat_row=hdr_row)
+    return ws
+
+
 # ── RAW ──────────────────────────────────────────────────────────────────────
 
 def sheet_raw(wb, ctx, anchors):
@@ -1812,11 +1993,17 @@ def sheet_attribution(wb, ctx, anchors):
              f"{osum['n_went_negative']} of {osum['n_periods']} periods "
              f"({osum['pct_negative']:.1f}%). A negative occupancy is proof the derivation broke — "
              f"more people left the car than entered it. At this rate that is not an edge case to "
-             f"footnote, it is the typical outcome, so no occupancy figure appears in this "
-             f"workbook. The system counts door crossings; it does not measure how many people "
-             f"are in a lift.", font=BODY_BOLD, wrap=True, fill=FILL_WARN)
+             f"footnote, it is the typical outcome, so no CROSSING-DERIVED occupancy figure "
+             f"appears in this workbook. Counting crossings does not measure how many people are "
+             f"in a lift.\n"
+             f"This does NOT apply to CAR LOADING. That sheet carries a different instrument: a "
+             f"per-frame count of people simultaneously inside the cabin zone, which never "
+             f"accumulates and so cannot drift or go negative. It is a measured MINIMUM, and it is "
+             f"not a corrected version of the figure rejected here — the two must never be added, "
+             f"averaged, or presented as versions of one number.",
+             font=BODY_BOLD, wrap=True, fill=FILL_WARN)
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
-        ws.row_dimensions[row].height = 76
+        ws.row_dimensions[row].height = 140      # the paragraph grew when CAR LOADING arrived
         row += 1
         anchors["occupancy_rejected"] = ("FLOOR ATTRIBUTION", f"A{row - 1}")
 

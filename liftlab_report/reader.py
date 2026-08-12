@@ -326,6 +326,43 @@ def fetch_transits(db, gw: str, t0: float, t1: float) -> list[dict]:
             for r in rows if r["ts"] is not None]
 
 
+def fetch_occupancy_episodes(db, gw: str, t0: float, t1: float) -> list[dict]:
+    """Door-open episodes carrying PEAK CAR OCCUPANCY, from validation_item.
+
+    Every episode in range is returned, INCLUDING those with no occupancy coverage. The evidence
+    rule (occupancy_frames > 0) is applied by model.measured_occupancy, not here, so the workbook
+    can report how many episodes carried no measurement — a denominator the reader needs and that a
+    filter at the read would have silently removed.
+
+    A gateway older than the occupancy columns has no such columns at all. That is a missing
+    FEATURE, not missing data, and it is reported as such rather than as an empty result: the two
+    look identical in a spreadsheet and mean completely different things.
+    """
+    cols = {r[1] for r in db.execute("PRAGMA table_info(validation_item)")}
+    need = {"occupancy_max", "occupancy_frames", "occupancy_degraded", "analysed_frames"}
+    if not need.issubset(cols):
+        return []
+    human = "human_occupancy" if "human_occupancy" in cols else "NULL AS human_occupancy"
+    rows = _q(db, f"SELECT cam, ts_start, ts_end, occupancy_max, occupancy_frames, "
+                  f"occupancy_degraded, analysed_frames, {human}, counting_version, status "
+                  f"FROM validation_item WHERE gateway_id=? AND ts_start>=? AND ts_start<? "
+                  f"ORDER BY cam, ts_start", (gw, t0, t1))
+    return [{"cam": r["cam"], "ts": float(r["ts_start"]), "ts_end": r["ts_end"],
+             "occupancy_max": r["occupancy_max"], "occupancy_frames": r["occupancy_frames"],
+             "occupancy_degraded": r["occupancy_degraded"],
+             "analysed_frames": r["analysed_frames"], "human_occupancy": r["human_occupancy"],
+             "counting_version": r["counting_version"], "status": r["status"],
+             "instrument": GPU_ENGINE}
+            for r in rows if r["ts_start"] is not None]
+
+
+def occupancy_feature_present(db) -> bool:
+    """Does this gateway carry the occupancy columns at all? Distinguishes 'no measurement was
+    taken' from 'this deployment cannot take one' — the workbook prints different sentences."""
+    cols = {r[1] for r in db.execute("PRAGMA table_info(validation_item)")}
+    return {"occupancy_max", "occupancy_frames"}.issubset(cols)
+
+
 def fetch_floor_confidence(db, gw: str, t0: float, t1: float,
                            ok_reasons: tuple = ("ok", "single_panel")) -> dict[str, dict]:
     """{cam: {confident, total}} over the range, aggregated in SQL.

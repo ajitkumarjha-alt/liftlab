@@ -9,6 +9,7 @@ Sources of truth mirrored here (do not silently diverge from them):
   dash_api.CLOSE_TRAVEL_MAX_BOUNDARY    2026-07-16T11:48:11+00:00
   dash_api.DOOR_SPECS                   ch29 2.00s / 2.31s Bank C, C26 1.50 s/p
   dash_api.DATA_GAPS                    Jul 19-20 relay stall (ch29)
+  dash_api.OCC_CALIBRATION              peak car occupancy is a measured minimum
 """
 
 from __future__ import annotations
@@ -145,12 +146,139 @@ DOOR_SPECS = {
     "ch29": {"sheet_close_s": 2.00, "compliance_s": 2.31, "bank": "C",
              "transfer_sheet_s": 1.50, "sheet_open_s": 3.00},
 }
+# PEAK CAR OCCUPANCY — mirrored verbatim from dash_api.OCC_CALIBRATION so the
+# workbook and the dashboard cannot state the same figure with different limits.
+# The number is the most people SEEN AT ONCE inside the cabin zone during one
+# door-open episode: a floor, not a count. The 0.5x is one scene on one camera.
+OCC_CALIBRATION = ("measured minimum; ~0.5x at heavy crowding (n=1 scene, ch30); "
+                   "undercount grows with crowding")
+OCC_ANCHOR_NOTE = ("foot anchor — the same membership point as the transit counter; a centre anchor "
+                   "measured LOWER against a floor polygon, so it is not the fix")
+
 # Defaults used for cameras with no explicit spec entry (sheet-wide values).
 SHEET_CLOSE_S = 2.00
 SHEET_OPEN_S = 3.00
 SHEET_TRANSFER_S_PP = 1.50
 COMPLIANCE_CLIFF_S = 2.31            # Bank C non-compliance line
 HC_PEAK_DESIGN_PCT = 8.0             # 5-min handling capacity design assumption
+
+# ── Car capacity, and THE BASIS IT IS STATED ON ──────────────────────────────
+# Capacity in PERSONS, per Aj — not kg. A kg rating divided by an assumed body
+# mass is a different number with a different error, and the sheet's loading
+# assumption is written against persons, so persons is the only basis on which
+# the two can be compared at all.
+#
+# THE REFUSAL. A loading factor is occupancy / capacity. If the basis of that
+# denominator is not confirmed, the quotient is not a measurement of anything:
+# 5/13 on nameplate persons and 5/13 on design persons are different claims
+# about the building even when the arithmetic is identical, and only one of them
+# can be checked against the sheet's 80%. So until the basis is CONFIRMED the
+# workbook prints the measured occupancy in absolute people and prints NO
+# percentage — not a provisional one, not a greyed-out one, not one in a
+# footnote. There is no such thing as a provisional denominator.
+#
+# CAPACITY_PERSONS_PLACEHOLDER is carried so the sheet can show what it WOULD
+# use, marked as a placeholder that is not in use. It is never multiplied by
+# anything while the basis is unconfirmed.
+CAPACITY_PERSONS_PLACEHOLDER = 13
+CAPACITY_SIDECAR_DEFAULT = "lift_capacity.json"
+CAPACITY_BASES = {
+    "nameplate_persons": "nameplate persons — the figure on the car's rating "
+                         "plate / lift licence, as installed",
+    "design_persons_mep02": f"design persons per {SHEET_NAME} — the figure the "
+                            f"sheet designed the car to carry",
+}
+# The sheet's design car loading. The workbook may only compare against this
+# when its own basis MATCHES the basis the sheet's 80% is written on.
+SHEET_LOADING_PCT = 80.0
+
+
+def load_capacity(path: str | Path | None = None) -> dict:
+    """The capacity declaration: persons per car, its basis, and the sheet's basis.
+
+    Sidecar JSON, same convention as lift_banks.json:
+
+        {"basis": "nameplate_persons",          # or design_persons_mep02
+         "basis_confirmed_by": "who confirmed it, and from what document",
+         "sheet_basis": "design_persons_mep02", # what MEP-02's 80% is written on
+         "persons": {"ch30": 13, "ch27": 13}}
+
+    Missing file, missing basis, or a basis not in CAPACITY_BASES -> UNCONFIRMED.
+    Unconfirmed is the DEFAULT and is never upgraded by inference: a capacity
+    number present without a stated basis stays unconfirmed, because the number
+    is not the thing in doubt.
+    """
+    p = (Path(path) if path
+         else Path(__file__).resolve().parent.parent / CAPACITY_SIDECAR_DEFAULT)
+    out = {"basis": None, "basis_label": None, "basis_confirmed_by": None,
+           "sheet_basis": None, "persons": {}, "source": f"{p} (not found)",
+           "placeholder_persons": CAPACITY_PERSONS_PLACEHOLDER}
+    try:
+        data = json.loads(Path(p).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    out["source"] = str(p)
+    basis = str(data.get("basis") or "").strip()
+    if basis in CAPACITY_BASES:
+        out["basis"] = basis
+        out["basis_label"] = CAPACITY_BASES[basis]
+    elif basis:
+        out["source"] += f" (basis {basis!r} is not one of {sorted(CAPACITY_BASES)})"
+    out["basis_confirmed_by"] = (data.get("basis_confirmed_by") or "").strip() or None
+    sb = str(data.get("sheet_basis") or "").strip()
+    out["sheet_basis"] = sb if sb in CAPACITY_BASES else None
+    for cam, n in (data.get("persons") or {}).items():
+        try:
+            out["persons"][cam] = int(n)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def capacity_status(capacity: dict) -> dict:
+    """May a loading factor be printed, and if not, exactly what is missing.
+
+    Two independent gates, reported separately because they are fixed by
+    different people:
+      * `can_print_loading` — is the workbook's own basis confirmed at all
+      * `can_compare_sheet` — does that basis MATCH the one the sheet's 80% uses
+    A matching-basis failure is not a smaller version of the first; it means the
+    workbook and the sheet are both internally consistent and are talking about
+    different cars.
+    """
+    cap = capacity or {}
+    basis, sheet_basis = cap.get("basis"), cap.get("sheet_basis")
+    who = cap.get("basis_confirmed_by")
+    missing = []
+    if not basis:
+        missing.append(f"capacity basis (one of: {', '.join(sorted(CAPACITY_BASES))})")
+    if not who:
+        missing.append("who confirmed the basis, and from which document")
+    if not cap.get("persons"):
+        missing.append("persons per car")
+    can = not missing
+    if can and not sheet_basis:
+        cmp_ok, cmp_why = False, (
+            f"the basis {SHEET_NAME}'s {SHEET_LOADING_PCT:.0f}% loading is written on "
+            f"has not been stated, so this workbook cannot say whether its own "
+            f"basis matches it")
+    elif can and sheet_basis != basis:
+        cmp_ok, cmp_why = False, (
+            f"basis MISMATCH — this workbook measures against "
+            f"{CAPACITY_BASES[basis]}, while {SHEET_NAME}'s "
+            f"{SHEET_LOADING_PCT:.0f}% is written on {CAPACITY_BASES[sheet_basis]}. "
+            f"Same arithmetic, different car. The comparison is withheld rather "
+            f"than made across the two.")
+    elif can:
+        cmp_ok, cmp_why = True, (
+            f"basis matches {SHEET_NAME}: both are {CAPACITY_BASES[basis]}")
+    else:
+        cmp_ok, cmp_why = False, "no basis, so nothing to compare"
+    return {"can_print_loading": can, "missing": missing,
+            "can_compare_sheet": cmp_ok, "compare_note": cmp_why,
+            "basis": basis, "basis_label": (CAPACITY_BASES.get(basis) if basis else None),
+            "basis_confirmed_by": who, "sheet_basis": sheet_basis}
+
 
 # ── Channels ─────────────────────────────────────────────────────────────────
 CHANNELS = [16, 27, 29, 30, 32, 34, 37]

@@ -588,6 +588,70 @@ def occupancy_periods(transits: list[dict], stamps: dict, validation: dict,
     return by
 
 
+def measured_occupancy(episodes: list[dict], stamps: dict, t0: float, t1: float) -> dict[tuple, dict]:
+    """PEAK CAR OCCUPANCY per (cam, counting_version) — MEASURED, not derived.
+
+    A DIFFERENT INSTRUMENT from occupancy_periods() above, and the distinction is the whole point.
+    That one accumulates boarded-minus-alighted across crossings and goes negative in most periods,
+    which is why the workbook ships the finding and not the number. This one is a count of DISTINCT
+    TRACKS SIMULTANEOUSLY INSIDE THE CABIN ZONE on a single frame — it never accumulates, so it
+    cannot drift, and it cannot go negative. The two must never be added, averaged or shown as
+    versions of one figure.
+
+    IT IS STILL A FLOOR. Detection misses people, bodies occlude each other, and the foot anchor
+    drops anyone whose feet leave the polygon. eras.OCC_CALIBRATION states the size of that gap and
+    the single scene it was measured on. Every field below is "at least this many".
+
+    THE EVIDENCE RULE: an episode counts only where occupancy_frames > 0. NULL means a worker that
+    predates the feature; 0 means no analysed frames stood behind the peak. Both are counted in
+    n_no_evidence and excluded from the statistics — never treated as an empty car.
+
+    ERA SCOPING is by counting_version, because the cabin polygon and the membership anchor live in
+    the counting logic. Peaks from two versions describe two different zones and are keyed apart.
+    """
+    by: dict[tuple, dict] = {}
+    for e in episodes:
+        if not (t0 <= e["ts"] < t1) or eras.in_gap(e["cam"], e["ts"]):
+            continue
+        ver = e.get("counting_version") or eras.counting_version_at(e["cam"], e["ts"], stamps)
+        k = (e["cam"], ver)
+        b = by.setdefault(k, {"cam": e["cam"], "counting_version": ver, "peaks": [], "hand": [],
+                              "n_episodes": 0, "n_no_evidence": 0, "n_degraded": 0,
+                              "frames": 0, "first_ts": None, "last_ts": None})
+        b["n_episodes"] += 1
+        b["first_ts"] = e["ts"] if b["first_ts"] is None else min(b["first_ts"], e["ts"])
+        b["last_ts"] = e["ts"] if b["last_ts"] is None else max(b["last_ts"], e["ts"])
+        if e.get("human_occupancy") is not None:
+            # LEG 2: a hand count taken beside the machine's peak for the same episode. Kept
+            # whether or not the machine had coverage — the human saw the car either way.
+            b["hand"].append({"ts": e["ts"], "human": int(e["human_occupancy"]),
+                              "machine": e.get("occupancy_max")})
+        if not (e.get("occupancy_frames") or 0) > 0:
+            b["n_no_evidence"] += 1
+            continue
+        b["peaks"].append(int(e.get("occupancy_max") or 0))
+        b["frames"] += int(e["occupancy_frames"])
+        if e.get("occupancy_degraded"):
+            b["n_degraded"] += 1
+    for b in by.values():
+        pk = sorted(b["peaks"])
+        b["n"] = len(pk)
+        b["peak"] = pk[-1] if pk else None
+        b["p95"] = stats.pctl(pk, 0.95) if pk else None
+        b["median"] = stats.pctl(pk, 0.5) if pk else None
+        b["mean"] = round(sum(pk) / len(pk), 2) if pk else None
+        # Hand counts, paired with the machine peak for the SAME episode. The ratio is the only
+        # honest calibration this system can build, and it is reported per pair rather than as a
+        # single factor until there are enough pairs to justify one.
+        pairs = [h for h in b["hand"] if h["machine"] is not None]
+        b["n_hand"] = len(b["hand"])
+        b["n_hand_pairs"] = len(pairs)
+        b["hand_pairs"] = pairs
+        b["hand_ratio"] = (round(sum(p["machine"] for p in pairs) / sum(p["human"] for p in pairs), 3)
+                           if pairs and sum(p["human"] for p in pairs) else None)
+    return by
+
+
 def occupancy_summary(periods_by_key: dict) -> dict:
     """Fleet-level honesty check: how often did the derivation break?"""
     tot = neg = 0
