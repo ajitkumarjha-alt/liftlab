@@ -68,6 +68,15 @@ _SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 validation_router = APIRouter()
 
 
+def _i(v):
+    """int or NULL. A MISSING occupancy field must stay NULL, never become 0: a worker that predates
+    the feature reported nothing, and 0 would read downstream as "an empty cabin was measured"."""
+    try:
+        return None if v is None else int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _db():
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
@@ -83,6 +92,16 @@ def _db():
       n_images INTEGER DEFAULT 0, status TEXT DEFAULT 'pending',
       human_boarded INTEGER, human_alighted INTEGER, reviewer TEXT, reviewed_at REAL, created_at REAL);
     """)
+    # PEAK CAR OCCUPANCY (2026-08-12). Additive columns; nothing existing changes meaning, so no era
+    # boundary — same precedent as floor_age_s. occupancy_frames is the evidence denominator and
+    # occupancy_degraded marks a peak taken while the worker was dropping >20% of segments.
+    for _col, _typ in (("occupancy_max", "INTEGER"), ("occupancy_frames", "INTEGER"),
+                       ("occupancy_degraded", "INTEGER"), ("analysed_frames", "INTEGER"),
+                       ("human_occupancy", "INTEGER")):
+        try:
+            db.execute(f"ALTER TABLE validation_item ADD COLUMN {_col} {_typ}")
+        except sqlite3.OperationalError:
+            pass                                  # already there
     for col, typ in (("counting_version", "TEXT"),         # logic it was counted under
                      ("det_max", "INTEGER"), ("det_mean", "REAL"),   # detection audit: what YOLO+tracker saw
                      ("distinct_ids", "INTEGER"), ("det_frames", "INTEGER"),
@@ -173,22 +192,27 @@ async def validation_item(gw: str, cam: str, request: Request, authorization: st
         # item. The transits themselves are already in transit_event/gw_event; this is the door-open audit.
         db.execute(
             "INSERT INTO validation_item (gateway_id,cam,ts_start,ts_end,machine_boarded,machine_alighted,"
-            "n_images,counting_version,status,created_at) VALUES (?,?,?,?,?,?,0,?,'auto',?)",
+            "n_images,counting_version,status,occupancy_max,occupancy_frames,occupancy_degraded,"
+            "analysed_frames,created_at) VALUES (?,?,?,?,?,?,0,?,'auto',?,?,?,?,?)",
             (gw, cam, float(d.get("ts_start", 0)), float(d.get("ts_end", 0)),
              int(d.get("machine_boarded", 0)), int(d.get("machine_alighted", 0)),
-             d.get("counting_version"), time.time()))
+             d.get("counting_version"), _i(d.get("occupancy_max")), _i(d.get("occupancy_frames")),
+             _i(d.get("occupancy_degraded")), _i(d.get("analysed_frames")), time.time()))
         db.commit()
         db.close()
         return {"stored": "auto", "state": "live"}
     cur = db.execute(
         "INSERT INTO validation_item (gateway_id,cam,ts_start,ts_end,machine_boarded,machine_alighted,"
-        "n_images,counting_version,det_max,det_mean,distinct_ids,det_frames,conf_min,conf_mean,conf_max,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "n_images,counting_version,det_max,det_mean,distinct_ids,det_frames,conf_min,conf_mean,conf_max,"
+        "occupancy_max,occupancy_frames,occupancy_degraded,analysed_frames,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (gw, cam, float(d.get("ts_start", 0)), float(d.get("ts_end", 0)),
          int(d.get("machine_boarded", 0)), int(d.get("machine_alighted", 0)), 0,
          d.get("counting_version"), d.get("det_max"), d.get("det_mean"),
          d.get("distinct_ids"), d.get("det_frames"),
-         d.get("conf_min"), d.get("conf_mean"), d.get("conf_max"), time.time()))
+         d.get("conf_min"), d.get("conf_mean"), d.get("conf_max"),
+         _i(d.get("occupancy_max")), _i(d.get("occupancy_frames")),
+         _i(d.get("occupancy_degraded")), _i(d.get("analysed_frames")), time.time()))
     item_id = cur.lastrowid
     imgs = (d.get("images") or [])[:MAX_IMGS]
 
