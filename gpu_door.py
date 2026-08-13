@@ -462,6 +462,7 @@ class FloorReader:
 
     def __init__(self, templates, digit_cells, arrow_cell, min_score=0.55, blank_range=40,
                  arrow_labels=ARROWS, blank_label=BLANK, shift_search=2, margin_min=0.05,
+                 arrow_margin_min=0.04, arrow_switch_margin=0.10, arrow_hold_reads=25,
                  blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90,
                  blank_lit_margin=0.15, confuse_band=0.0, disc_min=0.10, valid_floors=None):
         # A tower has a FIXED set of floors. A read that assembles to something outside it — a phantom
@@ -473,6 +474,14 @@ class FloorReader:
         self.templates = {k: np.asarray(v, dtype=np.float32) for k, v in templates.items()}
         self.digit_cells = list(digit_cells)
         self.arrow_cell = arrow_cell
+        # Arrow ambiguity control. Defaults are deliberately conservative: hold a direction unless
+        # the challenger is clearly better, and never hold a stale one for long.
+        self.arrow_margin_min = float(arrow_margin_min)      # keep the current direction above this
+        self.arrow_switch_margin = float(arrow_switch_margin)  # ...and switch only above this
+        self.arrow_hold_reads = int(arrow_hold_reads)        # ambiguous reads before withholding
+        self._last_direction = None
+        self._amb_run = 0
+        self.n_arrow_ambiguous = 0
         self.min_score = min_score
         # RIGID SHIFT SEARCH radius (px). The LED display translates as one; per-frame jitter (~2-4px
         # measured) at tight cells breaks the most sensitive cell (tens) while units/arrow — anchored /
@@ -545,6 +554,32 @@ class FloorReader:
         cc = c.astype(np.float32).ravel(); cc = cc - cc.mean()
         nd = float(np.sqrt((d * d).sum())); ncr = float(np.sqrt((cc * cc).sum()))
         return float((cc * d).sum() / (nd * ncr)) if nd > 1e-6 and ncr > 1e-6 else 0.0
+
+    def _match2(self, cell_img, labels):
+        """(best_label, best_score, runner_up_score). Argmax alone cannot see ambiguity: two arrows
+        at 0.68 and 0.66 produce a confident-looking winner that changes with sensor noise."""
+        import cv2
+        best = (None, -2.0)
+        second = -2.0
+        if cell_img.size == 0 or cell_img.shape[0] < 2 or cell_img.shape[1] < 2:
+            return None, -2.0, -2.0
+        for lab in labels:
+            tpl = self.templates.get(lab)
+            if tpl is None:
+                continue
+            t = tpl
+            if t.shape[0] > cell_img.shape[0] or t.shape[1] > cell_img.shape[1]:
+                t = cv2.resize(t, (cell_img.shape[1], cell_img.shape[0]))
+            try:
+                sc = float(cv2.matchTemplate(cell_img, t, cv2.TM_CCOEFF_NORMED).max())
+            except Exception:
+                continue
+            if sc > best[1]:
+                second = best[1]
+                best = (lab, sc)
+            elif sc > second:
+                second = sc
+        return best[0], best[1], second
 
     def _match(self, cell_img, labels):
         import cv2
@@ -692,7 +727,7 @@ class FloorReader:
         direction = None
         if self.arrow_labels:                        # arrow shifts with the display too (rigid)
             acell = (self.arrow_cell[0] + dx, self.arrow_cell[1] + dy, self.arrow_cell[2], self.arrow_cell[3])
-            arrow, arr_s = self._match(crop(panel_gray, acell), self.arrow_labels)
+            arrow, arr_s, arr_2nd = self._match2(crop(panel_gray, acell), self.arrow_labels)
             if arrow is not None and arr_s >= self.min_score:
                 # A SINGLE-CLASS CLASSIFIER OUTPUT IS NOT A MEASUREMENT. arrow_labels is filtered to
                 # the arrows that have TEMPLATES, and a template only exists for an arrow the
@@ -706,7 +741,39 @@ class FloorReader:
                 # read_conf exactly as before, so FLOOR reading is unchanged — only the direction
                 # claim is withheld.
                 if len(self.arrow_labels) >= 2:
-                    direction = arrow
+                    # MARGIN + HYSTERESIS, the same discipline the digit cells already apply.
+                    #
+                    # The arrow was accepted on ABSOLUTE score alone, so two templates scoring 0.68
+                    # and 0.66 produced a confident winner that changed with noise. Measured on the
+                    # restored snapshot: ch29 flipped direction 56,753 times AT AN UNCHANGED FLOOR,
+                    # median read_conf 0.683 — comfortably above min_score, and wrong half the time.
+                    # ch27 was near-immune (11 flips) only because it has ONE arrow template and the
+                    # two-template rule above was already withholding its direction.
+                    #
+                    # Every one of those flips changed (floor, direction, door_state) and therefore
+                    # emitted a gw_door_event row: 63% of ch29's rows were direction-only changes.
+                    #
+                    # SWITCHING costs more than HOLDING. A direction already established is kept
+                    # unless the challenger clears the wider margin; that is what stops an oscillation
+                    # at the decision boundary without making the reader sluggish about a real change.
+                    _margin = arr_s - arr_2nd if arr_2nd > -1.5 else 1.0
+                    _need = (self.arrow_margin_min if arrow == self._last_direction
+                             else self.arrow_switch_margin)
+                    if _margin >= _need:
+                        direction = arrow
+                        self._last_direction = arrow
+                        self._amb_run = 0
+                    else:
+                        # AMBIGUOUS. Hold the established direction rather than emitting None —
+                        # alternating direction<->None chatters exactly as badly as up<->down — but
+                        # only for a bounded run, because a held claim is still a claim.
+                        self._amb_run += 1
+                        self.n_arrow_ambiguous += 1
+                        if self._amb_run <= self.arrow_hold_reads:
+                            direction = self._last_direction
+                        else:
+                            direction = None
+                            self._last_direction = None
                 scores.append(arr_s)
         floor_str = "".join(chars)
         if self.valid_floors is not None and floor_str not in self.valid_floors:

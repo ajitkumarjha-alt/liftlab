@@ -630,6 +630,15 @@ def _is_h3_era(era):
 
 
 H3_TRAVEL_NOTE = "h3: travel unmeasured by design"
+# CYCLE COUNTS ARE UNDER VALIDATION (2026-08-13). _h3_cycle_ts counts a cycle on every transition
+# into 'closed' with NO dwell test, and the gw_door_event census measured 41-64% of door_state flips
+# lasting under one second — p10 of 0.08s, which is ONE FRAME at 12.5fps. A 0.3s open->closed burst
+# is therefore counted exactly like a lift that stood open and shut. The counts stay VISIBLE, as the
+# h2 travel figures did: era hygiene is labelling, not deletion. The caveat comes off when
+# tools/dwell_validation.py has graded a threshold against the frame-anchored hand truth.
+H3_CYCLE_CAVEAT = ("cycle counts under dwell validation — may include state chatter "
+                   "(no minimum dwell is applied; census 2026-08-13 found 41-64% of door-state "
+                   "flips lasting under 1s)")
 # One sentence, one place. Every surface that prints an h2-era travel figure prints this beside it.
 H2_SUPERSEDED_NOTE = ("SUPERSEDED — h2 edge-column instrument invalidated 2026-08-05: offline replay "
                       "against hand-timed video showed it detects ~62% of real closes and emitted 41 "
@@ -721,6 +730,7 @@ def _door_gpu_by_cam(db, gw, cams, t0=None, t1=None):
                 "instrument": "GPU door engine (gw_door_event) — h3 STATE-ONLY",
                 "n_rows": len(h3rows), "n_cycles": len(cyc_ts), "n": 0,
                 "travel_unmeasured": True, "travel_note": H3_TRAVEL_NOTE,
+                "cycles_provisional": True, "cycle_caveat": H3_CYCLE_CAVEAT,
                 "pool": "completed cycles (state transitions; travel not measured)",
                 "median": None, "p85": None, "min": None, "max": None,
                 "hist": None, "hist_edges": _HIST_EDGES,
@@ -2970,6 +2980,11 @@ function panel(d){
     +kv('range',(g.min==null?'—':g.min+'–'+g.max+'s'))
     +(sup?('<div class=mut style="font-size:11px;margin-top:6px;padding:4px 6px;border-left:3px solid #b06a00;background:rgba(176,106,0,.07)">'
            +esc(g.superseded_note||'')+'.</div>'):'')
+    // The cycle count is an ASSERTION built on state transitions, and the dwell threshold that would
+    // make it a safe one has not been graded against hand truth yet. Say so where it is read, not
+    // only in a release note — the same discipline the h2 travel figures get.
+    +(g.cycles_provisional?('<div class=mut style="font-size:11px;margin-top:6px;padding:4px 6px;border-left:3px solid #b06a00;background:rgba(176,106,0,.07)">'
+           +esc(g.cycle_caveat||'')+'.</div>'):'')
     +bars(g); }
   var door=(piDoor||gpuDoor)?(piDoor+(piDoor&&gpuDoor?'<hr style="border:none;border-top:1px solid var(--b);margin:8px 0">':'')+gpuDoor)
     : '<div class=blank>no door cycles recorded</div>';

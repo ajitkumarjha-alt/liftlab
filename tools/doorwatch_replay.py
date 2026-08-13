@@ -123,9 +123,11 @@ def replay_h3(cam, video, roi, skip_before, stride):
 
     tr = gpu_door.DoorTrackerH3()
     events = []
+    wire_states = []          # (t, wire door_state) per processed frame — what gw_door_event sees
     for k, f in enumerate(frames):
         t = (f - 1) / fps
         cyc = tr.update(t, float(state[k]))
+        wire_states.append((t, gpu_door.H3_STATE_TO_WIRE.get(getattr(tr, "state", None))))
         if cyc:
             ce = cyc["close_full"]
             events.append({"cam": cam, "ts": ce, "close_ts": ce,
@@ -136,7 +138,10 @@ def replay_h3(cam, video, roi, skip_before, stride):
             "openness_min": round(float(state.min()), 3),
             "openness_max": round(float(state.max()), 3),
             "openness_span": round(float(state.max() - state.min()), 3),
-            "n_template": len(tidx), "suppressed": tr.suppressed, "abandoned": tr.abandoned}
+            "n_template": len(tidx), "suppressed": tr.suppressed, "abandoned": tr.abandoned,
+            # The per-frame wire state, so a consumer can reconstruct exactly the gw_door_event
+            # stream this engine would have produced and test the CLAIM layer against hand truth.
+            "wire_states": wire_states}
     return events, diag
 
 
