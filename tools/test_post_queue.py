@@ -34,6 +34,8 @@ def main():
 
     c = q.drain_counters()
     print(f"dropped: {c['dropped']}")
+    print("\n=== analyzer_status starvation (ch29 18:39-08:00) ===")
+    fails += status_is_never_starved()
     if c["dropped"]["floorcheck"] == 0: fails.append("droppable overflow was not counted")
     if c["dropped"]["status"] != 9: fails.append(f"coalesce should count 9 replaced, got {c['dropped']['status']}")
     if c["dropped"]["critical"] != 12:
@@ -81,6 +83,62 @@ def main():
     print()
     print("FAIL: " + "; ".join(fails) if fails else "POST QUEUE: ALL ASSERTIONS PASS")
     return 1 if fails else 0
+
+
+def status_is_never_starved():
+    """ch29's analyzer_status stopped 18:39-08:00 while its door and transit lanes kept flowing.
+    The coalesce slot is the obvious suspect; this eliminates it.
+
+    Three properties, each of which would have to fail for the queue to be the cause:
+      * COALESCE is served ABOVE droppable, so a flood of floorchecks cannot starve it;
+      * a put() into the coalesce slot notifies the sender, so it never waits out the 1 s timeout;
+      * a send that RAISES is counted and the loop continues — one failing status cannot wedge the
+        thread that also carries door events.
+    """
+    import threading
+    import time as _t
+    fails, sent, gate = [], [], threading.Event()
+
+    def sender(url, payload, what=""):
+        gate.wait(timeout=5)
+        if payload.get("boom"):
+            raise RuntimeError("gateway said no")
+        sent.append(what)
+
+    q = PostQueue(sender, max_critical=8, max_droppable=4, log=lambda m: None)
+    # PRESSURE FIRST, sender blocked: 200 droppables against one status.
+    for i in range(200):
+        q.put("/fc", {"ts": i}, "floorcheck", cls=DROPPABLE)
+    q.put("/st", {"ts": 1}, "analyzer_status", cls=COALESCE, drop_key="analyzer_status")
+    for i in range(3):
+        q.put("/door", {"ts": i, "seq": i}, "door_event", cls=CRITICAL)
+    q.start(); gate.set()
+    for _ in range(50):
+        if "analyzer_status" in sent:
+            break
+        _t.sleep(0.05)
+    order = [w for w in sent]
+    print(f"  first three delivered under 200-deep droppable pressure: {order[:3]}")
+    if "analyzer_status" not in order:
+        fails.append("analyzer_status was never sent under droppable pressure — the coalesce slot "
+                     "CAN be starved, which would explain the 18:39-08:00 gap")
+    elif order.index("analyzer_status") > 3:
+        fails.append(f"analyzer_status waited behind {order.index('analyzer_status')} droppables")
+
+    # A FAILING STATUS MUST NOT WEDGE THE LANE THAT CARRIES DOOR EVENTS.
+    q.put("/st", {"ts": 2, "boom": True}, "analyzer_status", cls=COALESCE, drop_key="analyzer_status")
+    q.put("/door", {"ts": 99, "seq": 99}, "door_event", cls=CRITICAL)
+    for _ in range(50):
+        if sent.count("door_event") >= 4:
+            break
+        _t.sleep(0.05)
+    print(f"  after a status POST raised: door_event still delivered "
+          f"({sent.count('door_event')} total), queue failed={q.failed}")
+    if sent.count("door_event") < 4:
+        fails.append("a raising analyzer_status stopped the sender thread — door events would stop "
+                     "too, which is NOT what was observed, so this is not the mechanism either")
+    q.stop()
+    return fails
 
 
 if __name__ == "__main__":

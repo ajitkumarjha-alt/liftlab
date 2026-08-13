@@ -630,6 +630,10 @@ def _is_h3_era(era):
 
 
 H3_TRAVEL_NOTE = "h3: travel unmeasured by design"
+# One sentence, one place. Every surface that prints an h2-era travel figure prints this beside it.
+H2_SUPERSEDED_NOTE = ("SUPERSEDED — h2 edge-column instrument invalidated 2026-08-05: offline replay "
+                      "against hand-timed video showed it detects ~62% of real closes and emitted 41 "
+                      "phantom cycles inside verified door-CLOSED windows. Not a current measurement")
 UNCALIBRATED_NOTE = ("no door calibration on this camera — door cycles and close-travel are "
                      "UNAVAILABLE, not zero, until it is calibrated")
 H3_TRAVEL_REASON = (
@@ -1940,6 +1944,14 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
             door_gpu[_cam] = dg
         if t2 is not None:
             tier2[_cam] = t2
+    # INSTRUMENT INVALIDATION, ANNOTATED AT THE SOURCE. This used to be computed inside the
+    # headline loop, which `continue`s on any camera with no DOOR_SPECS entry — i.e. on every camera
+    # except ch29. So ch16's card printed "close median 1.47s · LIVE" from the same h2 edge-column
+    # tracker the compliance panel marks SUPERSEDED, with no caveat at all. The rule belongs on the
+    # data, where every consumer inherits it, rather than on one panel that happened to apply it.
+    for _cam, _g in door_gpu.items():
+        _g["superseded"] = (not _g.get("travel_unmeasured")) and (_g.get("n") or 0) > 0
+        _g["superseded_note"] = (H2_SUPERSEDED_NOTE if _g["superseded"] else None)
     pending_cams = sorted(c for c, m in agg_meta.items() if m.get("state") != "ok")
     agg_computed_at = [m["computed_at"] for m in agg_meta.values() if m.get("computed_at")]
     _budget_check("transit_by_cam")
@@ -2030,7 +2042,7 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
         # labelling, not deletion, and deleting them would hide that they were ever quoted — but they
         # must not read as current measurement. h3 rows carry travel_unmeasured instead and are not
         # superseded; they never made the claim.
-        superseded = (not g.get("travel_unmeasured")) and (g.get("n") or 0) > 0
+        superseded = g.get("superseded", False)   # annotated above, for every camera
         headline.append(dict(spec, cam=cam, median=g["median"], p85=g["p85"], n=g["n"],
                              instrument=("GPU door engine (gw_door_event) — h3 STATE-ONLY"
                                          if g.get("travel_unmeasured")
@@ -2039,8 +2051,7 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
                              travel_note=g.get("travel_note"),
                              n_reopens=g.get("n_reopens"),
                              superseded=superseded,
-                             superseded_note=("SUPERSEDED — instrument invalidated 2026-08-05, "
-                                              "see validation" if superseded else None),
+                             superseded_note=(g.get("superseded_note") if superseded else None),
                              era=g["era"], live=True, n_cycles=g["n_cycles"], reason=g.get("reason"),
                              measurement_suspect=g.get("measurement_suspect"),
                              n_impossible=g.get("n_impossible"), plausible_n=g.get("plausible_n"),
@@ -2718,6 +2729,10 @@ var GW="__GW__", cur=null, DATA=null;
 // DEEP LINK: /dash?cam=ch16 opens that camera's tab. Every wizard page breadcrumbs back here, and
 // "back to dash" that dumps you on a different camera is not a breadcrumb.
 (function(){var m=/[?&]cam=([A-Za-z0-9._-]+)/.exec(location.search); if(m)cur=m[1];})();
+// ?view=trends was WRITTEN by selectCam and read by nothing — a URL parameter the page emitted and
+// then ignored, so a shared link always landed on Cameras. Read here, applied once the first data
+// load has run (setMode needs the DOM nodes and the camera list).
+var WANT_VIEW=(/[?&]view=trends\b/.test(location.search))?'trends':'cams';
 function esc(s){return s==null?'':(''+s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
 function age(s){return s==null?'—':(s<90?Math.round(s)+'s':Math.round(s/60)+'m')+' ago'}
 function kv(k,v,c){return '<div class=kv><span class=mut>'+k+'</span><b class="'+(c||'')+'">'+v+'</b></div>'}
@@ -2942,10 +2957,19 @@ function panel(d){
   else if(g.n_cycles===0){ gpuDoor='<div class=mut style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">GPU engine · era '+esc((g.era||'').slice(0,8))+' · LIVE</div>'
     +kv('floor-read rows',esc(g.n_rows))
     +'<div class=blank style="color:#b06a00">'+esc(g.reason||'no completed open→close cycle')+'</div>'; }
-  else { gpuDoor='<div class=mut style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">GPU engine · era '+esc((g.era||'').slice(0,8))+' · LIVE</div>'
+  else {
+    // THE CAVEAT TRAVELS WITH THE NUMBER. The compliance panel marks h2-era travel SUPERSEDED; this
+    // card printed the same figure as "LIVE" with no caveat, because the rule lived in a loop that
+    // skipped every camera without a DOOR_SPECS entry — ch16 showed "1.47s · LIVE" from the very
+    // instrument the panel above declares invalidated. Reported 2026-08-13.
+    var sup=g.superseded;
+    gpuDoor='<div class=mut style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">GPU engine · era '+esc((g.era||'').slice(0,8))+(sup?' · <span class=warn>SUPERSEDED</span>':' · LIVE')+'</div>'
     +kv('close cycles',esc(g.n_cycles))
-    +kv('close median / p85',(g.median==null?'—':g.median+'s')+' / '+(g.p85==null?'—':g.p85+'s')+'  (n='+g.n+')')
+    +kv('close median / p85',(g.median==null?'—':g.median+'s')+' / '+(g.p85==null?'—':g.p85+'s')+'  (n='+g.n+')'
+        +(sup?' <span class=warn>· not a current measurement</span>':''))
     +kv('range',(g.min==null?'—':g.min+'–'+g.max+'s'))
+    +(sup?('<div class=mut style="font-size:11px;margin-top:6px;padding:4px 6px;border-left:3px solid #b06a00;background:rgba(176,106,0,.07)">'
+           +esc(g.superseded_note||'')+'.</div>'):'')
     +bars(g); }
   var door=(piDoor||gpuDoor)?(piDoor+(piDoor&&gpuDoor?'<hr style="border:none;border-top:1px solid var(--b);margin:8px 0">':'')+gpuDoor)
     : '<div class=blank>no door cycles recorded</div>';
@@ -3596,11 +3620,37 @@ function heatCard(){
     +(trReady&&TR.range&&TR.range.label?' · range: '+esc(TR.range.label):' · all history (range loading)')+'</div></div>';
 }
 function loadTrends(){
-  renderTrends();  // show selector immediately
-  fetch('/dash/'+GW+'/trends?'+trQuery()).then(function(r){return r.json()}).then(function(t){TR=t;renderTrends();}).catch(function(){});
+  // DISCARD A PAYLOAD THAT DESCRIBES ANOTHER CAMERA, BEFORE DRAWING ANYTHING.
+  //
+  // This rendered immediately "to show the selector" while TR still held the PREVIOUS camera's
+  // fetch, so between the click and the response the page drew ch27's summary line and range under
+  // ch16's heading, with ch16's per-floor panel beneath it (heatCard guards on TR.cam===trCam and
+  // falls back, the summary line did not guard at all). Reported 2026-08-13 on
+  // /dash?cam=ch16&view=trends. The selector variables were already unified by d8429b3 — they were
+  // never the disagreement; a cached payload was.
+  //
+  // An empty view that says "loading…" is honest. A populated view describing a different lift is
+  // not, and floors belong to one shaft, so it is not a cosmetic difference.
+  var want = trCam || 'fleet';
+  if (TR && (TR.cam || 'fleet') !== want) TR = null;
+  renderTrends();
+  var forCam = trCam;                                  // what THIS request is for
+  fetch('/dash/'+GW+'/trends?'+trQuery()).then(function(r){return r.json()}).then(function(t){
+    // A response that arrives after the selection moved on must be dropped, not drawn: two clicks
+    // in quick succession can resolve out of order, and the loser would overwrite the winner.
+    if (forCam !== trCam) return;
+    TR = t; renderTrends();
+  }).catch(function(){});
 }
 
-function render(){ if(!DATA)return; nav(); healthbar(DATA); strip(DATA); headline(DATA); unavail(DATA); if(mode==='cams'){tabs(DATA); panel(DATA);} }
+// tabs() seeds trCam from cur, and it only runs in the Cameras view — so a page that OPENS on
+// Trends (?view=trends) never seeded it at all. Seed it here instead, on every render, so the two
+// views cannot start out describing different lifts.
+function render(){ if(!DATA)return;
+  if(!cur){ cur=(DATA.cameras[0]&&DATA.cameras[0].cam)||''; }
+  if(cur && trCam !== cur){ trCam = cur; }
+  nav(); healthbar(DATA); strip(DATA); headline(DATA); unavail(DATA);
+  if(mode==='cams'){tabs(DATA); panel(DATA);} }
 
 /* ── DATA REFRESH: one in flight, bounded failures, backoff ────────────────────
    This was `load(); setInterval(load, 15000);` — a fixed timer with NO in-flight guard and no
@@ -3663,6 +3713,10 @@ function load(){
       var w=d.window||{}, wl=w.label?(' · '+w.label+(w.expensive?' ⚠ expensive':'')):'';
       document.getElementById('stamp').textContent='· '+d.ist_today+wl+' · updated '+new Date().toLocaleTimeString();
       render();
+      // Apply ?view=trends ONCE, after the first payload: setMode needs the camera list, and render()
+      // above has just seeded trCam from cur, so the trends fetch goes out for the camera in the URL
+      // rather than for whatever was selected last.
+      if(WANT_VIEW==='trends' && mode!=='trends'){ WANT_VIEW='cams'; setMode('trends'); }
       scheduleLoad(REFRESH_MS);
     })
     .catch(function(err){

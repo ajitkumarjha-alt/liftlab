@@ -61,17 +61,27 @@ eval(fs.readFileSync(process.argv[2], 'utf8'));
 const D = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
 const T = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
 const want = process.argv[6];
+const view = process.argv[7] || 'cams';       // which view the URL opens on
+const staleTR = process.argv[8] ? JSON.parse(fs.readFileSync(process.argv[8],'utf8')) : null;
+global.window.location.search = '?cam=' + (want||'ch32') + (view==='trends' ? '&view=trends' : '');
 GW='site-A'; DATA=D; TR=T;
 el('healthbar'); el('strip'); el('tabs'); el('panel'); el('trendview'); el('headline'); el('unavail');
 // Drive it the way the page does: tabs() defaults the selection, then a click selects.
 tabs(D);
 const afterDefault = {cur: cur, trCam: trCam};
 if (want) { selectCam(want, {noTrends:true}); }
-mode='trends'; TR=T; renderTrends();
+// STALE-PAYLOAD CASE: plant a payload describing ANOTHER camera, exactly as a cached TR would be
+// after switching lifts, then drive the real loadTrends() and see what the page draws before the
+// response arrives (fetch never resolves in this harness — that IS the window under test).
+if (staleTR) { TR = staleTR; mode='trends'; loadTrends(); }
+else { mode='trends'; TR=T; renderTrends(); }
+const midFlight = els['trendview'].innerHTML;
+if (!staleTR) { renderTrends(); }
 panel(D);
 fs.writeFileSync(process.argv[5], JSON.stringify({
   panel: els['panel'].innerHTML, trend: els['trendview'].innerHTML,
-  tabs: els['tabs'].innerHTML, cur: cur, trCam: trCam,
+  tabs: els['tabs'].innerHTML, cur: cur, trCam: trCam, mode: mode,
+  midFlight: midFlight, trCamAfter: trCam,
   afterDefault: afterDefault, urls: urls, fetches: fetches,
 }));
 """
@@ -158,7 +168,7 @@ CREATE TABLE health_status (id INTEGER PRIMARY KEY, gateway_id TEXT, ts REAL, ok
     con.close()
 
 
-def render(tmp, D, data, trends, select=None):
+def render(tmp, D, data, trends, select=None, view="cams", stale=None):
     node = shutil.which("node")
     if not node:
         return None
@@ -170,8 +180,13 @@ def render(tmp, D, data, trends, select=None):
     open(p["h.js"], "w").write(HARNESS_JS)
     json.dump(data, open(p["data.json"], "w"))
     json.dump(trends, open(p["tr.json"], "w"))
-    r = subprocess.run([node, p["h.js"], p["d.js"], p["data.json"], p["tr.json"], p["out.json"],
-                        select or ""], capture_output=True, text=True)
+    argv = [node, p["h.js"], p["d.js"], p["data.json"], p["tr.json"], p["out.json"],
+            select or "", view]
+    if stale is not None:
+        sp = os.path.join(tmp, "stale.json")
+        json.dump(stale, open(sp, "w"))
+        argv.append(sp)
+    r = subprocess.run(argv, capture_output=True, text=True)
     if r.returncode != 0:
         print("  node failed:", (r.stderr or "").strip().splitlines()[:3])
         raise SystemExit(1)
@@ -316,6 +331,70 @@ def main():
         fails.append("an uncalibrated camera still shows 'cycles/hr 0' as if the lift were idle")
     if "2.31 Bank C" in sel["trend"]:
         fails.append("the Bank C compliance line is still drawn on an uncalibrated camera")
+
+    print("\n=== 7. SELECTOR ON BOTH VIEWS, and a stale payload must never render ===")
+    # /dash?cam=ch16&view=trends drew ch27's summary line with ch16's per-floor panel beneath it.
+    # The selector VARIABLES were already unified — they were never the disagreement. Two other
+    # things were: ?view=trends was written by selectCam and read by nothing, and loadTrends()
+    # rendered immediately while TR still held the previous camera's fetch.
+    tr16 = D.dash_trends("site-A", cam="ch29", period="all").payload      # the "previous" camera
+    for view in ("cams", "trends"):
+        o = render(tmp, D, data, tr27, select="ch27", view=view)
+        print(f"  view={view:6s} cur={o['cur']} trCam={o['trCam']} mode={o['mode']} "
+              f"urls={o['urls'][-1:] }")
+        if o["cur"] != "ch27" or o["trCam"] != "ch27":
+            fails.append(f"view={view}: selectors disagree — cur={o['cur']} trCam={o['trCam']}")
+        tab_on = re.findall(r'<div class="tab on"[^>]*>(?:<span[^>]*></span>)?(ch\d+)', o["tabs"])
+        if view == "cams" and tab_on != ["ch27"]:
+            fails.append(f"view={view}: tab highlight disagrees: {tab_on}")
+        if o["urls"] and "cam=ch27" not in o["urls"][-1]:
+            fails.append(f"view={view}: URL does not follow the selection: {o['urls'][-1]}")
+        # the summary line names the camera the payload is FOR
+        m = re.search(r'font-size:12px;margin:2px 0 6px">([a-z0-9]+) ·', o["trend"])
+        print(f"    summary line names: {m.group(1) if m else '??'}")
+        if m and m.group(1) != "ch27":
+            fails.append(f"view={view}: the summary line names {m.group(1)}, not the selection")
+
+    src_js = D.dash_page()
+    if "WANT_VIEW" not in src_js:
+        fails.append("?view=trends is still written by selectCam and read by nothing")
+    if "if(WANT_VIEW==='trends' && mode!=='trends')" not in src_js:
+        fails.append("?view=trends is parsed but never applied after the first data load")
+
+    print("  mid-flight, with a stale ch29 payload cached and ch27 selected:")
+    o = render(tmp, D, data, tr27, select="ch27", view="trends", stale=tr16)
+    mid = o["midFlight"]
+    m = re.search(r'font-size:12px;margin:2px 0 6px">([a-z0-9]+) ·', mid)
+    print(f"    summary line mid-flight: {m.group(1) if m else '(none — loading)'}")
+    if m and m.group(1) != "ch27":
+        fails.append(f"a stale payload rendered under the new selection: the summary line said "
+                     f"{m.group(1)} while ch27 was selected — this is the reported regression")
+    if "loading" not in mid and not m:
+        fails.append("mid-flight the trends view shows neither the right camera nor 'loading'")
+    if "ch29" in mid and "ch27" not in mid:
+        fails.append("mid-flight the view is describing ch29 while ch27 is selected")
+
+    print("\n=== 8. h2-era travel carries its invalidation ON THE CAMERA CARD, not just the panel ===")
+    # ch16 showed "close median 1.47s · LIVE" from the h2 edge-column instrument the compliance
+    # panel marks SUPERSEDED. The rule lived in a loop that skipped every camera without a
+    # DOOR_SPECS entry, so it reached exactly one camera.
+    h2 = dict(data)
+    h2["door_gpu"] = {"ch16": {"era": "aa11bb22", "n_cycles": 40, "n": 40, "median": 1.47,
+                               "p85": 1.9, "min": 1.1, "max": 2.4, "hist": [1, 2, 3],
+                               "hist_edges": [0, 1, 2, 3], "superseded": True,
+                               "superseded_note": D.H2_SUPERSEDED_NOTE}}
+    h2["cameras"] = [dict(c, cam="ch16") if c["cam"] == "ch32" else c for c in data["cameras"]]
+    o = render(tmp, D, h2, tr27, select="ch16", view="cams")
+    pan = o["panel"]
+    for needle, why in (("SUPERSEDED", "the card must mark the era superseded"),
+                        ("not a current measurement", "the number must be caveated inline"),
+                        ("invalidated 2026-08-05", "the card must name the invalidation")):
+        ok = needle in pan
+        print(f"  {'printed' if ok else 'NOT PRINTED'} — {needle}")
+        if not ok:
+            fails.append(f"{why} ({needle!r} absent from the camera card)")
+    if re.search(r"era aa11bb22 · LIVE", pan):
+        fails.append("the card still labels a superseded h2 era as LIVE")
 
     print()
     if fails:
