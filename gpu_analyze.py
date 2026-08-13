@@ -967,15 +967,22 @@ def main():
             if _PQ is not None:
                 if _PQ.ensure_alive(log=log):
                     _st_payload["queue_revived"] = _PQ.revived
-                _q_stall = _PQ.stalled_for()
-                _st_payload["queue_stalled_s"] = round(_q_stall, 1)
+                # TWO different silences, and the ch29 incident was the second one.
+                #   stalled_for()   — nothing at all is being delivered (dead/wedged sender)
+                #   slot_waiting_s() — plenty is being delivered, just not THIS lane
+                # The first fix shipped only measured the former, so it could never have fired here:
+                # door events kept last_sent_ts fresh all night while the status lane starved.
+                _q_stall = max(_PQ.stalled_for(), _PQ.slot_waiting_s())
+                _st_payload["queue_stalled_s"] = round(_PQ.stalled_for(), 1)
+                _st_payload["queue_slot_wait_s"] = round(_PQ.slot_waiting_s(), 1)
                 _st_payload["queue_depth"] = list(_PQ.depth())
             if _PQ is not None and _q_stall < QUEUE_STALL_DIRECT_S:
                 _PQ.put(f"{CLOUD}/api/gw/{GW}/analyzer_status", _st_payload, "analyzer_status",
                         cls=_pq_mod.COALESCE, drop_key="analyzer_status")
             else:
                 if _PQ is not None:
-                    log(f"POST QUEUE STALLED {_q_stall:.0f}s with {_PQ.depth()} queued — posting "
+                    log(f"POST QUEUE STARVING THE STATUS LANE: stalled={_PQ.stalled_for():.0f}s "
+                        f"slot_wait={_PQ.slot_waiting_s():.0f}s depth={_PQ.depth()} — posting "
                         f"analyzer_status DIRECTLY so liveness does not depend on the queue")
                 http_post_json(f"{CLOUD}/api/gw/{GW}/analyzer_status", _st_payload,
                                what="analyzer_status")

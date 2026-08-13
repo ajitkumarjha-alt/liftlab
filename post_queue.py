@@ -60,12 +60,17 @@ class PostQueue:
     a network: the worker passes its existing http_post_json.
     """
 
-    def __init__(self, sender, send_cap_s=120.0, max_critical=512, max_droppable=128, log=print):
+    def __init__(self, sender, send_cap_s=120.0, coalesce_max_wait_s=60.0, max_critical=512, max_droppable=128, log=print):
         self._sender = sender
         self._log = log
         self._crit = deque()
         self._drop = deque()
         self._coalesced = {}                 # what -> (url, payload); newest only
+        self._coalesced_at = {}              # what -> when this lane was first filled and unserved
+        # The coalesce lane may not go unserved longer than this even under sustained CRITICAL
+        # pressure. 60s is two heartbeats: long enough that normal operation is unchanged, short
+        # enough that the fleet never loses sight of a busy worker.
+        self.coalesce_max_wait_s = float(coalesce_max_wait_s)
         self.last_sent_ts = None             # for stalled_for(): a stuck sender vs a quiet one
         self._started_ts = time.time()
         self.revived = 0                     # times the sender thread had to be restarted
@@ -92,6 +97,8 @@ class PostQueue:
                 key = drop_key or what
                 if key in self._coalesced:
                     self.dropped["status" if "status" in what else "other"] += 1
+                else:
+                    self._coalesced_at[key] = time.time()   # first unserved fill; see slot_waiting_s
                 self._coalesced[key] = (url, payload, what)
             elif cls == CRITICAL:
                 if len(self._crit) >= self._max_crit:
@@ -114,16 +121,46 @@ class PostQueue:
 
     # ---- consumer side ----
     def _next(self):
-        """CRITICAL first, then coalesced, then droppable. Starving droppable under sustained
-        pressure is correct: the rows that change derived counts go first."""
+        """CRITICAL first, then coalesced, then droppable — EXCEPT that the coalesce slot has a
+        guaranteed maximum wait.
+
+        THE ch29 INCIDENT, 2026-08-12 18:39 -> 05:00. Strict priority means the slot is reached only
+        when `self._crit` is EMPTY at the instant _next() runs. ch29 emitted 1196-5505 door events an
+        hour all night — every one of them CRITICAL — and once the arrival rate crossed the drain
+        rate, `_crit` stopped emptying. From that moment the slot was never served again: analyzer_status
+        stopped dead while door events flowed perfectly, one healthy thread, no exception, no log
+        line, nothing to find. It could not recover on its own and it did not.
+        
+        Starving DROPPABLE under sustained pressure is still correct — those rows are expendable by
+        definition. Starving the COALESCE lane is not, because that lane carries the liveness signal,
+        and a liveness signal that yields to load is silent exactly when the box is busiest.
+
+        So the slot keeps its low priority until it has waited `coalesce_max_wait_s`, and then it
+        goes first. Under normal load nothing changes: the slot is served in the gaps, as before.
+        """
+        if self._coalesced and self.slot_waiting_s() >= self.coalesce_max_wait_s:
+            _k = next(iter(self._coalesced))
+            self._coalesced_at.pop(_k, None)
+            return self._coalesced.pop(_k)
         if self._crit:
             return self._crit.popleft()
         if self._coalesced:
             _k = next(iter(self._coalesced))
+            self._coalesced_at.pop(_k, None)
             return self._coalesced.pop(_k)
         if self._drop:
             return self._drop.popleft()
         return None
+
+    def slot_waiting_s(self):
+        """How long the coalesce lane has gone UNSERVED. 0.0 when the slot is empty.
+
+        Timed from the FIRST fill that has not yet been served, not from the newest payload: the
+        question is how long this lane has been silent, and replacing the payload every 30s does not
+        make the silence any shorter."""
+        if not self._coalesced_at:
+            return 0.0
+        return time.time() - min(self._coalesced_at.values())
 
     def _run(self):
         while True:

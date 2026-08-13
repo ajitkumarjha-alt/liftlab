@@ -144,6 +144,44 @@ def queue_supervision():
         fails.append("the replacement sender does not drain the queue")
     wq.stop()
 
+    print("  THE ch29 INCIDENT: sustained CRITICAL pressure must not starve the slot forever:")
+    # Door events flowed at 1196-5505/hr all night while analyzer_status stopped dead. Strict
+    # priority reaches the slot only when _crit is EMPTY at that instant; once arrivals crossed the
+    # drain rate, that never happened again. One healthy thread, no exception, no log line.
+    got, stop_flood = [], threading.Event()
+    fq = PostQueue(lambda url, payload, what="": (time.sleep(0.05), got.append(what))[1],
+                   coalesce_max_wait_s=1.0, log=lambda m: None).start()
+
+    def flood():
+        i = 0
+        while not stop_flood.is_set():
+            fq.put("/d", {"i": i}, "door_event", cls=CRITICAL)
+            i += 1
+            time.sleep(0.02)                       # 50/s in, ~20/s out: _crit never empties
+
+    threading.Thread(target=flood, daemon=True).start()
+    time.sleep(0.3)
+    fq.put("/s", {"i": 0}, "analyzer_status", cls=COALESCE, drop_key="analyzer_status")
+    time.sleep(2.5)
+    stop_flood.set(); time.sleep(0.2)
+    n_door, n_status = got.count("door_event"), got.count("analyzer_status")
+    print(f"    2.5s of flood: door_event={n_door}  analyzer_status={n_status}")
+    if n_door < 20:
+        fails.append("fixture error: the flood did not saturate the critical lane")
+    if n_status < 1:
+        fails.append("the coalesce lane is STILL starved under sustained critical pressure — this "
+                     "is the ch29 incident: door events flow, status never sends, nothing is logged")
+    # and the starvation must be VISIBLE, not merely survivable
+    fq.put("/s", {"i": 1}, "analyzer_status", cls=COALESCE, drop_key="analyzer_status")
+    fq._coalesced_at["analyzer_status"] = time.time() - 45
+    print(f"    slot_waiting_s() after 45s unserved: {fq.slot_waiting_s():.0f}s")
+    if fq.slot_waiting_s() < 40:
+        fails.append("slot_waiting_s does not report how long the lane has been unserved")
+    empty = PostQueue(lambda *a, **k: None, log=lambda m: None)
+    if empty.slot_waiting_s() != 0.0:
+        fails.append("an empty slot reports a wait — the fallback would fire on an idle worker")
+    fq.stop()
+
     print("  stalled_for() separates a STUCK queue from a QUIET one:")
     idle = PostQueue(lambda *a, **k: None, log=lambda m: None)
     print(f"    empty queue, never sent: stalled_for={idle.stalled_for():.1f}s")
@@ -168,12 +206,16 @@ def liveness_does_not_ride_the_queue():
     fails = []
     for needle, why in (
             ("_PQ.ensure_alive(log=log)", "the heartbeat must ask whether the sender is alive"),
-            ("_q_stall = _PQ.stalled_for()", "it must measure whether the queue is draining"),
+            ("_q_stall = max(_PQ.stalled_for(), _PQ.slot_waiting_s())",
+             "the fallback must trigger on a STARVED LANE, not only on a dead queue — door events "
+             "kept last_sent_ts fresh all night while status starved"),
             ("if _PQ is not None and _q_stall < QUEUE_STALL_DIRECT_S:",
              "a stalled queue must not carry the signal that would report it"),
             ("posting\\n                        f\"analyzer_status DIRECTLY", "")):
         if needle and needle.replace("\\n", "\n") not in src and why:
             fails.append(f"{why} ({needle!r} absent)")
+    if "queue_slot_wait_s" not in src:
+        fails.append("the status lane's wait is not reported to the gateway")
     if "queue_stalled_s" not in src:
         fails.append("queue health is not reported to the gateway, so /ops cannot see it")
     print("  heartbeat supervises the queue, reports its depth, and posts directly when it stalls")
