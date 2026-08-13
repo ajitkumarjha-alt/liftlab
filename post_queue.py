@@ -60,7 +60,7 @@ class PostQueue:
     a network: the worker passes its existing http_post_json.
     """
 
-    def __init__(self, sender, max_critical=512, max_droppable=128, log=print):
+    def __init__(self, sender, send_cap_s=120.0, max_critical=512, max_droppable=128, log=print):
         self._sender = sender
         self._log = log
         self._crit = deque()
@@ -69,6 +69,11 @@ class PostQueue:
         self.last_sent_ts = None             # for stalled_for(): a stuck sender vs a quiet one
         self._started_ts = time.time()
         self.revived = 0                     # times the sender thread had to be restarted
+        self._send_started_ts = None         # when the CURRENT send began; None between sends
+        self._send_what = None
+        # A single send may not hold the queue longer than this before it is abandoned. 120s is well
+        # past any healthy POST (the slow-log fires at 2s) and well short of a shift.
+        self.send_cap_s = float(send_cap_s)
         self._max_crit = max_critical
         self._max_drop = max_droppable
         self._cv = threading.Condition()
@@ -131,6 +136,14 @@ class PostQueue:
             if item is None:
                 continue
             url, payload, what = item
+            # SEND IN FLIGHT, timestamped. urllib's timeout is per socket OPERATION, not per call: a
+            # gateway that trickles bytes, or a half-open connection a NAT dropped, can hold one POST
+            # open indefinitely without ever tripping it. A blocked sender and a dead sender look
+            # IDENTICAL from outside — queue accepts, depth grows, nothing is delivered, nothing is
+            # logged — and neither can recover on its own, which is why ch29 stayed silent for ten
+            # hours rather than for ten seconds.
+            self._send_started_ts = time.time()
+            self._send_what = what
             try:
                 self._sender(url, payload, what=what)
                 self.sent += 1
@@ -147,6 +160,8 @@ class PostQueue:
                     self._log(f"POST {what} failed: {type(e).__name__}: {str(e)[:120]}")
                 except BaseException:
                     pass                              # logging must never be the thing that kills it
+            finally:
+                self._send_started_ts = None
 
     def start(self):
         if self._t is None or not self._t.is_alive():
@@ -157,6 +172,12 @@ class PostQueue:
     def alive(self):
         return bool(self._t and self._t.is_alive())
 
+    def stuck_in_send_s(self):
+        """Seconds the CURRENT send has been in flight, 0.0 if none. A thread can be alive and
+        useless — is_alive() is not liveness, it is only existence."""
+        t0 = self._send_started_ts
+        return (time.time() - t0) if t0 else 0.0
+
     def ensure_alive(self, log=None):
         """Restart the sender if it died. -> True if it had to be revived.
 
@@ -164,8 +185,19 @@ class PostQueue:
         succeeds, depth still grows, and every caller believes it posted. The only way to notice is
         to ask, so somebody has to ask — the worker's heartbeat does, once per beat.
         """
-        if self.alive():
+        stuck = self.stuck_in_send_s()
+        if self.alive() and stuck < self.send_cap_s:
             return False
+        if self.alive():
+            # ALIVE BUT WEDGED. Abandon it: the thread is blocked in a socket read that no timeout is
+            # going to end, and it holds no lock while it waits, so a fresh sender can take over the
+            # queue immediately. The abandoned thread is a daemon and dies with the process — one
+            # leaked thread per wedge is a far better outcome than a queue that never delivers again.
+            self._log(f"POST QUEUE SENDER WEDGED IN A SEND for {stuck:.0f}s "
+                      f"({self._send_what!r}) — abandoning that thread and starting a fresh sender. "
+                      f"urllib's timeout is per socket operation, so a trickling or half-open "
+                      f"connection can hold one POST open indefinitely.")
+            self._send_started_ts = None
         self.revived += 1
         (log or self._log)(f"POST QUEUE SENDER WAS DEAD — restarting it (revival #{self.revived}, "
                            f"depth={self.depth()}, sent={self.sent} failed={self.failed}). Every "

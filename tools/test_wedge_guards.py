@@ -112,6 +112,38 @@ def queue_supervision():
     if len(sent) < 3:
         fails.append("the revived sender does not deliver")
 
+    print("  a sender ALIVE BUT WEDGED IN A SEND is abandoned and replaced:")
+    # THE CASE `is_alive()` CANNOT SEE. urllib's timeout is per socket operation, so a gateway that
+    # trickles bytes holds one POST open forever without raising. The thread stays alive, the queue
+    # accepts, depth grows, nothing is delivered and nothing is logged — indistinguishable from a
+    # dead sender, and equally unrecoverable. Ten hours of ch29 silence rather than ten seconds.
+    hang = threading.Event()
+    delivered = []
+    wq = PostQueue(lambda url, payload, what="": (hang.wait(timeout=30), delivered.append(what))[1],
+                   send_cap_s=0.5, log=logs.append).start()
+    wq.put("/x", {"n": 1}, "door_event", cls=CRITICAL)
+    time.sleep(0.9)
+    print(f"    alive={wq.alive()} stuck_in_send={wq.stuck_in_send_s():.1f}s delivered={delivered}")
+    if not wq.alive():
+        fails.append("fixture error: the wedged sender thread should still be alive")
+    if wq.stuck_in_send_s() < 0.5:
+        fails.append("a send in flight is not being timed, so a wedge cannot be detected")
+    if wq.ensure_alive() is not True:
+        fails.append("a sender wedged in a send was reported healthy — is_alive() is existence, "
+                     "not liveness, and this is the shape that stayed silent for ten hours")
+    if not any("WEDGED IN A SEND" in m for m in logs):
+        fails.append("the wedge was not logged")
+    wq.put("/x", {"n": 2}, "analyzer_status", cls=COALESCE, drop_key="analyzer_status")
+    hang.set()
+    for _ in range(60):
+        if "analyzer_status" in delivered:
+            break
+        time.sleep(0.05)
+    print(f"    after replacement, delivered={delivered}")
+    if "analyzer_status" not in delivered:
+        fails.append("the replacement sender does not drain the queue")
+    wq.stop()
+
     print("  stalled_for() separates a STUCK queue from a QUIET one:")
     idle = PostQueue(lambda *a, **k: None, log=lambda m: None)
     print(f"    empty queue, never sent: stalled_for={idle.stalled_for():.1f}s")
