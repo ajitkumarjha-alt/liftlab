@@ -62,24 +62,38 @@ def cycle_ts(rows, min_dwell_s=0.0):
     return out
 
 
-def grade(claimed_ts, truth, fps, tol=5.0):
-    """-> (matched, missed, false). One truth close may match at most one claim."""
+def grade(claimed_ts, truth, phantoms, fps, tol=5.0):
+    """-> (matched, missed, phantom, unmatched). One truth close matches at most one claim.
+
+    THE DISTINCTION THIS HARNESS GOT WRONG FIRST TIME, and it is the whole difference between a
+    finding and a libel. My first version counted every unmatched claim as FALSE. The truth CSV is
+    NOT exhaustive: it lists closes somebody hand-timed — 13 of them across 47 minutes of ch27 — so
+    a claim at a moment nobody timed is UNKNOWN, not false. Reporting 38 "false cycles" on that
+    basis would have been exactly the class of error this project keeps catching in other people's
+    numbers.
+
+    Only phantom_periods can convict: those are windows verified door-CLOSED, so a claimed cycle
+    inside one is provably not a cycle. doorwatch_replay.score() has always drawn this line; I
+    dropped it and had to be shown the consequence.
+    """
     tr = sorted((row["end_f"] - 1) / fps for row in truth)
-    used, matched, false = set(), 0, 0
+    used, matched, phantom, unmatched = set(), 0, 0, 0
     for c in sorted(claimed_ts):
         hit = None
         for k, t in enumerate(tr):
-            if k in used:
-                continue
-            if abs(t - c) <= tol:
+            if k not in used and abs(t - c) <= tol:
                 hit = k
                 break
-        if hit is None:
-            false += 1
-        else:
+        if hit is not None:
             used.add(hit)
             matched += 1
-    return matched, len(tr) - len(used), false
+            continue
+        cf = c * fps
+        if any(p["start_f"] <= cf <= p["end_f"] for p in phantoms):
+            phantom += 1                       # inside a verified door-CLOSED window: provably false
+        else:
+            unmatched += 1                     # nobody timed this moment; unknown, not false
+    return matched, len(tr) - len(used), phantom, unmatched
 
 
 def main():
@@ -88,6 +102,7 @@ def main():
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--tol", type=float, default=5.0)
     ap.add_argument("--truth", default="tools/groundtruth_20260805.csv")
+    ap.add_argument("--phantoms", default="tools/phantom_periods_20260805.csv")
     a = ap.parse_args()
     cams = a.cam or sorted(CORPUS)
 
@@ -104,28 +119,34 @@ def main():
             print(f"=== {cam}: SKIPPED — {video} not present ===\n")
             continue
         truth = dr.load_truth(a.truth, cam)
+        phantoms = dr.load_phantom(a.phantoms, cam)
         ev, diag = dr.replay_h3(cam, video, list(spec["roi"]), 0.0, a.stride)
         rows = emitted_rows(diag["wire_states"])
         fps = diag["fps"]
         print(f"=== {cam} — {os.path.basename(video)} @ {fps}fps, stride {a.stride} ===")
         print(f"  hand-timed real closes: {len(truth)}   engine cycle EVENTS (tracker): {len(ev)}")
         print(f"  gw_door_event rows the emit gate would write (door_state only): {len(rows)}")
-        print(f"  {'dwell':>6} {'claimed':>8} {'matched':>8} {'missed':>7} {'FALSE':>6}  verdict")
+        print(f"  {'dwell':>6} {'claimed':>8} {'matched':>8} {'missed':>7} {'PHANTOM':>8} {'unmatch':>8}  verdict")
         best = None
         for d in (0.0, 1.0, 2.0, 3.0):
             cts = cycle_ts(rows, d)
-            m, miss, fa = grade(cts, truth, fps, a.tol)
+            m, miss, ph, un = grade(cts, truth, phantoms, fps, a.tol)
             flag = ""
-            if best is None and fa == 0:
+            # A THRESHOLD ONLY QUALIFIES IF IT STILL FINDS THE TRUTH. "Zero phantoms" with zero
+            # matches is silence, not accuracy — my first summary rule picked 3.0s for ch30 on
+            # exactly that basis, where it claimed nothing at all and missed all 8 real closes.
+            if best is None and ph == 0 and miss == 0:
                 best = d
-                flag = "  <- first threshold with NO false cycles"
-            print(f"  {d:>5.1f}s {len(cts):>8} {m:>8} {miss:>7} {fa:>6}{flag}")
+                flag = "  <- no phantoms AND no missed closes"
+            print(f"  {d:>5.1f}s {len(cts):>8} {m:>8} {miss:>7} {ph:>8} {un:>8}{flag}")
         verdict[cam] = best
         print()
     print("SUMMARY")
     for cam, b in verdict.items():
-        print(f"  {cam}: lowest dwell with zero false cycles = "
-              + (f"{b:.1f}s" if b is not None else "NONE of 0/1/2/3s eliminated them"))
+        print(f"  {cam}: lowest dwell with no phantoms AND no missed closes = "
+              + (f"{b:.1f}s" if b is not None else "NONE of 0/1/2/3s"))
+    print("\n  UNMATCHED is not FALSE. The truth CSV lists hand-timed closes, not every close that")
+    print("  happened; only phantom_periods (verified door-CLOSED) can convict a claim.")
     print("\nThe threshold the truth supports goes into _h3_cycle_ts — the CLAIM layer. The raw")
     print("gw_door_event stream stays lossless; a row is evidence, a cycle is an assertion.")
     return 0

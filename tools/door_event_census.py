@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import time
 import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -38,7 +39,15 @@ def _ts(s):
 
 
 def busiest_hour(db, cam, t0, t1):
-    """The hour with the most rows — the census should describe the worst case, not an average."""
+    """The hour with the most rows in [t0,t1) — the census should describe the worst case.
+
+    BOUND THE SEARCH, ALWAYS. Unbounded, "busiest hour ever" picks whichever ERA was busiest, and
+    for a camera that has run two engines that is silently the older one. Caught 2026-08-13 by the
+    operator, from the census's own output: ch16/ch27/ch30's windows carried close_travel_s rows,
+    which h3 never emits — so a table headed as a cross-camera comparison was comparing h2 against
+    ch29's h3. The tool reported the era on every line, which is the only reason it was catchable;
+    it should not have needed catching.
+    """
     rows = db.execute(
         "SELECT CAST(ts/3600 AS INT) h, COUNT(*) n FROM gw_door_event "
         "WHERE cam=? AND ts>=? AND ts<? GROUP BY h ORDER BY n DESC LIMIT 1", (cam, t0, t1)).fetchone()
@@ -214,33 +223,61 @@ def main():
     ap.add_argument("--cam", action="append")
     ap.add_argument("--all-cams", action="store_true")
     ap.add_argument("--hours", type=float, default=1.0)
+    ap.add_argument("--recent-hours", type=float, default=0.0,
+                    help="search only the last N hours — the way to keep every camera's window in "
+                         "the SAME era. Unbounded picks whichever era was busiest, silently.")
+    ap.add_argument("--busiest-within", action="store_true",
+                    help="with --from/--to, still pick the busiest HOUR inside that range")
     ap.add_argument("--from", dest="frm")
     ap.add_argument("--to", dest="to")
     a = ap.parse_args()
     db = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
 
+    seen = []
     cams = a.cam or []
     if a.all_cams or not cams:
         cams = [r[0] for r in db.execute("SELECT DISTINCT cam FROM gw_door_event ORDER BY cam")]
 
     print("gw_door_event CENSUS — every row is a (floor,direction,door_state) change or a cycle.")
     for cam in cams:
-        if a.frm:
+        if a.frm and not a.busiest_within:
             t0, t1 = _ts(a.frm), _ts(a.to) if a.to else _ts(a.frm) + a.hours * 3600
         else:
-            span = db.execute("SELECT MIN(ts), MAX(ts) FROM gw_door_event WHERE cam=?",
-                              (cam,)).fetchone()
-            if not span or span[0] is None:
-                print(f"\n=== {cam} — no rows at all ===")
-                continue
-            bh = busiest_hour(db, cam, span[0], span[1])
+            if a.frm:
+                lo, hi = _ts(a.frm), (_ts(a.to) if a.to else time.time())
+            elif a.recent_hours:
+                hi = time.time(); lo = hi - a.recent_hours * 3600
+            else:
+                span = db.execute("SELECT MIN(ts), MAX(ts) FROM gw_door_event WHERE cam=?",
+                                  (cam,)).fetchone()
+                if not span or span[0] is None:
+                    print(f"\n=== {cam} — no rows at all ===")
+                    continue
+                lo, hi = span
+            bh = busiest_hour(db, cam, lo, hi)
             if bh is None:
+                print(f"\n=== {cam} — no rows in the selected range ===")
                 continue
             t0, t1, _n = bh
-        report(census(db, cam, t0, t1), db)
-    print("\nWindow chosen: busiest hour per camera unless --from/--to given "
-          "(a census of the average hour would describe a problem nobody has).")
+        c = census(db, cam, t0, t1)
+        report(c, db)
+        seen.append(c)
+    # ERA CONSISTENCY. A cross-camera table whose rows come from different engines is not a
+    # comparison, and nothing but this check stops one being read as one.
+    engines = {c["engine"] for c in seen if c.get("n")}
+    if len(engines) > 1:
+        print("\n  *** WINDOWS SPAN DIFFERENT ENGINES: " + ", ".join(sorted(engines)) + " ***")
+        for c in seen:
+            if c.get("n"):
+                print(f"      {c['cam']:6s} {c['engine']:9s} "
+                      f"{datetime.fromtimestamp(c['t0'], IST):%Y-%m-%d %H:%M} IST")
+        print("      These rows are NOT comparable. h2 and h3 classify door_state by different")
+        print("      methods, so a rate or a dwell from one says nothing about the other. Re-run")
+        print("      with --recent-hours 24 (or --from/--to --busiest-within) so every window is")
+        print("      drawn from the same era.")
     return 0
+    print("\nWindow: busiest hour per camera within the selected range (a census of the average "
+          "hour would describe a problem nobody has).")
 
 
 if __name__ == "__main__":
