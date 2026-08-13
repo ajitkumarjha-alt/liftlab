@@ -630,15 +630,31 @@ def _is_h3_era(era):
 
 
 H3_TRAVEL_NOTE = "h3: travel unmeasured by design"
-# CYCLE COUNTS ARE UNDER VALIDATION (2026-08-13). _h3_cycle_ts counts a cycle on every transition
-# into 'closed' with NO dwell test, and the gw_door_event census measured 41-64% of door_state flips
-# lasting under one second — p10 of 0.08s, which is ONE FRAME at 12.5fps. A 0.3s open->closed burst
-# is therefore counted exactly like a lift that stood open and shut. The counts stay VISIBLE, as the
-# h2 travel figures did: era hygiene is labelling, not deletion. The caveat comes off when
-# tools/dwell_validation.py has graded a threshold against the frame-anchored hand truth.
-H3_CYCLE_CAVEAT = ("cycle counts under dwell validation — may include state chatter "
-                   "(no minimum dwell is applied; census 2026-08-13 found 41-64% of door-state "
-                   "flips lasting under 1s)")
+# DWELL VALIDATION: RUN, AND IT REFUTED THE PROPOSED FIX (2026-08-13).
+#
+# The census found 41-64% of door_state flips lasting under a second, and the obvious remedy was a
+# minimum dwell before a transition into 'closed' counts as a cycle. tools/dwell_validation.py
+# graded exactly that against the frame-anchored hand truth, replaying the real h3 tracker over
+# ch27_clean and ch30_peak and running _h3_cycle_ts verbatim at 0/1/2/3s:
+#
+#   ch27  13 hand-timed closes:  dwell 0 -> 13 matched, 0 missed, 0 PHANTOM, 38 unmatched
+#                                dwell 1 -> 11 matched, 2 MISSED       dwell 3 -> 5 matched, 8 MISSED
+#   ch30   8 hand-timed closes:  dwell 0 ->  8 matched, 0 missed, 0 PHANTOM,  9 unmatched
+#                                dwell 2 ->  5 matched, 3 MISSED       dwell 3 -> 0 matched, 8 MISSED
+#
+# ZERO PHANTOMS AT EVERY THRESHOLD: not one claimed cycle falls inside a window verified door-CLOSED,
+# so the truth offers no evidence that any claim is false. And every threshold above 0 destroys real
+# closes — REAL closes on this corpus have short preceding dwells. Dwell does not separate chatter
+# from cycles here; it only separates cycles from nothing.
+#
+# So no dwell threshold is applied, on evidence rather than by default. What remains uncertain is
+# the UNMATCHED claims (38 on ch27, 9 on ch30) — moments nobody hand-timed, which are unknown, not
+# false. That is what this caveat now says, because "may include chatter" implied a remedy the
+# corpus has ruled out.
+H3_CYCLE_CAVEAT = ("cycle counts include transitions no hand-timed close corroborates "
+                   "(ch27 38 of 51, ch30 9 of 17 on the corpus replay). NOT proven false — none "
+                   "fall in a verified door-CLOSED window — and a minimum-dwell filter was tested "
+                   "and rejected: every threshold above 0s destroyed real closes")
 # One sentence, one place. Every surface that prints an h2-era travel figure prints this beside it.
 H2_SUPERSEDED_NOTE = ("SUPERSEDED — h2 edge-column instrument invalidated 2026-08-05: offline replay "
                       "against hand-timed video showed it detects ~62% of real closes and emitted 41 "
