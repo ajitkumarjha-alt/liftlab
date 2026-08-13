@@ -239,6 +239,28 @@ def wd_phase(name):
         _wd.phase(name)
 
 
+def wd_self_restart(reason, log=None):
+    """Deliberate exit, rc=1, with a banner an operator will actually grep for.
+
+    Routed through the watchdog module so there is ONE such banner, but it must still work when the
+    watchdog failed to import: a guard that cannot fire because its logging helper is missing is a
+    guard that does not exist. Falls back to the same shape inline.
+    """
+    if _wd is not None and hasattr(_wd, "self_restart"):
+        _wd.self_restart(reason, log=log)
+        return                                    # (never reached: self_restart exits)
+    (log or print)(f"WORKER SELF-RESTART rc=1 — {reason}")
+    (log or print)("WORKER SELF-RESTART rc=1 — TRACEBACK (faulthandler, all threads) follows; this "
+                   "is a DELIBERATE exit, not an unhandled exception")
+    try:
+        import faulthandler as _fh
+        _fh.dump_traceback(all_threads=True)
+        sys.stderr.flush(); sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(1)
+
+
 # Pooled keep-alive session: urllib does a fresh TCP+TLS handshake PER segment (~3-4 RTTs of setup
 # before a byte moves) — that is the 952ms fetch. requests.Session reuses the connection, so connect
 # collapses to ~0 after the first. Degrade to urllib if requests is somehow absent (never crash the run).
@@ -1194,10 +1216,9 @@ def main():
                     track_fail_streak += 1
                     log(f"det.track FAILED ({track_fail_streak}/{TRACK_FAIL_MAX}): {type(e).__name__}: {str(e)[:100]}")
                     if track_fail_streak >= TRACK_FAIL_MAX:
-                        log(f"det.track failed {track_fail_streak}x consecutively — tracker wedged, exiting for restart")
-                        import faulthandler as _fh
-                        _fh.dump_traceback(all_threads=True)
-                        os._exit(1)
+                        wd_self_restart(
+                            f"TRACKER DEAD: det.track raised {track_fail_streak}x consecutively "
+                            f"({type(e).__name__}: {str(e)[:80]})", log=log)
                     dets = []
                 track_ms += (time.time() - tr_t0) * 1000     # YOLO inference — the cost that must fit the budget
                 # SILENT-[] WEDGE (see TRACKER_IDLESS_MAX): confident boxes, no ids, for a long
@@ -1208,11 +1229,9 @@ def main():
                     idless_streak += 1
                     if idless_streak >= TRACKER_IDLESS_MAX:
                         if time.time() - last_idless_rebuild < 600:
-                            log(f"TRACKER WEDGED AGAIN {time.time() - last_idless_rebuild:.0f}s after an "
-                                f"in-place rebuild — healing did not stick. Dumping stacks and exiting for restart.")
-                            import faulthandler as _fh
-                            _fh.dump_traceback(all_threads=True)
-                            os._exit(1)
+                            wd_self_restart(
+                                f"TRACKER WEDGED AGAIN {time.time() - last_idless_rebuild:.0f}s "
+                                f"after an in-place rebuild — healing did not stick", log=log)
                         log(f"TRACKER WEDGED: {idless_streak} consecutive frames with confident detections "
                             f"but ZERO track ids — ByteTrack state is poisoned (the silent-[] mode that "
                             f"stopped counting cold on 07-29/30). Rebuilding detector + counter in place.")
@@ -1374,10 +1393,9 @@ def main():
                     and time.time() - last_transit_post_wall >= TRANSIT_STALL_S):
                 log(f"COUNTING WEDGED: {door_opens_since_transit} door opens and NO transit posted in "
                     f"{time.time() - last_transit_post_wall:.0f}s while segments flow — YOLO/tracker path "
-                    f"is producing nothing. Dumping stacks and exiting for restart.")
-                import faulthandler as _fh
-                _fh.dump_traceback(all_threads=True)
-                os._exit(1)
+                    f"is producing nothing.")
+                wd_self_restart("COUNTING WEDGED: door opens with no transit posted while "
+                                     "segments flow", log=log)
             # ── DOOR-INDEPENDENT WEDGE CHECK (see TRANSIT_IDLE_STALL_S). Runs only right here, after
             # a fully-processed segment, for the same reason the liveness signal does: a starved or
             # idle loop must never reach it. History arms it; flow attests it; zero output convicts.
@@ -1407,10 +1425,9 @@ def main():
                 log(f"COUNTING WEDGED (door-independent): NO transit posted in "
                     f"{time.time() - last_transit_post_wall:.0f}s across {segs_since_transit} processed "
                     f"segments, in an hour this camera historically posts {hist_rate:.1f}/hr. "
-                    f"Zones present, segments flowing, output silent. Dumping stacks and exiting for restart.")
-                import faulthandler as _fh
-                _fh.dump_traceback(all_threads=True)
-                os._exit(1)
+                    f"Zones present, segments flowing, output silent.")
+                wd_self_restart("COUNTING WEDGED (door-independent): no transit posted across "
+                                     "many segments in a historically busy hour", log=log)
         # close a stale validation episode (door shut) + refresh this cam's mode periodically
         if episode and time.time() - episode["ts_end"] > EPISODE_GAP_S:
             _tot_d = segments + dropped

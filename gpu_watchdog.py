@@ -84,17 +84,39 @@ def _watch(stall_secs: float, grace: float, poll: float) -> None:
 
         with _lock:
             label, ph, ph_age = _last_label, _phase, time.monotonic() - _phase_t
-        _log("STALL: no segment processed for %.0fs (limit %.0fs). last_seg=%s "
-             "phase=%r (in this phase %.0fs). Dumping all thread stacks, then exiting "
-             "so systemd restarts us." % (stalled, stall_secs, label, ph, ph_age))
+        # os._exit (inside self_restart), NOT sys.exit: SystemExit raised in a non-main thread
+        # unwinds only THAT thread. sys.exit here would kill the watchdog and leave the wedged main
+        # loop running — a silently disarmed watchdog on top of a hung worker, which is strictly
+        # worse than no watchdog. This exit must be unconditional.
+        self_restart("WATCHDOG STALL: no segment processed for %.0fs (limit %.0fs). last_seg=%s "
+                     "phase=%r (in this phase %.0fs)" % (stalled, stall_secs, label, ph, ph_age))
+
+
+def self_restart(reason: str, log=None) -> None:
+    """The ONE way this worker ever exits on purpose. Logs a greppable banner, dumps every thread,
+    exits rc=1 for the supervisor.
+
+    WHY A BANNER. Every deliberate exit in this worker dumps stacks with faulthandler, whose output
+    contains the words "Thread 0x..." and "  File ..." — and NOT "Traceback", "Error" or
+    "Exception". So a self-restart looks in the journal exactly like an unexplained crash: rc=1 and
+    nothing that any of the words an operator greps for will match. ch29 restarted five times across
+    three days before that was established, and the reason line was sitting in the journal the whole
+    time under a phrase nobody thought to search.
+
+    The banner is deliberately ugly and unique: WORKER SELF-RESTART, plus the literal word TRACEBACK
+    so the natural grep finds the dump that follows it.
+    """
+    line = f"WORKER SELF-RESTART rc=1 — {reason}"
+    (log or _log)(line)
+    (log or _log)("WORKER SELF-RESTART rc=1 — TRACEBACK (faulthandler, all threads) follows; this is "
+                  "a DELIBERATE exit, not an unhandled exception")
+    try:
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
         sys.stderr.flush()
         sys.stdout.flush()
-        # os._exit, NOT sys.exit: SystemExit raised in a non-main thread unwinds only
-        # THAT thread. sys.exit here would kill the watchdog and leave the wedged main
-        # loop running — a silently disarmed watchdog on top of a hung worker, which is
-        # strictly worse than no watchdog. This exit must be unconditional.
-        os._exit(1)
+    except Exception:
+        pass
+    os._exit(1)
 
 
 def arm(stall_secs: float = 120.0, grace: float = 180.0, poll: float = 5.0) -> None:
