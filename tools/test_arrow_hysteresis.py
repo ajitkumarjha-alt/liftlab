@@ -29,9 +29,19 @@ class FakeReader:
         self.arrow_margin_min, self.arrow_switch_margin = margin_min, switch_margin
         self.arrow_hold_reads, self.min_score = hold_reads, min_score
         self._last_direction, self._amb_run, self.n_arrow_ambiguous = None, 0, 0
+        self.n_arrow_dropout = 0
 
     def step(self, best, best_s, second_s):
+        # DROPOUT: the arrow falls under min_score for a frame. This is the DOMINANT live term on
+        # ch29's h3-era hour ('down'->None x756, None->'down' x754) and it never enters the margin
+        # branch below, so it needs the same bounded hold one level out.
         if best is None or best_s < self.min_score:
+            if self._last_direction is not None:
+                self._amb_run += 1
+                self.n_arrow_dropout += 1
+                if self._amb_run <= self.arrow_hold_reads:
+                    return self._last_direction
+                self._last_direction = None
             return None
         margin = best_s - second_s if second_s > -1.5 else 1.0
         need = (self.arrow_margin_min if best == self._last_direction else self.arrow_switch_margin)
@@ -101,6 +111,25 @@ def main():
     if held > 30:
         fails.append(f"held too long ({held} reads) before withholding")
 
+    print("\n=== 3b. LIVE ch29 h3 pattern: the arrow DROPS OUT rather than flipping ===")
+    # The snapshot flapped up<->down; the live h3 hour flaps direction<->None. Both are the same
+    # instability, but only one of them enters the margin branch.
+    r4 = FakeReader()
+    live = [r4.step("down", 0.82, 0.30) if i % 2 == 0 else r4.step(None, -2.0, -2.0)
+            for i in range(60)]
+    naive = ["down" if i % 2 == 0 else None for i in range(60)]
+    print(f"  arrow under min_score every other read: before {flips(naive)} changes, "
+          f"after {flips(live)}  (dropouts held: {r4.n_arrow_dropout})")
+    if flips(live) > 2:
+        fails.append(f"dropout flapping not suppressed ({flips(live)} changes) — this is the "
+                     f"DOMINANT live term on ch29 and it bypasses the margin branch entirely")
+    r5 = FakeReader()
+    gone = [r5.step(None, -2.0, -2.0) for _ in range(60)]
+    if gone[-1] is not None:
+        fails.append("a permanently absent arrow is held forever — the hold must be bounded")
+    print(f"  arrow gone for 60 reads: withheld by read "
+          f"{next(i for i, v in enumerate(gone) if v is None)}")
+
     print("\n=== 4. one arrow template: unchanged, still withheld (ch27's control case) ===")
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gpu_door.py")).read()
     if "if len(self.arrow_labels) >= 2:" not in src:
@@ -110,7 +139,7 @@ def main():
 
     print("\n=== 5. the test is testing the shipped code, not itself ===")
     for needle in ("_match2(", "arr_2nd", "self.arrow_switch_margin", "self._amb_run",
-                   "self.arrow_hold_reads", "n_arrow_ambiguous"):
+                   "self.arrow_hold_reads", "n_arrow_ambiguous", "n_arrow_dropout"):
         if needle not in src:
             fails.append(f"gpu_door.py does not contain {needle!r} — the transcription has drifted")
     print("  every element of the transcribed branch is present in gpu_door.py")

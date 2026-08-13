@@ -482,6 +482,7 @@ class FloorReader:
         self._last_direction = None
         self._amb_run = 0
         self.n_arrow_ambiguous = 0
+        self.n_arrow_dropout = 0
         self.min_score = min_score
         # RIGID SHIFT SEARCH radius (px). The LED display translates as one; per-frame jitter (~2-4px
         # measured) at tight cells breaks the most sensitive cell (tens) while units/arrow — anchored /
@@ -728,6 +729,24 @@ class FloorReader:
         if self.arrow_labels:                        # arrow shifts with the display too (rigid)
             acell = (self.arrow_cell[0] + dx, self.arrow_cell[1] + dy, self.arrow_cell[2], self.arrow_cell[3])
             arrow, arr_s, arr_2nd = self._match2(crop(panel_gray, acell), self.arrow_labels)
+            # DROPOUT IS THE OTHER HALF OF THE OSCILLATION, and it lives OUTSIDE the branch below.
+            #
+            # The snapshot's ch29 flapped 'up' <-> 'down'; its LIVE h3-era hour flaps
+            # 'down' -> None x756 / None -> 'down' x754 — the arrow falling under min_score for a
+            # frame and coming back. The margin/hysteresis rule below never sees those, because they
+            # never enter the branch. Fixing only the in-branch case would have left the dominant
+            # live term untouched, and the "after" census would have looked like the fix failed.
+            #
+            # Same discipline, one level out: a direction already established survives a brief
+            # dropout, for the same bounded run, and is then withheld.
+            if (arrow is None or arr_s < self.min_score) and len(self.arrow_labels) >= 2 \
+                    and self._last_direction is not None:
+                self._amb_run += 1
+                self.n_arrow_dropout += 1
+                if self._amb_run <= self.arrow_hold_reads:
+                    direction = self._last_direction
+                else:
+                    self._last_direction = None
             if arrow is not None and arr_s >= self.min_score:
                 # A SINGLE-CLASS CLASSIFIER OUTPUT IS NOT A MEASUREMENT. arrow_labels is filtered to
                 # the arrows that have TEMPLATES, and a template only exists for an arrow the
