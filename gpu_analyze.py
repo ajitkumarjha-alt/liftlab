@@ -44,6 +44,10 @@ VAL_SEQ_PER_TRANSIT = int(os.environ.get("VAL_SEQ_PER_TRANSIT", "3"))  # frames 
 FRAME_BUF = int(os.environ.get("FRAME_BUF", "40"))        # ring of recent frames (~1.6s @25fps)
 MAX_BEHIND = int(os.environ.get("MAX_BEHIND", "3"))        # if >this new segs queued, jump to live edge
 HEARTBEAT_S = float(os.environ.get("HEARTBEAT_S", "30"))   # analyzer heartbeat to the cloud
+# Queue stuck this long with work outstanding -> post the heartbeat DIRECTLY instead of queueing it.
+# 90s is three beats: long enough not to fire on one slow gateway POST, short enough that a wedged
+# queue is visible on /ops within two minutes rather than never.
+QUEUE_STALL_DIRECT_S = float(os.environ.get("QUEUE_STALL_DIRECT_S", "90"))
 SEG_DUR_S = float(os.environ.get("SEG_DUR_S", "2"))
 SEG_BUDGET_MS = SEG_DUR_S * 1000                 # real-time budget: one segment's worth of wall time
 PREFETCH_N = int(os.environ.get("PREFETCH_N", "2"))   # fetch this many segments AHEAD while tracking (overlap)
@@ -201,6 +205,12 @@ TRANSIT_HIST_ALPHA = float(os.environ.get("TRANSIT_HIST_ALPHA", "0.25"))        
 # genuinely running (a starved stream must NOT fire this — upstream outages are the relay
 # watchdog's job, and a restart here cannot conjure segments).
 TRANSIT_IDLE_MIN_SEGS = int(os.environ.get("TRANSIT_IDLE_MIN_SEGS", "300"))
+# The door-INDEPENDENT check convicts on an ABSENCE, so it must only run when an absence is
+# informative. 07:00-23:00 IST, matching health_check.py's active window and derived from the same
+# measurement. Outside it the guard is disarmed; the door-DEPENDENT check still runs at all hours
+# because it requires door opens, which are positive evidence of use.
+TRANSIT_IDLE_ACTIVE_FROM = int(os.environ.get("TRANSIT_IDLE_ACTIVE_FROM", "7"))
+TRANSIT_IDLE_ACTIVE_TO = int(os.environ.get("TRANSIT_IDLE_ACTIVE_TO", "23"))
 IST_OFF_S = 5.5 * 3600.0                          # IST hour bucketing without a tz database
 
 
@@ -942,10 +952,31 @@ def main():
             # the worker genuinely cannot reach the gateway — honest "down-ish" — instead of
             # draining a backlog of stale statuses each claiming to describe now. Safe to drop:
             # gpu_fleet has no reference to analyzer_status, so no restart path keys on it.
+            # A LIVENESS SIGNAL MUST NOT RIDE THE SUBSYSTEM IT ATTESTS.
+            #
+            # analyzer_status is how the fleet knows this worker is alive, and it was queued through
+            # the post queue — so when the sender thread died, the one signal that would have said so
+            # died with it. Transits kept flowing (they are posted directly), so the camera looked
+            # half-healthy for hours: ch29, 2026-08-12 18:39 IST onward.
+            #
+            # Two changes: ask the queue whether its sender is still there (nobody was asking), and
+            # when the queue is dead or visibly stuck, post the status DIRECTLY. The status POST is
+            # small and infrequent; paying for it on the main loop occasionally is cheaper than being
+            # unable to report that the queue stopped.
+            _q_stall = 0.0
             if _PQ is not None:
+                if _PQ.ensure_alive(log=log):
+                    _st_payload["queue_revived"] = _PQ.revived
+                _q_stall = _PQ.stalled_for()
+                _st_payload["queue_stalled_s"] = round(_q_stall, 1)
+                _st_payload["queue_depth"] = list(_PQ.depth())
+            if _PQ is not None and _q_stall < QUEUE_STALL_DIRECT_S:
                 _PQ.put(f"{CLOUD}/api/gw/{GW}/analyzer_status", _st_payload, "analyzer_status",
                         cls=_pq_mod.COALESCE, drop_key="analyzer_status")
             else:
+                if _PQ is not None:
+                    log(f"POST QUEUE STALLED {_q_stall:.0f}s with {_PQ.depth()} queued — posting "
+                        f"analyzer_status DIRECTLY so liveness does not depend on the queue")
                 http_post_json(f"{CLOUD}/api/gw/{GW}/analyzer_status", _st_payload,
                                what="analyzer_status")
         except Exception as e:
@@ -1418,14 +1449,34 @@ def main():
                 hour_id, hour_posts, hour_segs = now_hour, 0, 0
                 hour_covered = True               # from here we see this hour from its first minute
             hist_rate = hist_ewma[_ist_hour(time.time())]
-            if (TRANSIT_IDLE_STALL_S > 0 and ctr is not None
+            # ACTIVE HOURS ONLY. This guard fired on THREE cameras between 04:57 and 05:46 IST on
+            # 2026-08-13 — historical rates 3.5, 8.0 and 10.1/hr — and killed all three workers.
+            # Dead-of-night quiet read as a wedge.
+            #
+            # The arming test compares against an EWMA, which is a MEAN, and then convicts on a
+            # single zero. An hour that averages 3.5/hr contains many hours of zero: measured over
+            # the restored snapshot, 51-55% of DAYTIME hours on days a camera was demonstrably live
+            # carry no transits at all, and nights are emptier still. A mean is not a floor, and this
+            # guard was treating it as one.
+            #
+            # Active hours are the same 07:00-23:00 IST the health line uses, for the same reason and
+            # from the same evidence. Inside them a 45-minute silence across 300+ segments on a lift
+            # that normally moves is still convicting; outside them it is a residential building
+            # asleep. The other guards are untouched: det.track failures, the door-dependent counting
+            # check and the watchdog stall all key on POSITIVE evidence that something happened and
+            # produced nothing, which no amount of quiet can fake.
+            _h_now = _ist_hour(time.time())
+            _active = TRANSIT_IDLE_ACTIVE_FROM <= _h_now < TRANSIT_IDLE_ACTIVE_TO
+            if (TRANSIT_IDLE_STALL_S > 0 and ctr is not None and _active
                     and hist_rate is not None and hist_rate >= TRANSIT_HIST_MIN_RATE
                     and segs_since_transit >= TRANSIT_IDLE_MIN_SEGS
                     and time.time() - last_transit_post_wall >= TRANSIT_IDLE_STALL_S):
                 log(f"COUNTING WEDGED (door-independent): NO transit posted in "
                     f"{time.time() - last_transit_post_wall:.0f}s across {segs_since_transit} processed "
                     f"segments, in an hour this camera historically posts {hist_rate:.1f}/hr. "
-                    f"Zones present, segments flowing, output silent.")
+                    f"Zones present, segments flowing, output silent. "
+                    f"(hour {_h_now:02d} IST is inside the {TRANSIT_IDLE_ACTIVE_FROM:02d}-"
+                    f"{TRANSIT_IDLE_ACTIVE_TO:02d} active window, so an absence here is a finding.)")
                 wd_self_restart("COUNTING WEDGED (door-independent): no transit posted across "
                                      "many segments in a historically busy hour", log=log)
         # close a stale validation episode (door shut) + refresh this cam's mode periodically

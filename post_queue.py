@@ -66,6 +66,9 @@ class PostQueue:
         self._crit = deque()
         self._drop = deque()
         self._coalesced = {}                 # what -> (url, payload); newest only
+        self.last_sent_ts = None             # for stalled_for(): a stuck sender vs a quiet one
+        self._started_ts = time.time()
+        self.revived = 0                     # times the sender thread had to be restarted
         self._max_crit = max_critical
         self._max_drop = max_droppable
         self._cv = threading.Condition()
@@ -131,15 +134,56 @@ class PostQueue:
             try:
                 self._sender(url, payload, what=what)
                 self.sent += 1
-            except Exception as e:                    # a dead gateway must not kill the sender
+                self.last_sent_ts = time.time()
+            except BaseException as e:                # a dead gateway must not kill the sender
+                # BaseException, not Exception. This caught Exception only, so anything outside that
+                # hierarchy — or a raise from inside self._log — unwound _run() and the thread died
+                # SILENTLY. Nothing supervised it, so every lane that rides this queue (door events,
+                # floorchecks, analyzer_status) went quiet forever while the main loop carried on:
+                # transits kept flowing because they are posted DIRECTLY, not queued. That is exactly
+                # the ch29 signature — status stops, transits continue, worker lives for hours.
                 self.failed += 1
-                self._log(f"POST {what} failed: {type(e).__name__}: {str(e)[:120]}")
+                try:
+                    self._log(f"POST {what} failed: {type(e).__name__}: {str(e)[:120]}")
+                except BaseException:
+                    pass                              # logging must never be the thing that kills it
 
     def start(self):
-        if self._t is None:
+        if self._t is None or not self._t.is_alive():
             self._t = threading.Thread(target=self._run, name="post-queue", daemon=True)
             self._t.start()
         return self
+
+    def alive(self):
+        return bool(self._t and self._t.is_alive())
+
+    def ensure_alive(self, log=None):
+        """Restart the sender if it died. -> True if it had to be revived.
+
+        A queue whose thread is gone accepts puts forever and delivers nothing: `put()` still
+        succeeds, depth still grows, and every caller believes it posted. The only way to notice is
+        to ask, so somebody has to ask — the worker's heartbeat does, once per beat.
+        """
+        if self.alive():
+            return False
+        self.revived += 1
+        (log or self._log)(f"POST QUEUE SENDER WAS DEAD — restarting it (revival #{self.revived}, "
+                           f"depth={self.depth()}, sent={self.sent} failed={self.failed}). Every "
+                           f"queued lane was silent until now; directly-posted lanes were not, which "
+                           f"is why this can hide behind healthy-looking transit counts.")
+        self._t = None
+        self.start()
+        return True
+
+    def stalled_for(self):
+        """Seconds since the last successful send WHILE something is queued; 0.0 when idle/current.
+
+        Distinguishes a stuck sender from a quiet one — an empty queue that has sent nothing for an
+        hour is a quiet camera, not a fault."""
+        nc, nd, nq = self.depth()
+        if not (nc or nd or nq):
+            return 0.0
+        return time.time() - (self.last_sent_ts or self._started_ts)
 
     def stop(self, drain_s=5.0):
         with self._cv:
