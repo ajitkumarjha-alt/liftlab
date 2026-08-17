@@ -7,6 +7,25 @@ This ships **door state only**. Floor attribution on these three is NOT part of 
 
 ---
 
+## 0a. DOOR GEOMETRY PRECEDES THE TRACKER FLAG — the step this note originally skipped
+
+**A camera with no `door_roi_frame` comes up `door=off (geometry incomplete)` and the tracker flag
+does nothing.** The first attempt at this batch failed exactly there on all three: templates in
+place, POSTs accepted, workers up with the door engine disabled.
+
+Geometry does NOT live in the registry. `camera_registry_api._geom_for` READS
+`CALIB_DIR/{gw}/{cam}/roi.json` and serves it in the string shapes gpu_analyze parses, so there is
+no registry column to POST a door band into — it has to be written to roi.json, and `/calib-roi`'s
+save endpoint is what does that. It also records `frame_wh`, `saved_at`, `source_image` and
+`drawn_on_wh`; `frame_wh` is the provenance that makes a later resolution change detectable, so a
+hand-written roi.json without it is geometry that cannot be checked later.
+
+So, per camera, BEFORE section 1:
+
+    1. draw the door band at /calib-roi/site-A/{cam}  (Aj: approx x240-405, full door height)
+    2. confirm roi.json has door_roi_frame AND frame_wh
+    3. only then the template file and the POST
+
 ## 0. ORDER — ALL THREE FILES FIRST, THEN THE POSTS. This one bites.
 
 `door_tracker` is in the registry config hash, so a POST restarts that camera's worker within
@@ -125,7 +144,7 @@ against h3 on 2026-08-13.
 Expect door_state to get calmer: ch29's h3 hour showed dwell p50 2.45 s against h2's 0.32–1.67 s,
 and door_state fell to 4.7% of rows from 19–98%.
 
-## 6. FLOOR ATTRIBUTION IS NOT IN THIS DEPLOY
+## 6. FLOOR ATTRIBUTION IS NOT IN THIS DEPLOY — and this needed a code change to be true
 
 These cameras get door state and nothing else. Floor needs `digit_cells` / `arrow_cell`, and the
 derivation from pixel variance **failed**: the row band it produces changes with how many frames are
@@ -133,9 +152,23 @@ sampled (ch34 gave three different answers over 300/600/1200 frames), so it is n
 Column structure converged on ch32 and ch37 and is contributed as evidence to `/calibrate`; ch34
 shows no column gap at any sample size.
 
-Until cells exist and pass the standing OCR gate — **n ≥ 20 correct-or-abstain, zero confident
-misreads** — floor on these three is not trusted and not attributed. The engine will emit
-`floor=NULL` with a `no_read` reason, which is the correct output for an uncalibrated panel.
+**The original version of this note promised behaviour the code could not perform.** It said these
+cameras would ship door state and emit `floor=NULL`, but `build_door_engine` required
+DOOR_ROI_FRAME **and** PANEL_ROIS **and** DIGIT_CELLS **and** ARROW_CELL, and `DoorFloorEngine`
+raised outright on an empty panel list. A camera with a perfect door band and no cells could not run
+the engine at all. That is why all three came up `door=off`.
+
+Door-only is now a first-class mode: the door band is the only hard requirement, and a camera
+without panel geometry reports `floor=NULL` with reason **`no_panel_geometry`** on every row — a
+reason that names the cause, so it can never be mistaken for a failed OCR on a real panel. It
+requires the GPU code at the md5 in section 1a.
+
+The alternative — inventing panel geometry to satisfy the constructor — was available and is worse
+than useless: `valid_floors` is None by default, so any assembled digit string is accepted, and the
+result would be confident WRONG floor reads. That is exactly what the OCR gate exists to prevent.
+
+Until cells exist and pass the standing gate — **n ≥ 20 correct-or-abstain, zero confident
+misreads** — floor on these three is not trusted and not attributed.
 
 ## 7. Rollback
 

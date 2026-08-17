@@ -603,8 +603,14 @@ def build_door_engine(prefetched_tpl=None):
     """Fetch templates (unless handed a set) + build the DoorFloorEngine from the calibrated geometry.
     Returns (engine, door_version) on success, else (None, reason). NEVER raises into the worker."""
     import gpu_door as gd
-    if not (DOOR_ROI_FRAME and PANEL_ROIS and DIGIT_CELLS and ARROW_CELL):
-        return None, "geometry missing (need DOOR_ROI_FRAME, PANEL_ROIS, DIGIT_CELLS, ARROW_CELL)"
+    # THE DOOR BAND IS THE ONLY HARD REQUIREMENT. Panel geometry is what a FLOOR needs, and a camera
+    # without it runs door-only: state and cycles, floor=NULL with reason 'no_panel_geometry'.
+    # This gate used to demand all four, so a camera with a perfectly good door band and no cells
+    # came up door=off entirely — which is how ch32/ch34/ch37 failed on 2026-08-13 after a deploy
+    # note that promised exactly the door-only behaviour the code could not perform.
+    if not DOOR_ROI_FRAME:
+        return None, "geometry missing (need DOOR_ROI_FRAME — draw the door band at /calib-roi)"
+    _door_only = not (PANEL_ROIS and DIGIT_CELLS and ARROW_CELL)
     tpl = prefetched_tpl
     if tpl is None:
         try:
@@ -613,12 +619,17 @@ def build_door_engine(prefetched_tpl=None):
             return None, f"template fetch failed: {type(e).__name__}: {str(e)[:80]}"
     try:
         droi = tuple(int(v) for v in DOOR_ROI_FRAME.split(","))
-        prois = _parse_xywh_list(PANEL_ROIS)
-        panels = [(prois[0], _parse_xywh_list(DIGIT_CELLS), _parse_xywh_list(ARROW_CELL)[0])]
-        if len(prois) >= 2 and PANEL1_DIGIT_CELLS and PANEL1_ARROW_CELL:
+        if _door_only:
+            panels, mode = [], ("DOOR-ONLY (no panel geometry) — door state and cycles only; "
+                                "floor is NULL with reason 'no_panel_geometry' on every row")
+            prois = []
+        else:
+            prois = _parse_xywh_list(PANEL_ROIS)
+            panels = [(prois[0], _parse_xywh_list(DIGIT_CELLS), _parse_xywh_list(ARROW_CELL)[0])]
+        if not _door_only and len(prois) >= 2 and PANEL1_DIGIT_CELLS and PANEL1_ARROW_CELL:
             panels.append((prois[1], _parse_xywh_list(PANEL1_DIGIT_CELLS), _parse_xywh_list(PANEL1_ARROW_CELL)[0]))
             mode = "2-panel agree-or-discard"
-        else:
+        elif not _door_only:
             mode = ("SINGLE-PANEL (no agree-or-discard) — set PANEL1_DIGIT_CELLS/PANEL1_ARROW_CELL "
                     "from a panel1 anchor read to enable the free confidence check")
         ft = gd.FloorTracker(floor_order=FLOOR_ORDER or None)

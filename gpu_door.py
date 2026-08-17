@@ -1099,8 +1099,18 @@ class DoorFloorEngine:
                  blank_min=0.45, shift_floor=0.40, lit_range=120, blank_strong=0.90,
                  blank_lit_margin=0.15, confuse_band=0.0, disc_min=0.10, valid_floors=None,
                  state_tpl=None, state_meta=None):
-        if not panels:
-            raise ValueError("DoorFloorEngine needs at least one panel (panel_roi, digit_cells, arrow_cell)")
+        # DOOR-ONLY IS A FIRST-CLASS MODE, not an error. A camera with a calibrated door band and NO
+        # panel geometry can measure door STATE perfectly well; it simply has no floor to report.
+        # This used to raise, which meant a camera without cells could not run the engine at all —
+        # so "ships door state, emits floor=NULL" was a promise the code could not keep, and three
+        # cameras came up door=off on 2026-08-13 because of it.
+        #
+        # The alternative — inventing panel geometry to satisfy the constructor — would produce
+        # CONFIDENT WRONG floor reads: valid_floors is None by default, so any assembled string is
+        # accepted. A NULL floor with a reason is the honest output for an uncalibrated panel.
+        # (door_only is a PROPERTY derived from self.readers — see below. A stored flag is one more
+        # thing that can be forgotten by a harness building the engine with __new__, and one more
+        # thing that can disagree with reality after readers are changed.)
         self.door_roi = tuple(door_roi)
         # h3 state template. Present -> door_pass runs the NCC path and `door_tracker` must be a
         # DoorTrackerH3. Absent -> the edge-column path, unchanged. The band and the ROI x-slice come
@@ -1160,6 +1170,17 @@ class DoorFloorEngine:
         openness = self.door.openness(col) if col is not None else None
         return cycle, self.door.state, openness, strength
 
+    @property
+    def door_only(self):
+        """No panel geometry -> door state and cycles, never a floor.
+
+        DERIVED, not stored. The readers ARE the panels, so asking them cannot go stale, and an
+        engine built by a test harness through __new__ (tools/test_floor_stride.py does exactly
+        this to bypass template setup) gets the right answer without having to know the flag exists.
+        A stored flag broke that harness the moment it was added.
+        """
+        return not getattr(self, "readers", None)
+
     def floor_pass(self, gray, t):
         """THE FLOOR HALF, isolated: panel OCR + reconcile + FloorTracker. -> a read dict.
 
@@ -1175,6 +1196,12 @@ class DoorFloorEngine:
         every DOOR_STRIDE frame and the floor half gets its own, slower cadence — the caller decides
         via `do_floor` on process(); nothing here changes what a single read COMPUTES.
         """
+        if self.door_only:
+            # No panel, no read. NOT an empty read that might look like a failed OCR on a real
+            # panel — the reason names the cause so a NULL floor here is never mistaken for one.
+            return {"t": t, "floor": None, "direction": None, "conf": None, "agreed": None,
+                    "reason": "no_panel_geometry", "candidates": None, "shift": None,
+                    "n_arrow_labels": 0, "stop": None}
         reads = [rdr.read_panel(crop(gray, proi)) for proi, rdr in self.readers]
         oks = [r for r in reads if r["status"] == "ok"]
         ambigs = [r for r in reads if r["status"] == "ambiguous"]
