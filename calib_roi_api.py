@@ -123,6 +123,27 @@ def _age(p):
         return None
 
 
+# ── KNOWN DEFECT, 2026-08-17: THE SNAPSHOT IS NOT A RESCALED WORKER FRAME ────────────────────
+# Everything below assumes the drawing image differs from the worker's frame by a SCALE, and the
+# page corrects for it with per-axis ratios. On ch32 that assumption is false. Measured:
+#
+#   door   worker frame x240 w160    drawn on the snapshot 152,4,196,109   origin x1.58, width x0.82
+#   panel  worker frame x85  w70     drawn on the snapshot  99,37,52,107   origin x0.86, width x1.35
+#
+# No single factor maps both the origin and the width, on either rectangle — so the snapshot is a
+# DIFFERENT FRAMING, not a smaller copy of the same one. A pixel comparison of today's worker frame
+# against Thursday's capture found a phase shift of (-0.1,-0.2)px and NCC 0.996 at identical
+# coordinates: the CAMERA has not moved. The snapshot route has diverged from the stream route.
+#
+# CONSEQUENCE: an ROI drawn on the snapshot and converted by scales() lands on the wrong pixels, and
+# nothing downstream says so — it surfaces later as bad OCR, which is the failure this file's own
+# 409 was written to prevent, arriving by a route the 409 does not cover.
+#
+# UNTIL THE SNAPSHOT ROUTE IS FIXED: geometry for these cameras is written in FRAME coordinates
+# directly (the save endpoint does not scale — scales() is browser-side only), and verified against
+# the live stream with tools/check_live_band.py, which pulls from the worker's own playlist rather
+# than the snapshot.
+
 def _pick_image(d, gw, cam):
     """Which JPEG to draw on, and everything the page needs to convert coordinates honestly.
 
@@ -246,7 +267,16 @@ async def roi_save(gw: str, cam: str, request: Request):
     # whole-file write would silently delete a cell geometry the operator had already approved —
     # and they would only find out from a bad build. Redrawing ROIs must touch ROIs only.
     out = _load_roi(d)
+    # A snapshot-drawn ROI is recorded as UNVERIFIED. The page's scale correction assumes the
+    # snapshot is the worker frame at a different size, and on ch32 that was measurably false; a
+    # consumer of roi.json should be able to tell which route the geometry came in by.
+    _src = (img or {}).get("source")
     out.update({"door_roi_frame": door, "panel_rois": panels,
+                "geometry_verified_against_stream": (_src == "calib_frame"),
+                "geometry_note": (None if _src == "calib_frame" else
+                                  "drawn on the rescaled snapshot; the snapshot route is known to "
+                                  "diverge from the worker frame (see _pick_image). Verify with "
+                                  "tools/check_live_band.py before trusting floor reads."),
                 # Provenance: which frame these were drawn on. A later frame-size change (camera
                 # reconfig, sub-stream resolution change) invalidates them, and this makes that
                 # detectable rather than mysterious.
