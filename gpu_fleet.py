@@ -136,6 +136,23 @@ def fetch_registry():
     return {"cams": out, "hash": d.get("hash"), "t": d.get("t")}
 
 
+def _door_state_str(door_missing, panel_missing):
+    """What the door engine will do, and WHICH field decided it.
+
+    "geometry incomplete" was printed for four different absences, so the line told an operator that
+    something was missing without saying what — while they were looking at the very field it wanted,
+    already drawn and served. Same nameless-absence defect the dashboard work removed from three
+    panels: an absence must always say which kind of absence it is.
+    """
+    if door_missing:
+        return ("off (no door_roi_frame — draw the door band at /calib-roi; nothing else is "
+                "required to run the door engine)")
+    if panel_missing:
+        return ("ON door-only (have door_roi_frame; missing " + ", ".join(panel_missing)
+                + " — floor will be NULL with reason no_panel_geometry until those are calibrated)")
+    return "ON door+floor"
+
+
 def start(cam, cfg):
     env = dict(os.environ, CAM=cam, GW=GW,
                DOOR_STRIDE=str(cfg["stride"]), PYTHONUNBUFFERED="1",
@@ -161,8 +178,18 @@ def start(cam, cfg):
             env[envname] = geom[key]
         else:
             env.pop(envname, None)
-    env["GPU_DOOR"] = "1" if (geom.get("door_roi_frame") and geom.get("panel_rois")
-                              and geom.get("digit_cells") and geom.get("arrow_cell")) else "0"
+    # THE DOOR BAND IS THE ONLY REQUIREMENT, at this layer too. This demanded all four fields, so a
+    # camera with a calibrated door band and no panel cells was spawned with GPU_DOOR=0 and the door
+    # engine never started — even after 592276a relaxed the WORKER's gate to match. Two gates, one
+    # relaxed, and the symptom was unchanged: ch32/ch34/ch37 still came up door=off on 2026-08-17
+    # with their geometry saved and served. Relaxing one of two gates changes nothing, and the log
+    # line said the same thing either way, which is how it survived a fix aimed straight at it.
+    #
+    # Panel fields absent -> the worker runs its door-only path and reports floor=NULL with reason
+    # 'no_panel_geometry'. Panel fields present -> unchanged behaviour.
+    _door_missing = [k for k in ("door_roi_frame",) if not geom.get(k)]
+    _panel_missing = [k for k in ("panel_rois", "digit_cells", "arrow_cell") if not geom.get(k)]
+    env["GPU_DOOR"] = "0" if _door_missing else "1"
     # Per-camera DoorTracker levels from the registry (ch29's close_th recalibration). Same
     # absent-means-UNSET rule as geometry: a level not set for THIS camera must fall back to the
     # worker default, never inherit another camera's tuning from the fleet environment.
@@ -199,7 +226,7 @@ def start(cam, cfg):
     log(f"{cam}: door_tracker={cfg.get('door_tracker', 'h2')} (registry) — the worker logs which "
         f"engine it actually resolved, including any fallback to h2")
     log(f"{cam}: started pid={p.pid} stride={cfg['stride']} analyze_fps={cfg['analyze_fps']} "
-        f"door={'ON' if env.get('GPU_DOOR') == '1' else 'off (geometry incomplete — draw it at /calib-roi)'} "
+        f"door={_door_state_str(_door_missing, _panel_missing)} "
         f"zones={zones}"
         + (f" door_levels={lv} (NON-DEFAULT — this worker's door era moves)" if lv else ""))
 
