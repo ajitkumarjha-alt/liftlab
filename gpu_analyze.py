@@ -949,6 +949,12 @@ def main():
             _tot = segments + dropped
             _st_payload = {"cam": CAM, "counting_version": counting.COUNTING_VERSION,
                             "zones": ZONES_SOURCE,   # registry | builtin-ch29 | none (counting OFF)
+                            # THE CONFIG GAP NOBODY CONSUMED. build_door_engine has logged
+                            # "floor whitelist: NONE" at startup since it was written, and nothing
+                            # read it — so 20.4% of ch16's floor attribution was garbage accepted as
+                            # good reads for as long as the camera has run. On the wire it can be
+                            # reported, and cannot silently regress on the next camera.
+                            "floor_alphabet_n": len(FLOOR_ALPHABET),
                             "uptime_s": time.time() - started, "segments": segments, "dropped": dropped,
                             "posted": posted, "last_transit_ts": last_transit_ts, "mode": val_state,
                             # output-attestation signal (self-flag): doors opening but no transit posting

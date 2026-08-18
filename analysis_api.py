@@ -80,6 +80,10 @@ def _db():
                      ("fetch_ms", "REAL"), ("decode_ms", "REAL"),
                      ("drop_frac", "REAL"), ("drop_rate_hr", "REAL"),
                      ("connect_ms", "REAL"), ("transfer_ms", "REAL"), ("analyze_fps", "REAL"),
+                     # The valid-floor whitelist size. 0 means UNSET, which is a config gap: every
+                     # assembled string is then accepted as a good read. It rode the wire only as a
+                     # startup log line that nothing consumed.
+                     ("floor_alphabet_n", "INTEGER"),
                      ("headers_ms", "REAL"),   # renamed connect_ms (it always measured time-to-headers);
                                                # old column stays for historical rows, no longer written
                      ("door_opens_since_transit", "INTEGER"), ("s_since_transit_post", "REAL")):
@@ -254,11 +258,13 @@ def _status_write(gw, d):
     db = _db()
     db.execute(
         "INSERT INTO analyzer_status (gateway_id,cam,ts,counting_version,uptime_s,segments,dropped,"
-        "posted,last_transit_ts,mode,rej_disp,rej_dwell,rej_hist,rej_in,rej_out,proc_ms,track_ms,seg_budget_ms,"
+        "posted,last_transit_ts,mode,floor_alphabet_n,"
+        "rej_disp,rej_dwell,rej_hist,rej_in,rej_out,proc_ms,track_ms,seg_budget_ms,"
         "fetch_ms,decode_ms,drop_frac,drop_rate_hr,headers_ms,transfer_ms,analyze_fps,"
         "door_opens_since_transit,s_since_transit_post) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(gateway_id,cam) DO UPDATE SET ts=excluded.ts, counting_version=excluded.counting_version,"
+        "floor_alphabet_n=excluded.floor_alphabet_n, "
         "uptime_s=excluded.uptime_s, segments=excluded.segments, dropped=excluded.dropped, "
         "posted=excluded.posted, last_transit_ts=excluded.last_transit_ts, mode=excluded.mode, "
         "rej_disp=excluded.rej_disp, rej_dwell=excluded.rej_dwell, rej_hist=excluded.rej_hist, "
@@ -270,6 +276,7 @@ def _status_write(gw, d):
         "door_opens_since_transit=excluded.door_opens_since_transit, s_since_transit_post=excluded.s_since_transit_post",
         (gw, str(d.get("cam", "")), time.time(), d.get("counting_version"), d.get("uptime_s"),
          d.get("segments"), d.get("dropped"), d.get("posted"), d.get("last_transit_ts"), d.get("mode"),
+         d.get("floor_alphabet_n"),
          d.get("rej_disp"), d.get("rej_dwell"), d.get("rej_hist"),
          d.get("rej_in"), d.get("rej_out"), d.get("proc_ms"), d.get("track_ms"), d.get("seg_budget_ms"),
          d.get("fetch_ms"), d.get("decode_ms"), d.get("drop_frac"), d.get("drop_rate_hr"),

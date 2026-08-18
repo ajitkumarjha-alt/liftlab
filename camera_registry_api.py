@@ -86,6 +86,17 @@ def _geometry(gw, cam):
     arrow = _xywh(cells.get("arrow_cell"))
     if arrow:
         out["arrow_cell"] = arrow
+    # THE VALID-FLOOR WHITELIST travels the same way as the geometry it belongs to. FloorReader has
+    # had `valid_floors` and the `off_alphabet` flag all along; nothing ever configured them, so
+    # every assembled string was accepted as a good read — measured on ch16, 20.4% of its attributed
+    # floors are implausible by shape, '1G' alone 2,902 rows, all marked reason='single_panel'.
+    # ABSENT means UNSET, not empty, for the same reason the geometry does: an inherited value would
+    # whitelist this camera against another lift's floor list.
+    fa = d.get("floor_alphabet")
+    if isinstance(fa, (list, tuple)):
+        fa = ",".join(str(x).strip() for x in fa if str(x).strip())
+    if isinstance(fa, str) and fa.strip():
+        out["floor_alphabet"] = fa.strip()
     # Cells measured against a panel that has since moved describe different pixels. The wizard
     # already flags this; carry the flag so a worker is not configured from geometry known stale.
     if cells.get("stale"):

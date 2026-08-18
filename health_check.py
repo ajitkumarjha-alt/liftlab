@@ -356,12 +356,27 @@ def evaluate(db, gw, now=None):
     elif pi_age > PI_STALE_S:
         infra.append(f"Pi telemetry {_age_phrase(pi_age)} old (last {_hhmm(pi_ts, now)}) — the relay "
                      f"is not reporting, so every camera figure below may be describing a dead feed")
+    # ── CONFIG GAPS, reported alongside faults ──────────────────────────────────────────────
+    # The floor whitelist has been logged as "NONE" at worker startup since it was written and
+    # nothing consumed it, so ch16 ran with 20.4% of its floor attribution accepted as good reads
+    # for as long as it has existed. A warning nobody reads is not a warning. It is now on the wire
+    # (analyzer_status.floor_alphabet_n) and reported here per camera, so the next camera cannot
+    # regress into the same silence.
+    gaps = []
+    if _has_col(db, "analyzer_status", "floor_alphabet_n"):
+        for r in db.execute("SELECT cam, floor_alphabet_n FROM analyzer_status WHERE gateway_id=?",
+                            (gw,)):
+            if r["cam"] in cams and not (r["floor_alphabet_n"] or 0):
+                gaps.append(f"{r['cam']} floor whitelist: NONE")
     ls_active, ls_note = _litestream()
     if ls_active is False:
         infra.append(f"litestream {ls_note} — the gateway DB is NOT being replicated. On 2026-08-04 "
                      f"the backup chain was found unrestorable at every timestamp because nobody had "
                      f"tried in weeks; silence is how that happened")
 
+    # A CONFIG GAP IS NOT A FAULT. It does not make the line say BREACH — nothing is broken right
+    # now — but it is stated every time until it is closed, which is the difference between a
+    # warning and a warning nobody reads.
     ok = not bad and not infra
     n = len(cams)
     hhmm = datetime.fromtimestamp(now, IST).strftime("%H:%M")
@@ -397,13 +412,16 @@ def evaluate(db, gw, now=None):
     # MISSING key, and this key is always present.
     oos_cams = [c for c in cams
                 if (detail[c].get("klass") or "").startswith("LIFT OUT OF SERVICE")]
+    if gaps:
+        line += (" [CONFIG GAP: " + "; ".join(gaps)
+                 + " — every assembled string is accepted as a good read until set]")
     if oos_cams and ok:
         line += (" (" + ", ".join(f"{c}: {detail[c]['klass']}" for c in oos_cams) + ")")
     elif quiet and ok:
         line += f" (outside active hours: {', '.join(quiet)} quiet — reported, not alarmed)"
     return {"gw": gw, "ts": now, "ok": ok, "cams": cams, "cam_source": cam_source,
             "n_cams": n, "bad": bad, "detail": detail, "line": line, "infra": infra,
-            "quiet_offhours": quiet, "active_hours": _active(now),
+            "quiet_offhours": quiet, "active_hours": _active(now), "config_gaps": gaps,
             "pi_age_s": (None if pi_age is None else round(pi_age, 1)),
             "litestream_ok": ls_active, "litestream_note": ls_note,
             "prev_ok": (None if prev is None else prev["ok"])}

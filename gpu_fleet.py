@@ -173,7 +173,12 @@ def start(cam, cfg):
                          # this camera with another lift's polygons, the exact ch16 undercount this
                          # plumbing exists to end.
                          ("zone_landing", "ZONE_LANDING"), ("zone_cabin", "ZONE_CABIN"),
-                         ("zone_frame", "ZONE_FRAME")):
+                         ("zone_frame", "ZONE_FRAME"),
+                         # The valid-floor whitelist is per CAMERA — ch16's list is 58 floors and
+                         # ch29's is 97, and they barely overlap. It was previously settable only in
+                         # /etc/liftlab-gpu.env, i.e. ONE value for the whole fleet, which is why it
+                         # was never set at all.
+                         ("floor_alphabet", "FLOOR_ALPHABET")):
         if geom.get(key):
             env[envname] = geom[key]
         else:

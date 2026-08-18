@@ -436,6 +436,37 @@ def main():
     if km.startswith("LIFT OUT OF SERVICE"):
         fails.append("a lift that is moving and opening its doors was called out of service")
 
+    print("\n=== 11e. the floor-whitelist CONFIG GAP is reported, and is not a fault ===")
+    # build_door_engine has logged "floor whitelist: NONE" at startup since it was written and
+    # nothing consumed it, so ch16 ran with 20.4% of its floor attribution accepted as good reads
+    # for as long as it has existed. A warning nobody reads is not a warning.
+    gpath = os.path.join(tmp, "gap.db")
+    t_g = datetime(2026, 8, 18, 10, 0, tzinfo=IST).timestamp()
+    build(gpath, t_g - 300)
+    con = sqlite3.connect(gpath)
+    con.execute("ALTER TABLE analyzer_status ADD COLUMN floor_alphabet_n INTEGER")
+    con.execute("UPDATE analyzer_status SET ts=?, floor_alphabet_n=0", (t_g - 20,))
+    con.execute("UPDATE analyzer_status SET floor_alphabet_n=58 WHERE cam='ch27'")
+    con.execute("INSERT INTO relay_status (gateway_id,ts,streams_alive) VALUES ('site-A',?,7)",
+                (t_g - 30,))
+    con.commit(); con.close()
+    dbg = H._db(gpath)
+    try:
+        rg = H.evaluate(dbg, "site-A", now=t_g)
+    finally:
+        dbg.close()
+    print(f"  ok={rg['ok']}  gaps={len(rg['config_gaps'])}")
+    print(f"  {rg['line'][:170]}")
+    if not rg["config_gaps"]:
+        fails.append("the floor-whitelist gap is not reported")
+    if any("ch27" in g for g in rg["config_gaps"]):
+        fails.append("a camera WITH a whitelist was reported as a gap")
+    if not rg["ok"]:
+        fails.append("a config gap was treated as a FAULT — nothing is broken right now, and "
+                     "alarming it would put it in the same bucket as a silent camera")
+    if "CONFIG GAP" not in rg["line"]:
+        fails.append("the gap is on the payload but not on the line anyone reads")
+
     print("\n=== 12. a silent camera simulated against a COPY OF THE REAL DATABASE ===")
     # A synthetic fixture proves the logic; a real database proves it against the shapes the
     # gateway actually holds — seven cameras, real registry rows, real analyzer_status, real
