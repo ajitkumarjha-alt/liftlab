@@ -71,6 +71,13 @@ ACTIVE_TO = int(os.environ.get("HEALTH_ACTIVE_TO", "23"))             # 23:00 IS
 # breach permanently and for the wrong reason.
 PI_STALE_S = float(os.environ.get("HEALTH_PI_STALE_S", "600"))
 LITESTREAM_UNIT = os.environ.get("HEALTH_LITESTREAM_UNIT", "litestream")
+# OUT-OF-SERVICE detection. A parked lift shows a static indicator and never opens its doors, so the
+# discriminator is stability plus door silence — not the floor value, which this reader cannot be
+# trusted to render (ch16: 20.4% of its floor strings are implausible by shape).
+OOS_MIN_S = float(os.environ.get("HEALTH_OOS_MIN_S", "3600"))       # silent at least this long
+OOS_MIN_READS = int(os.environ.get("HEALTH_OOS_MIN_READS", "50"))   # enough reads to call it stable
+OOS_STABLE_FRAC = float(os.environ.get("HEALTH_OOS_STABLE_FRAC", "0.9"))
+OOS_MAX_OPENS_HR = float(os.environ.get("HEALTH_OOS_MAX_OPENS_HR", "1.0"))
 # A camera is expected to be posting only if the registry says it is enabled. The denominator comes
 # from the REGISTRY, never from "cameras that happen to have rows" — a camera that vanished entirely
 # would otherwise drop out of the count and the line would cheerfully report all-of-nothing healthy.
@@ -119,6 +126,13 @@ def _age_phrase(sec):
     if sec < 5400:
         return f"{sec / 60:.0f}m"
     return f"{sec / 3600:.1f}h"
+
+
+def _has_col(db, table, col):
+    try:
+        return any(r[1] == col for r in db.execute(f"PRAGMA table_info({table})"))
+    except sqlite3.OperationalError:
+        return False                              # no such table either
 
 
 def _one(db, sql, args=()):
@@ -232,6 +246,48 @@ def evaluate(db, gw, now=None):
                     and prev and (now - prev["ts"]) > 120):
                 reasons.append(f"alive but processing nothing — segments stuck at {segments} "
                                f"since {_hhmm(prev['ts'], now)} (no video reaching the worker)")
+        # ── OUT OF SERVICE IS A CLASS, NOT A FAULT ───────────────────────────────────────────
+        # ch16, 2026-08-18: silent from 11:07 with segments flowing and a fresh heartbeat, reported
+        # as "worker stall class". The lift was OUT OF SERVICE, parked at P4 — the cabin indicator
+        # read "P4 OUT" and zero transits were CORRECT. Nothing was broken except the classification.
+        #
+        # The evidence to tell them apart was already on the wire: a working camera watching a
+        # parked lift sees a STATIC display. So the discriminator is not the floor VALUE (which the
+        # reader cannot be trusted to render — see below) but its STABILITY: one floor, unchanged,
+        # while the door never opens. A lift in service moves; a lift out of service does not.
+        #
+        # THE FLOOR STRING IS REPORTED BUT NOT TRUSTED. ch16's reader emits 85 distinct floor
+        # strings, 20.4% of them implausible by shape — '1G' alone is 2,902 rows — and every one is
+        # marked as a good read because no FLOOR_ALPHABET is configured. So the indicator text is
+        # quoted as "the reader's assembly", never as a fact about the building.
+        oos = None
+        # A gateway older than the floor column has no indicator to read, and that is a MISSING
+        # FEATURE rather than a lift in service — the check simply does not apply. Asking the schema
+        # is cheaper than discovering it through an OperationalError in the one code path whose job
+        # is to report calmly.
+        if tr_ts is not None and tr_age > OOS_MIN_S and _has_col(db, "gw_door_event", "floor"):
+            fl = db.execute(
+                "SELECT floor, COUNT(*) n, MIN(ts) first_ts, MAX(ts) last_ts FROM gw_door_event "
+                "WHERE gateway_id=? AND cam=? AND ts>=? AND floor IS NOT NULL "
+                "GROUP BY floor ORDER BY n DESC", (gw, cam, now - tr_age)).fetchall()
+            n_reads = sum(r["n"] for r in fl)
+            if n_reads >= OOS_MIN_READS and fl:
+                top = fl[0]
+                share = top["n"] / n_reads
+                # Door activity during the same window would mean the lift IS working and merely
+                # carrying nobody — a different statement, and not this one.
+                opened = _one(db, "SELECT COUNT(*) FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                                  "AND ts>=? AND door_state='open'", (gw, cam, now - tr_age)) or 0
+                # DOOR ACTIVITY AS A RATE, NOT AS ZERO. Requiring exactly zero opens is brittle:
+                # a parked lift can be opened once by an engineer, and one row in four hours would
+                # have disqualified it. A lift IN SERVICE opens its doors tens of times an hour, so
+                # the two populations are orders of magnitude apart and a rate separates them
+                # cleanly without depending on a single row.
+                opens_hr = opened / max(1e-9, tr_age / 3600.0)
+                if share >= OOS_STABLE_FRAC and opens_hr < OOS_MAX_OPENS_HR:
+                    oos = {"floor": top["floor"], "share": round(100.0 * share, 1),
+                           "n_reads": n_reads, "since": tr_ts, "opens_hr": round(opens_hr, 2)}
+
         # ── TRANSIT SILENCE, and WHICH CLASS OF SILENCE it is ────────────────────────────────
         # The class is the whole value of the line. Three states share one symptom (no transits):
         #   segments FROZEN   -> the worker is stalled; the stream may be fine (the resume stall)
@@ -242,12 +298,21 @@ def evaluate(db, gw, now=None):
         quiet_offhours = False
         klass = None
         transit_breach = False
+        if oos:
+            # REPORTED, NOT ALARMED. A parked lift is a fact about the building, not a fault in the
+            # fleet, and calling it a breach is how an operator learns to ignore the line.
+            klass = (f"LIFT OUT OF SERVICE — indicator has read {oos['floor']!r} on "
+                     f"{oos['share']:.0f}% of {oos['n_reads']} reads and the doors have opened "
+                     f"{oos['opens_hr']:.2f}/hr since {_hhmm(oos['since'], now)} "
+                     f"(reader assembly, not a verified string)")
         if tr_ts is None:
             reasons.append("no transit ever recorded")
             klass, transit_breach = "no transit ever recorded", True
         elif tr_age > TRANSIT_STALE_S:
             seg_moved = (ps is not None and segments is not None and segments != ps)
-            if hb_ts is None or (hb_age or 0) > HB_STALE_S:
+            if oos:
+                pass                              # the class is already set, and it is not a stall
+            elif hb_ts is None or (hb_age or 0) > HB_STALE_S:
                 klass = "worker not running"
             elif ps is None:
                 klass = "segments unknown = first check"       # no previous sample to compare
@@ -255,7 +320,9 @@ def evaluate(db, gw, now=None):
                 klass = "segments flowing = worker stall class"
             else:
                 klass = "segments frozen too = upstream/relay class"
-            if _active(now):
+            if oos:
+                quiet_offhours = True             # carried on the payload as REPORTED, never bad
+            elif _active(now):
                 transit_breach = True
                 reasons.append(f"no transit in {_age_phrase(tr_age)} (last {_hhmm(tr_ts, now)}) "
                                f"[{klass}]")
@@ -326,7 +393,13 @@ def evaluate(db, gw, now=None):
     # Cameras quiet outside active hours: REPORTED, never alarmed. Carried on the payload so the
     # dashboard and the daily line can show them without the word BREACH attached.
     quiet = [c for c in cams if detail[c].get("quiet_offhours")]
-    if quiet and ok:
+    # .get("klass") is None for a healthy camera, not "" — dict.get's default only applies to a
+    # MISSING key, and this key is always present.
+    oos_cams = [c for c in cams
+                if (detail[c].get("klass") or "").startswith("LIFT OUT OF SERVICE")]
+    if oos_cams and ok:
+        line += (" (" + ", ".join(f"{c}: {detail[c]['klass']}" for c in oos_cams) + ")")
+    elif quiet and ok:
         line += f" (outside active hours: {', '.join(quiet)} quiet — reported, not alarmed)"
     return {"gw": gw, "ts": now, "ok": ok, "cams": cams, "cam_source": cam_source,
             "n_cams": n, "bad": bad, "detail": detail, "line": line, "infra": infra,

@@ -33,7 +33,7 @@ CREATE TABLE analyzer_status (gateway_id TEXT, cam TEXT, ts REAL, segments INTEG
 CREATE TABLE transit_event (id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT,
   ts REAL, direction TEXT, track_id INTEGER);
 CREATE TABLE gw_door_event (id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, cam TEXT,
-  ts REAL, door_state TEXT, door_version TEXT);
+  ts REAL, floor TEXT, door_state TEXT, door_version TEXT);
 CREATE TABLE relay_status (id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEXT, ts REAL,
   sum_delivered_mbps REAL, streams_alive INTEGER, streams_delivering INTEGER);
 """
@@ -378,6 +378,63 @@ def main():
     print(f"  healthy/breach/crash -> {got}")
     if got != ["INSTALL:0", "INSTALL:1", "ABORT:3"]:
         fails.append(f"the corrected install decision is wrong: {got}")
+
+    print("\n=== 11d. OUT OF SERVICE is a class, not a fault (ch16, 2026-08-18) ===")
+    # The lift was parked at P4 with the indicator reading "P4 OUT". Zero transits were CORRECT and
+    # the checker called it "worker stall class" — nothing was broken except the classification.
+    # The discriminator is the indicator's STABILITY plus door silence, not the floor VALUE: this
+    # reader emits 85 distinct floor strings on ch16, 20.4% implausible by shape, so the string is
+    # quoted as an assembly and never as a fact.
+    opath = os.path.join(tmp, "oos.db")
+    t_oos = datetime(2026, 8, 18, 14, 0, tzinfo=IST).timestamp()
+    build(opath, t_oos - 4 * 3600)                 # last transit 4h ago, inside active hours
+    con = sqlite3.connect(opath)
+    for k in range(200):                           # a static indicator, doors never opening
+        con.execute("INSERT INTO gw_door_event (gateway_id,cam,ts,floor,door_state) "
+                    "VALUES ('site-A','ch16',?, 'P4', 'closed')", (t_oos - 4 * 3600 + 60 * k,))
+    # The worker is HEALTHY — fresh heartbeat, segments flowing, Pi reporting. That is the whole
+    # point: everything about the fleet is fine and the lift is simply parked.
+    con.execute("UPDATE analyzer_status SET ts=?", (t_oos - 20,))
+    con.execute("INSERT INTO relay_status (gateway_id,ts,streams_alive) VALUES ('site-A',?,7)",
+                (t_oos - 30,))
+    con.commit(); con.close()
+    dbo = H._db(opath)
+    try:
+        ro = H.evaluate(dbo, "site-A", now=t_oos)
+    finally:
+        dbo.close()
+    k16 = (ro["detail"].get("ch16") or {}).get("klass") or ""
+    print(f"  ch16 class: {k16[:120]}")
+    print(f"  ch16 in bad list: {'ch16' in ro['bad']}   line: {ro['line'][:110]}")
+    if not k16.startswith("LIFT OUT OF SERVICE"):
+        fails.append(f"a parked lift with a static indicator was not classed out of service: {k16!r}")
+    if "ch16" in ro["bad"]:
+        fails.append("out of service was ALARMED as a fault — it is a fact about the building, and "
+                     "alarming it is how an operator learns to ignore the line")
+    if "reader assembly" not in k16:
+        fails.append("the indicator string is quoted as fact rather than as the reader's assembly")
+
+    print("  a MOVING lift that is merely quiet must NOT be called out of service:")
+    mpath = os.path.join(tmp, "moving.db")
+    build(mpath, t_oos - 4 * 3600)
+    con = sqlite3.connect(mpath)
+    for k in range(200):                           # floor changes, doors open: in service, no riders
+        con.execute("INSERT INTO gw_door_event (gateway_id,cam,ts,floor,door_state) "
+                    "VALUES ('site-A','ch16',?,?,?)",
+                    (t_oos - 4 * 3600 + 60 * k, str(3 + (k % 9)), "open" if k % 5 == 0 else "closed"))
+    con.execute("UPDATE analyzer_status SET ts=?", (t_oos - 20,))
+    con.execute("INSERT INTO relay_status (gateway_id,ts,streams_alive) VALUES ('site-A',?,7)",
+                (t_oos - 30,))
+    con.commit(); con.close()
+    dbm = H._db(mpath)
+    try:
+        rm = H.evaluate(dbm, "site-A", now=t_oos)
+    finally:
+        dbm.close()
+    km = (rm["detail"].get("ch16") or {}).get("klass") or ""
+    print(f"  ch16 class: {km[:100]}")
+    if km.startswith("LIFT OUT OF SERVICE"):
+        fails.append("a lift that is moving and opening its doors was called out of service")
 
     print("\n=== 12. a silent camera simulated against a COPY OF THE REAL DATABASE ===")
     # A synthetic fixture proves the logic; a real database proves it against the shapes the
