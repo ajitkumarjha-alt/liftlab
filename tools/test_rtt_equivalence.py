@@ -167,6 +167,48 @@ def main():
     print(f"  built 9 trips in the current era and 9 across the older three; counted "
           f"{dash.get('n_trips') if dash else '?'}")
 
+    print("\n=== the request path must not walk seven cameras' history ===")
+    # THE DEPLOYED FAILURE: RTT rode /data, which serves all seven cameras, and blew the 25s budget
+    # the moment the era fix made the walk match rows. The budget guard named the phase, which is
+    # the only reason it was a five-minute diagnosis — but a guard firing is not a design.
+    src = open(os.path.join(ROOT, "dash_api.py")).read()
+    i = src.index("def _dash_data_inner")
+    j = src.index('@dash_router.get("/dash/{gw}/trends")', i)
+    if "_rtt_by_cam(" in src[i:j]:
+        fails.append("/data still computes RTT for every camera on every request — that is the "
+                     "timeout")
+    if '@dash_router.get("/dash/{gw}/rtt")' not in src:
+        fails.append("there is no per-camera RTT endpoint to fetch it from instead")
+    print("  /data: clear   per-camera endpoint: present")
+
+    print("\n=== bounded: the version scan, the row cap, and the cache ===")
+    import time as _t
+    from test_dash_occupancy import _stub as _s2
+    _s2()
+    os.environ["GATEWAY_DB"] = path
+    sys.modules.pop("dash_api", None)
+    import dash_api as D2
+    db2 = D2._db()
+    try:
+        t = _t.time(); D2._rtt_by_cam(db2, "site-A", ["ch29"], None, None, ""); cold = _t.time() - t
+        t = _t.time(); D2._rtt_by_cam(db2, "site-A", ["ch29"], None, None, ""); warm = _t.time() - t
+    finally:
+        db2.close()
+    print(f"  cold {cold * 1000:.0f}ms   cached {warm * 1000:.0f}ms")
+    if warm > cold / 2 and cold > 0.01:
+        fails.append(f"the cache saves nothing ({warm*1000:.0f}ms vs {cold*1000:.0f}ms) — it is "
+                     "probably sitting behind the query it was meant to avoid")
+    if "_vw, _vargs = _ts_clause(t0, t1)" not in src:
+        fails.append("the door_version scan is unbounded — a full history scan per camera per "
+                     "request, before a single trip is walked")
+    if "RTT_MAX_ROWS" not in src or "too_many_rows" not in src:
+        fails.append("no row cap: a wide range on a chattering camera walks the whole window on "
+                     "the request path")
+    if "truncat" not in src.lower():
+        fails.append("the cap must REFUSE rather than truncate — a partial walk drops round trips "
+                     "and reports a median from part of the window")
+    print("  version scan bounded, row cap refuses rather than truncates, cache ahead of the work")
+
     print()
     if fails:
         for f in fails:

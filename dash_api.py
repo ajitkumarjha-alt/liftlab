@@ -633,6 +633,12 @@ H3_TRAVEL_NOTE = "h3: travel unmeasured by design"
 # The home floor a round trip is measured from. G on this site; a lift whose lobby is not G would
 # need this per camera, and would then need saying on the label — it changes what RTT MEANS.
 RTT_HOME = os.environ.get("DASH_RTT_HOME", "G")
+# RTT is walked on the request path, so it is capped and cached. The cap refuses rather than
+# truncates: a partial walk drops round trips and reports a median from part of the window, which is
+# worse than saying no.
+RTT_MAX_ROWS = int(os.environ.get("DASH_RTT_MAX_ROWS", "120000"))
+RTT_CACHE_TTL_S = float(os.environ.get("DASH_RTT_CACHE_TTL_S", "120"))
+_RTT_CACHE = {}
 # DWELL VALIDATION: RUN, AND IT REFUTED THE PROPOSED FIX (2026-08-13).
 #
 # The census found 41-64% of door_state flips lasting under a second, and the obvious remedy was a
@@ -1820,24 +1826,52 @@ def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override=""):
         # `=`, so it selected NOTHING: ch29 reported no rows while tools/rtt.py found 1569 trips on
         # the same database two hours earlier. Sharing the walk was never enough; era selection is
         # part of the derivation.
+        # THE CACHE COMES FIRST, keyed on the INPUTS. Placed after era resolution it still paid for
+        # the version scan on every hit — measured at 614ms for a full-history call, which is most
+        # of the cost it was meant to avoid. Same inputs, same answer; nothing needs resolving to
+        # know that.
+        ck = (gw, cam, era_override, t0, t1)
+        hit = _RTT_CACHE.get(ck)
+        if hit and (time.time() - hit[0]) < RTT_CACHE_TTL_S:
+            out[cam] = hit[1]
+            continue
+        # BOUNDED BY THE SAME RANGE. Unbounded this was a full scan of the camera's whole history
+        # — 115,936 rows on ch29 — once per camera per request, before a single trip was walked.
+        _vw, _vargs = _ts_clause(t0, t1)
         vers = [(r["door_version"], r["mx"]) for r in _q(
             db, "SELECT door_version, MAX(ts) mx FROM gw_door_event WHERE gateway_id=? AND cam=? "
-                "AND door_version IS NOT NULL AND door_version<>'' GROUP BY door_version", (gw, cam))]
+                "AND door_version IS NOT NULL AND door_version<>''" + _vw
+                + " GROUP BY door_version", (gw, cam, *_vargs))]
         _ov, _src = _era_for(db, gw, cam, era_override)
         # _era_for's value is a prefix (or a user pin); expand it to the one full version it names.
         era, _err = rtt_core.expand_era(vers, _ov if (era_override or DOOR_ERA not in ("", "auto"))
                                         else None)
         if _err:
             out[cam] = {"state": "era_ambiguous", "note": _err}
+            _RTT_CACHE[ck] = (time.time(), out[cam])
             continue
         if not era:
             out[cam] = {"state": "no_era", "note": "no door-engine reads in any era"}
+            _RTT_CACHE[ck] = (time.time(), out[cam])
             continue
         w, wargs = _ts_clause(t0, t1)
+        # ROW CAP. A wide range on a chattering camera is hundreds of thousands of rows, and this
+        # runs on the request path. Refuse loudly rather than spend the budget: a truncated walk
+        # would silently drop round trips and report a median computed from part of the window.
+        n_rows = _q(db, "SELECT COUNT(*) n FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                        "AND door_version = ?" + w, (gw, cam, era, *wargs))[0]["n"]
+        if n_rows > RTT_MAX_ROWS:
+            out[cam] = {"state": "too_many_rows", "era": era, "n_rows": n_rows,
+                        "note": f"{n_rows} door rows in this range exceeds the {RTT_MAX_ROWS} the "
+                                f"request path will walk. Narrow the range — a truncated walk would "
+                                f"drop round trips and report a median from part of the window."}
+            _RTT_CACHE[ck] = (time.time(), out[cam])
+            continue
         rows = _q(db, "SELECT ts, floor, door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
                       "AND door_version = ?" + w + " ORDER BY ts, id", (gw, cam, era, *wargs))
         if not rows:
             out[cam] = {"state": "no_rows", "era": era}
+            _RTT_CACHE[ck] = (time.time(), out[cam])
             continue
         n_floor = sum(1 for r in rows if r["floor"] is not None)
         if not n_floor:
@@ -1847,11 +1881,16 @@ def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override=""):
             out[cam] = {"state": "no_floor", "era": era, "n_rows": len(rows),
                         "note": "no floor attribution on this camera — RTT needs a home-floor read, "
                                 "so it is UNAVAILABLE, not zero"}
+            _RTT_CACHE[ck] = (time.time(), out[cam])
             continue
         S = rtt_core.summarise(rows, home=RTT_HOME)
         S.update({"state": "ok", "era": era, "n_rows": len(rows),
                   "floor_attributed_pct": round(100.0 * n_floor / len(rows), 1)})
         out[cam] = S
+        _RTT_CACHE[ck] = (time.time(), S)
+        if len(_RTT_CACHE) > 64:                  # bounded: a handful of cameras x ranges
+            for k in list(_RTT_CACHE)[:32]:
+                _RTT_CACHE.pop(k, None)
     return out, None
 
 
@@ -2046,7 +2085,11 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
     # all-history peak beside a 7-day cycle count under one heading, and the peak would win the
     # reader's attention while describing a different span.
     occ = _occupancy_by_cam(db, gw, t0, t1)
-    rtt, rtt_err = _rtt_by_cam(db, gw, [c["cam"] for c in cams], t0, t1, era)
+    # RTT IS NOT COMPUTED HERE ANY MORE. It walked every door row of all seven cameras on every
+    # /data request and blew the 25s budget the moment the era fix made it match rows — the guard
+    # named the phase, which is the only reason this was a five-minute diagnosis. A round trip is a
+    # property of ONE shaft and the panel shows ONE camera, so it is fetched per camera from
+    # /dash/{gw}/rtt instead. See _rtt_by_cam's cache and the row cap.
     xfer = _transfer_by_cam(db, gw)
     floor_cov = _floor_coverage(db, gw)
     registry = _registry(db, gw)
@@ -2093,7 +2136,6 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
             "door": door.get(cam),
             "transit": (dict(trans[cam], source=(a or {}).get("counting_version")) if cam in trans else None),
             "occupancy": occ.get(cam),
-            "rtt": rtt.get(cam),
             "analyzer": (None if a is None else
                          {"up": a["up"], "age_s": a["age_s"], "mode": a.get("mode"),
                           "counting_version": a.get("counting_version"),
@@ -2199,7 +2241,7 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
                          "pi": pi, "relay": relay, "gpu": gpu,
                          # The calibration travels WITH the data, not only in the page that draws it,
                          # so any consumer of this endpoint gets the number and its limits together.
-                         "rtt_note": {"home": RTT_HOME, "error": rtt_err,
+                         "rtt_note": {"home": RTT_HOME, "lazy": f"/dash/{gw}/rtt?cam=<cam>",
                                       "definition": f"door CLOSED at {RTT_HOME} -> next door OPEN "
                                                     f"at {RTT_HOME}, both ends a STOP not a pass"},
                          "occupancy_note": {"label": OCC_LABEL, "calibration": OCC_CALIBRATION,
@@ -2611,6 +2653,35 @@ def dash_health(gw: str):
                 + (f"DELIVERY: {h['delivery_error']}\n" if h.get("delivery_error") else ""))
     return Response(body, media_type="text/plain; charset=utf-8",
                     headers={"Cache-Control": "no-store"})
+
+
+@dash_router.get("/dash/{gw}/rtt")
+def dash_rtt(gw: str, cam: str = "", era: str = "", days: float | None = None):
+    """RTT for ONE camera, over the SELECTED RANGE. Never for the fleet, never all-history.
+
+    This used to ride /data, which serves seven cameras, so one request walked every door row of
+    every camera — 115,936 on ch29 alone — and blew the 25s budget the moment the era fix made the
+    walk match rows. A round trip is a property of one shaft and the panel shows one camera, so the
+    work follows the selection instead of preceding it.
+
+    cam is REQUIRED. A fleet RTT would pool round trips from different shafts, which is not a
+    slower version of the right answer — it is a different and wrong one.
+    """
+    if not cam:
+        return JSONResponse({"error": "cam is required — a round trip is a property of one shaft, "
+                                      "so there is no fleet RTT to compute"}, status_code=400)
+    t0, t1, window = _window(days)
+    db = _db()
+    try:
+        out, err = _rtt_by_cam(db, gw, [cam], t0, t1, era)
+    finally:
+        db.close()
+    return JSONResponse({"gw": gw, "cam": cam, "window": window, "error": err,
+                         "rtt": out.get(cam),
+                         "note": {"home": RTT_HOME,
+                                  "definition": f"door CLOSED at {RTT_HOME} -> next door OPEN at "
+                                                f"{RTT_HOME}, both ends a STOP not a pass"}},
+                        headers={"Cache-Control": "no-store"})
 
 
 @dash_router.get("/dash/{gw}/cams")
@@ -3046,6 +3117,8 @@ function selectCam(cam, opts){
   opts = opts || {};
   if(!cam) return;
   cur = cam; trCam = cam;
+  // Do NOT carry the previous camera's RTT into this one's card, even for the instant before the
+  // fetch lands — that is the stale-payload defect from the trends view, one panel over.
   try{history.replaceState(null,'','/dash?cam='+encodeURIComponent(cam)
       +(mode==='trends'?'&view=trends':''));}catch(e){}
   render();
@@ -3150,8 +3223,17 @@ function panel(d){
   // Every absence names itself, and the caveat travels with the number rather than living in a
   // release note: RTT runs at dwell=0 because every threshold tested destroyed real closes, so
   // sub-second chatter at the home floor can FRAGMENT a trip and bias the median LOW.
-  var rt=c.rtt, rttCard;
-  if(!rt){ rttCard='<div class=blank>no RTT computed for this camera</div>'; }
+  // FETCHED LAZILY, for the selected camera only. RTT walks door rows and /data serves seven
+  // cameras; computing it there cost the whole endpoint its budget. RTT_BY[cam] is filled by
+  // loadRTT() and the card renders "measuring" until it arrives — an honest wait, not a blank.
+  var rt=RTT_BY[c.cam], rttCard;
+  if(rt===undefined){ rttCard='<div class=blank>measuring round trips…</div>'; loadRTT(c.cam); }
+  else if(rt===null){ rttCard='<div class=blank>RTT request failed — reload to retry</div>'; }
+  else if(rt.state==='too_many_rows'){
+    rttCard='<div style="padding:10px;border:1px dashed #b06a00;border-radius:6px">'
+      +'<b>RANGE TOO WIDE TO WALK</b><div class=mut style="font-size:11px;margin-top:4px">'
+      +esc(rt.note||'')+'</div></div>';
+  }
   else if(rt.state==='no_era'){ rttCard='<div class=blank>'+esc(rt.note||'no door-engine era')+'</div>'; }
   else if(rt.state==='no_rows'){ rttCard='<div class=blank>no door rows in this window (era '+esc((rt.era||'').slice(0,12))+')</div>'; }
   else if(rt.state==='era_ambiguous'){ rttCard='<div style="padding:10px;border:1px dashed #b06a00;border-radius:6px">'
@@ -3346,6 +3428,18 @@ function tier2card(t,cam){
 }
 
 var mode='cams', trCam='', TR=null;
+// One entry per camera: undefined = not asked, null = the request failed, object = the answer.
+var RTT_BY={}, RTT_INFLIGHT={};
+function loadRTT(cam){
+  if(!cam || RTT_INFLIGHT[cam]) return;
+  RTT_INFLIGHT[cam]=true;
+  var eq=eraQuery();
+  fetch('/dash/'+GW+'/rtt?cam='+encodeURIComponent(cam)+(eq?('&'+eq):''))
+    .then(function(r){return r.json()})
+    .then(function(j){ RTT_BY[cam]=j.rtt||null; RTT_INFLIGHT[cam]=false;
+                       if(cur===cam && mode==='cams') panel(DATA); })
+    .catch(function(){ RTT_BY[cam]=null; RTT_INFLIGHT[cam]=false; });
+}
 // SEED FROM THE URL, same parameter the Dash tab reads. These were two independent selectors: ?cam=
 // set `cur` (the Dash tab) and never touched trCam, so /dash?cam=ch27 could render the heatmap for
 // whatever camera was last clicked here — reported 2026-08-05 as ch27 in the URL showing ch29's
