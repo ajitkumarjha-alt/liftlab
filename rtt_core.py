@@ -146,3 +146,49 @@ def summarise(rows, home="G"):
         "caveat": RTT_CAVEAT, "travel_gap": TRAVEL_GAP, "dwell_s": DWELL_S,
         "home": home,
     }
+
+
+# ── ERA RESOLUTION — the other half of "one derivation" ──────────────────────────────────────
+# Sharing the WALK was not enough. The CLI scoped on the FULL door_version with `=`; the dash used
+# _era_for, which returns everything before the '+' (templates hash + engine tag + levels tag, but
+# NOT the geometry signature) — a PREFIX, which every other dash consumer matches with LIKE. I wrote
+# `= prefix`, which matches nothing, so ch29 reported no rows while the CLI found 1569 trips on the
+# same database. Two callers, one walk, and they still disagreed, because era selection is part of
+# the derivation and I had left it outside.
+#
+# So both callers now resolve the era HERE and match it the same way.
+
+def newest_era(version_rows):
+    """The full door_version to scope by: newest by EVENT TIME, complete string.
+
+    `version_rows` is [(door_version, last_ts)]. Returns None when there are none.
+
+    FULL, not a prefix. The prefix is the templates hash and the engine tag follows it, so
+    '260d4a0f%' matched three eras on ch29 — untagged, h2, and h2 with recalibrated levels — and
+    would pool h3 in too. An era that pools instruments is not an era.
+    """
+    best, best_ts = None, None
+    for dv, ts in version_rows:
+        if not dv:
+            continue
+        if best_ts is None or (ts is not None and ts > best_ts):
+            best, best_ts = dv, ts
+    return best
+
+
+def expand_era(version_rows, spec):
+    """A user-supplied era (possibly a prefix) -> (full_version, error).
+
+    A prefix that matches more than one full version is REFUSED rather than silently resolved: those
+    are different instruments and picking one for the operator would be a guess wearing a number.
+    """
+    if not spec:
+        return newest_era(version_rows), None
+    matches = [dv for dv, _ts in version_rows if dv and dv.startswith(spec)]
+    if len(matches) > 1:
+        return None, ("era %r matches %d different door_versions (%s) — the prefix is the templates "
+                      "hash and the engine tag follows it, so this spans instruments; pass one in "
+                      "full" % (spec, len(matches), ", ".join(sorted(matches)[:3])))
+    if not matches:
+        return None, "era %r matches no door_version for this camera" % (spec,)
+    return matches[0], None

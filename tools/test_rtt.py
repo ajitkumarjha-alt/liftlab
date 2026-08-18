@@ -108,11 +108,44 @@ def main():
         fails.append("the evidence for dwell=0 is not recorded where the constant lives")
     print("  DWELL_S=0.0, with the validation result recorded beside it")
 
+    print("\n=== 7b. ERA RESOLUTION is shared too — the half that was still divergent ===")
+    # THE STAGE-2 DEFECT. dash_api._era_for returns everything before the '+' (templates hash +
+    # engine tag + levels tag, NOT the geometry signature) — a PREFIX, which every other dash
+    # consumer matches with LIKE. _rtt_by_cam matched it with `=`, which selects NOTHING: ch29
+    # reported "no rows" while the CLI found 1569 trips on the same DB. Sharing the walk was not
+    # enough; era selection is part of the derivation.
+    vers = [("260d4a0f+495e8f48", 100.0),
+            ("260d4a0fh2+495e8f48", 200.0),
+            ("260d4a0fh2Laa52+495e8f48", 300.0),
+            ("260d4a0fh3-stateL9f2T5471cb+495e8f48", 400.0)]
+    full = rtt_core.newest_era(vers)
+    print(f"  newest full era: {full}")
+    if full != "260d4a0fh3-stateL9f2T5471cb+495e8f48":
+        fails.append(f"newest_era picked {full!r} — it must be the newest by event time, in full")
+    if "+" not in (full or ""):
+        fails.append("newest_era returned a prefix; a prefix pools instruments")
+    got, err = rtt_core.expand_era(vers, "260d4a0f")
+    print(f"  prefix '260d4a0f' -> {'REFUSED' if err else got}")
+    if not err:
+        fails.append("an ambiguous prefix was silently resolved — it spans four instruments here, "
+                     "including h2 and h3")
+    got2, err2 = rtt_core.expand_era(vers, "260d4a0fh3-stateL9f2T5471cb+495e8f48")
+    if err2 or got2 != vers[3][0]:
+        fails.append(f"a full era was not accepted verbatim: {got2!r} {err2!r}")
+    # the vestigial levels tag must not trip resolution — it is part of the era string, nothing more
+    got3, err3 = rtt_core.expand_era(vers, "260d4a0fh3-state")
+    print(f"  h3 prefix incl. the vestigial L-tag era -> {'REFUSED' if err3 else got3}")
+    if err3 or got3 != vers[3][0]:
+        fails.append("the h3 era with its vestigial levels tag did not resolve uniquely")
+
     print("\n=== 8. ONE derivation: the dash imports it, never re-implements it ===")
     dash = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                              "dash_api.py")).read()
     if "import rtt_core" not in dash:
         fails.append("dash_api does not import rtt_core")
+    if "rtt_core.expand_era" not in dash:
+        fails.append("dash_api resolves the era itself instead of through rtt_core — this is the "
+                     "exact divergence that made ch29 report no rows")
     for banned in ("def _rtt_trips", "st == \"closed\" and prev in (\"closing\", \"open\")"):
         if banned in dash and "rtt" in dash[max(0, dash.find(banned) - 400):dash.find(banned)]:
             fails.append(f"dash_api appears to re-implement the trip walk ({banned!r})")

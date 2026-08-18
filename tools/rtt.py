@@ -43,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from rtt_core import (DWELL_S, IST, PEAK_WINDOWS, RTT_CAVEAT, SHEET_CLOSE_S, SHEET_OPEN_S,
                       TRAVEL_GAP, classify, cycles_with_floor, summarise, trips)
+from rtt_core import expand_era as rtt_core_expand
 
 DWELL_CAVEAT = RTT_CAVEAT
 
@@ -78,6 +79,11 @@ def main():
     versions = [r["door_version"] for r in db.execute(
         "SELECT door_version, COUNT(*) n FROM gw_door_event WHERE cam=? AND ts>=? AND ts<? "
         "AND door_version IS NOT NULL GROUP BY door_version ORDER BY MAX(ts) DESC", (a.cam, t0, t1))]
+    # SAME RESOLUTION AS THE DASH — rtt_core.expand_era, not a second rule here.
+    _vrows = [(r["door_version"], r["mx"]) for r in db.execute(
+        "SELECT door_version, MAX(ts) mx FROM gw_door_event WHERE cam=? AND ts>=? AND ts<? "
+        "AND door_version IS NOT NULL GROUP BY door_version", (a.cam, t0, t1))]
+    _full, _err = rtt_core_expand(_vrows, a.era or None)
     if a.era:
         matched = [v for v in versions if v.startswith(a.era)]
         if len(matched) > 1:
@@ -92,6 +98,12 @@ def main():
         era_full = matched[0] if matched else a.era
     else:
         era_full = versions[0] if versions else ""
+    # Cross-check: the shared resolver and this path must name the SAME era, or the CLI and the
+    # dash are back to disagreeing — which is the defect this whole refactor exists to close.
+    if _full and era_full and _full != era_full:
+        print(f"  ERA RESOLUTION DISAGREES: this path picked {era_full!r}, rtt_core picked "
+              f"{_full!r}. Using rtt_core's, which is what the dash uses.")
+        era_full = _full
     era = era_full
     rows = db.execute("SELECT ts, floor, door_state, door_version FROM gw_door_event "
                       "WHERE cam=? AND ts>=? AND ts<? AND door_version = ? ORDER BY ts, id",

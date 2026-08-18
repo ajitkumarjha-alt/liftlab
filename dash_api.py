@@ -1812,9 +1812,24 @@ def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override=""):
         import rtt_core
     except Exception as e:                      # the dash must not fail because a tool is missing
         return {}, f"rtt_core unavailable: {type(e).__name__}"
+    _ = rtt_core
     out = {}
     for cam in cams:
-        era, _src = _era_for(db, gw, cam, era_override)
+        # ERA RESOLVED BY rtt_core, IDENTICALLY TO THE CLI. _era_for returns everything before the
+        # '+' — a PREFIX, which every other dash consumer matches with LIKE. This matched it with
+        # `=`, so it selected NOTHING: ch29 reported no rows while tools/rtt.py found 1569 trips on
+        # the same database two hours earlier. Sharing the walk was never enough; era selection is
+        # part of the derivation.
+        vers = [(r["door_version"], r["mx"]) for r in _q(
+            db, "SELECT door_version, MAX(ts) mx FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                "AND door_version IS NOT NULL AND door_version<>'' GROUP BY door_version", (gw, cam))]
+        _ov, _src = _era_for(db, gw, cam, era_override)
+        # _era_for's value is a prefix (or a user pin); expand it to the one full version it names.
+        era, _err = rtt_core.expand_era(vers, _ov if (era_override or DOOR_ERA not in ("", "auto"))
+                                        else None)
+        if _err:
+            out[cam] = {"state": "era_ambiguous", "note": _err}
+            continue
         if not era:
             out[cam] = {"state": "no_era", "note": "no door-engine reads in any era"}
             continue
@@ -2657,9 +2672,14 @@ def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
         cams = [cam] if cam else [c["cam"] for c in _cameras(db, gw)]
         out = []
         for c in cams:
-            e, _s = _era_for(db, gw, c, era)
-            if not e:
-                continue
+            vers = [(r["door_version"], r["mx"]) for r in _q(
+                db, "SELECT door_version, MAX(ts) mx FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                    "AND door_version IS NOT NULL AND door_version<>'' GROUP BY door_version",
+                (gw, c))]
+            _ov, _s = _era_for(db, gw, c, era)
+            e, _err = rtt_core.expand_era(vers, _ov if era else None)
+            if _err or not e:
+                continue                       # ambiguous or absent: no rows rather than wrong rows
             w, wargs = _ts_clause(t0, t1)
             rows = _q(db, "SELECT ts, floor, door_state FROM gw_door_event WHERE gateway_id=? "
                           "AND cam=? AND door_version = ?" + w + " ORDER BY ts, id",
@@ -3133,7 +3153,9 @@ function panel(d){
   var rt=c.rtt, rttCard;
   if(!rt){ rttCard='<div class=blank>no RTT computed for this camera</div>'; }
   else if(rt.state==='no_era'){ rttCard='<div class=blank>'+esc(rt.note||'no door-engine era')+'</div>'; }
-  else if(rt.state==='no_rows'){ rttCard='<div class=blank>no door rows in this window (era '+esc((rt.era||'').slice(0,8))+')</div>'; }
+  else if(rt.state==='no_rows'){ rttCard='<div class=blank>no door rows in this window (era '+esc((rt.era||'').slice(0,12))+')</div>'; }
+  else if(rt.state==='era_ambiguous'){ rttCard='<div style="padding:10px;border:1px dashed #b06a00;border-radius:6px">'
+      +'<b>ERA AMBIGUOUS</b><div class=mut style="font-size:11px;margin-top:4px">'+esc(rt.note||'')+'</div></div>'; }
   else if(rt.state==='no_floor'){
     rttCard='<div style="padding:10px;border:1px dashed #b06a00;border-radius:6px">'
       +'<b>RTT UNAVAILABLE \u2014 no floor attribution</b>'
@@ -3668,7 +3690,9 @@ function renderTrends(){
         return absent('round trip time / hour-of-day (s)',
           'door closed at the home floor \u2192 next door open at the home floor',
           'RTT UNAVAILABLE for '+esc(trCam),
-          esc((R&&R.note)||'no door-engine reads with floor attribution in this era')
+          esc((R&&R.note)|| (R&&R.state==='no_rows'
+                ? ('no door rows in this window for era '+String(R.era||'').slice(0,12))
+                : 'no door-engine reads in any era'))
           +'. RTT is defined by the home floor; without a floor read there is no trip to measure. '
           +'This is not a lift that made no journeys.');
       }
