@@ -40,79 +40,11 @@ import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
-IST = timezone(timedelta(hours=5, minutes=30))
-DWELL_S = 0.0                     # see the module docstring; do not change without re-validating
-RTT_MIN_S, RTT_MAX_S = 30.0, 600.0
-PEAK_WINDOWS = {"AM peak": (8, 10), "PM peak": (18, 20)}
-SHEET_OPEN_S, SHEET_CLOSE_S = 3.00, 2.00        # MEP-02 v28, mirrored from liftlab_report.eras
-DWELL_CAVEAT = ("cycle counts include transitions no hand-timed close corroborates; a minimum-dwell "
-                "filter was tested and rejected (every threshold above 0s destroyed real closes)")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from rtt_core import (DWELL_S, IST, PEAK_WINDOWS, RTT_CAVEAT, SHEET_CLOSE_S, SHEET_OPEN_S,
+                      TRAVEL_GAP, classify, cycles_with_floor, summarise, trips)
 
-
-def cycles_with_floor(rows):
-    """-> [(ts_closed, floor_at_that_cycle)] using _h3_cycle_ts's rule, verbatim.
-
-    The floor carried is the last non-NULL floor seen at or before the close, within the same
-    open->closed run: that is the floor the car was AT while its doors were open.
-    """
-    out, prev, cur_floor = [], None, None
-    for r in rows:
-        st, fl = r["door_state"], r["floor"]
-        if fl is not None:
-            cur_floor = fl
-        if st == "closed" and prev in ("closing", "open"):
-            out.append((r["ts"], cur_floor))
-            cur_floor = None                      # a new run starts with no floor asserted
-        if st != prev:
-            prev = st
-    return out
-
-
-def opens_with_floor(rows):
-    """-> [(ts_open, floor)] for transitions INTO 'open'. The door OPENING at G ends a round trip."""
-    out, prev, cur_floor = [], None, None
-    for r in rows:
-        st, fl = r["door_state"], r["floor"]
-        if fl is not None:
-            cur_floor = fl
-        if st == "open" and prev != "open":
-            out.append((r["ts"], cur_floor))
-        if st != prev:
-            prev = st
-    return out
-
-
-def trips(rows, home="G"):
-    """Round trips: door CLOSED at `home` -> the next door OPEN at `home`.
-
-    Both ends must be STOPS at home — a cycle whose floor is home, and an open whose floor is home —
-    so a car merely passing the ground floor cannot end a trip.
-    """
-    closes = [(t, f) for t, f in cycles_with_floor(rows)]
-    opens = [(t, f) for t, f in opens_with_floor(rows)]
-    out = []
-    oi = 0
-    for t0, f0 in closes:
-        if f0 != home:
-            continue
-        while oi < len(opens) and opens[oi][0] <= t0:
-            oi += 1
-        j = oi
-        while j < len(opens):
-            t1, f1 = opens[j]
-            if f1 == home:
-                out.append((t0, t1, t1 - t0))
-                break
-            j += 1
-    return out
-
-
-def classify(dt):
-    if dt < RTT_MIN_S:
-        return "short (<30s) — likely a phantom G, or the doors reopened at G"
-    if dt > RTT_MAX_S:
-        return "long (>600s) — likely a missed G read, or the car was parked"
-    return None
+DWELL_CAVEAT = RTT_CAVEAT
 
 
 def main():
@@ -186,7 +118,7 @@ def main():
     tr = trips(rows, a.home)
     good, anomalies = [], Counter()
     per_hour = {}
-    for ts, _te, dt in tr:
+    for ts, _te, dt, _ns in tr:
         why = classify(dt)
         h = datetime.fromtimestamp(ts, IST).hour
         b = per_hour.setdefault(h, {"ok": [], "anom": 0})
@@ -217,6 +149,17 @@ def main():
         n, med, p85 = stats(b["ok"])
         print(f"  {h:02d}:00 {n:>5} {med:>9.1f} {p85:>8.1f} {b['anom']:>5}")
 
+    S = summarise(rows, a.home)
+    sd = S["stops"]
+    print(f"\n  STOPS PER ROUND TRIP — the fragmentation check")
+    print(f"    median {sd['median']}  p85 {sd['p85']}  over {sd['n']} trips")
+    print("    " + "  ".join(f"{k}:{v}" for k, v in sd["hist"].items()))
+    if sd["median"] is not None and sd["median"] <= 2:
+        print("    A median of 2 stops on a tall tower is LOW. With dwell=0 a sub-second chatter")
+        print("    pair at the home floor ends one trip and starts another, so a real round trip")
+        print("    can arrive here as two — which biases the RTT median LOW. Read the two numbers")
+        print("    together: a plausible RTT with implausible stops is a fragmented trip.")
+
     print(f"\n  {'window':>10} {'n':>5} {'median s':>9} {'p85 s':>8}")
     n, med, p85 = stats([d for _t_, d in good])
     print(f"  {'all-day':>10} {n:>5} {med:>9.1f} {p85:>8.1f}")
@@ -245,12 +188,10 @@ def main():
             prev_open_ts = None
         if st != prev:
             prev = st
-    stops_per_trip = None
-    if good:
-        # stops in a trip = cycles between the trip's endpoints, averaged
-        cyc = [t for t, _f in cycles_with_floor(rows)]
-        per = [sum(1 for c in cyc if ts < c <= ts + d) for ts, d in good]
-        stops_per_trip = statistics.median(per) if per else None
+    # PLAUSIBLE trips only. Averaging over the anomalies too gave a median of 0, because a
+    # sub-30s "trip" contains no stops by construction — the component check would then have
+    # divided a real RTT by nothing.
+    stops_per_trip = S["stops"]["median"]
     if dwell_v:
         dn, dmed, _dp = stats(dwell_v)
         print(f"    measured door-open dwell per stop: median {dmed:.1f}s over {dn} stops")
