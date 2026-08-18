@@ -1,0 +1,148 @@
+{
+  "zone_landing": [
+    [
+      195,
+      424
+    ],
+    [
+      274,
+      299
+    ],
+    [
+      259,
+      285
+    ],
+    [
+      237,
+      196
+    ],
+    [
+      119,
+      285
+    ]
+  ],
+  "zone_cabin": [
+    [
+      189,
+      493
+    ],
+    [
+      328,
+      286
+    ],
+    [
+      530,
+      440
+    ],
+    [
+      478,
+      569
+    ],
+    [
+      251,
+      571
+    ]
+  ],
+  "zone_frame": [
+    704,
+    576
+  ],
+  "zones_saved_at": "2026-07-29T04:08:09Z",
+  "zones_provenance": "landing tightened per ch27 verdict, 2026-07-29; prior stamp 92%/n=26 under old geometry",
+  "door_roi_frame": [
+    2,
+    2,
+    335,
+    446
+  ],
+  "panel_rois": [
+    [
+      10,
+      158,
+      71,
+      101
+    ]
+  ],
+  "frame_wh": [
+    704,
+    576
+  ],
+  "saved_at": "2026-07-30T14:54:47Z",
+  "source_image": "calib_frame",
+  "drawn_on_wh": [
+    704,
+    576
+  ],
+  "cells": {
+    "digit_cells": [
+      [
+        9,
+        31,
+        6,
+        22
+      ],
+      [
+        15,
+        19,
+        6,
+        22
+      ],
+      [
+        21,
+        7,
+        6,
+        22
+      ]
+    ],
+    "arrow_cell": [
+      30,
+      1,
+      8,
+      22
+    ],
+    "pitch": 6,
+    "cell_w": 6,
+    "panel_wh": [
+      71,
+      101
+    ],
+    "anchors": {
+      "tens_left": 15,
+      "units_left": 21,
+      "digit_top": 13,
+      "digit_bottom": 35,
+      "arrow_left": 30
+    },
+    "anchor_crop": "_calib_crop_030.png",
+    "drawn": {
+      "tens": [
+        15,
+        19,
+        8,
+        18
+      ],
+      "units": [
+        21,
+        7,
+        9,
+        25
+      ],
+      "arrow": [
+        30,
+        1,
+        8,
+        31
+      ],
+      "hundreds": null
+    },
+    "warnings": [
+      "TENS and UNITS heights differ by 7px \u2014 shared height 22px used (the glyph box is one size; only position varies)",
+      "tilt is -12px per 6px of pitch \u2014 that is a very steep slant for an LED panel. Real ones run a few px; check TENS and UNITS are on the same row.",
+      "d0 sits [+0,+18]px off the uniform grid \u2014 beyond \u00b14px that is more likely a bad drag than a real slant. Check the overlay.",
+      "d1 sits [+0,+6]px off the uniform grid \u2014 beyond \u00b14px that is more likely a bad drag than a real slant. Check the overlay.",
+      "d2 sits [+0,-6]px off the uniform grid \u2014 beyond \u00b14px that is more likely a bad drag than a real slant. Check the overlay.",
+      "arrow sits [+0,-12]px off the uniform grid \u2014 beyond \u00b14px that is more likely a bad drag than a real slant. Check the overlay."
+    ],
+    "saved_at": "2026-07-30T15:17:43Z"
+  }
+}

@@ -637,8 +637,6 @@ RTT_HOME = os.environ.get("DASH_RTT_HOME", "G")
 # truncates: a partial walk drops round trips and reports a median from part of the window, which is
 # worse than saying no.
 RTT_MAX_ROWS = int(os.environ.get("DASH_RTT_MAX_ROWS", "120000"))
-RTT_CACHE_TTL_S = float(os.environ.get("DASH_RTT_CACHE_TTL_S", "120"))
-_RTT_CACHE = {}
 # DWELL VALIDATION: RUN, AND IT REFUTED THE PROPOSED FIX (2026-08-13).
 #
 # The census found 41-64% of door_state flips lasting under a second, and the obvious remedy was a
@@ -1335,6 +1333,16 @@ def _aggregate_table(db):
         source_rows INTEGER,        -- rows the walk consumed, so a thin aggregate is visible
         compute_ms INTEGER,
         PRIMARY KEY (gateway_id, cam, counting_version, door_version, window_days))""")
+    # RTT joins door_gpu and tier2 as a third precomputed payload on the SAME era key. It shipped
+    # first as a live walk on the request path and reintroduced exactly the hang the paragraph above
+    # exists to prevent: /trends went to 152.8 s and /data to 24.5 s on the live box.
+    # ALTER, not a recreate: the table is already on every gateway and holds the only record of what
+    # the fleet looked like in retired eras.
+    cols = {r[1] for r in db.execute("PRAGMA table_info(door_aggregate)")}
+    if "rtt" not in cols:
+        db.execute("ALTER TABLE door_aggregate ADD COLUMN rtt TEXT")
+    if "rtt_ms" not in cols:
+        db.execute("ALTER TABLE door_aggregate ADD COLUMN rtt_ms INTEGER")
 
 
 def _current_keys(db, gw, cam):
@@ -1382,6 +1390,41 @@ def _aggregate_read(db, gw, cam, window_days):
                     "counting_version": cv, "door_version": dv, "window_days": window_days}
 
 
+def _rtt_read(db, gw, cam, window_days):
+    """Serve the STORED round-trip summary. NEVER walks. -> (summary|None, meta).
+
+    Same era key and same never-across-boundaries rule as _aggregate_read: an RTT computed under one
+    door_version describes one instrument, and serving it beside another pools two.
+
+    A miss is reported as PENDING, never as "no round trips". Those are opposite claims — one says
+    the lift did not move, the other says nobody has looked yet — and the panel must not print the
+    first when the second is true."""
+    cv, dv = _current_keys(db, gw, cam)
+    if dv is None:
+        return None, {"state": "no door rows for this camera in any era"}
+    try:
+        r = db.execute("SELECT rtt, rtt_ms, computed_at FROM door_aggregate WHERE gateway_id=? "
+                       "AND cam=? AND counting_version=? AND door_version=? AND window_days=?",
+                       (gw, cam, cv, dv, float(window_days))).fetchone()
+    except sqlite3.OperationalError:
+        return None, {"state": "not yet computed — the precompute job has never run on this schema",
+                      "current_door_version": dv}
+    if not r or not r["rtt"]:
+        return None, {"state": "not yet computed for the current era/window",
+                      "current_door_version": dv, "window_days": window_days,
+                      "detail": "the precompute job (liftlab-precompute.timer) fills this off the "
+                                "request path; this is pending computation, NOT an absence of "
+                                "round trips"}
+    try:
+        S = json.loads(r["rtt"])
+    except (ValueError, TypeError):
+        return None, {"state": "stored RTT unreadable", "computed_at": r["computed_at"]}
+    return S, {"state": "ok", "computed_at": r["computed_at"],
+               "age_s": (round(time.time() - r["computed_at"], 1) if r["computed_at"] else None),
+               "compute_ms": r["rtt_ms"], "door_version": dv, "window_days": window_days,
+               "source": "door_aggregate (precomputed off the request path)"}
+
+
 def aggregate_refresh(db, gw, cam, window_days=None):
     """Walk the rows and STORE. Scheduler/CLI ONLY — never a request handler."""
     _aggregate_table(db)
@@ -1397,14 +1440,21 @@ def aggregate_refresh(db, gw, cam, window_days=None):
     dg = dg_all.get(cam)
     src = (dg or {}).get("n_rows") or (t2 or {}).get("rows_in_era") or 0
     ms = int((time.time() - t_start) * 1000)
+    # THE ONLY PLACE THE RTT WALK RUNS. Off the request path, once per era per window, on the timer.
+    _r0 = time.time()
+    _rt, _rerr = _rtt_by_cam(db, gw, [cam], t0, t1)
+    rtt = (_rt or {}).get(cam)
+    rtt_ms = int((time.time() - _r0) * 1000)
     db.execute("INSERT INTO door_aggregate (gateway_id,cam,counting_version,door_version,"
-               "window_days,door_gpu,tier2,computed_at,source_rows,compute_ms) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?) "
+               "window_days,door_gpu,tier2,computed_at,source_rows,compute_ms,rtt,rtt_ms) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
                "ON CONFLICT(gateway_id,cam,counting_version,door_version,window_days) DO UPDATE SET "
                "door_gpu=excluded.door_gpu, tier2=excluded.tier2, computed_at=excluded.computed_at, "
-               "source_rows=excluded.source_rows, compute_ms=excluded.compute_ms",
+               "source_rows=excluded.source_rows, compute_ms=excluded.compute_ms, "
+               "rtt=excluded.rtt, rtt_ms=excluded.rtt_ms",
                (gw, cam, cv, dv, d, json.dumps(dg) if dg else None,
-                json.dumps(t2) if t2 else None, time.time(), src, ms))
+                json.dumps(t2) if t2 else None, time.time(), src, ms,
+                json.dumps(rtt) if rtt else None, rtt_ms))
     db.commit()
     # Keep the table from growing an entry per retired era forever.
     db.execute("DELETE FROM door_aggregate WHERE gateway_id=? AND cam=? AND NOT "
@@ -1412,7 +1462,8 @@ def aggregate_refresh(db, gw, cam, window_days=None):
     db.commit()
     return {"gw": gw, "cam": cam, "source_rows": src, "compute_ms": ms,
             "has_tier2": t2 is not None, "counting_version": cv, "door_version": dv,
-            "window_days": d}
+            "window_days": d, "rtt_ms": rtt_ms,
+            "rtt_trips": (rtt or {}).get("n_trips"), "rtt_error": _rerr}
 
 
 # ── floor alphabet: derived on a SCHEDULE, served from a table ─────────────────
@@ -1826,15 +1877,11 @@ def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override=""):
         # `=`, so it selected NOTHING: ch29 reported no rows while tools/rtt.py found 1569 trips on
         # the same database two hours earlier. Sharing the walk was never enough; era selection is
         # part of the derivation.
-        # THE CACHE COMES FIRST, keyed on the INPUTS. Placed after era resolution it still paid for
-        # the version scan on every hit — measured at 614ms for a full-history call, which is most
-        # of the cost it was meant to avoid. Same inputs, same answer; nothing needs resolving to
-        # know that.
-        ck = (gw, cam, era_override, t0, t1)
-        hit = _RTT_CACHE.get(ck)
-        if hit and (time.time() - hit[0]) < RTT_CACHE_TTL_S:
-            out[cam] = hit[1]
-            continue
+        # NO IN-PROCESS CACHE. There was one, keyed on (gw, cam, era, t0, t1), and it never fired:
+        # t0 arrives as time.time()-minus-a-span, so every request minted a new key. It measured
+        # 0ms on a fixture that passed a stable (None, None) and 9.0s on the live box. Rather than
+        # repair the key, the walk moved off the request path entirely — a process cache cannot help
+        # a cold start, a restart, or a first view, and this is the only caller that remains.
         # BOUNDED BY THE SAME RANGE. Unbounded this was a full scan of the camera's whole history
         # — 115,936 rows on ch29 — once per camera per request, before a single trip was walked.
         _vw, _vargs = _ts_clause(t0, t1)
@@ -1848,11 +1895,9 @@ def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override=""):
                                         else None)
         if _err:
             out[cam] = {"state": "era_ambiguous", "note": _err}
-            _RTT_CACHE[ck] = (time.time(), out[cam])
             continue
         if not era:
             out[cam] = {"state": "no_era", "note": "no door-engine reads in any era"}
-            _RTT_CACHE[ck] = (time.time(), out[cam])
             continue
         w, wargs = _ts_clause(t0, t1)
         # ROW CAP. A wide range on a chattering camera is hundreds of thousands of rows, and this
@@ -1865,13 +1910,11 @@ def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override=""):
                         "note": f"{n_rows} door rows in this range exceeds the {RTT_MAX_ROWS} the "
                                 f"request path will walk. Narrow the range — a truncated walk would "
                                 f"drop round trips and report a median from part of the window."}
-            _RTT_CACHE[ck] = (time.time(), out[cam])
             continue
         rows = _q(db, "SELECT ts, floor, door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
                       "AND door_version = ?" + w + " ORDER BY ts, id", (gw, cam, era, *wargs))
         if not rows:
             out[cam] = {"state": "no_rows", "era": era}
-            _RTT_CACHE[ck] = (time.time(), out[cam])
             continue
         n_floor = sum(1 for r in rows if r["floor"] is not None)
         if not n_floor:
@@ -1881,16 +1924,11 @@ def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override=""):
             out[cam] = {"state": "no_floor", "era": era, "n_rows": len(rows),
                         "note": "no floor attribution on this camera — RTT needs a home-floor read, "
                                 "so it is UNAVAILABLE, not zero"}
-            _RTT_CACHE[ck] = (time.time(), out[cam])
             continue
         S = rtt_core.summarise(rows, home=RTT_HOME)
         S.update({"state": "ok", "era": era, "n_rows": len(rows),
                   "floor_attributed_pct": round(100.0 * n_floor / len(rows), 1)})
         out[cam] = S
-        _RTT_CACHE[ck] = (time.time(), S)
-        if len(_RTT_CACHE) > 64:                  # bounded: a handful of cameras x ranges
-            for k in list(_RTT_CACHE)[:32]:
-                _RTT_CACHE.pop(k, None)
     return out, None
 
 
@@ -2374,10 +2412,29 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                 if not occ_ver.get(r["cam"]) or r["counting_version"] == occ_ver.get(r["cam"])]
     # RTT by hour-of-day, for the chart. Single camera only: a fleet RTT would pool round trips from
     # different shafts, and a shaft is what a round trip is a property of.
-    rtt_tr = None
+    #
+    # READ, NEVER WALK. This called _rtt_by_cam directly and that is what took /trends from ~60 s to
+    # 152.8 s on the live box — a full walk added to every trends request, for a chart most requests
+    # do not even show. The in-process cache could not save it: both callers build t0 from
+    # time.time(), so every request produced a fresh cache key and a fresh walk.
+    # AND NO LIVE FALLBACK, unlike tier2 below. tier2's inline path is affordable because every one
+    # of its inputs is bounded in SQL; the RTT walk is not — the era filter is a LIKE that no index
+    # covers, so it post-filters every row in the ts range and costs ~40 ms per 10k rows SCANNED
+    # regardless of how few are in the era. On a custom range RTT is reported unavailable, and the
+    # panel says which range would have it. An unavailable number is recoverable; a 152-second
+    # request is not.
+    rtt_tr, rtt_meta = None, None
     if cam:
-        _rt, _re = _rtt_by_cam(db, gw, [cam], t0, t1, era)
-        rtt_tr = (_rt or {}).get(cam)
+        _rtt_cache_ok = (not era) and (not from_d) and (not to_d) and (period in ("", "all", "week"))
+        if _rtt_cache_ok:
+            rtt_tr, rtt_meta = _rtt_read(db, gw, cam, WINDOW_DAYS)
+        else:
+            rtt_meta = {"state": "not served for this range",
+                        "detail": f"round trips are precomputed for the rolling {WINDOW_DAYS:g}-day "
+                                  f"window on the current era only; this request overrides the era "
+                                  f"or asks for a custom range, and RTT is never derived on the "
+                                  f"request path",
+                        "window_days": WINDOW_DAYS}
     # The first episode that EVER carried occupancy coverage for this selection, ignoring the range.
     _ofr = _q(db, "SELECT MIN(ts_start) mn FROM validation_item WHERE gateway_id=? "
                   "AND occupancy_frames > 0" + (" AND cam=?" if cam else ""),
@@ -2555,6 +2612,12 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                          # that reads as "the car was empty". A dash with no reason is the same
                          # failure as the 0-cycles bug two panels over.
                          "rtt": rtt_tr,
+                         # The state travels with the value. Without it a pending RTT and a camera
+                         # with genuinely no round trips arrive as the same null.
+                         "rtt_state": (rtt_meta or {}).get("state"),
+                         "rtt_detail": (rtt_meta or {}).get("detail"),
+                         "rtt_computed_at": (rtt_meta or {}).get("computed_at"),
+                         "rtt_window_days": (rtt_meta or {}).get("window_days"),
                          "rtt_note": {"home": RTT_HOME,
                                       "fleet": (None if cam else "RTT is per-shaft; a fleet figure "
                                                                 "would pool round trips from "
@@ -2666,18 +2729,37 @@ def dash_rtt(gw: str, cam: str = "", era: str = "", days: float | None = None):
 
     cam is REQUIRED. A fleet RTT would pool round trips from different shafts, which is not a
     slower version of the right answer — it is a different and wrong one.
+
+    AND IT READS, IT DOES NOT WALK. Taking RTT off /data was not enough: cold 21.0 s, "warm" 9.0 s
+    on the live box, because the in-process cache was keyed on a t0 built from time.time() and so
+    never once fired — three identical requests produced three keys and three full walks. The walk
+    now runs only in aggregate_refresh, on the precompute timer, and this endpoint reads one
+    indexed row.
     """
     if not cam:
         return JSONResponse({"error": "cam is required — a round trip is a property of one shaft, "
                                       "so there is no fleet RTT to compute"}, status_code=400)
-    t0, t1, window = _window(days)
+    d = WINDOW_DAYS if days is None else float(days)
+    _, _, window = _window(d)
+    if era or abs(d - WINDOW_DAYS) > 1e-9:
+        return JSONResponse(
+            {"gw": gw, "cam": cam, "window": window, "rtt": None,
+             "state": "not served for this range",
+             "error": f"round trips are precomputed for the rolling {WINDOW_DAYS:g}-day window on "
+                      f"the camera's current era. Deriving one here is what took this endpoint to "
+                      f"21 s. For another range or era: tools/rtt.py, off the request path."},
+            headers={"Cache-Control": "no-store"})
     db = _db()
     try:
-        out, err = _rtt_by_cam(db, gw, [cam], t0, t1, era)
+        S, meta = _rtt_read(db, gw, cam, d)
     finally:
         db.close()
-    return JSONResponse({"gw": gw, "cam": cam, "window": window, "error": err,
-                         "rtt": out.get(cam),
+    return JSONResponse({"gw": gw, "cam": cam, "window": window,
+                         "rtt": S, "state": meta.get("state"), "meta": meta,
+                         # PENDING IS NOT ZERO. A miss means nobody has computed it yet; printing
+                         # "no round trips" there would assert the lift never moved.
+                         "error": (None if meta.get("state") == "ok" else meta.get("detail")
+                                   or meta.get("state")),
                          "note": {"home": RTT_HOME,
                                   "definition": f"door CLOSED at {RTT_HOME} -> next door OPEN at "
                                                 f"{RTT_HOME}, both ends a STOP not a pass"}},
@@ -3229,6 +3311,13 @@ function panel(d){
   var rt=RTT_BY[c.cam], rttCard;
   if(rt===undefined){ rttCard='<div class=blank>measuring round trips…</div>'; loadRTT(c.cam); }
   else if(rt===null){ rttCard='<div class=blank>RTT request failed — reload to retry</div>'; }
+  else if(rt.state==='pending'){
+    // Named, not blank: this is the precompute not having reached this era/camera yet, which no
+    // reload fixes and which must never be read as "this lift made no round trips".
+    rttCard='<div style="padding:10px;border:1px dashed #667;border-radius:6px">'
+      +'<b>RTT NOT YET COMPUTED</b><div class=mut style="font-size:11px;margin-top:4px">'
+      +esc(rt.note||'')+'</div></div>';
+  }
   else if(rt.state==='too_many_rows'){
     rttCard='<div style="padding:10px;border:1px dashed #b06a00;border-radius:6px">'
       +'<b>RANGE TOO WIDE TO WALK</b><div class=mut style="font-size:11px;margin-top:4px">'
@@ -3436,7 +3525,11 @@ function loadRTT(cam){
   var eq=eraQuery();
   fetch('/dash/'+GW+'/rtt?cam='+encodeURIComponent(cam)+(eq?('&'+eq):''))
     .then(function(r){return r.json()})
-    .then(function(j){ RTT_BY[cam]=j.rtt||null; RTT_INFLIGHT[cam]=false;
+    // PENDING IS NOT FAILURE AND NOT ZERO. `j.rtt||null` collapsed "the precompute has not reached
+    // this camera yet" into the same null as a dead request, and the card said "reload to retry"
+    // for a condition no reload can fix. The server's state travels with the value.
+    .then(function(j){ RTT_BY[cam] = j.rtt || {state:'pending', note:(j.error||j.state||'')};
+                       RTT_INFLIGHT[cam]=false;
                        if(cur===cam && mode==='cams') panel(DATA); })
     .catch(function(){ RTT_BY[cam]=null; RTT_INFLIGHT[cam]=false; });
 }

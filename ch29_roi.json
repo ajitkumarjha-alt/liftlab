@@ -1,0 +1,113 @@
+{
+  "zone_landing": [
+    [
+      514,
+      394
+    ],
+    [
+      834,
+      322
+    ],
+    [
+      722,
+      529
+    ],
+    [
+      732,
+      684
+    ],
+    [
+      761,
+      776
+    ],
+    [
+      618,
+      827
+    ]
+  ],
+  "zone_cabin": [
+    [
+      630,
+      870
+    ],
+    [
+      932,
+      747
+    ],
+    [
+      1042,
+      733
+    ],
+    [
+      1308,
+      1056
+    ],
+    [
+      587,
+      1056
+    ],
+    [
+      548,
+      914
+    ]
+  ],
+  "zone_frame": [
+    1920,
+    1080
+  ],
+  "zones_saved_at": "2026-07-28T11:31:42Z",
+  "zones_provenance": "desk-rig 2026-07-11, geometry-verified 2026-07-15; builtin->registry 2026-07-28",
+  "door_roi_frame": [
+    172,
+    3,
+    185,
+    412
+  ],
+  "panel_rois": [
+    [
+      124,
+      116,
+      51,
+      92
+    ],
+    [
+      379,
+      44,
+      40,
+      89
+    ]
+  ],
+  "frame_wh": [
+    704,
+    576
+  ],
+  "cells": {
+    "digit_cells": [
+      [
+        5,
+        2,
+        8,
+        20
+      ],
+      [
+        14,
+        5,
+        8,
+        20
+      ],
+      [
+        21,
+        2,
+        8,
+        20
+      ]
+    ],
+    "arrow_cell": [
+      29,
+      2,
+      8,
+      20
+    ]
+  },
+  "consolidated_note": "pre-consolidation calibration merged from _calib_rois.json + _calib_fitcells.json (fitcells supersedes cells); prior keys preserved"
+}

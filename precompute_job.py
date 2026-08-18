@@ -76,8 +76,16 @@ def main():
                 if m.get("skipped"):
                     print(f"[precompute] aggregate {gw}/{cam}: skipped ({m['skipped']})", flush=True)
                 else:
+                    # RTT is reported SEPARATELY, with its own millisecond cost. It is the most
+                    # expensive part of the sweep — the era filter is a LIKE no index covers, so it
+                    # post-filters every row in the window — and it is the part that has to stay
+                    # inside the timer interval. A line that hides it inside one total cannot show
+                    # the sweep drifting towards its own period.
                     print(f"[precompute] aggregate {gw}/{cam}: {m['source_rows']} rows, "
                           f"tier2={'yes' if m['has_tier2'] else 'none'}, "
+                          f"rtt={m.get('rtt_trips') if m.get('rtt_trips') is not None else '-'} trips"
+                          f" in {(m.get('rtt_ms') or 0)/1000:.2f}s"
+                          + (f" [{m['rtt_error']}]" if m.get("rtt_error") else "") + ", "
                           f"cv={m['counting_version'] or '-'} dv={m['door_version']} "
                           f"window={m['window_days']}d in {time.time()-t0:.2f}s", flush=True)
                 ok += 1

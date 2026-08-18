@@ -41,6 +41,11 @@ CREATE TABLE gw_door_event (id INTEGER PRIMARY KEY AUTOINCREMENT, gateway_id TEX
   reason TEXT, close_travel_s REAL, door_version TEXT);
 CREATE TABLE channel_map (gateway_id TEXT, channel INTEGER, is_lift INTEGER, label TEXT,
   marked_at REAL);
+-- The precompute keys on (counting_version, door_version), so the fixture has to carry the
+-- counting side too or _current_keys cannot form the key the aggregate is stored under.
+CREATE TABLE analyzer_status (gateway_id TEXT, cam TEXT, counting_version TEXT, ts REAL);
+CREATE TABLE transit_event (gateway_id TEXT, cam TEXT, ts REAL, direction TEXT,
+  counting_version TEXT);
 """
 
 
@@ -189,15 +194,20 @@ def main():
     sys.modules.pop("dash_api", None)
     import dash_api as D2
     db2 = D2._db()
-    try:
-        t = _t.time(); D2._rtt_by_cam(db2, "site-A", ["ch29"], None, None, ""); cold = _t.time() - t
-        t = _t.time(); D2._rtt_by_cam(db2, "site-A", ["ch29"], None, None, ""); warm = _t.time() - t
-    finally:
-        db2.close()
-    print(f"  cold {cold * 1000:.0f}ms   cached {warm * 1000:.0f}ms")
-    if warm > cold / 2 and cold > 0.01:
-        fails.append(f"the cache saves nothing ({warm*1000:.0f}ms vs {cold*1000:.0f}ms) — it is "
-                     "probably sitting behind the query it was meant to avoid")
+    db2.close()
+    # THE IN-PROCESS CACHE IS GONE, AND ITS ABSENCE IS THE ASSERTION. It was keyed on
+    # (gw, cam, era, t0, t1) where t0 = time.time() - days*86400 — a different float every request —
+    # so three identical user requests minted three keys and did three full walks. The old version
+    # of this block measured it with an explicit (None, None), a STABLE key production never uses,
+    # and so reported "cold 2439ms / cached 0ms" while the live box served 9.0s warm.
+    #
+    # A cache test that constructs its own key cannot see the key production uses. The lesson is not
+    # "fix the key" — a process cache cannot help a cold start or a first view either — so the walk
+    # moved to the precompute timer and the cache was deleted rather than repaired.
+    if "_RTT_CACHE" in src or "RTT_CACHE_TTL_S" in src:
+        fails.append("the in-process RTT cache is still present — it never fired (t0 is "
+                     "time.time()-relative) and now has no request-path caller to serve")
+    print("  in-process cache removed; the walk runs on the precompute timer only")
     if "_vw, _vargs = _ts_clause(t0, t1)" not in src:
         fails.append("the door_version scan is unbounded — a full history scan per camera per "
                      "request, before a single trip is walked")
@@ -207,7 +217,56 @@ def main():
     if "truncat" not in src.lower():
         fails.append("the cap must REFUSE rather than truncate — a partial walk drops round trips "
                      "and reports a median from part of the window")
-    print("  version scan bounded, row cap refuses rather than truncates, cache ahead of the work")
+    print("  version scan bounded, row cap refuses rather than truncates")
+
+    # ── THE WALK MUST NOT BE REACHABLE FROM ANY REQUEST HANDLER ──────────────────────────────
+    # An in-process cache was the wrong instrument: it cannot help a cold process, a restart, or a
+    # first view, and here it could not fire at all. The walk belongs on the precompute timer, and
+    # the endpoints read the stored row — which is the rule door_aggregate already stated for tier2.
+    print("\n=== the walk is off every request path ===")
+    for fn in ("dash_data", "dash_trends", "dash_rtt"):
+        i = src.find(f"def {fn}(")
+        if i < 0:
+            fails.append(f"{fn} is missing entirely")
+            continue
+        j = src.find("\n@", i)
+        body = src[i:j if j > 0 else len(src)]
+        if "_rtt_by_cam(" in body:
+            fails.append(f"{fn} still WALKS door rows — this is what took /trends to 152.8s live; "
+                         f"it must read the precomputed row via _rtt_read")
+        print(f"  {fn:12s} {'WALKS' if '_rtt_by_cam(' in body else 'reads'}")
+    _ar = src.find("def aggregate_refresh(")
+    if _ar < 0 or "_rtt_by_cam(" not in src[_ar:src.find("\ndef ", _ar + 10)]:
+        fails.append("aggregate_refresh does not compute RTT — nothing would ever fill the column, "
+                     "and every panel would sit on 'not yet computed' forever")
+
+    # ── AND THE PRECOMPUTE MUST PRESERVE THE EQUIVALENCE ─────────────────────────────────────
+    # Moving the walk off the request path is only safe if the stored answer is the SAME answer.
+    # Storing a summary the CLI disagrees with would replace a slow truth with a fast falsehood.
+    print("\n=== the stored answer equals the walked answer ===")
+    _s2()
+    os.environ["GATEWAY_DB"] = path
+    sys.modules.pop("dash_api", None)
+    import dash_api as D3
+    db3 = D3._db()
+    try:
+        pend, pmeta = D3._rtt_read(db3, "site-A", "ch29", D3.WINDOW_DAYS)
+        print(f"  before any precompute: {pmeta.get('state')}")
+        if pend is not None:
+            fails.append("_rtt_read invented a summary with nothing precomputed")
+        if "not yet computed" not in (pmeta.get("state") or ""):
+            fails.append(f"a miss must report PENDING, not absence — got {pmeta.get('state')!r}; "
+                         f"'no round trips' asserts the lift never moved")
+        D3.aggregate_refresh(db3, "site-A", "ch29")
+        got, gmeta = D3._rtt_read(db3, "site-A", "ch29", D3.WINDOW_DAYS)
+        print(f"  after precompute:      {gmeta.get('state')}  trips={(got or {}).get('n_trips')}")
+        if not got:
+            fails.append("nothing stored after aggregate_refresh")
+        elif got.get("n_trips") != cli["n_trips"]:
+            fails.append(f"stored trips {got.get('n_trips')} != CLI trips {cli["n_trips"]} — the "
+                         f"precompute changed the answer, not just where it is computed")
+    finally:
+        db3.close()
 
     print()
     if fails:
