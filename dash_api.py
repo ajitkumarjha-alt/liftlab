@@ -630,6 +630,9 @@ def _is_h3_era(era):
 
 
 H3_TRAVEL_NOTE = "h3: travel unmeasured by design"
+# The home floor a round trip is measured from. G on this site; a lift whose lobby is not G would
+# need this per camera, and would then need saying on the label — it changes what RTT MEANS.
+RTT_HOME = os.environ.get("DASH_RTT_HOME", "G")
 # DWELL VALIDATION: RUN, AND IT REFUTED THE PROPOSED FIX (2026-08-13).
 #
 # The census found 41-64% of door_state flips lasting under a second, and the obvious remedy was a
@@ -1795,6 +1798,48 @@ def _transit_by_cam(db, gw):
             for r in rows}
 
 
+def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override=""):
+    """ROUND TRIP TIME per camera — the derivation is rtt_core's, never a second copy here.
+
+    RTT is what the whole MEP-02 sheet resolves to, so it must not be computable two ways. This
+    reads the era-scoped door rows and hands them to the same function tools/rtt.py calls.
+
+    ERA SCOPED ON THE FULL door_version. The 8-char prefix is the TEMPLATES hash and the engine tag
+    follows it, so a prefix pools h2 with h3 — measured on ch29, where one prefix matched three
+    eras. _era_for returns the full string and that is what is matched.
+    """
+    try:
+        import rtt_core
+    except Exception as e:                      # the dash must not fail because a tool is missing
+        return {}, f"rtt_core unavailable: {type(e).__name__}"
+    out = {}
+    for cam in cams:
+        era, _src = _era_for(db, gw, cam, era_override)
+        if not era:
+            out[cam] = {"state": "no_era", "note": "no door-engine reads in any era"}
+            continue
+        w, wargs = _ts_clause(t0, t1)
+        rows = _q(db, "SELECT ts, floor, door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                      "AND door_version = ?" + w + " ORDER BY ts, id", (gw, cam, era, *wargs))
+        if not rows:
+            out[cam] = {"state": "no_rows", "era": era}
+            continue
+        n_floor = sum(1 for r in rows if r["floor"] is not None)
+        if not n_floor:
+            # THE ABSENCE HAS A NAME. A camera with no floor attribution cannot have an RTT at all —
+            # the home floor is what defines the trip — and that is a different statement from
+            # "this lift made no round trips".
+            out[cam] = {"state": "no_floor", "era": era, "n_rows": len(rows),
+                        "note": "no floor attribution on this camera — RTT needs a home-floor read, "
+                                "so it is UNAVAILABLE, not zero"}
+            continue
+        S = rtt_core.summarise(rows, home=RTT_HOME)
+        S.update({"state": "ok", "era": era, "n_rows": len(rows),
+                  "floor_attributed_pct": round(100.0 * n_floor / len(rows), 1)})
+        out[cam] = S
+    return out, None
+
+
 def _occupancy_by_cam(db, gw, t0=None, t1=None):
     """Per-camera PEAK CAR OCCUPANCY over the window, from the door-open episodes in validation_item.
 
@@ -1986,6 +2031,7 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
     # all-history peak beside a 7-day cycle count under one heading, and the peak would win the
     # reader's attention while describing a different span.
     occ = _occupancy_by_cam(db, gw, t0, t1)
+    rtt, rtt_err = _rtt_by_cam(db, gw, [c["cam"] for c in cams], t0, t1, era)
     xfer = _transfer_by_cam(db, gw)
     floor_cov = _floor_coverage(db, gw)
     registry = _registry(db, gw)
@@ -2032,6 +2078,7 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
             "door": door.get(cam),
             "transit": (dict(trans[cam], source=(a or {}).get("counting_version")) if cam in trans else None),
             "occupancy": occ.get(cam),
+            "rtt": rtt.get(cam),
             "analyzer": (None if a is None else
                          {"up": a["up"], "age_s": a["age_s"], "mode": a.get("mode"),
                           "counting_version": a.get("counting_version"),
@@ -2137,6 +2184,9 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
                          "pi": pi, "relay": relay, "gpu": gpu,
                          # The calibration travels WITH the data, not only in the page that draws it,
                          # so any consumer of this endpoint gets the number and its limits together.
+                         "rtt_note": {"home": RTT_HOME, "error": rtt_err,
+                                      "definition": f"door CLOSED at {RTT_HOME} -> next door OPEN "
+                                                    f"at {RTT_HOME}, both ends a STOP not a pass"},
                          "occupancy_note": {"label": OCC_LABEL, "calibration": OCC_CALIBRATION,
                                             "anchor": OCC_ANCHOR_NOTE,
                                             "basis": "distinct tracks simultaneously inside the cabin "
@@ -2265,6 +2315,12 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                   ([gw, cam, *occ_args] if cam else [gw, *occ_args]))
     occ_rows = [r for r in occ_rows
                 if not occ_ver.get(r["cam"]) or r["counting_version"] == occ_ver.get(r["cam"])]
+    # RTT by hour-of-day, for the chart. Single camera only: a fleet RTT would pool round trips from
+    # different shafts, and a shaft is what a round trip is a property of.
+    rtt_tr = None
+    if cam:
+        _rt, _re = _rtt_by_cam(db, gw, [cam], t0, t1, era)
+        rtt_tr = (_rt or {}).get(cam)
     # The first episode that EVER carried occupancy coverage for this selection, ignoring the range.
     _ofr = _q(db, "SELECT MIN(ts_start) mn FROM validation_item WHERE gateway_id=? "
                   "AND occupancy_frames > 0" + (" AND cam=?" if cam else ""),
@@ -2441,6 +2497,11 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                          # say "these hours predate the measurement" instead of printing a bare dash
                          # that reads as "the car was empty". A dash with no reason is the same
                          # failure as the 0-cycles bug two panels over.
+                         "rtt": rtt_tr,
+                         "rtt_note": {"home": RTT_HOME,
+                                      "fleet": (None if cam else "RTT is per-shaft; a fleet figure "
+                                                                "would pool round trips from "
+                                                                "different shafts")},
                          "occupancy_note": {"label": OCC_LABEL, "calibration": OCC_CALIBRATION,
                                             "anchor": OCC_ANCHOR_NOTE,
                                             "n_episodes": len(occ_rows),
@@ -2491,6 +2552,7 @@ _EXPORT = {
     "floor_events": "one row per GPU door/floor read (gw_door_event), era-filtered",
     "per_floor":   "the Tier-2 per-floor aggregate — stops, direction split, riders",
     "episodes":    "one row per door-open episode (validation_item): peak car occupancy + its coverage",
+    "rtt":         "one row per ROUND TRIP: home-floor close -> next home-floor open, with stops",
 }
 
 # WHY OCCUPANCY IS ITS OWN DATASET AND NOT COLUMNS ON door_cycles. door_cycles is gw_event — the Pi
@@ -2586,6 +2648,29 @@ def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
         out = [(r["cam"], r["ts"], _iso_ist(r["ts"]), r["direction"], r["track_id"])
                for r in rows if _in_range(r["ts"], t0, t1)]
         return _csv(out, ["cam", "ts_epoch", "ts_ist", "direction", "track_id"], f"{tag}.csv")
+
+    if dataset == "rtt":
+        # ONE ROW PER TRIP, plausible and anomalous alike, with the anomaly reason in a column.
+        # Filtering here would hide the quality signal: the anomaly rate is a measurement of floor
+        # attribution, and a file that contains only the trips that worked cannot show it.
+        import rtt_core
+        cams = [cam] if cam else [c["cam"] for c in _cameras(db, gw)]
+        out = []
+        for c in cams:
+            e, _s = _era_for(db, gw, c, era)
+            if not e:
+                continue
+            w, wargs = _ts_clause(t0, t1)
+            rows = _q(db, "SELECT ts, floor, door_state FROM gw_door_event WHERE gateway_id=? "
+                          "AND cam=? AND door_version = ?" + w + " ORDER BY ts, id",
+                      (gw, c, e, *wargs))
+            for t_a, t_b, dt, ns in rtt_core.trips(rows, RTT_HOME):
+                why = rtt_core.classify(dt)
+                out.append((c, t_a, _iso_ist(t_a), t_b, round(dt, 1), ns,
+                            "" if why else "plausible", why or "", RTT_HOME, e))
+        db.close()
+        return _csv(out, ["cam", "start_epoch", "start_ist", "end_epoch", "rtt_s", "stops",
+                          "class", "anomaly_reason", "home_floor", "era"], f"{tag}.csv")
 
     if dataset == "episodes":
         rows = _q(db, "SELECT cam, ts_start, ts_end, machine_boarded, machine_alighted, "
@@ -3041,6 +3126,43 @@ function panel(d){
       +esc(oc.anchor_note)+'.</div>';
   }
 
+  // ROUND TRIP TIME — the coefficient the whole MEP-02 sheet resolves to.
+  // Every absence names itself, and the caveat travels with the number rather than living in a
+  // release note: RTT runs at dwell=0 because every threshold tested destroyed real closes, so
+  // sub-second chatter at the home floor can FRAGMENT a trip and bias the median LOW.
+  var rt=c.rtt, rttCard;
+  if(!rt){ rttCard='<div class=blank>no RTT computed for this camera</div>'; }
+  else if(rt.state==='no_era'){ rttCard='<div class=blank>'+esc(rt.note||'no door-engine era')+'</div>'; }
+  else if(rt.state==='no_rows'){ rttCard='<div class=blank>no door rows in this window (era '+esc((rt.era||'').slice(0,8))+')</div>'; }
+  else if(rt.state==='no_floor'){
+    rttCard='<div style="padding:10px;border:1px dashed #b06a00;border-radius:6px">'
+      +'<b>RTT UNAVAILABLE \u2014 no floor attribution</b>'
+      +'<div class=mut style="font-size:11px;margin-top:4px">'+esc(rt.note||'')
+      +'. A round trip is defined by the home floor, so without a floor read there is no trip to '
+      +'measure \u2014 this is not a lift that made no journeys.</div></div>';
+  } else {
+    var ar=rt.anomaly_rate;
+    rttCard='<div class=mut style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">'
+      +'door closed at '+esc(rt.home)+' &rarr; next door open at '+esc(rt.home)+'</div>'
+      +kv('median / p85',(rt.all_day.median==null?'\u2014':rt.all_day.median+'s')+' / '
+          +(rt.all_day.p85==null?'\u2014':rt.all_day.p85+'s')+' <span class=mut>(n='+rt.all_day.n+')</span>')
+      +kv('AM / PM peak',(rt.windows['AM peak'].median==null?'\u2014':rt.windows['AM peak'].median+'s')
+          +' / '+(rt.windows['PM peak'].median==null?'\u2014':rt.windows['PM peak'].median+'s'))
+      +kv('anomaly rate',(ar==null?'\u2014':ar+'%')+' <span class=mut>('+rt.n_anomalies+' of '+rt.n_trips
+          +' trips outside 30\u2013600s)</span>',(ar!=null&&ar>25?'bad':''))
+      +kv('stops per trip',(rt.stops.median==null?'\u2014':rt.stops.median)+' <span class=mut>(p85 '
+          +(rt.stops.p85==null?'\u2014':rt.stops.p85)+')</span>')
+      +(ar!=null&&ar>25?('<div class=mut style="font-size:11px;margin-top:6px;padding:4px 6px;border-left:3px solid #b00;background:rgba(176,0,0,.07)">'
+        +'<b>anomaly rate above 25%</b> \u2014 this is a statement about FLOOR ATTRIBUTION, not about the '
+        +'lift. Treat the median as provisional.</div>'):'')
+      +(rt.stops.median!=null&&rt.stops.median<=2?('<div class=mut style="font-size:11px;margin-top:6px;padding:4px 6px;border-left:3px solid #b06a00;background:rgba(176,106,0,.07)">'
+        +'<b>stops per trip is low</b> \u2014 a real round trip may be arriving as two. A plausible RTT '
+        +'with implausible stops is a fragmented trip.</div>'):'')
+      +'<div class=mut style="font-size:11px;margin-top:6px;padding:4px 6px;border-left:3px solid #b06a00;background:rgba(176,106,0,.07)">'
+      +esc(rt.caveat||'')+'.</div>'
+      +'<div class=mut style="font-size:11px;margin-top:4px">'+esc(rt.travel_gap||'')+'.</div>';
+  }
+
   // STATE
   var a=c.analyzer, v=c.validation, state;
   if(!a){state='<div class=blank>not analysed — relay only</div>';}
@@ -3075,6 +3197,7 @@ function panel(d){
     +'<div class=card><h3>Door</h3>'+door+'</div>'
     +'<div class=card><h3>Transit</h3>'+trans+'</div>'
     +'<div class=card><h3>Car occupancy <span class=mut style="font-weight:400">peak per door-open</span></h3>'+occCard+'</div>'
+    +'<div class=card><h3>Round trip time <span class=mut style="font-weight:400">RTT &rarr; interval &rarr; compliance</span></h3>'+rttCard+'</div>'
     +'<div class=card><h3>State</h3>'+state+'</div>'
     +'<div class=card><h3>GPU analysis</h3>'+gpuToggle(d,c.cam)+'</div>'
     +'<div class=card><h3>Camera</h3>'+kv('channel',esc(c.channel))+kv('label',esc(c.label||'—'))
@@ -3443,7 +3566,7 @@ function exportBar(){
     +(trCam?('&cam='+encodeURIComponent(trCam)):'')+'">⤓ floor events — ALL eras, labelled</a>';
   return '<div class=dlbar>'+dl('door_cycles','door cycles')+dl('transits','transits')
     +dl('floor_events','floor events')+dl('per_floor','per-floor')
-    +dl('episodes','episodes + occupancy')+allEras
+    +dl('episodes','episodes + occupancy')+dl('rtt','round trips')+allEras
     +'<span class=mut style="font-size:11px">CSV — the rows behind these charts, same range'+(trCam?'':' (fleet)')+'</span></div>';
 }
 // A BARE DASH DOES NOT SAY WHICH ABSENCE IT IS. Peak occupancy only began being recorded when the
@@ -3532,6 +3655,34 @@ function renderTrends(){
     +'<div class=card>'+svgBars('riders (boardings+alightings) / hour-of-day',
         'boardings + alightings counted at this door — usage volume, not unique people',
         hours,prof.map(function(p){return p.boarded+p.alighted}),'#2a6db0',null,'','riders')+'</div>'
+    // ROUND TRIP TIME by hour-of-day. Same chart family as cycles/hr, and the label carries n,
+    // the anomaly rate and the dwell caveat — the three things that decide whether the curve
+    // means anything. A designed-absence panel where the camera has no floor attribution: RTT is
+    // defined by the home floor, so no floor is UNAVAILABLE and not zero.
+    +((function(){
+      var R=TR.rtt;
+      if(!trCam) return '<div class=card><div class=h>round trip time / hour-of-day</div>'
+        +'<div class=blank>pick a lift \u2014 a round trip is a property of one shaft, so a fleet '
+        +'figure would pool trips from different buildings columns</div></div>';
+      if(!R||R.state==='no_floor'||R.state==='no_era'||R.state==='no_rows'){
+        return absent('round trip time / hour-of-day (s)',
+          'door closed at the home floor \u2192 next door open at the home floor',
+          'RTT UNAVAILABLE for '+esc(trCam),
+          esc((R&&R.note)||'no door-engine reads with floor attribution in this era')
+          +'. RTT is defined by the home floor; without a floor read there is no trip to measure. '
+          +'This is not a lift that made no journeys.');
+      }
+      var vals=R.by_hour.map(function(h){return h.median});
+      return '<div class=card>'+svgBars('round trip time / hour-of-day (s) \u2014 median',
+        'door closed at '+esc(R.home)+' \u2192 next door open at '+esc(R.home)+'; both ends a STOP, not a pass',
+        hours,vals,'#7a1f5c',null,'','s')
+        +'<div class=mut style="font-size:11px;margin-top:4px">n='+R.all_day.n+' plausible trips'
+        +' \u00b7 anomaly rate <b'+(R.anomaly_rate>25?' class=bad':'')+'>'+R.anomaly_rate+'%</b>'
+        +' ('+R.n_anomalies+' of '+R.n_trips+' outside 30\u2013600s)'
+        +' \u00b7 stops/trip median '+R.stops.median
+        +'<br><b>'+esc(R.caveat||'')+'</b>'
+        +'<br>'+esc(R.travel_gap||'')+'</div></div>';
+    })())
     // PEAK CAR OCCUPANCY. Same chart family as riders/hr, deliberately: it is read in the same
     // glance and must not look like a more precise instrument than it is. An hour with episodes but
     // no people is a real 0; an hour with no episodes draws nothing, and the n row below says which
