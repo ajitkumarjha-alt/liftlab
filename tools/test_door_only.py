@@ -69,6 +69,52 @@ def main():
             if rec["reason"] != "no_panel_geometry":
                 fails.append(f"{name}: reason {rec['reason']!r} does not name the cause")
 
+    print("\n=== 3b. build_door_engine() with a door band only and NO templates endpoint ===")
+    # THE TEST THE OPERATOR SPECIFIED, and the one that would have caught gates 3-5 before deploy.
+    # No panel geometry, and the templates URL points at a closed port so any fetch attempt fails
+    # loudly rather than silently succeeding against a real endpoint.
+    import importlib
+    for k, v in (("ANALYSIS_TOKEN", "t"), ("CLOUD", "http://127.0.0.1:1"), ("CAM", "ch32"),
+                 ("GW", "site-A"), ("GPU_DOOR", "1"),
+                 ("DOOR_ROI_FRAME", "240,15,165,105")):
+        os.environ[k] = v
+    for k in ("PANEL_ROIS", "DIGIT_CELLS", "ARROW_CELL",
+              "PANEL1_DIGIT_CELLS", "PANEL1_ARROW_CELL"):
+        os.environ.pop(k, None)
+    import gpu_analyze
+    importlib.reload(gpu_analyze)
+    eng2, reason = gpu_analyze.build_door_engine()
+    print(f"  engine: {eng2 is not None}   reason/version: {str(reason)[:96]}")
+    if eng2 is None:
+        fails.append(f"build_door_engine returned None with a door band and no templates "
+                     f"endpoint: {reason!r} — this is the 404 gate, still closed")
+    else:
+        print(f"  door_only={eng2.door_only}  door_version={reason}")
+        if not eng2.door_only:
+            fails.append("the engine built but is not in door-only mode")
+        if not str(reason).startswith("notpl000"):
+            fails.append(f"door_version {reason!r} does not declare the absent template set — a "
+                         "hash of an empty dict reads as if templates exist")
+
+    print("\n=== 3c. no OTHER unconditional floor-side dependency in the build path ===")
+    ga = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                           "gpu_analyze.py")).read()
+    body = ga[ga.index("def build_door_engine"):]
+    body = body[:body.index("\ndef ", 10)]
+    for pat, why in (
+            ("tpl = gd.fetch_templates", "the templates fetch must sit behind `elif tpl is None`"),
+            ("_parse_xywh_list(PANEL_ROIS)[0]", "indexing [0] of an empty PANEL_ROIS raises")):
+        if pat in body and "elif tpl is None" not in body:
+            fails.append(f"{why} ({pat!r} still unconditional)")
+    if "_parse_xywh_list(PANEL_ROIS)[0]" in ga:
+        fails.append("PANEL_ROIS is still indexed [0] somewhere — empty in door-only mode")
+    if "not getattr(door_eng, \"door_only\", False)" not in ga:
+        fails.append("the PERIODIC template refetch is not guarded — a door-only camera would 404 "
+                     "against the templates endpoint every TEMPLATES_REFETCH_S forever")
+    if "panel0_roi is not None and FLOORCHECK_PER_HR" not in ga:
+        fails.append("floorcheck posting is not guarded — a door-only camera has no panel to crop")
+    print("  templates fetch, periodic refetch, panel0_roi index and floorcheck all guarded")
+
     print("\n=== 4. the gate requires the door band, and ONLY the door band ===")
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                             "gpu_analyze.py")).read()

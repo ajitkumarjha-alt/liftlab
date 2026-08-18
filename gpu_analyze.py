@@ -611,8 +611,20 @@ def build_door_engine(prefetched_tpl=None):
     if not DOOR_ROI_FRAME:
         return None, "geometry missing (need DOOR_ROI_FRAME — draw the door band at /calib-roi)"
     _door_only = not (PANEL_ROIS and DIGIT_CELLS and ARROW_CELL)
+    # FLOOR TEMPLATES ARE A FLOOR DEPENDENCY, so a door-only camera must not fetch them AT ALL.
+    #
+    # THE THIRD GATE. This ran unconditionally and 404s for a camera with no cells — the endpoint
+    # only exists once an alphabet has been built — so build_door_engine returned
+    # "template fetch failed: HTTPError 404" and the door-only path below was never reached. Two
+    # earlier gates had already been relaxed for exactly this camera set and the symptom was
+    # unchanged each time, because each fix addressed the layer the previous error message named.
+    #
+    # `templates` is only ever read by FloorReader, and door-only builds no readers, so an empty
+    # dict is not a degraded template set — it is the correct one.
     tpl = prefetched_tpl
-    if tpl is None:
+    if tpl is None and _door_only:
+        tpl = {}
+    elif tpl is None:
         try:
             tpl = gd.fetch_templates(TEMPLATES_URL, headers=HDRS)
         except Exception as e:
@@ -708,8 +720,13 @@ def build_door_engine(prefetched_tpl=None):
     # does. Templates therefore move the comparability boundary and must not pool across it.
     if resolved_logic == gd.TRACKER_LOGIC_H3:
         levels_tag += "T" + str(state_meta.get("md5", ""))[:6]
-    version = f"{eng.hash[:8]}{resolved_logic}{levels_tag}+{geom_sig}"
-    log(f"GPU_DOOR: {len(panels)} panel(s) [{mode}]; templates_hash={eng.hash[:12]}; door_version={version}")
+    # A door-only engine's templates_hash is sha256 of nothing — a constant, identical on every such
+    # camera. That is not wrong as an era discriminator (they genuinely share "no templates"), but a
+    # reader seeing a hash would assume a template set exists. Say what it is instead.
+    _thash8 = "notpl000" if _door_only else eng.hash[:8]
+    version = f"{_thash8}{resolved_logic}{levels_tag}+{geom_sig}"
+    log(f"GPU_DOOR: {len(panels)} panel(s) [{mode}]; "
+        f"templates_hash={'none (door-only)' if _door_only else eng.hash[:12]}; door_version={version}")
     if FLOOR_ALPHABET:
         log(f"GPU_DOOR floor whitelist: {len(FLOOR_ALPHABET)} valid floors {FLOOR_ALPHABET[:6]}"
             f"{'...' if len(FLOOR_ALPHABET) > 6 else ''} — off-alphabet reads flagged, not counted")
@@ -905,7 +922,11 @@ def main():
             log(f"GPU_DOOR DISABLED: {dv}")
         else:
             door_version, door_thash = dv, door_eng.hash
-            panel0_roi = _parse_xywh_list(PANEL_ROIS)[0]
+            # A FIFTH floor-side dependency, found in the same audit: this indexes [0] of the parsed
+            # PANEL_ROIS, which is EMPTY in door-only mode -> IndexError immediately after the engine
+            # built successfully. panel0_roi only feeds post_floorcheck, which is a floor artefact.
+            _prois = _parse_xywh_list(PANEL_ROIS) if PANEL_ROIS else []
+            panel0_roi = _prois[0] if _prois else None
             log(f"GPU_DOOR live: stride={DOOR_STRIDE} (~{25 // DOOR_STRIDE}fps), heartbeat<= {DOOR_HB_S}s, "
                 f"floorcheck={FLOORCHECK_PER_HR}/hr, templates refetch {TEMPLATES_REFETCH_S:.0f}s")
 
@@ -1058,7 +1079,13 @@ def main():
             heartbeat(); last_hb = time.time()
         # GPU_DOOR: re-pull the templates periodically; reload the engine ONLY if the content hash
         # changed, so a door_calib --build propagates to the GPU without a redeploy (content-hash cache).
-        if door_eng is not None and time.time() - last_tpl_refetch > TEMPLATES_REFETCH_S:
+        # THE FOURTH GATE, found by auditing rather than by hitting it. This re-pull runs for any
+        # camera with a door engine, so a door-only camera would 404 against the templates endpoint
+        # every TEMPLATES_REFETCH_S (600s) for the life of the worker, logging a failure each time —
+        # a permanent error stream for a camera that is working exactly as intended, which is how a
+        # real fault later gets lost in the noise. A door-only engine has no templates to refresh.
+        if (door_eng is not None and not getattr(door_eng, "door_only", False)
+                and time.time() - last_tpl_refetch > TEMPLATES_REFETCH_S):
             last_tpl_refetch = time.time()
             try:
                 new_tpl = door_gd.fetch_templates(TEMPLATES_URL, headers=HDRS)
@@ -1244,7 +1271,11 @@ def main():
                         if should or (d_off - door_last_emit) >= DOOR_HB_S:
                             post_door_event(drec, door_version, door_thash, critical=bool(should))
                             door_last_emit = d_off
-                        if FLOORCHECK_PER_HR > 0 and (d_off - last_fc_ts) >= (3600.0 / FLOORCHECK_PER_HR):
+                        # A floorcheck samples the PANEL crop for the review page. Door-only has no
+                        # panel, so there is nothing to sample — and posting a cropless floorcheck
+                        # would put empty review items in front of a human as if they were reads.
+                        if (panel0_roi is not None and FLOORCHECK_PER_HR > 0
+                                and (d_off - last_fc_ts) >= (3600.0 / FLOORCHECK_PER_HR)):
                             post_floorcheck(drec, fr, panel0_roi, door_version)
                             last_fc_ts = d_off
                         door_post_ms += (time.time() - _post_t0) * 1000   # blocking HTTP only

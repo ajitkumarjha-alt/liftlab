@@ -40,7 +40,18 @@ install -o "$LABUSER" -g "$LABUSER" -m 644 /tmp/gpu_watchdog.py "$APPDIR/gpu_wat
 # operator set (GPU_DOOR, DOOR_ROI_FRAME, PANEL_ROIS, DIGIT_CELLS, ARROW_CELL, ...). Atomic temp+mv.
 ENVF=/etc/liftlab-gpu.env
 umask 077
-{ [ -f "$ENVF" ] && grep -v '^ANALYSIS_TOKEN=' "$ENVF" || true; printf 'ANALYSIS_TOKEN=%s\n' "${ANALYSIS_TOKEN#*:}"; } > "$ENVF.tmp"
+# QUOTE VALUES CONTAINING SHELL METACHARACTERS while merging. DIGIT_CELLS and PANEL_ROIS are
+# semicolon-separated ("x,y,w,h;x,y,w,h"), and an unquoted semicolon is fine for systemd's
+# EnvironmentFile but ENDS THE COMMAND under `source` — so a human debugging with
+# `source /etc/liftlab-gpu.env` gets a truncated assignment and then whatever followed the ';'
+# executed as a command. systemd strips matching surrounding quotes, so quoting is safe for both.
+# Values already quoted are left alone; only the value is quoted, never the key.
+{ [ -f "$ENVF" ] && grep -v '^ANALYSIS_TOKEN=' "$ENVF" \
+    | awk -F= 'BEGIN{OFS="="} /^[A-Za-z_][A-Za-z0-9_]*=/ {
+        k=$1; v=substr($0, index($0,"=")+1);
+        if (v !~ /^".*"$/ && v !~ /^\x27.*\x27$/ && v ~ /[;&|<> \t*?()$`\\]/) { print k "=\"" v "\""; next }
+      } { print }' || true
+  printf 'ANALYSIS_TOKEN=%s\n' "${ANALYSIS_TOKEN#*:}"; } > "$ENVF.tmp"
 mv "$ENVF.tmp" "$ENVF"
 umask 022
 KEPT=$(( $(wc -l < "$ENVF") - 1 ))
