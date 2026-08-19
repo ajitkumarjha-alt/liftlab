@@ -193,6 +193,21 @@ def render(tmp, D, data, trends, select=None, view="cams", stale=None):
     return json.load(open(p["out.json"]))
 
 
+
+def _precompute_trends(D, cams):
+    """Fill trends_cache the way the timer does, so dash_trends has something to serve.
+
+    /trends no longer derives on the request path — the default view is precomputed per (cam, era)
+    and served from trends_cache. A test that calls dash_trends on a fresh database is testing the
+    'not computed yet' path, not the numbers. Production runs precompute_job before serving; so does
+    this. The pending path has its own coverage in test_trends_cache.py."""
+    db = D._db()
+    try:
+        for c in cams:
+            D.trends_refresh(db, "site-A", c)
+    finally:
+        db.close()
+
 def main():
     fails = []
     from test_dash_occupancy import _stub
@@ -205,6 +220,7 @@ def main():
 
     db = D._db()
     data = D._dash_data_inner(db, "site-A").payload
+    _precompute_trends(D, ["ch29", "ch27", "ch32"])
     tr29 = D.dash_trends("site-A", cam="ch29", period="all").payload
     tr27 = D.dash_trends("site-A", cam="ch27", period="all").payload
     tr32 = D.dash_trends("site-A", cam="ch32", period="all").payload

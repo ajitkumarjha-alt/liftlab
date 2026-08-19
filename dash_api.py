@@ -669,6 +669,9 @@ RTT_HOME = os.environ.get("DASH_RTT_HOME", "G")
 # truncates: a partial walk drops round trips and reports a median from part of the window, which is
 # worse than saying no.
 RTT_MAX_ROWS = int(os.environ.get("DASH_RTT_MAX_ROWS", "120000"))
+# How old a cached trends payload may be before the UI is told to call it stale. It is still SERVED
+# past this — a stale number that renders beats a fresh one that times out — but it is labelled.
+TRENDS_STALE_S = float(os.environ.get("DASH_TRENDS_STALE_S", "5400"))
 # DWELL VALIDATION: RUN, AND IT REFUTED THE PROPOSED FIX (2026-08-13).
 #
 # The census found 41-64% of door_state flips lasting under a second, and the obvious remedy was a
@@ -2328,10 +2331,12 @@ def _dash_data_inner(db, gw: str, era: str = "", days: float | None = None):
                                         "close_travel_max": CLOSE_TRAVEL_MAX_BOUNDARY}})
 
 
-@dash_router.get("/dash/{gw}/trends")
-def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
-                period: str = "all", from_d: str = "", to_d: str = "", era: str = ""):
+def _trends_compute(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
+                    period: str = "all", from_d: str = "", to_d: str = "", era: str = ""):
     """Hour-of-day profile + window stats for a DATE RANGE. cam='' -> FLEET (all lift cams).
+
+    NOT A REQUEST HANDLER ANY MORE. This is the derivation; dash_trends serves it from
+    trends_cache and the precompute timer is what calls this. See _trends_read for why.
 
     period = day | week | month | all, or an explicit from_d/to_d (YYYY-MM-DD). The hour-of-day
     profile is unchanged in shape — it is now computed over the selected range instead of all
@@ -2636,7 +2641,7 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
         if k != "all_day":
             windows[k]["demand_ratio_vs_allday"] = round((windows[k]["cycles_per_hr"] or 0) / ad, 2)
 
-    return JSONResponse({"gw": gw, "cam": cam or "fleet", "n_days": n_days_real, "profile": profile,
+    return ({"gw": gw, "cam": cam or "fleet", "n_days": n_days_real, "profile": profile,
                          "windows": windows, "tier2_range": tier2_range,
                          # WHERE tier2 CAME FROM, and WHAT WINDOW IT DESCRIBES. 'cache' is the
                          # precomputed aggregate (rolling WINDOW_DAYS, written hourly off the
@@ -2696,6 +2701,175 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                          "boundaries": {"close_travel_max": {"iso": CLOSE_TRAVEL_MAX_BOUNDARY, "epoch": _BOUNDARY_EPOCH,
                                         "note": "CLOSE_TRAVEL_MAX 10->30s; close-travel here uses the post-boundary regime only"}},
                          "data_gaps": [g for g in DATA_GAPS if (cam is None or cam in g.get("cams", []) or not g.get("cams"))]})
+
+
+# ============================================================ trends cache
+# WHY THIS EXISTS, AND WHY MAKING THE QUERIES FASTER WAS NOT ENOUGH.
+#
+# /trends was 29 s before RTT existed and 37.7 s after the era range rewrite and ix_door_era — the
+# index is used and the plan is right, and the endpoint still cannot be loaded. Two reasons:
+#
+#   1. The era filter only helps in PROPORTION TO WHAT IT EXCLUDES. Measured per camera on the
+#      snapshot: ch29's current era holds 72 of 232,956 rows (0.0%), ch16's holds 44,935 of 87,280
+#      (51.5%). The 1780x figure came from ch29 — an era so selective it flattered the fix. On ch16
+#      the SAME query with the SAME index costs 582 ms, because scoping to the era still returns
+#      half the table. Live, an era that has been running a week is most of what the camera holds.
+#   2. period='all' puts NO ts bound on anything, so the era IS the range.
+#
+# Row volume, not plan shape, is the remaining cost, and no index removes rows the answer needs.
+# So: compute per (cam, era, period) on the timer, serve from the table, never in the request path —
+# the rule door_aggregate already stated and this endpoint never followed.
+#
+# STALE IS SERVED, DELIBERATELY, with its age attached. A number from an hour ago that renders beats
+# a current one that times out; the age travels with it so nobody reads it as live.
+_TRENDS_CACHEABLE_PERIODS = ("", "all", "week", "day", "month")
+
+
+def _trends_table(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS trends_cache (
+        gateway_id TEXT, cam TEXT,          -- '' for the fleet view
+        period TEXT,
+        counting_version TEXT, door_version TEXT,   -- era key, same rule as door_aggregate
+        payload TEXT, computed_at REAL, compute_ms INTEGER,
+        PRIMARY KEY (gateway_id, cam, period, counting_version, door_version))""")
+
+
+def _trends_key(db, gw, cam):
+    """The era key this payload is stored under. For the fleet it is the whole fleet's keys, joined,
+    so that ANY camera changing era invalidates the fleet view rather than leaving it half-current."""
+    if cam:
+        cv, dv = _current_keys(db, gw, cam)
+        # NEVER NULL. _current_keys returns door_version=None for a camera with no door rows, and
+        # `WHERE door_version=?` bound to None matches NOTHING in SQL — NULL=NULL is NULL, not true.
+        # So every door-less camera (ch32, ch34, ch37) wrote a cache row it could never read back
+        # and sat on "not computed" for ever, while the fleet key silently took the same shape.
+        # A door-less camera still has occupancy and transits worth serving.
+        return (cv or ""), (dv or "")
+    cvs, dvs = [], []
+    for c in [x["cam"] for x in _cameras(db, gw)]:
+        cv, dv = _current_keys(db, gw, c)
+        cvs.append(cv or "")
+        dvs.append(dv or "")
+    return ",".join(cvs), ",".join(dvs)
+
+
+def _trends_read(db, gw, cam, period):
+    """Serve the stored payload. NEVER computes. -> (payload|None, meta)."""
+    cv, dv = _trends_key(db, gw, cam)
+    try:
+        r = db.execute("SELECT payload, computed_at, compute_ms FROM trends_cache WHERE "
+                       "gateway_id=? AND cam=? AND period=? AND counting_version=? AND door_version=?",
+                       (gw, cam, period or "all", cv, dv)).fetchone()
+    except sqlite3.OperationalError:
+        return None, {"state": "not yet computed — the precompute job has never run on this schema"}
+    if not r:
+        return None, {"state": "not yet computed for the current era",
+                      "detail": "the precompute job (liftlab-precompute.timer) fills this off the "
+                                "request path; this is pending computation, NOT an absence of data",
+                      "current_door_version": dv}
+    try:
+        body = json.loads(r["payload"])
+    except (ValueError, TypeError):
+        return None, {"state": "stored payload unreadable", "computed_at": r["computed_at"]}
+    age = (time.time() - r["computed_at"]) if r["computed_at"] else None
+    return body, {"state": "ok", "computed_at": r["computed_at"],
+                  "age_s": (round(age, 1) if age is not None else None),
+                  "stale": bool(age is not None and age > TRENDS_STALE_S),
+                  "compute_ms": r["compute_ms"], "door_version": dv,
+                  "source": "trends_cache (precomputed off the request path)"}
+
+
+def trends_refresh(db, gw, cam="", period="all"):
+    """Compute and STORE. Scheduler/CLI ONLY — never a request handler."""
+    _trends_table(db)
+    cv, dv = _trends_key(db, gw, cam)
+    t_start = time.time()
+    body = _trends_compute(gw, cam=cam, period=period)
+    ms = int((time.time() - t_start) * 1000)
+    db.execute("INSERT INTO trends_cache (gateway_id,cam,period,counting_version,door_version,"
+               "payload,computed_at,compute_ms) VALUES (?,?,?,?,?,?,?,?) "
+               "ON CONFLICT(gateway_id,cam,period,counting_version,door_version) DO UPDATE SET "
+               "payload=excluded.payload, computed_at=excluded.computed_at, "
+               "compute_ms=excluded.compute_ms",
+               (gw, cam, period, cv, dv, json.dumps(body), time.time(), ms))
+    db.commit()
+    # One era per (cam, period): retired eras are not viewable through the cache anyway, because the
+    # key is the CURRENT one, and keeping them grows the table without ever being read.
+    db.execute("DELETE FROM trends_cache WHERE gateway_id=? AND cam=? AND period=? AND NOT "
+               "(counting_version=? AND door_version=?)", (gw, cam, period, cv, dv))
+    db.commit()
+    return {"gw": gw, "cam": cam or "fleet", "period": period, "compute_ms": ms,
+            "bytes": len(json.dumps(body)), "door_version": dv}
+
+
+def _trends_skeleton(gw, cam, meta):
+    """The payload shape, with every value NULL and state='not_computed'.
+
+    STRUCTURALLY COMPLETE ON PURPOSE. The first version of this returned {'profile': [],
+    'windows': {}} and the client died on `TR.boundaries.close_travel_max.iso` and
+    `windows.all_day` — the page broke exactly as it does today, only faster. A payload that omits
+    keys is not a smaller answer, it is a crash.
+
+    And every value is NULL rather than 0. A zero here would render as a lift that stood still all
+    week, which is the same misreading as the 0-cycles bug and the empty-axes defect: the UI must be
+    able to tell "nobody has computed this" from "this is what happened". test_trends_cache asserts
+    this key set against a real computed payload, so a new field cannot be added to _trends_compute
+    without being added here too."""
+    return {
+        "gw": gw, "cam": cam or "fleet", "state": "not_computed", "cache": meta,
+        "note": "this view is precomputed off the request path and has not been computed for the "
+                "current era yet. It is NOT a report that there is no data — run precompute_job.py, "
+                "or wait for liftlab-precompute.timer.",
+        "n_days": None, "profile": [],
+        "windows": {k: None for k in ("all_day", "am_peak", "pm_peak")},
+        "tier2_range": None, "tier2_source": None, "tier2_computed_at": None, "tier2_age_s": None,
+        "tier2_window_days": None, "tier2_cache_state": None, "tier2_cache_note": None,
+        "rtt": None, "rtt_state": None, "rtt_detail": None, "rtt_computed_at": None,
+        "rtt_window_days": None,
+        "rtt_note": {"home": RTT_HOME, "fleet": None},
+        "occupancy_note": {"label": OCC_LABEL, "calibration": OCC_CALIBRATION,
+                           "anchor": OCC_ANCHOR_NOTE, "n_episodes": None,
+                           "first_ts": None, "first_ist": None},
+        "counting_eras": {"in_range": [], "crossing": False, "note": None},
+        "range": {"period": None, "from_d": None, "to_d": None, "label": None, "t0": None,
+                  "t1": None, "cycles": None, "transits": None, "cycles_pi": None,
+                  "cycles_gpu": None, "close_instrument": None,
+                  "travel_unmeasured_cams": [], "travel_unmeasured_note": None,
+                  "uncalibrated_cams": [], "uncalibrated_note": None},
+        "boundaries": {"close_travel_max": {"iso": CLOSE_TRAVEL_MAX_BOUNDARY,
+                                            "epoch": _BOUNDARY_EPOCH, "note": None}},
+        "data_gaps": [],
+    }
+
+
+@dash_router.get("/dash/{gw}/trends")
+def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
+                period: str = "all", from_d: str = "", to_d: str = "", era: str = ""):
+    """The cached trends payload for the current era, or an honest 'not computed yet'.
+
+    A CUSTOM RANGE, AN ERA OVERRIDE OR AN HOUR FILTER still derives live — those are deliberate acts
+    by someone who has asked a specific question, they are not what the page loads by default, and
+    they are not what was timing out. The default view is the one that must never compute.
+    """
+    cacheable = (not era and not from_d and not to_d
+                 and from_h == -1 and to_h == -1
+                 and (period or "all") in _TRENDS_CACHEABLE_PERIODS)
+    db = _db()
+    try:
+        if cacheable:
+            body, meta = _trends_read(db, gw, cam, period or "all")
+            if body is not None:
+                return JSONResponse({**body, "cache": meta},
+                                    headers={"Cache-Control": "no-store"})
+            return JSONResponse(_trends_skeleton(gw, cam, meta),
+                                headers={"Cache-Control": "no-store"})
+    finally:
+        db.close()
+    body = _trends_compute(gw, cam=cam, from_h=from_h, to_h=to_h, period=period,
+                           from_d=from_d, to_d=to_d, era=era)
+    return JSONResponse({**body, "cache": {"state": "derived live",
+                                           "why": "custom range, era override or hour filter"}},
+                        headers={"Cache-Control": "no-store"})
 
 
 # ============================================================ CSV export
@@ -3848,6 +4022,27 @@ function trTableHtml(prof,W){
 }
 function renderTrends(){
   if(!TR){document.getElementById('trendview').innerHTML=trCams()+'<div class=mut>loading…</div>';return;}
+  // THE REQUEST FAILED, AND SAYING SO IS THE POINT. loadTrends used to .catch(){} silently, so a
+  // 37-second timeout left the section on "loading…" for ever — indistinguishable from a slow box,
+  // and the reason the view read as hung rather than as broken.
+  if(TR.fetch_error){
+    document.getElementById('trendview').innerHTML=trCams()
+      +'<div style="padding:12px;border:1px dashed #b00;border-radius:6px">'
+      +'<b>TRENDS REQUEST FAILED</b><div class=mut style="font-size:12px;margin-top:4px">'
+      +esc(TR.fetch_error)+'</div>'
+      +'<div style="margin-top:8px"><button onclick="TR=null;loadTrends()">retry</button></div></div>';
+    return;
+  }
+  // NOT COMPUTED YET is not "no data". Rendering the charts from nulls would draw empty axes beside
+  // a zero, which reads as a lift that stood still all week — the 0-cycles misreading again.
+  if(TR.state==='not_computed'){
+    var cst=(TR.cache||{});
+    document.getElementById('trendview').innerHTML=trCams()
+      +'<div style="padding:12px;border:1px dashed #667;border-radius:6px">'
+      +'<b>NOT COMPUTED YET</b><div class=mut style="font-size:12px;margin-top:4px">'
+      +esc(TR.note||'')+(cst.detail?(' '+esc(cst.detail)):'')+'</div></div>';
+    return;
+  }
   var prof=TR.profile, hours=prof.map(function(p){return p.hour}), W=TR.windows;
   var bd=TR.boundaries.close_travel_max.iso.slice(0,10);
   var gaps=(TR.data_gaps||[]);
@@ -4071,7 +4266,14 @@ function loadTrends(){
     // in quick succession can resolve out of order, and the loser would overwrite the winner.
     if (forCam !== trCam) return;
     TR = t; renderTrends();
-  }).catch(function(){});
+  }).catch(function(e){
+    // NEVER SWALLOW THIS. An empty catch left the section on "loading…" indefinitely when /trends
+    // timed out, which is how a 37-second endpoint presented as a hung page with nothing to report.
+    if (forCam !== trCam) return;
+    TR = {cam: forCam || 'fleet', fetch_error: String((e && e.message) || e ||
+         'the request did not complete')};
+    renderTrends();
+  });
 }
 
 // tabs() seeds trCam from cur, and it only runs in the Cameras view — so a page that OPENS on

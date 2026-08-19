@@ -23,6 +23,8 @@ The plan lines are the diagnosis. Read them for:
 """
 import argparse
 import os
+import cProfile
+import pstats
 import sqlite3
 import sys
 import time
@@ -107,14 +109,40 @@ def main():
                            "'validation_item') ORDER BY tbl_name"):
         print(f"  {r[0]:18s} {r[1]:22s} {(r[2] or '(auto)').split('(', 1)[-1].rstrip(')')}")
 
-    print(f"\n=== running dash_trends(cam={a.cam!r}, period={a.period!r}) ===")
+    # PROFILE THE DERIVATION, NOT THE CACHE READ. dash_trends now serves a precomputed payload, so
+    # timing it would report 2 ms and say nothing about why the payload takes as long as it does.
+    fn = getattr(D, "_trends_compute", None) or D.dash_trends
+    print(f"\n=== running {fn.__name__}(cam={a.cam!r}, period={a.period!r}) ===")
+    prof = cProfile.Profile()
     t0 = time.time()
+    prof.enable()
     try:
-        D.dash_trends(a.gw, cam=a.cam, period=a.period)
+        fn(a.gw, cam=a.cam, period=a.period)
     except Exception as e:                       # a slow endpoint may also be a broken one
         print(f"  RAISED {type(e).__name__}: {e}")
+    prof.disable()
     total = time.time() - t0
-    print(f"  total {total:.2f}s across {len(CALLS)} statements\n")
+    sql_ms = sum(c[2] for c in CALLS)
+    # THE SPLIT THAT WAS MISSING. This reported only SQL time, so an endpoint spending 30 s walking
+    # rows in Python would have shown a fast query list and no explanation. Row VOLUME is the cost
+    # the era filter cannot remove, and volume is spent in Python.
+    print(f"  wall {total:.2f}s   SQL {sql_ms/1000:.2f}s across {len(CALLS)} statements   "
+          f"Python {max(total - sql_ms/1000, 0):.2f}s")
+    if total > 0.2 and sql_ms / 1000 < total * 0.6:
+        print("  >>> MOST OF THE TIME IS NOT IN SQL. Top Python frames by cumulative time:")
+        st = pstats.Stats(prof)
+        st.sort_stats("cumulative")
+        rows = [(f, st.stats[f]) for f in st.stats]
+        rows.sort(key=lambda kv: -kv[1][3])
+        shown = 0
+        for (fname, lineno, func), (_cc, _nc, _tt, ct, _cal) in rows:
+            if "dash_api" not in fname and "rtt_core" not in fname:
+                continue
+            print(f"      {ct:7.2f}s cumulative  {func}  ({os.path.basename(fname)}:{lineno})")
+            shown += 1
+            if shown >= 8:
+                break
+    print()
 
     # ── ranked, with the plan for each ──────────────────────────────────────────────────────
     agg = {}

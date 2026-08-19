@@ -93,6 +93,22 @@ def main():
                 err += 1
                 print(f"[precompute] aggregate {gw}/{cam}: FAILED {type(e).__name__}: {e}", flush=True)
 
+        # ── stage 3: the trends payload, per camera AND for the fleet ──
+        # LAST, because it reads the aggregates stages 1-2 just wrote: a trends payload built before
+        # them would cache the "not yet computed" tier2/RTT states for a whole timer interval.
+        for cam in cams + ([""] if not only_cam else []):
+            t0 = time.time()
+            try:
+                m = D.trends_refresh(db, gw, cam)
+                print(f"[precompute] trends {gw}/{m['gw'] and (cam or 'fleet')}: "
+                      f"{m['bytes']//1024}KB in {time.time()-t0:.2f}s "
+                      f"(dv={(m['door_version'] or '-')[:24]})", flush=True)
+                ok += 1
+            except Exception as e:
+                err += 1
+                print(f"[precompute] trends {gw}/{cam or 'fleet'}: FAILED {type(e).__name__}: {e}",
+                      flush=True)
+
     db.close()
     print(f"[precompute] done: {ok} ok, {err} failed, {time.time()-t_all:.1f}s total", flush=True)
     return 1 if (err and not ok) else 0
