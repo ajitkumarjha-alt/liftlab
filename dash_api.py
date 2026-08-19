@@ -4083,12 +4083,25 @@ function renderTrends(){
   // THE REQUEST FAILED, AND SAYING SO IS THE POINT. loadTrends used to .catch(){} silently, so a
   // 37-second timeout left the section on "loading…" for ever — indistinguishable from a slow box,
   // and the reason the view read as hung rather than as broken.
-  if(TR.fetch_error){
+  // TWO DIFFERENT FAULTS, TWO DIFFERENT SENTENCES. fetch_error means the request did not complete.
+  // render_error means it completed and the page could not draw the answer. They shared one label
+  // because renderTrends() ran INSIDE loadTrends's promise chain, so a TypeError while drawing fell
+  // into .catch and was reported as "TRENDS REQUEST FAILED" — on a request that returned 200 in
+  // 0.283s. That sends the reader to the network tab for a fault in the payload or the renderer.
+  // Retry is offered for a request; it is NOT offered for a render fault, because retrying a
+  // deterministic payload only reproduces it.
+  if(TR.fetch_error||TR.render_error){
+    var isFetch=!!TR.fetch_error;
     document.getElementById('trendview').innerHTML=trCams()
       +'<div style="padding:12px;border:1px dashed #b00;border-radius:6px">'
-      +'<b>TRENDS REQUEST FAILED</b><div class=mut style="font-size:12px;margin-top:4px">'
-      +esc(TR.fetch_error)+'</div>'
-      +'<div style="margin-top:8px"><button onclick="TR=null;loadTrends()">retry</button></div></div>';
+      +'<b>'+(isFetch?'TRENDS REQUEST FAILED':'TRENDS RENDER FAILED')+'</b>'
+      +'<div class=mut style="font-size:12px;margin-top:4px">'
+      +esc(TR.fetch_error||TR.render_error)
+      +(isFetch?'':' — the request SUCCEEDED and the payload could not be drawn. This is a bug in '
+        +'the page or a payload shape it does not handle, not a slow or unreachable server.')
+      +'</div>'
+      +(isFetch?'<div style="margin-top:8px"><button onclick="TR=null;loadTrends()">retry</button></div>':'')
+      +'</div>';
     return;
   }
   // NOT COMPUTED YET is not "no data". Rendering the charts from nulls would draw empty axes beside
@@ -4099,6 +4112,18 @@ function renderTrends(){
       +'<div style="padding:12px;border:1px dashed #667;border-radius:6px">'
       +'<b>NOT COMPUTED YET</b><div class=mut style="font-size:12px;margin-top:4px">'
       +esc(TR.note||'')+(cst.detail?(' '+esc(cst.detail)):'')+'</div></div>';
+    return;
+  }
+  // STRUCTURALLY INCOMPLETE PAYLOAD -> a sentence, never a throw. The skeleton is built complete on
+  // purpose, but a payload from an older build, a renamed field, or a future state this page has
+  // not seen must degrade to one panel instead of taking the whole view down. Drawing from missing
+  // fields is how an empty axis comes to read as a lift that stood still all week.
+  if(!Array.isArray(TR.profile)||!TR.boundaries||!TR.boundaries.close_travel_max){
+    document.getElementById('trendview').innerHTML=trCams()
+      +'<div style="padding:12px;border:1px dashed #b00;border-radius:6px">'
+      +'<b>TRENDS PAYLOAD INCOMPLETE</b><div class=mut style="font-size:12px;margin-top:4px">'
+      +'the response is missing fields this view requires (profile / boundaries), so it is being '
+      +'reported rather than drawn.</div></div>';
     return;
   }
   var prof=TR.profile, hours=prof.map(function(p){return p.hour}), W=TR.windows;
@@ -4164,15 +4189,29 @@ function renderTrends(){
       if(!trCam) return '<div class=card><div class=h>round trip time / hour-of-day</div>'
         +'<div class=blank>pick a lift \u2014 a round trip is a property of one shaft, so a fleet '
         +'figure would pool trips from different buildings columns</div></div>';
-      if(!R||R.state==='no_floor'||R.state==='no_era'||R.state==='no_rows'){
+      // GUARD ON THE DATA THIS PANEL NEEDS, NOT ON A LIST OF KNOWN-BAD STATES. This enumerated
+      // no_floor/no_era/no_rows and fell through to R.by_hour.map() on anything else — and there IS
+      // an anything else: the row-cap guard returns state='too_many_rows' with no by_hour. ch27 and
+      // ch29 are both over the 120,000-row cap, so both threw "Cannot read properties of undefined
+      // (reading 'map')" and killed the ENTIRE trends view, not just this card. A whitelist of bad
+      // states silently drifts out of date every time the server gains one; an absent array cannot.
+      if(!R||!Array.isArray(R.by_hour)||!R.by_hour.length){
+        // THE REASON MUST MATCH THE FAULT. The home-floor sentence is true for no_floor/no_era/
+        // no_rows and FALSE for too_many_rows — that is a range too large to walk, not a lift with
+        // no floor reads. Printing it there sends the reader hunting a calibration problem they do
+        // not have, which is the same misdescription the health line was corrected for.
+        var why=(R&&R.note)||(R&&R.state==='no_rows'
+              ? ('no door rows in this window for era '+String(R.era||'').slice(0,12))
+              : 'no door-engine reads in any era');
+        var floorish=!R||R.state==='no_floor'||R.state==='no_era'||R.state==='no_rows';
         return absent('round trip time / hour-of-day (s)',
           'door closed at the home floor \u2192 next door open at the home floor',
           'RTT UNAVAILABLE for '+esc(trCam),
-          esc((R&&R.note)|| (R&&R.state==='no_rows'
-                ? ('no door rows in this window for era '+String(R.era||'').slice(0,12))
-                : 'no door-engine reads in any era'))
-          +'. RTT is defined by the home floor; without a floor read there is no trip to measure. '
-          +'This is not a lift that made no journeys.');
+          esc(why)+(floorish
+            ? '. RTT is defined by the home floor; without a floor read there is no trip to measure. '
+              +'This is not a lift that made no journeys.'
+            : ' This is a cap on what the request path will walk — NOT a lift that made no journeys, '
+              +'and not a fault in the lift.'));
       }
       var vals=R.by_hour.map(function(h){return h.median});
       return '<div class=card>'+svgBars('round trip time / hour-of-day (s) \u2014 median',
@@ -4323,7 +4362,16 @@ function loadTrends(){
     // A response that arrives after the selection moved on must be dropped, not drawn: two clicks
     // in quick succession can resolve out of order, and the loser would overwrite the winner.
     if (forCam !== trCam) return;
-    TR = t; renderTrends();
+    TR = t;
+    // A THROW HERE IS NOT A NETWORK FAULT. renderTrends() sat bare in this chain, so any TypeError
+    // while drawing landed in the .catch below and was labelled a failed request. Caught and
+    // relabelled at the boundary, so the sentence names the half that actually broke.
+    try { renderTrends(); }
+    catch (e) {
+      TR = {cam: forCam || 'fleet', render_error: String((e && e.message) || e ||
+           'the payload could not be drawn')};
+      renderTrends();
+    }
   }).catch(function(e){
     // NEVER SWALLOW THIS. An empty catch left the section on "loading…" indefinitely when /trends
     // timed out, which is how a 37-second endpoint presented as a hung page with nothing to report.
