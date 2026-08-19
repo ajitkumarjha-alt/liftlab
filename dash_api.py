@@ -293,6 +293,36 @@ def _ts_clause(t0, t1):
     return sql, args
 
 
+def _era_clause(prefix):
+    """SQL fragment + args selecting one era's rows by templates-hash PREFIX, as a RANGE.
+
+    THIS REPLACES `door_version LIKE prefix||'%'`, AND THE REWRITE IS THE WHOLE FIX.
+    SQLite's LIKE is case-insensitive for ASCII by default, so the optimiser may not convert it to a
+    range and no index on door_version can serve it. Measured on ch29 (232,956 rows in the camera,
+    72 in the era), period=all:
+
+        LIKE, index (gateway_id,cam,ts)                  426.0 ms   SEARCH (gateway_id=? AND cam=?)
+        LIKE, after adding (…,door_version,ts)           543.3 ms   SEARCH (gateway_id=? AND cam=?)
+        range, index (gateway_id,cam,ts)                 298.9 ms   SEARCH (gateway_id=? AND cam=?)
+        range, after adding (…,door_version,ts)            0.2 ms   SEARCH (… AND door_version>? AND <?)
+
+    The index ALONE changes nothing — LIKE still cannot use it. The rewrite alone changes little.
+    Together they are ~1780x, because only then does the era stop being a post-filter evaluated on
+    every row the camera has ever stored.
+
+    `>= p AND < p⁺` is exactly LIKE's prefix semantics under BINARY collation, with one deliberate
+    difference: it is CASE-SENSITIVE. The prefix always comes from a door_version already in the
+    table (_era_for reads one), so exact case is the correct match; LIKE's case-folding was
+    accidental and could only ever have pooled two eras differing by case.
+    """
+    p = str(prefix or "")
+    if not p:
+        return "", []
+    # p⁺ = the smallest string greater than every string starting with p.
+    hi = p[:-1] + chr(ord(p[-1]) + 1)
+    return " AND door_version >= ? AND door_version < ?", [p, hi]
+
+
 def _window(days=None):
     """-> (t0, t1, meta). t1 stays None: 'last N days' has no ceiling."""
     d = WINDOW_DAYS if days is None else float(days)
@@ -487,9 +517,10 @@ def _door_transition_census_h3(db, gw, cam, era, _w, _wargs):
     A completed cycle is a transition into 'closed' from 'closing' or from 'open' — the same rule as
     _h3_cycle_ts, deliberately, so the funnel and the cycle count cannot disagree.
     """
+    _ec, _eargs = _era_clause(era)
     rows = _q(db, "SELECT ts, door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
-                  "AND door_version LIKE ?" + _w + " ORDER BY ts, id",
-              (gw, cam, era + "%", *_wargs))
+                  + _ec + _w + " ORDER BY ts, id",
+              (gw, cam, *_eargs, *_wargs))
     if _GUARD_EPOCH is not None:
         rows = [r for r in rows if r["ts"] is not None and float(r["ts"]) >= _GUARD_EPOCH]
     NUL = "~null"
@@ -563,9 +594,10 @@ def _door_transition_census(db, gw, cam, era, t0=None, t1=None):
     _w, _wargs = _ts_clause(t0, t1)
     if _is_h3_era(era):
         return _door_transition_census_h3(db, gw, cam, era, _w, _wargs)
+    _ec, _eargs = _era_clause(era)
     rows = _q(db, "SELECT ts, door_state FROM gw_door_event WHERE gateway_id=? AND cam=? "
-                  "AND door_version LIKE ? AND door_state IS NOT NULL" + _w + " ORDER BY ts, id",
-              (gw, cam, era + "%", *_wargs))
+                  + _ec + " AND door_state IS NOT NULL" + _w + " ORDER BY ts, id",
+              (gw, cam, *_eargs, *_wargs))
     # Same guard-regime cut as the close-travel pool: pre-guard transitions are the mispairing era's
     # artifacts; a funnel over them diagnoses a tracker that no longer runs.
     if _GUARD_EPOCH is not None:
@@ -739,9 +771,10 @@ def _door_gpu_by_cam(db, gw, cams, t0=None, t1=None):
         # WITHOUT it, because for h3 a NULL state is a meaningful element of the sequence — see
         # _h3_cycle_ts. Filtering it there would count abandoned descents as cycles.
         if _is_h3_era(era):
+            _ec, _eargs = _era_clause(era)
             h3rows = _q(db, "SELECT ts, door_state, close_travel_s ct FROM gw_door_event "
-                            "WHERE gateway_id=? AND cam=? AND door_version LIKE ?"
-                            + w + " ORDER BY ts, id", (gw, cam, era + "%", *wargs))
+                            "WHERE gateway_id=? AND cam=?" + _ec
+                            + w + " ORDER BY ts, id", (gw, cam, *_eargs, *wargs))
             cyc_ts = _h3_cycle_ts(h3rows)
             reopens = _h3_reopens(h3rows)
             spec = DOOR_SPECS.get(cam)
@@ -768,9 +801,10 @@ def _door_gpu_by_cam(db, gw, cams, t0=None, t1=None):
                 "reason": H3_TRAVEL_REASON,
             }
             continue
+        _ec, _eargs = _era_clause(era)
         rows = _q(db, "SELECT ts, door_state, close_travel_s ct FROM gw_door_event "
-                      "WHERE gateway_id=? AND cam=? AND door_version LIKE ? AND door_state IS NOT NULL"
-                      + w + " ORDER BY ts, id", (gw, cam, era + "%", *wargs))
+                      "WHERE gateway_id=? AND cam=?" + _ec + " AND door_state IS NOT NULL"
+                      + w + " ORDER BY ts, id", (gw, cam, *_eargs, *wargs))
         # GUARD-REGIME CUT. The 5f1488a time-guards changed what gets emitted without moving the era,
         # so pre-guard mispairings share the era with clean rows. With DASH_DOOR_GUARD_TS set, the
         # quotable pool is post-guard rows only; the excluded count stays visible, never silent.
@@ -1572,9 +1606,10 @@ def _tier2(db, gw, cam, transits, t0=None, t1=None, era_override=""):
     # so the UI can offer "view that week" instead of auto-newest silently hiding it.
     eras_list, eras_computed_at = _era_census(db, gw, cam)
     _w, _wargs = _ts_clause(t0, t1)
+    _ec, _eargs = _era_clause(era)
     rows = _q(db, "SELECT ts, floor, direction, door_state, reason, read_conf FROM gw_door_event "
-                  "WHERE gateway_id=? AND cam=? AND door_version LIKE ?" + _w + " ORDER BY ts",
-              (gw, cam, era + "%", *_wargs))
+                  "WHERE gateway_id=? AND cam=?" + _ec + _w + " ORDER BY ts",
+              (gw, cam, *_eargs, *_wargs))
     # Optional DATE RANGE on top of the era. Both sides are filtered together: leaving transits
     # unfiltered while narrowing the door rows would join riders to windows that are no longer in
     # the result, and the per-floor totals would exceed the range they claim to describe.
@@ -2372,19 +2407,21 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
             # _h3_cycle_ts for why NULL states are kept in the walk.
             if _is_h3_era(e):
                 h3_cams.append(c)
+                _ec, _eargs = _era_clause(e)
                 h3rows = _q(db, "SELECT ts, door_state FROM gw_door_event WHERE gateway_id=? "
-                                "AND cam=? AND door_version LIKE ?" + _ts_clause(t0, t1)[0]
+                                "AND cam=?" + _ec + _ts_clause(t0, t1)[0]
                                 + " ORDER BY ts, id",
-                            (gw, c, e + "%", *_ts_clause(t0, t1)[1]))
+                            (gw, c, *_eargs, *_ts_clause(t0, t1)[1]))
                 gpu_cyc += [{"ts": ts, "ct": None} for ts in _h3_cycle_ts(h3rows)]
                 continue
             # FLEET CASE: this loop is the per-camera walk, so the bound goes on every camera's
             # query, not just the single-camera one. Unbounded here meant a fleet request read
             # every door row this gateway has ever stored, once per camera.
+            _ec, _eargs = _era_clause(e)
             gpu_cyc += _q(db, "SELECT ts, close_travel_s ct FROM gw_door_event WHERE gateway_id=? "
-                              "AND cam=? AND door_version LIKE ? AND close_travel_s IS NOT NULL"
+                              "AND cam=?" + _ec + " AND close_travel_s IS NOT NULL"
                               + _ts_clause(t0, t1)[0],
-                          (gw, c, e + "%", *_ts_clause(t0, t1)[1]))
+                          (gw, c, *_eargs, *_ts_clause(t0, t1)[1]))
     # COUNTING-ERA SPANS, derived from validation_item stamps (first/last episode per version) —
     # never from a hardcoded date. A range that spans more than one era pools transits counted by
     # DIFFERENT logic; the payload names every era in range so the UI can label the pooling, and an
@@ -2887,10 +2924,11 @@ def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
                 e, _src = _era_for(db, gw, c, era)
                 if not e:
                     continue
+                _ec, _eargs = _era_clause(e)
                 rows += _q(db, "SELECT cam, ts, floor, direction, door_state, read_conf, panels_agreed, "
                                "reason, close_travel_s, door_version FROM gw_door_event "
-                               "WHERE gateway_id=? AND cam=? AND door_version LIKE ? ORDER BY ts",
-                           (gw, c, e + "%"))
+                               "WHERE gateway_id=? AND cam=?" + _ec + " ORDER BY ts",
+                           (gw, c, *_eargs))
         db.close()
         out = [(r["cam"], r["ts"], _iso_ist(r["ts"]), r["floor"], r["direction"], r["door_state"],
                 r["read_conf"], r["panels_agreed"], r["reason"], r["close_travel_s"], r["door_version"],

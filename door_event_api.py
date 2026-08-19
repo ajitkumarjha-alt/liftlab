@@ -135,6 +135,20 @@ def _init_schema():
           panels_agreed INTEGER, reason TEXT, close_travel_s REAL,
           door_version TEXT, templates_hash TEXT, received_at REAL)""")
         db.execute("CREATE INDEX IF NOT EXISTS ix_door_event ON gw_door_event (gateway_id,cam,ts)")
+        # ERA-SCOPED READS. Every dash query filters by (gateway_id, cam, ERA, ts) and the index
+        # above stops at cam, so the era was a post-filter on every row the camera had ever stored:
+        # 232,956 read to return 72, ~40 ms per 10k scanned. This index only helps once the callers
+        # ask by RANGE rather than LIKE (see dash_api._era_clause) — with LIKE the planner ignores it
+        # entirely, measured 543 ms vs 426 ms without. Range + this index: 0.2 ms.
+        # COVERING for the era census (GROUP BY door_version with MIN/MAX(ts)), which is why ts is
+        # the fourth column rather than the index being (gateway_id,cam,door_version) alone.
+        #
+        # BUILD TIME IS REAL: 5.4 s over 652k rows locally, so expect tens of seconds over 1.8M on
+        # the VM, during which this table is locked. The deploy note builds it with sqlite3 BEFORE
+        # the service restarts, which makes this call a no-op; it stays here so the index can never
+        # simply be missing on a fresh gateway.
+        db.execute("CREATE INDEX IF NOT EXISTS ix_door_era ON gw_door_event "
+                   "(gateway_id,cam,door_version,ts)")
         try:
             db.execute("ALTER TABLE gw_door_event ADD COLUMN candidates TEXT")   # reason='ambiguous' top-2 [[lab,score],..]
         except sqlite3.OperationalError:
