@@ -1,4 +1,12 @@
-# /trends at 1.8M door rows — deploy (2026-08-19)
+# /trends at 1.8M door rows — deploy (2026-08-19, rev 2)
+
+> **REV 1 DID NOT WORK, AND THE HEADLINE NUMBER IN IT WAS WRONG.** `ix_door_era` is built and used
+> — the plan is right — and `/trends` went 29 s → 37.7 s, `/data` 4.8 s → 9.0 s. The "1780x" was
+> measured on ch29, whose current era holds **72 of 232,956 rows (0.0%)**: the era filter helps in
+> proportion to what it EXCLUDES and I picked the camera where it excluded everything. On ch16
+> (51.5% in era) the same query with the same index still costs 582 ms. Row VOLUME is the residual
+> cost and no index removes rows the answer needs. Rev 2 moves the derivation to the timer.
+> **The index stays** — it is proven good and it makes the precompute cheaper.
 
 VM only. One index built by hand **before** the restart, then three files. No GPU box, no Pi, no
 registry change.
@@ -7,9 +15,9 @@ registry change.
 
 | box | path | md5 |
 |---|---|---|
-| VM | `dash_api.py` | `9fff4beddc3db2c045b41ee729ed4d07` |
+| VM | `dash_api.py` | `dda2e83b73d9f37acbe5939b77b5b7be` |
 | VM | `door_event_api.py` | `ee93e0c070c4e229475f81241af1db11` |
-| VM | `precompute_job.py` | `4964b81d9fa90b9814b2235b742d6d86` |
+| VM | `precompute_job.py` | `5c7f09795a5089b2897894d04cf5c04a` |
 | VM | `rtt_core.py` | `ffbaf2522e698b7193b8a87b1b20591a` |
 
 This dash_api **supersedes** `3c40b00c…` (the precomputed RTT re-land) — it is that plus the era
@@ -76,7 +84,26 @@ done
 sudo systemctl start liftlab-cloud
 ```
 
-## 3. Fill the RTT column once, then let the timer own it
+## 3. THE PRECOMPUTE IS NOW MANDATORY, NOT A WARM-UP
+
+`/trends` no longer derives anything for the default view. Until the job runs, every trends page
+reads **"NOT COMPUTED YET"** — the honest state, deliberately not an empty chart beside a zero.
+
+```bash
+sudo -u liftlab GATEWAY_DB=/var/lib/liftlab/gateway.db \
+  $APP/.venv/bin/python $APP/precompute_job.py site-A
+#   [precompute] trends site-A/ch29: 29KB in 0.21s (dv=260d4a0fh3-stateT5471cb)
+#   [precompute] trends site-A/fleet: 9KB in 0.40s
+```
+
+Run it **once by hand now**, then the timer owns it. A cached payload is served even when stale,
+with its age attached, because a number from an hour ago that renders beats a current one that
+times out — `DASH_TRENDS_STALE_S` (default 5400) only controls when the UI labels it stale.
+
+Custom date ranges, era overrides and hour filters still derive live: those are deliberate questions
+and are not what was timing out.
+
+## 3b. Fill the RTT column once, then let the timer own it
 
 RTT no longer runs in any request handler. Until the precompute has run, every RTT panel reads
 **"RTT NOT YET COMPUTED"** — which is the honest state, and deliberately not "no round trips".
@@ -99,12 +126,19 @@ drifting towards its own period.
 time curl -fsS -u "$OPERATOR" "https://lift.gargi.online/dash/site-A/trends?cam=ch29" -o /dev/null
 time curl -fsS -u "$OPERATOR" "https://lift.gargi.online/dash/site-A/data" -o /dev/null
 time curl -fsS -u "$OPERATOR" "https://lift.gargi.online/dash/site-A/rtt?cam=ch29" -o /dev/null
-python3 tools/trends_profile.py --db /tmp/gw_copy.db --cam ch29     # after — plans should now read
+python3 tools/trends_profile.py --db /tmp/gw_copy.db --cam ch29     # after
+#   wall Xs   SQL Ys across N statements   Python Zs
 #   SEARCH gw_door_event USING INDEX ix_door_era (… AND door_version>? AND door_version<?)
+# It now profiles the DERIVATION (_trends_compute), not the cache read, and splits SQL from Python
+# — if most of the time is Python it drops into cProfile and names the frames. That split is what
+# rev 1 lacked: it timed only SQL, so a run spending its seconds walking rows would have shown a
+# fast query list and no explanation.
 ```
 
-Local, 652k rows: trends 2.79 s → **0.25 s** single camera, **0.40 s** fleet; `/rtt` 0.1–2.5 ms.
-The live starting point is 29 s, so judge it against that, not against these.
+Local, 652k rows: trends **1.1–1.7 ms** served from cache (miss 1.7 ms, and a miss now renders a
+named state instead of charts); precompute 66–404 ms per entry; `/rtt` 0.1–2.5 ms. The request path
+no longer scales with the table, so the live figure should look like these rather than like a
+fraction of 37 s — if it does not, the profiler will say why in one run.
 
 And open the page — `/trends` returning fast is not the same as the trends section rendering. The
 browser showed "loading…" indefinitely, which is a client-side symptom of the same timeout and needs
