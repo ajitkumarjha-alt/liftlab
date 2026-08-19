@@ -11,7 +11,7 @@
 VM only. One index built by hand **before** the restart, then three files. No GPU box, no Pi, no
 registry change.
 
-**md5s as published on `pi-scripts`** (`3721a1a`), verified by fetching them back from raw.
+**md5s as published on `pi-scripts`** (`405bfa3`), verified by fetching them back from raw.
 
 | box | path | md5 |
 |---|---|---|
