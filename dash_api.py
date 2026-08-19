@@ -2714,7 +2714,21 @@ def _trends_compute(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                          "rtt": rtt_tr,
                          # The state travels with the value. Without it a pending RTT and a camera
                          # with genuinely no round trips arrive as the same null.
-                         "rtt_state": (rtt_meta or {}).get("state"),
+                         #
+                         # ONE QUESTION, ONE ANSWER. This used to carry the DELIVERY state — 'ok'
+                         # meaning a stored payload was found and parsed — while rtt.state carries
+                         # the MEASUREMENT state. Both were true, and they shared a word AND the
+                         # value 'ok', so ch29 served rtt_state='ok' beside rtt.state='too_many_rows'
+                         # (the row-cap refusal). A reader who trusts the top-level field concludes
+                         # the round-trip figure is fine; there is no figure at all. Two fields that
+                         # disagree about the same noun is how the next hour gets lost.
+                         #
+                         # So the top level MIRRORS the object whenever there is an object. Delivery
+                         # is a different question and still worth answering — it gets its own key
+                         # instead of borrowing this one.
+                         "rtt_state": ((rtt_tr or {}).get("state")
+                                       or (rtt_meta or {}).get("state")),
+                         "rtt_delivery_state": (rtt_meta or {}).get("state"),
                          "rtt_detail": (rtt_meta or {}).get("detail"),
                          "rtt_computed_at": (rtt_meta or {}).get("computed_at"),
                          "rtt_window_days": (rtt_meta or {}).get("window_days"),
@@ -2882,7 +2896,8 @@ def _trends_skeleton(gw, cam, meta):
         "windows": {k: None for k in ("all_day", "am_peak", "pm_peak")},
         "tier2_range": None, "tier2_source": None, "tier2_computed_at": None, "tier2_age_s": None,
         "tier2_window_days": None, "tier2_cache_state": None, "tier2_cache_note": None,
-        "rtt": None, "rtt_state": None, "rtt_detail": None, "rtt_computed_at": None,
+        "rtt": None, "rtt_state": None, "rtt_delivery_state": None, "rtt_detail": None,
+        "rtt_computed_at": None,
         "rtt_window_days": None,
         "rtt_note": {"home": RTT_HOME, "fleet": None},
         "occupancy_note": {"label": OCC_LABEL, "calibration": OCC_CALIBRATION,

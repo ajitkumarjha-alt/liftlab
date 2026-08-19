@@ -172,6 +172,58 @@ def main():
     if "TRENDS PAYLOAD INCOMPLETE" not in h:
         fails.append("a payload missing 'profile' did not render the incomplete-payload panel")
 
+    print("\n=== 5. rtt_state and rtt.state may never disagree ===")
+    # They used to answer DIFFERENT questions under one name: rtt_state carried the delivery state
+    # ('ok' = a stored payload was found and parsed) while rtt.state carries the measurement state.
+    # Live, ch29 served rtt_state='ok' beside rtt.state='too_many_rows' — the top-level field said
+    # the round-trip figure was fine when there was no figure. Whichever a reader trusts must be the
+    # same answer, so the top level mirrors the object and delivery gets its own key.
+    _pdb = D._db()
+    try:
+        # SEED THE DISAGREEMENT. On a fixture with no stored RTT every rtt is null and the invariant
+        # passes without ever being exercised — a test that cannot fail. Plant a stored payload whose
+        # MEASUREMENT state is a refusal while its DELIVERY is a clean hit, which is exactly the live
+        # ch29 case: found and parsed ('ok') but nothing measured ('too_many_rows').
+        # The render fixture builds a LEGACY door_aggregate (…, payload TEXT), so
+        # CREATE TABLE IF NOT EXISTS is a no-op and _rtt_read only ever reports "never run on this
+        # schema". Rebuild it on the production schema so this section talks to the real read path.
+        _pdb.execute("DROP TABLE IF EXISTS door_aggregate")
+        D._aggregate_table(_pdb)
+        _cv, _dv = D._current_keys(_pdb, "site-A", "ch29")
+        _pdb.execute(
+            "INSERT OR REPLACE INTO door_aggregate (gateway_id,cam,counting_version,door_version,"
+            "window_days,door_gpu,tier2,rtt,rtt_ms,computed_at,source_rows,compute_ms) "
+            "VALUES ('site-A','ch29',?,?,?,NULL,NULL,?,1,?,0,0)",
+            (_cv or "", _dv or "", float(D.WINDOW_DAYS),
+             json.dumps({"state": "too_many_rows", "era": _dv, "n_rows": 377854,
+                         "note": "seeded: over the row cap"}), 1.0))
+        _pdb.commit()
+
+        for c in ("ch29", "ch27", "ch32"):
+            D.trends_refresh(_pdb, "site-A", c)
+            body = D.dash_trends("site-A", cam=c, period="all").payload
+            inner = (body.get("rtt") or {}).get("state")
+            top, dely = body.get("rtt_state"), body.get("rtt_delivery_state")
+            print(f"  {c}: rtt.state={str(inner):16s} rtt_state={str(top):16s} "
+                  f"rtt_delivery_state={dely!r}")
+            if inner is not None and top != inner:
+                fails.append(f"{c}: rtt_state={top!r} contradicts rtt.state={inner!r}")
+            if inner is None and top is None and dely is None:
+                fails.append(f"{c}: no rtt object and no state anywhere — the null is unexplained")
+            # The seeded camera is the one that must prove the point: a refusal at the top level
+            # while delivery reports a clean hit underneath.
+            if c == "ch29":
+                if inner != "too_many_rows":
+                    fails.append("the seeded too_many_rows payload never reached the response — "
+                                 "section 5 is not exercising the disagreement it exists for")
+                elif top != "too_many_rows":
+                    fails.append(f"ch29: rtt_state={top!r} did not mirror the refusal")
+                elif dely != "ok":
+                    fails.append(f"ch29: rtt_delivery_state={dely!r} lost the delivery fact "
+                                 f"(the payload WAS found and parsed)")
+    finally:
+        _pdb.close()
+
     shutil.rmtree(tmp, ignore_errors=True)
     print()
     if fails:
