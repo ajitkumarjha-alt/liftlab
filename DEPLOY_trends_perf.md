@@ -75,6 +75,12 @@ done
 md5sum /tmp/dash_api.py /tmp/door_event_api.py /tmp/precompute_job.py /tmp/rtt_core.py
 # compare against the table above BEFORE installing
 
+# IF AN md5 DOES NOT MATCH, raw.githubusercontent SERVED A STALE COPY — the ?cb= cache-buster did
+# NOT defeat it on 2026-08-19, verified against the API. Refetch through the API, which is not
+# cached, rather than retrying raw:
+#   curl -fsSL "https://api.github.com/repos/ajitkumarjha-alt/liftlab/contents/$f?ref=pi-scripts" \
+#        -H "Accept: application/vnd.github.raw" -o "/tmp/$f"
+
 APP=/opt/liftlab-b3/cloud
 STAMP=$(date +%Y%m%d-%H%M%S)
 for f in dash_api.py door_event_api.py precompute_job.py rtt_core.py; do
