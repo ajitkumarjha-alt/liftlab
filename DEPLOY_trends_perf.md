@@ -184,6 +184,29 @@ config change on any camera is possible, but has not happened yet on this fleet.
 - The duration is carried on the health payload **whether or not it breached**, so the dashboard can
   show the trend rather than only the moment it crossed.
 
+### The sweep grew when RTT and the other periods were filled
+
+RTT and the trends payload are now precomputed for **every period the picker offers** (Today / 7d /
+30d / All), not just the default. Before this, Today and 30 days served the not-computed skeleton
+for ever and All/7d hit the RTT row cap on the two busiest cameras — RTT was unviewable on every
+button. Measured on the same devbox, same database:
+
+| sweep | total | alphabet | aggregate | rtt | trends |
+|---|---|---|---|---|---|
+| default period only | 112.9s | 23.4s | 57.2s | — | 32.4s |
+| all four periods | **192.5s** | 21.7s | 35.0s | **41.6s** | 94.1s |
+
+At the live box's measured 4.3x that is roughly **8m10s → 14m**, against a 1h timer: still a 23%
+duty cycle, but it lands just under `HEALTH_PRECOMPUTE_SLOW_S` (900s). Expect the health line to
+start reporting the sweep if the fleet or the eras grow. That is the instrument working, not a
+fault — but decide deliberately whether to raise the threshold or narrow `TRENDS_FILL_PERIODS`
+rather than letting it fire and be ignored.
+
+**Run the sweep by hand at deploy.** `_rtt_read` falls back to the legacy `door_aggregate.rtt`
+column only at the DEFAULT window, and the default view is `period=all`, which maps to window 0 —
+so between deploying and the first sweep, RTT reads "not yet computed" on the default view. One
+by-hand run closes that window; the deploy note's step 3a already tells you to do it.
+
 ### Which lever, and in what order — measured, because the obvious answer is wrong
 
 A full sweep on the devbox splits **aggregate 50.6% / trends 28.7% / alphabet 20.7%**. So:

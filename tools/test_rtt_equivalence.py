@@ -235,10 +235,20 @@ def main():
             fails.append(f"{fn} still WALKS door rows — this is what took /trends to 152.8s live; "
                          f"it must read the precomputed row via _rtt_read")
         print(f"  {fn:12s} {'WALKS' if '_rtt_by_cam(' in body else 'reads'}")
-    _ar = src.find("def aggregate_refresh(")
-    if _ar < 0 or "_rtt_by_cam(" not in src[_ar:src.find("\ndef ", _ar + 10)]:
-        fails.append("aggregate_refresh does not compute RTT — nothing would ever fill the column, "
+    # SOMETHING OFF THE REQUEST PATH MUST STILL FILL IT. The walk used to live in
+    # aggregate_refresh, which covered the DEFAULT WINDOW ONLY — so Today and 30 days had nothing to
+    # serve and said so for ever. It now lives in rtt_refresh, one entry per period the picker
+    # offers. The assertion is unchanged in substance: a scheduler-only function must walk, or every
+    # panel sits on "not yet computed" permanently.
+    _rr = src.find("def rtt_refresh(")
+    if _rr < 0 or "_rtt_by_cam(" not in src[_rr:src.find("\ndef ", _rr + 10)]:
+        fails.append("rtt_refresh does not compute RTT — nothing would ever fill rtt_window, "
                      "and every panel would sit on 'not yet computed' forever")
+    # AND IT MUST WALK UNCAPPED. The 120,000-row cap is a request-path guard; applied to the timer
+    # it refused ch29 and ch27 outright and left RTT unviewable on every range a user can select.
+    if _rr >= 0 and "max_rows=None" not in src[_rr:src.find("\ndef ", _rr + 10)]:
+        fails.append("rtt_refresh walks WITH a row cap — the cap exists for the request path, and "
+                     "capping the timer is what made RTT unviewable on the busiest cameras")
 
     # ── AND THE PRECOMPUTE MUST PRESERVE THE EQUIVALENCE ─────────────────────────────────────
     # Moving the walk off the request path is only safe if the stored answer is the SAME answer.
@@ -257,14 +267,24 @@ def main():
         if "not yet computed" not in (pmeta.get("state") or ""):
             fails.append(f"a miss must report PENDING, not absence — got {pmeta.get('state')!r}; "
                          f"'no round trips' asserts the lift never moved")
-        D3.aggregate_refresh(db3, "site-A", "ch29")
+        D3.rtt_refresh(db3, "site-A", "ch29", D3.WINDOW_DAYS)
         got, gmeta = D3._rtt_read(db3, "site-A", "ch29", D3.WINDOW_DAYS)
         print(f"  after precompute:      {gmeta.get('state')}  trips={(got or {}).get('n_trips')}")
         if not got:
-            fails.append("nothing stored after aggregate_refresh")
+            fails.append("nothing stored after rtt_refresh")
         elif got.get("n_trips") != cli["n_trips"]:
             fails.append(f"stored trips {got.get('n_trips')} != CLI trips {cli["n_trips"]} — the "
                          f"precompute changed the answer, not just where it is computed")
+        # EVERY PERIOD THE PICKER OFFERS, not just the default window. This is the gap that made
+        # Today and 30 days report "not served for this range" while All and 7 days hit the cap.
+        print("  every window the picker maps to:")
+        for _w in D3.RTT_WINDOWS:
+            D3.rtt_refresh(db3, "site-A", "ch29", _w)
+            _g, _m = D3._rtt_read(db3, "site-A", "ch29", _w)
+            print(f"    window {_w:>4g}d -> {_m.get('state')}  trips={(_g or {}).get('n_trips')}")
+            if _m.get("state") != "ok":
+                fails.append(f"window {_w:g}d is not served after a full precompute "
+                             f"({_m.get('state')!r}) — the picker offers a range nothing fills")
     finally:
         db3.close()
 

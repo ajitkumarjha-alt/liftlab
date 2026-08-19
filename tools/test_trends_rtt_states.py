@@ -184,17 +184,15 @@ def main():
         # passes without ever being exercised — a test that cannot fail. Plant a stored payload whose
         # MEASUREMENT state is a refusal while its DELIVERY is a clean hit, which is exactly the live
         # ch29 case: found and parsed ('ok') but nothing measured ('too_many_rows').
-        # The render fixture builds a LEGACY door_aggregate (…, payload TEXT), so
-        # CREATE TABLE IF NOT EXISTS is a no-op and _rtt_read only ever reports "never run on this
-        # schema". Rebuild it on the production schema so this section talks to the real read path.
-        _pdb.execute("DROP TABLE IF EXISTS door_aggregate")
-        D._aggregate_table(_pdb)
+        # Seed the store _rtt_read actually reads: rtt_window, keyed by the window the requested
+        # PERIOD maps to. period='all' maps to window 0, not the default 7 — reading the default
+        # here is what the old aggregate-only layout did, and why Today and 30 days had nothing.
+        D._rtt_window_table(_pdb)
         _cv, _dv = D._current_keys(_pdb, "site-A", "ch29")
         _pdb.execute(
-            "INSERT OR REPLACE INTO door_aggregate (gateway_id,cam,counting_version,door_version,"
-            "window_days,door_gpu,tier2,rtt,rtt_ms,computed_at,source_rows,compute_ms) "
-            "VALUES ('site-A','ch29',?,?,?,NULL,NULL,?,1,?,0,0)",
-            (_cv or "", _dv or "", float(D.WINDOW_DAYS),
+            "INSERT OR REPLACE INTO rtt_window (gateway_id,cam,window_days,counting_version,"
+            "door_version,payload,computed_at,compute_ms) VALUES ('site-A','ch29',?,?,?,?,?,1)",
+            (D.RTT_PERIOD_DAYS["all"], _cv or "", _dv or "",
              json.dumps({"state": "too_many_rows", "era": _dv, "n_rows": 377854,
                          "note": "seeded: over the row cap"}), 1.0))
         _pdb.commit()

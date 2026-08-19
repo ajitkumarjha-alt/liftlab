@@ -668,7 +668,20 @@ RTT_HOME = os.environ.get("DASH_RTT_HOME", "G")
 # RTT is walked on the request path, so it is capped and cached. The cap refuses rather than
 # truncates: a partial walk drops round trips and reports a median from part of the window, which is
 # worse than saying no.
+# THE CAP IS A REQUEST-PATH GUARD, AND FOR A WHILE IT GUARDED NOTHING BUT THE TIMER. RTT stopped
+# being walked on the request path when it moved to the precompute job, and the cap moved with it —
+# so the only thing it still bounded was the one caller that has all hour to work. Measured live:
+# ch29 and ch27 hold 347,038 and 235,114 era rows in a 7-day window, so BOTH refused, and every
+# range a user could select showed the cap message. Pass max_rows explicitly to reimpose it on any
+# future live path; the timer passes None and walks. Uncapped cost, measured: ~25 us/row, 10.9s for
+# ch29's full 436,486-row era.
 RTT_MAX_ROWS = int(os.environ.get("DASH_RTT_MAX_ROWS", "120000"))
+# The picker's four periods, as the rolling windows RTT is stored under. 0 = all history, matching
+# _window()'s contract. RTT is a rolling-window figure labelled with its OWN window (rtt_window_days
+# travels on the payload) — it is not re-derived to the picker's exact IST-aligned bounds, and the
+# panel says which window it describes rather than implying it matches the range above it.
+RTT_PERIOD_DAYS = {"day": 1.0, "week": 7.0, "month": 30.0, "all": 0.0, "": 0.0}
+RTT_WINDOWS = (1.0, 7.0, 30.0, 0.0)
 # How old a cached trends payload may be before the UI is told to call it stale. It is still SERVED
 # past this — a stale number that renders beats a fresh one that times out — but it is labelled.
 TRENDS_STALE_S = float(os.environ.get("DASH_TRENDS_STALE_S", "5400"))
@@ -1427,6 +1440,54 @@ def _aggregate_read(db, gw, cam, window_days):
                     "counting_version": cv, "door_version": dv, "window_days": window_days}
 
 
+# ============================================================ RTT per window
+# WHY ITS OWN TABLE AND NOT ANOTHER door_aggregate COLUMN. door_aggregate is keyed by window_days,
+# so the obvious move is a row per window. It is wrong: _aggregate_read treats a row that EXISTS
+# with a NULL door_gpu as state='ok' with nothing in it — "computed, and this camera has no door
+# data" — when the truth is "nobody computed the aggregate for this window, only the RTT". That is
+# the pending-is-not-absence rule this file states in four other places, and writing RTT-only rows
+# into that table would break it for every /data?days= that is not the default.
+def _rtt_window_table(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS rtt_window (
+        gateway_id TEXT, cam TEXT,
+        window_days REAL,                   -- 0 = all history, same contract as _window()
+        counting_version TEXT, door_version TEXT,   -- era key, same rule as door_aggregate
+        payload TEXT, computed_at REAL, compute_ms INTEGER,
+        PRIMARY KEY (gateway_id, cam, window_days, counting_version, door_version))""")
+
+
+def rtt_refresh(db, gw, cam, window_days):
+    """Walk the era for ONE window and STORE. Scheduler/CLI ONLY — never a request handler.
+
+    UNCAPPED ON PURPOSE. See RTT_MAX_ROWS: the cap exists to stop a request spending an unbounded
+    budget, and this is the timer. Capping it here is what made RTT unviewable on every range.
+    """
+    _rtt_window_table(db)
+    d = float(window_days)
+    t0, t1, _ = _window(d)
+    cv, dv = _current_keys(db, gw, cam)
+    if dv is None:
+        return {"gw": gw, "cam": cam, "window_days": d, "skipped": "no door rows"}
+    t_start = time.time()
+    got, err = _rtt_by_cam(db, gw, [cam], t0, t1, max_rows=None)
+    S = (got or {}).get(cam)
+    ms = int((time.time() - t_start) * 1000)
+    db.execute("INSERT INTO rtt_window (gateway_id,cam,window_days,counting_version,door_version,"
+               "payload,computed_at,compute_ms) VALUES (?,?,?,?,?,?,?,?) "
+               "ON CONFLICT(gateway_id,cam,window_days,counting_version,door_version) DO UPDATE SET "
+               "payload=excluded.payload, computed_at=excluded.computed_at, "
+               "compute_ms=excluded.compute_ms",
+               (gw, cam, d, cv or "", dv or "", json.dumps(S) if S else None, time.time(), ms))
+    db.commit()
+    # One era per (cam, window): a retired era is never served, so keeping it only grows the table.
+    db.execute("DELETE FROM rtt_window WHERE gateway_id=? AND cam=? AND window_days=? AND NOT "
+               "(counting_version=? AND door_version=?)", (gw, cam, d, cv or "", dv or ""))
+    db.commit()
+    return {"gw": gw, "cam": cam, "window_days": d, "compute_ms": ms, "error": err,
+            "state": (S or {}).get("state"), "n_rows": (S or {}).get("n_rows"),
+            "n_trips": (S or {}).get("n_trips")}
+
+
 def _rtt_read(db, gw, cam, window_days):
     """Serve the STORED round-trip summary. NEVER walks. -> (summary|None, meta).
 
@@ -1439,13 +1500,28 @@ def _rtt_read(db, gw, cam, window_days):
     cv, dv = _current_keys(db, gw, cam)
     if dv is None:
         return None, {"state": "no door rows for this camera in any era"}
+    _src = "rtt_window"
     try:
-        r = db.execute("SELECT rtt, rtt_ms, computed_at FROM door_aggregate WHERE gateway_id=? "
-                       "AND cam=? AND counting_version=? AND door_version=? AND window_days=?",
-                       (gw, cam, cv, dv, float(window_days))).fetchone()
+        r = db.execute("SELECT payload rtt, compute_ms rtt_ms, computed_at FROM rtt_window "
+                       "WHERE gateway_id=? AND cam=? AND window_days=? AND counting_version=? "
+                       "AND door_version=?",
+                       (gw, cam, float(window_days), cv or "", dv or "")).fetchone()
     except sqlite3.OperationalError:
-        return None, {"state": "not yet computed — the precompute job has never run on this schema",
-                      "current_door_version": dv}
+        r = None
+    # LEGACY FALLBACK, AND IT IS LABELLED. Before rtt_window existed the RTT lived in a
+    # door_aggregate column at the default window only. Without this, the deploy between shipping
+    # the code and the first sweep completing would report "not yet computed" for every camera —
+    # a visible regression on the way to a fix. It reports its source so a stale legacy read is
+    # never mistaken for a fresh one.
+    if r is None and float(window_days) == float(WINDOW_DAYS):
+        _src = "door_aggregate (legacy column, pre-rtt_window)"
+        try:
+            r = db.execute("SELECT rtt, rtt_ms, computed_at FROM door_aggregate WHERE gateway_id=? "
+                           "AND cam=? AND counting_version=? AND door_version=? AND window_days=?",
+                           (gw, cam, cv, dv, float(window_days))).fetchone()
+        except sqlite3.OperationalError:
+            return None, {"state": "not yet computed — the precompute job has never run on this "
+                                   "schema", "current_door_version": dv}
     if not r or not r["rtt"]:
         return None, {"state": "not yet computed for the current era/window",
                       "current_door_version": dv, "window_days": window_days,
@@ -1456,7 +1532,7 @@ def _rtt_read(db, gw, cam, window_days):
         S = json.loads(r["rtt"])
     except (ValueError, TypeError):
         return None, {"state": "stored RTT unreadable", "computed_at": r["computed_at"]}
-    return S, {"state": "ok", "computed_at": r["computed_at"],
+    return S, {"state": "ok", "source": _src, "computed_at": r["computed_at"],
                "age_s": (round(time.time() - r["computed_at"], 1) if r["computed_at"] else None),
                "compute_ms": r["rtt_ms"], "door_version": dv, "window_days": window_days,
                "source": "door_aggregate (precomputed off the request path)"}
@@ -1477,21 +1553,20 @@ def aggregate_refresh(db, gw, cam, window_days=None):
     dg = dg_all.get(cam)
     src = (dg or {}).get("n_rows") or (t2 or {}).get("rows_in_era") or 0
     ms = int((time.time() - t_start) * 1000)
-    # THE ONLY PLACE THE RTT WALK RUNS. Off the request path, once per era per window, on the timer.
-    _r0 = time.time()
-    _rt, _rerr = _rtt_by_cam(db, gw, [cam], t0, t1)
-    rtt = (_rt or {}).get(cam)
-    rtt_ms = int((time.time() - _r0) * 1000)
+    # RTT IS NO LONGER WALKED HERE. It lives in rtt_window, one entry per PERIOD the picker offers,
+    # filled by rtt_refresh — this function only ever covered the default window, which is why Today
+    # and 30 days had nothing to serve. The rtt/rtt_ms columns are deliberately NOT written here any
+    # more and NOT cleared: they remain the labelled legacy fallback _rtt_read uses to bridge the gap
+    # between this deploy and the first sweep. Omitting them from DO UPDATE SET is what preserves
+    # them — an excluded.rtt of NULL would wipe the bridge on the first aggregate refresh.
     db.execute("INSERT INTO door_aggregate (gateway_id,cam,counting_version,door_version,"
-               "window_days,door_gpu,tier2,computed_at,source_rows,compute_ms,rtt,rtt_ms) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+               "window_days,door_gpu,tier2,computed_at,source_rows,compute_ms) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?) "
                "ON CONFLICT(gateway_id,cam,counting_version,door_version,window_days) DO UPDATE SET "
                "door_gpu=excluded.door_gpu, tier2=excluded.tier2, computed_at=excluded.computed_at, "
-               "source_rows=excluded.source_rows, compute_ms=excluded.compute_ms, "
-               "rtt=excluded.rtt, rtt_ms=excluded.rtt_ms",
+               "source_rows=excluded.source_rows, compute_ms=excluded.compute_ms",
                (gw, cam, cv, dv, d, json.dumps(dg) if dg else None,
-                json.dumps(t2) if t2 else None, time.time(), src, ms,
-                json.dumps(rtt) if rtt else None, rtt_ms))
+                json.dumps(t2) if t2 else None, time.time(), src, ms))
     db.commit()
     # Keep the table from growing an entry per retired era forever.
     db.execute("DELETE FROM door_aggregate WHERE gateway_id=? AND cam=? AND NOT "
@@ -1499,8 +1574,7 @@ def aggregate_refresh(db, gw, cam, window_days=None):
     db.commit()
     return {"gw": gw, "cam": cam, "source_rows": src, "compute_ms": ms,
             "has_tier2": t2 is not None, "counting_version": cv, "door_version": dv,
-            "window_days": d, "rtt_ms": rtt_ms,
-            "rtt_trips": (rtt or {}).get("n_trips"), "rtt_error": _rerr}
+            "window_days": d, "rtt_ms": None, "rtt_trips": None, "rtt_error": None}
 
 
 # ── floor alphabet: derived on a SCHEDULE, served from a table ─────────────────
@@ -1537,10 +1611,14 @@ def _precompute_run_table(db):
         -- PER STAGE, because a total cannot show WHICH half is growing, and the two halves have
         -- different fixes. trends_fleet_s and trends_cams_s read the SAME era rows twice: that
         -- duplication is the first lever if this ever approaches the interval.
-        alphabet_s REAL, aggregate_s REAL, trends_cams_s REAL, trends_fleet_s REAL,
+        alphabet_s REAL, aggregate_s REAL, rtt_s REAL, trends_cams_s REAL, trends_fleet_s REAL,
         n_ok INTEGER, n_err INTEGER,
         PRIMARY KEY (gateway_id, started_at))""")
     db.execute("CREATE INDEX IF NOT EXISTS ix_precompute_run ON precompute_run(gateway_id, started_at)")
+    # ALTER, not a recreate: the table already holds sweep history on any box that ran the previous
+    # build, and that history is the only record of how the fill time is trending.
+    if "rtt_s" not in {r[1] for r in db.execute("PRAGMA table_info(precompute_run)")}:
+        db.execute("ALTER TABLE precompute_run ADD COLUMN rtt_s REAL")
 
 
 def precompute_run_record(db, gw, started_at, stages, n_ok, n_err):
@@ -1548,10 +1626,11 @@ def precompute_run_record(db, gw, started_at, stages, n_ok, n_err):
     _precompute_run_table(db)
     fin = time.time()
     db.execute("INSERT OR REPLACE INTO precompute_run (gateway_id, started_at, finished_at, "
-               "total_s, alphabet_s, aggregate_s, trends_cams_s, trends_fleet_s, n_ok, n_err) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?)",
+               "total_s, alphabet_s, aggregate_s, rtt_s, trends_cams_s, trends_fleet_s, n_ok, "
+               "n_err) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                (gw, started_at, fin, fin - started_at,
                 stages.get("alphabet", 0.0), stages.get("aggregate", 0.0),
+                stages.get("rtt", 0.0),
                 stages.get("trends_cams", 0.0), stages.get("trends_fleet", 0.0), n_ok, n_err))
     db.commit()
     # Two weeks is enough to see a trend across an era rollover (observed era ages: 1.1-20.0 days)
@@ -1566,13 +1645,13 @@ def precompute_run_latest(db, gw):
     """-> the most recent recorded sweep, or None. READ ONLY."""
     try:
         r = db.execute("SELECT started_at, finished_at, total_s, alphabet_s, aggregate_s, "
-                       "trends_cams_s, trends_fleet_s, n_ok, n_err FROM precompute_run "
+                       "rtt_s, trends_cams_s, trends_fleet_s, n_ok, n_err FROM precompute_run "
                        "WHERE gateway_id=? ORDER BY started_at DESC LIMIT 1", (gw,)).fetchone()
     except sqlite3.OperationalError:
         return None          # the job has never run on this schema — NOT an error, and not a breach
     if not r:
         return None
-    d = dict(zip(("started_at", "finished_at", "total_s", "alphabet_s", "aggregate_s",
+    d = dict(zip(("started_at", "finished_at", "total_s", "alphabet_s", "aggregate_s", "rtt_s",
                   "trends_cams_s", "trends_fleet_s", "n_ok", "n_err"), tuple(r)))
     d["age_s"] = round(time.time() - (d["finished_at"] or 0), 1)
     return d
@@ -1951,7 +2030,7 @@ def _transit_by_cam(db, gw):
             for r in rows}
 
 
-def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override=""):
+def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override="", max_rows=None):
     """ROUND TRIP TIME per camera — the derivation is rtt_core's, never a second copy here.
 
     RTT is what the whole MEP-02 sheet resolves to, so it must not be computable two ways. This
@@ -1996,14 +2075,19 @@ def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override=""):
             out[cam] = {"state": "no_era", "note": "no door-engine reads in any era"}
             continue
         w, wargs = _ts_clause(t0, t1)
-        # ROW CAP. A wide range on a chattering camera is hundreds of thousands of rows, and this
-        # runs on the request path. Refuse loudly rather than spend the budget: a truncated walk
-        # would silently drop round trips and report a median computed from part of the window.
-        n_rows = _q(db, "SELECT COUNT(*) n FROM gw_door_event WHERE gateway_id=? AND cam=? "
-                        "AND door_version = ?" + w, (gw, cam, era, *wargs))[0]["n"]
-        if n_rows > RTT_MAX_ROWS:
+        # ROW CAP, ONLY WHEN A CALLER ASKS FOR ONE. A wide range on a chattering camera is hundreds
+        # of thousands of rows; on a request path that must be refused loudly rather than spend the
+        # budget, because a truncated walk would silently drop round trips and report a median from
+        # part of the window. The TIMER has no such budget and passes max_rows=None: capping it
+        # bought nothing and cost the fleet its RTT on every range a user could select.
+        if max_rows is None:
+            n_rows = -1
+        else:
+            n_rows = _q(db, "SELECT COUNT(*) n FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                            "AND door_version = ?" + w, (gw, cam, era, *wargs))[0]["n"]
+        if max_rows is not None and n_rows > max_rows:
             out[cam] = {"state": "too_many_rows", "era": era, "n_rows": n_rows,
-                        "note": f"{n_rows} door rows in this range exceeds the {RTT_MAX_ROWS} the "
+                        "note": f"{n_rows} door rows in this range exceeds the {max_rows} the "
                                 f"request path will walk. Narrow the range — a truncated walk would "
                                 f"drop round trips and report a median from part of the window."}
             continue
@@ -2525,9 +2609,13 @@ def _trends_compute(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
     # request is not.
     rtt_tr, rtt_meta = None, None
     if cam:
-        _rtt_cache_ok = (not era) and (not from_d) and (not to_d) and (period in ("", "all", "week"))
+        # EVERY PERIOD THE PICKER OFFERS, not just two. This was ('', 'all', 'week'), so Today and
+        # 30 days fell to the else-branch and reported "not served for this range" — while All and
+        # 7 days hit the row cap on the two busiest cameras. Net effect: RTT was unviewable on every
+        # button a user could press. The timer now fills one window per period; see RTT_WINDOWS.
+        _rtt_cache_ok = (not era) and (not from_d) and (not to_d) and (period in RTT_PERIOD_DAYS)
         if _rtt_cache_ok:
-            rtt_tr, rtt_meta = _rtt_read(db, gw, cam, WINDOW_DAYS)
+            rtt_tr, rtt_meta = _rtt_read(db, gw, cam, RTT_PERIOD_DAYS[period])
         else:
             rtt_meta = {"state": "not served for this range",
                         "detail": f"round trips are precomputed for the rolling {WINDOW_DAYS:g}-day "
@@ -2795,6 +2883,12 @@ def _trends_compute(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
 # STALE IS SERVED, DELIBERATELY, with its age attached. A number from an hour ago that renders beats
 # a current one that times out; the age travels with it so nobody reads it as live.
 _TRENDS_CACHEABLE_PERIODS = ("", "all", "week", "day", "month")
+# THE PERIODS THE TIMER ACTUALLY FILLS. '' is omitted deliberately: dash_trends normalises it to
+# 'all' before the lookup, so an entry under '' could never be read back. The timer used to fill
+# 'all' ONLY, so every other button on the picker served the not-computed skeleton — the page said
+# "NOT COMPUTED YET" on Today, 7 days and 30 days for ever, which is indistinguishable from a broken
+# precompute and was read as one.
+TRENDS_FILL_PERIODS = ("all", "day", "week", "month")
 
 
 def _trends_table(db):

@@ -207,14 +207,14 @@ def _precompute_slow(db, gw, now=None):
     """
     try:
         r = db.execute("SELECT started_at, finished_at, total_s, alphabet_s, aggregate_s, "
-                       "trends_cams_s, trends_fleet_s FROM precompute_run WHERE gateway_id=? "
-                       "ORDER BY started_at DESC LIMIT 1", (gw,)).fetchone()
+                       "COALESCE(rtt_s,0) rtt_s, trends_cams_s, trends_fleet_s FROM precompute_run "
+                       "WHERE gateway_id=? ORDER BY started_at DESC LIMIT 1", (gw,)).fetchone()
     except sqlite3.OperationalError:
         return None, None
     if not r or r["total_s"] is None:
         return None, None
     pc = {k: r[k] for k in ("started_at", "finished_at", "total_s", "alphabet_s", "aggregate_s",
-                            "trends_cams_s", "trends_fleet_s")}
+                            "rtt_s", "trends_cams_s", "trends_fleet_s")}
     pc["age_s"] = round((now or time.time()) - (r["finished_at"] or 0), 1)
     if r["total_s"] <= PRECOMPUTE_SLOW_S:
         return None, pc                    # carried on the payload regardless, so the dash can plot it
@@ -227,7 +227,7 @@ def _precompute_slow(db, gw, now=None):
     # same era rows twice, so ~2x on that stage — but that is ~14% of the sweep, not ~2x of it.
     # Quoting the whole-sweep saving as 2x would send the next person to the smaller half.
     parts = sorted((("aggregate", r["aggregate_s"] or 0.0), ("alphabet", r["alphabet_s"] or 0.0),
-                    ("trends", tc + tf)), key=lambda x: -x[1])
+                    ("rtt", r["rtt_s"] or 0.0), ("trends", tc + tf)), key=lambda x: -x[1])
     phrase = (f"precompute sweep {_age_phrase(tot)} — over the "
               f"{_age_phrase(PRECOMPUTE_SLOW_S)} threshold (default: half the 1h timer interval). "
               f"Stages: "

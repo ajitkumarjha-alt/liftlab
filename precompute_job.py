@@ -4,6 +4,7 @@
 Three stages, and the ORDER IS LOAD-BEARING:
   1. floor alphabet   -> floor_alphabet   (the all-era admission evidence)
   2. per-camera aggregate -> door_aggregate (door_gpu + tier2 for the default window)
+  2b. RTT per window  -> rtt_window       (one entry per period the picker offers)
   3. trends payload   -> trends_cache     (per camera AND the fleet; reads what 1-2 just wrote)
 
 Stage 2 depends on stage 1: _tier2 reads the stored alphabet to decide which floor reads are
@@ -56,7 +57,8 @@ def main():
         # is where this number went to be unread, and it is the one number that says whether the
         # sweep still fits inside its timer interval.
         t_gw = time.time()
-        stages = {"alphabet": 0.0, "aggregate": 0.0, "trends_cams": 0.0, "trends_fleet": 0.0}
+        stages = {"alphabet": 0.0, "aggregate": 0.0, "rtt": 0.0,
+                  "trends_cams": 0.0, "trends_fleet": 0.0}
         gw_ok = gw_err = 0
 
         # ── stage 1: alphabet (must complete before any aggregate for this camera) ──
@@ -105,21 +107,54 @@ def main():
                 print(f"[precompute] aggregate {gw}/{cam}: FAILED {type(e).__name__}: {e}", flush=True)
             stages["aggregate"] += time.time() - t0
 
+        # ── stage 2b: RTT, one entry per PERIOD the picker offers ──
+        # BEFORE stage 3, because the trends payload embeds the RTT summary: filling it afterwards
+        # would cache "not yet computed" for a whole timer interval on every camera.
+        #
+        # UNCAPPED. The 120,000-row cap is a request-path guard and this is the timer; capping it
+        # here is what left ch29 and ch27 showing the cap message on All and 7 days while Today and
+        # 30 days said "not served for this range" — RTT unviewable on every button.
+        for cam in cams:
+            for wd in D.RTT_WINDOWS:
+                t0 = time.time()
+                try:
+                    m = D.rtt_refresh(db, gw, cam, wd)
+                    if m.get("skipped"):
+                        print(f"[precompute] rtt {gw}/{cam} w={wd:g}d: skipped ({m['skipped']})",
+                              flush=True)
+                    else:
+                        print(f"[precompute] rtt {gw}/{cam} w={wd:g}d: "
+                              f"{m.get('n_rows') if m.get('n_rows') is not None else '-'} rows, "
+                              f"state={m.get('state')}, "
+                              f"trips={m.get('n_trips') if m.get('n_trips') is not None else '-'} "
+                              f"in {time.time()-t0:.2f}s"
+                              + (f" [{m['error']}]" if m.get("error") else ""), flush=True)
+                    ok += 1; gw_ok += 1
+                except Exception as e:
+                    err += 1; gw_err += 1
+                    print(f"[precompute] rtt {gw}/{cam} w={wd:g}d: FAILED {type(e).__name__}: {e}",
+                          flush=True)
+                stages["rtt"] += time.time() - t0
+
         # ── stage 3: the trends payload, per camera AND for the fleet ──
         # LAST, because it reads the aggregates stages 1-2 just wrote: a trends payload built before
         # them would cache the "not yet computed" tier2/RTT states for a whole timer interval.
         for cam in cams + ([""] if not only_cam else []):
+          # EVERY PERIOD THE PICKER OFFERS. Filling 'all' alone left Today / 7 days / 30 days on the
+          # not-computed skeleton permanently, which reads as a broken deploy rather than as a
+          # deliberate cache miss — and the request path will not derive, by design.
+          for _period in D.TRENDS_FILL_PERIODS:
             t0 = time.time()
             try:
-                m = D.trends_refresh(db, gw, cam)
-                print(f"[precompute] trends {gw}/{m['gw'] and (cam or 'fleet')}: "
+                m = D.trends_refresh(db, gw, cam, _period)
+                print(f"[precompute] trends {gw}/{m['gw'] and (cam or 'fleet')} p={_period}: "
                       f"{m['bytes']//1024}KB in {time.time()-t0:.2f}s "
                       f"(dv={(m['door_version'] or '-')[:24]})", flush=True)
                 ok += 1; gw_ok += 1
             except Exception as e:
                 err += 1; gw_err += 1
-                print(f"[precompute] trends {gw}/{cam or 'fleet'}: FAILED {type(e).__name__}: {e}",
-                      flush=True)
+                print(f"[precompute] trends {gw}/{cam or 'fleet'} p={_period}: "
+                      f"FAILED {type(e).__name__}: {e}", flush=True)
             # SPLIT DELIBERATELY. The fleet payload and the per-camera payloads read the SAME era
             # rows, so these two numbers are the evidence for the shared-read lever (~2x) that comes
             # BEFORE incremental fill. A single trends total would hide the duplication entirely.
@@ -128,6 +163,7 @@ def main():
         m = D.precompute_run_record(db, gw, t_gw, stages, gw_ok, gw_err)
         print(f"[precompute] {gw} sweep: {m['total_s']:.1f}s total "
               f"(alphabet {stages['alphabet']:.1f}s, aggregate {stages['aggregate']:.1f}s, "
+              f"rtt {stages['rtt']:.1f}s, "
               f"trends {stages['trends_cams']:.1f}s per-camera + {stages['trends_fleet']:.1f}s fleet)"
               f" — recorded to precompute_run", flush=True)
 
