@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Precompute everything /dash used to derive on the request path. RUNS OFF THE REQUEST PATH.
 
-Two stages, and the ORDER IS LOAD-BEARING:
+Three stages, and the ORDER IS LOAD-BEARING:
   1. floor alphabet   -> floor_alphabet   (the all-era admission evidence)
   2. per-camera aggregate -> door_aggregate (door_gpu + tier2 for the default window)
+  3. trends payload   -> trends_cache     (per camera AND the fleet; reads what 1-2 just wrote)
 
 Stage 2 depends on stage 1: _tier2 reads the stored alphabet to decide which floor reads are
 admissible. Running them as two independent timers would let an aggregate be computed against a
@@ -51,6 +52,12 @@ def main():
 
     for gw in ([only_gw] if only_gw else gateways(db)):
         cams = [only_cam] if only_cam else [c["cam"] for c in D._cameras(db, gw)]
+        # WALL TIME PER STAGE, RECORDED — not just printed. See precompute_run_record: the journal
+        # is where this number went to be unread, and it is the one number that says whether the
+        # sweep still fits inside its timer interval.
+        t_gw = time.time()
+        stages = {"alphabet": 0.0, "aggregate": 0.0, "trends_cams": 0.0, "trends_fleet": 0.0}
+        gw_ok = gw_err = 0
 
         # ── stage 1: alphabet (must complete before any aggregate for this camera) ──
         for cam in cams:
@@ -60,12 +67,16 @@ def main():
                 print(f"[precompute] alphabet {gw}/{cam}: {m['n_admitted']} floors from "
                       f"{m['evidence_rows']} rows, era={m['era']} in {time.time()-t0:.2f}s",
                       flush=True)
-                ok += 1
+                ok += 1; gw_ok += 1
             except Exception as e:                 # one bad camera must not stop the sweep
-                err += 1
+                err += 1; gw_err += 1
                 print(f"[precompute] alphabet {gw}/{cam}: FAILED {type(e).__name__}: {e}", flush=True)
+            stages["alphabet"] += time.time() - t0
 
         if alphabet_only:
+            # DELIBERATELY NOT RECORDED. A stage-1-only run is not a sweep, and writing its wall
+            # time to precompute_run would understate the duration the threshold is watching —
+            # an alphabet-only pass would read as "the fill got faster" and mask real drift.
             continue
 
         # ── stage 2: aggregates ──
@@ -88,10 +99,11 @@ def main():
                           + (f" [{m['rtt_error']}]" if m.get("rtt_error") else "") + ", "
                           f"cv={m['counting_version'] or '-'} dv={m['door_version']} "
                           f"window={m['window_days']}d in {time.time()-t0:.2f}s", flush=True)
-                ok += 1
+                ok += 1; gw_ok += 1
             except Exception as e:
-                err += 1
+                err += 1; gw_err += 1
                 print(f"[precompute] aggregate {gw}/{cam}: FAILED {type(e).__name__}: {e}", flush=True)
+            stages["aggregate"] += time.time() - t0
 
         # ── stage 3: the trends payload, per camera AND for the fleet ──
         # LAST, because it reads the aggregates stages 1-2 just wrote: a trends payload built before
@@ -103,11 +115,21 @@ def main():
                 print(f"[precompute] trends {gw}/{m['gw'] and (cam or 'fleet')}: "
                       f"{m['bytes']//1024}KB in {time.time()-t0:.2f}s "
                       f"(dv={(m['door_version'] or '-')[:24]})", flush=True)
-                ok += 1
+                ok += 1; gw_ok += 1
             except Exception as e:
-                err += 1
+                err += 1; gw_err += 1
                 print(f"[precompute] trends {gw}/{cam or 'fleet'}: FAILED {type(e).__name__}: {e}",
                       flush=True)
+            # SPLIT DELIBERATELY. The fleet payload and the per-camera payloads read the SAME era
+            # rows, so these two numbers are the evidence for the shared-read lever (~2x) that comes
+            # BEFORE incremental fill. A single trends total would hide the duplication entirely.
+            stages["trends_fleet" if not cam else "trends_cams"] += time.time() - t0
+
+        m = D.precompute_run_record(db, gw, t_gw, stages, gw_ok, gw_err)
+        print(f"[precompute] {gw} sweep: {m['total_s']:.1f}s total "
+              f"(alphabet {stages['alphabet']:.1f}s, aggregate {stages['aggregate']:.1f}s, "
+              f"trends {stages['trends_cams']:.1f}s per-camera + {stages['trends_fleet']:.1f}s fleet)"
+              f" — recorded to precompute_run", flush=True)
 
     db.close()
     print(f"[precompute] done: {ok} ok, {err} failed, {time.time()-t_all:.1f}s total", flush=True)

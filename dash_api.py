@@ -1520,6 +1520,64 @@ def aggregate_refresh(db, gw, cam, window_days=None):
 _ALPHA_TABLE_READY = set()
 
 
+# ============================================================ precompute run duration
+# WHY THIS IS RECORDED AND NOT JUST PRINTED. The deploy note says "watch the reported fill
+# duration" — that only works if something reports it. The job's stdout goes to the journal, which
+# nobody reads until after the timer has already been missed, and the one number that decides
+# whether the sweep still fits inside its interval was visible in exactly one place nobody looks.
+#
+# MEASURED, so the threshold is not a guess: the first full fill after the trends precompute landed
+# took 8m10s on the live VM against 1,124,885 in-era rows — 13.6% of the 1h timer. The cost tracks
+# CURRENT-ERA rows, not table size, so it grows with ingest and RESETS whenever a camera's
+# door_version rolls over. That sawtooth is why a calendar reminder is the wrong instrument and a
+# recorded duration is the right one.
+def _precompute_run_table(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS precompute_run (
+        gateway_id TEXT, started_at REAL, finished_at REAL, total_s REAL,
+        -- PER STAGE, because a total cannot show WHICH half is growing, and the two halves have
+        -- different fixes. trends_fleet_s and trends_cams_s read the SAME era rows twice: that
+        -- duplication is the first lever if this ever approaches the interval.
+        alphabet_s REAL, aggregate_s REAL, trends_cams_s REAL, trends_fleet_s REAL,
+        n_ok INTEGER, n_err INTEGER,
+        PRIMARY KEY (gateway_id, started_at))""")
+    db.execute("CREATE INDEX IF NOT EXISTS ix_precompute_run ON precompute_run(gateway_id, started_at)")
+
+
+def precompute_run_record(db, gw, started_at, stages, n_ok, n_err):
+    """Store one sweep's wall time. Scheduler ONLY — /dash never writes this."""
+    _precompute_run_table(db)
+    fin = time.time()
+    db.execute("INSERT OR REPLACE INTO precompute_run (gateway_id, started_at, finished_at, "
+               "total_s, alphabet_s, aggregate_s, trends_cams_s, trends_fleet_s, n_ok, n_err) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?)",
+               (gw, started_at, fin, fin - started_at,
+                stages.get("alphabet", 0.0), stages.get("aggregate", 0.0),
+                stages.get("trends_cams", 0.0), stages.get("trends_fleet", 0.0), n_ok, n_err))
+    db.commit()
+    # Two weeks is enough to see a trend across an era rollover (observed era ages: 1.1-20.0 days)
+    # and short enough that the table never becomes something to manage.
+    db.execute("DELETE FROM precompute_run WHERE gateway_id=? AND started_at < ?",
+               (gw, fin - 14 * 86400))
+    db.commit()
+    return {"gw": gw, "total_s": round(fin - started_at, 1), "stages": stages}
+
+
+def precompute_run_latest(db, gw):
+    """-> the most recent recorded sweep, or None. READ ONLY."""
+    try:
+        r = db.execute("SELECT started_at, finished_at, total_s, alphabet_s, aggregate_s, "
+                       "trends_cams_s, trends_fleet_s, n_ok, n_err FROM precompute_run "
+                       "WHERE gateway_id=? ORDER BY started_at DESC LIMIT 1", (gw,)).fetchone()
+    except sqlite3.OperationalError:
+        return None          # the job has never run on this schema — NOT an error, and not a breach
+    if not r:
+        return None
+    d = dict(zip(("started_at", "finished_at", "total_s", "alphabet_s", "aggregate_s",
+                  "trends_cams_s", "trends_fleet_s", "n_ok", "n_err"), tuple(r)))
+    d["age_s"] = round(time.time() - (d["finished_at"] or 0), 1)
+    return d
+
+
 def _alphabet_table(db):
     """Create the table once per connection-generation. Cheap: CREATE TABLE IF NOT EXISTS."""
     db.execute("""CREATE TABLE IF NOT EXISTS floor_alphabet (

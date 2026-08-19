@@ -74,6 +74,13 @@ LITESTREAM_UNIT = os.environ.get("HEALTH_LITESTREAM_UNIT", "litestream")
 # OUT-OF-SERVICE detection. A parked lift shows a static indicator and never opens its doors, so the
 # discriminator is stability plus door silence — not the floor value, which this reader cannot be
 # trusted to render (ch16: 20.4% of its floor strings are implausible by shape).
+# HALF THE PRECOMPUTE TIMER INTERVAL (apply_gwprecompute.sh installs EVERY=1h). A sweep past this
+# still fits, but it has used up half its headroom and the trend is the point: the fill cost tracks
+# CURRENT-ERA rows, which grow with ingest and reset on door_version rollover, so it sawtooths
+# upward rather than crossing a line once. Measured baseline: 8m10s on the live VM (13.6%).
+# NOT A BREACH. Nothing is broken at 16 minutes — this is reported every time until it is addressed,
+# the same rule the config gaps follow.
+PRECOMPUTE_SLOW_S = float(os.environ.get("HEALTH_PRECOMPUTE_SLOW_S", "900"))   # 15 min
 OOS_MIN_S = float(os.environ.get("HEALTH_OOS_MIN_S", "3600"))       # silent at least this long
 OOS_MIN_READS = int(os.environ.get("HEALTH_OOS_MIN_READS", "50"))   # enough reads to call it stable
 OOS_STABLE_FRAC = float(os.environ.get("HEALTH_OOS_STABLE_FRAC", "0.9"))
@@ -189,6 +196,49 @@ def expected_cams(db, gw):
     rows = db.execute("SELECT channel FROM channel_map WHERE gateway_id=? AND is_lift=1 "
                       "ORDER BY channel", (gw,)).fetchall()
     return [f"ch{r['channel']}" for r in rows], "channel_map (is_lift=1) — registry was empty"
+
+
+def _precompute_slow(db, gw, now=None):
+    """-> (phrase|None, payload|None) for the last recorded precompute sweep.
+
+    SILENT WHEN THE JOB HAS NEVER RUN. A box without the precompute timer installed must not have
+    this line cry wolf at it — the same rule _litestream follows for a unit that does not exist. An
+    absent record is an unknown, and an unknown is not a breach.
+    """
+    try:
+        r = db.execute("SELECT started_at, finished_at, total_s, alphabet_s, aggregate_s, "
+                       "trends_cams_s, trends_fleet_s FROM precompute_run WHERE gateway_id=? "
+                       "ORDER BY started_at DESC LIMIT 1", (gw,)).fetchone()
+    except sqlite3.OperationalError:
+        return None, None
+    if not r or r["total_s"] is None:
+        return None, None
+    pc = {k: r[k] for k in ("started_at", "finished_at", "total_s", "alphabet_s", "aggregate_s",
+                            "trends_cams_s", "trends_fleet_s")}
+    pc["age_s"] = round((now or time.time()) - (r["finished_at"] or 0), 1)
+    if r["total_s"] <= PRECOMPUTE_SLOW_S:
+        return None, pc                    # carried on the payload regardless, so the dash can plot it
+    tc, tf = (r["trends_cams_s"] or 0.0), (r["trends_fleet_s"] or 0.0)
+    tot = r["total_s"] or 1.0
+    # THE PHRASE NAMES THE BIGGEST STAGE, not a favourite fix. A duration alone tells the reader to
+    # worry without telling them where to look, and the stage that dominates is not the one the
+    # trends work made famous: measured on a full sweep, aggregate was 50.6% and all of trends
+    # 28.7%. The shared read IS the first lever *within trends* — fleet and per-camera derive the
+    # same era rows twice, so ~2x on that stage — but that is ~14% of the sweep, not ~2x of it.
+    # Quoting the whole-sweep saving as 2x would send the next person to the smaller half.
+    parts = sorted((("aggregate", r["aggregate_s"] or 0.0), ("alphabet", r["alphabet_s"] or 0.0),
+                    ("trends", tc + tf)), key=lambda x: -x[1])
+    phrase = (f"precompute sweep {_age_phrase(tot)} — over the "
+              f"{_age_phrase(PRECOMPUTE_SLOW_S)} threshold (default: half the 1h timer interval). "
+              f"Stages: "
+              + ", ".join(f"{n} {_age_phrase(v)} ({100*v/tot:.0f}%)" for n, v in parts)
+              + f"; trends splits {_age_phrase(tc)} per-camera + {_age_phrase(tf)} fleet. "
+              f"Cheapest fix inside trends is the SHARED READ — fleet and per-camera derive the "
+              f"same era rows twice, ~2x on that stage — but size the work against the stage that "
+              f"actually dominates above. Incremental fill is the harder step: _trends_key builds "
+              f"the fleet key from every camera's key joined, so one camera changing era "
+              f"invalidates the fleet entry anyway. See DEPLOY_trends_perf.md 3c")
+    return phrase, pc
 
 
 def _prev(db, gw):
@@ -368,6 +418,7 @@ def evaluate(db, gw, now=None):
                             (gw,)):
             if r["cam"] in cams and not (r["floor_alphabet_n"] or 0):
                 gaps.append(f"{r['cam']} floor whitelist: NONE")
+    pc_phrase, pc = _precompute_slow(db, gw, now)
     ls_active, ls_note = _litestream()
     if ls_active is False:
         infra.append(f"litestream {ls_note} — the gateway DB is NOT being replicated. On 2026-08-04 "
@@ -415,6 +466,11 @@ def evaluate(db, gw, now=None):
     if gaps:
         line += (" [CONFIG GAP: " + "; ".join(gaps)
                  + " — every assembled string is accepted as a good read until set]")
+    # SAME RULE AS A CONFIG GAP: stated every time until it is addressed, never the word BREACH.
+    # A sweep at 16 minutes still fits inside its hour; what matters is that it is now visible at
+    # all, because "watch the reported fill duration" needs something to do the reporting.
+    if pc_phrase:
+        line += f" [PRECOMPUTE: {pc_phrase}]"
     if oos_cams and ok:
         line += (" (" + ", ".join(f"{c}: {detail[c]['klass']}" for c in oos_cams) + ")")
     elif quiet and ok:
@@ -424,6 +480,9 @@ def evaluate(db, gw, now=None):
             "quiet_offhours": quiet, "active_hours": _active(now), "config_gaps": gaps,
             "pi_age_s": (None if pi_age is None else round(pi_age, 1)),
             "litestream_ok": ls_active, "litestream_note": ls_note,
+            # Carried whether or not it breached, so the dashboard can show the trend rather than
+            # only the moment it crossed. None means the job has never run — an unknown, not a zero.
+            "precompute": pc, "precompute_slow": bool(pc_phrase),
             "prev_ok": (None if prev is None else prev["ok"])}
 
 

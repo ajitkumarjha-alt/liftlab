@@ -126,6 +126,80 @@ systemctl list-timers liftlab-precompute --no-pager
 still fits inside its timer interval as the table grows; a total that hides them cannot show the job
 drifting towards its own period.
 
+## 3c. How long the fill takes, and what actually drives it
+
+**MEASURED ON THE LIVE BOX, NOT PROJECTED.** First full fill after this deploy: **8m10s (490s)**.
+A 2-core devbox ran the same fill against a `.backup` copy of the same database in **38.7s**. The
+12.7x gap is `Nice=10` + `IOSchedulingClass=idle` competing with ingest and the dash service — it is
+*not* table size, and it is not something a devbox measurement can be scaled up to. A projection
+from the devbox put this at ~100s and was wrong by 5x. Measure it on the box.
+
+Against the 1h timer (`OnUnitActiveSec`, `apply_gwprecompute.sh` default `EVERY=1h`) that is a
+**13.6% duty cycle, 7.3x headroom**. Comfortable — and not the thing to watch.
+
+**THE FILL COST TRACKS CURRENT-ERA ROWS, NOT TABLE SIZE.** The dominant query is the era range, and
+it returns only in-era rows; rows in retired eras cost nothing no matter how many accumulate. At
+this snapshot:
+
+| cam | era rows | era age | rows/day |
+|---|---|---|---|
+| ch29 | 436,486 | 8.0d | 54,689 |
+| ch27 | 365,776 | 13.6d | 26,966 |
+| ch30 | 165,889 | 13.6d | 12,229 |
+| ch16 | 133,624 | 20.0d | 6,686 |
+| ch37 | 9,128 | 1.1d | 8,503 |
+| ch32 | 8,297 | 1.1d | 7,733 |
+| ch34 | 5,685 | 1.1d | 5,292 |
+| **total** | **1,124,885** | | **~122,000/day** |
+
+1,124,885 in-era rows cost 490s. Ingest is **~116,000 rows/day** measured over 14 days, and all of
+it lands in the current era. Linear extrapolation to a 30-minute fill is ~4.1M in-era rows, i.e.
+**~25 days — but only if no era rolls over in that time.**
+
+> An earlier figure of ~59k rows/day was measured over a window spanning the **Jul-19/20 relay-stall
+> outage** — a real two-day collect-blind period the dash carries a DATA GAP banner for. Averaging
+> across it halves the rate. **116k/day is the number**; the outage explains the discrepancy, and any
+> future rate measured over a window containing a gap will understate the same way.
+
+**That caveat is the whole point.** An era rollover — any `door_version` change on a camera — drops
+that camera's in-era rows to near zero and its fill cost with it. Observed era ages here run 1.1 to
+20.0 days, so the fill **sawtooths rather than growing monotonically**. Twenty-five days with no
+config change on any camera is possible, but has not happened yet on this fleet.
+
+### The duration is now on a surface, not just in this note
+
+"Watch the reported fill duration" only works if something reports it. As of this change:
+
+- `precompute_job.py` records every sweep to a **`precompute_run`** table — `total_s` plus the wall
+  time of each stage (`alphabet_s`, `aggregate_s`, `trends_cams_s`, `trends_fleet_s`), 14 days
+  retained. A stage-1-only run (`ALPHABET_ONLY=1`) is deliberately **not** recorded: it is not a
+  sweep, and storing it would read as "the fill got faster" and mask real drift.
+- Each sweep also prints one summary line:
+  `[precompute] site-A sweep: 112.9s total (alphabet 23.4s, aggregate 57.2s, trends 14.9s per-camera + 17.5s fleet)`
+- `health_check.py` reads the latest row and appends to the health line once a sweep exceeds
+  `HEALTH_PRECOMPUTE_SLOW_S` (**default 900s = 15 min**, half the interval headroom). It follows the
+  CONFIG GAP rule: **stated every time until addressed, never the word BREACH** — nothing is broken
+  at 16 minutes. If the job has never run, the line says nothing at all; an absent record is an
+  unknown, and an unknown must not cry wolf on a box without the timer installed.
+- The duration is carried on the health payload **whether or not it breached**, so the dashboard can
+  show the trend rather than only the moment it crossed.
+
+### Which lever, and in what order — measured, because the obvious answer is wrong
+
+A full sweep on the devbox splits **aggregate 50.6% / trends 28.7% / alphabet 20.7%**. So:
+
+- **under ~15 min** — fine, do nothing.
+- **approaching the threshold** — read the stage split before choosing a fix. The **shared read** is
+  the first lever *inside trends*: the fleet payload and the per-camera payloads derive the same era
+  rows twice (18.3s fleet + 20.4s cameras on the devbox), so sharing one read is **~2x on that
+  stage**. But trends is under a third of the sweep, so that is **~14% off the total, not ~2x of
+  it** — quoting the 2x as a whole-sweep saving sends the next person to the smaller half. If
+  `aggregate_s` is the number that grew, the shared read will not help at all.
+- **after that** — an incremental fill, re-deriving only cameras whose era key or row count moved.
+  Bigger than it looks: `_trends_key` builds the fleet entry's key from every camera's key joined,
+  so any one camera moving era invalidates the fleet payload regardless, and the fleet derivation is
+  the single most expensive trends entry.
+
 ## 4. Verify
 
 ```bash
