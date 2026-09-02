@@ -32,8 +32,9 @@ displayed as `"` and `'`.
 | precompute | stage 4 in `precompute_job.py`, after 2b, recorded as `precompute_run.study_s` |
 | endpoints | `GET /dash/{gw}/riders_per_day`, `GET /dash/{gw}/rtt_fleet` |
 | CSV | `dataset=riders_per_day` (wide, `split=riders\|boarded\|alighted`), `riders_per_day_long`, `rtt_per_hour` |
-| page | two new tabs, `?view=riders` and `?view=rttfleet` |
-| test | `tools/test_study_views.py` |
+| page | two new tabs, `?view=riders` and `?view=rttfleet`, plus a **Download study bundle** button in every download bar |
+| bundle | `GET /dash/{gw}/bundle` — one ZIP, seven CSVs and a README, filtered to the selected range |
+| test | `tools/test_study_views.py`, `tools/test_study_bundle.py` |
 
 ## Three changes that touch the EXISTING views too
 
@@ -166,6 +167,61 @@ explanation anywhere in it.
 with every value NULL and `state="not_computed"` (the `_trends_skeleton` rule: a payload that omits
 keys is not a smaller answer, it is a crash). The CSVs emit `# NOT COMPUTED YET` header lines rather
 than a zero-row file, because an empty spreadsheet reads as "nothing was counted".
+
+## The study bundle
+
+`GET /dash/{gw}/bundle?period=…` returns `liftlab_<gw>_<from>_<to>.zip`. The button sits in all
+three download bars — only one view is visible at a time, so the reader sees exactly one — and it
+carries the same range as every other download on the page.
+
+| file | grain | source |
+|---|---|---|
+| `riders_per_day.csv` | date x lift, all three splits as COLUMNS (`<cam>_riders`, `<cam>_boarded`, `<cam>_alighted`) + fleet totals | `study_matrix` |
+| `riders_per_hour.csv` | lift x hour-of-day | `trends_cache` |
+| `door_cycles_per_hour.csv` | lift x hour-of-day, with close-travel where it is measured | `trends_cache` |
+| `occupancy_per_episode.csv` | one row per door-open episode | derived, bounded in SQL to the range |
+| `rtt_trips.csv` | one row per round trip, plausible AND anomalous, reason in a column | derived, capped per camera |
+| `eras.csv` | lift x era: door_version and counting_version boundaries with dates, precision, floor whitelist | derived, two GROUP BYs |
+| `outages.csv` | one row per `DATA_GAPS` window | a constant, no query |
+| `README.md` | every caveat the dash surfaces, **verbatim** | generated from the caveat registry |
+
+**WHY A BUNDLE.** Each CSV link was already honest on its own. A study is not assembled one link at
+a time, though: seven files arrive in seven downloads, in an order nobody records, and the caveats
+stay behind on the page they came from. What gets mailed onward is a folder of numbers with no
+provenance — and every misreading this system guards against becomes available again the moment the
+sentence is separated from the number. So the README is INSIDE the zip, it is written FIRST into the
+archive, and it names every file with at least one caveat under its own heading.
+
+**THE CAVEATS ARE VERBATIM, AND THAT IS TESTED.** Each one is the same module constant the dashboard
+prints beside the same number — `RIDERS_CAVEAT`, `RIDERS_DARK_NOTE`, `DIRECTION_RULE`,
+`PRECISION_PER_ERA_NOTE`, `H3_CYCLE_CAVEAT`, `rtt_core.RTT_CAVEAT`, `OCC_LABEL` +
+`OCC_CALIBRATION` + `OCC_ANCHOR_NOTE`, `FLOOR_WHITELIST_NONE_NOTE`. `test_study_bundle.py` asserts
+each as an exact substring of the constant, not against a phrase retyped in the test — a paraphrase
+in the test would let a paraphrase ship, and the first thing to drift is always the qualifier. The
+README is generated from a registry keyed by filename, so a file cannot be added to the bundle
+without its caveats arriving with it; the test walks that registry rather than a list of its own.
+
+**BOUNDS.** Precomputed where precomputed exists, and each file's manifest line says which.
+
+* The two hour-of-day files have **no live fallback**. On a custom date range they carry a state and
+  a reason per camera instead of numbers, because `_trends_compute` is the 152.8 s derivation this
+  whole layer exists to keep off the request path and running it for seven cameras inside one
+  download would be that request seven times over. The period buttons are fully precomputed.
+* `rtt_trips.csv` is the one expensive walk. It is capped at `DASH_BUNDLE_RTT_MAX_ROWS` (default
+  `RTT_MAX_ROWS`, 120,000) door rows **per camera and it REFUSES rather than truncating** — a
+  partial walk drops whole round trips and reports a median from part of the window. The refusal
+  lands in the file as a row with the row count and the reason, never as an absent camera.
+* One shared text budget (`DASH_BUNDLE_TEXT_BUDGET`, 64 MB) across the whole zip, not seven
+  independent caps: the 10 MB target is a question about the download, not about any one member.
+  CSV deflates ~8-12x. A file that stops short says so in its last line AND in the README — a short
+  file that looks complete is the worst of the three outcomes.
+* A wall-clock budget (`DASH_BUNDLE_BUDGET_S`, 60 s), armed exactly as `/data` arms its own. A
+  timeout is a 503 naming the phase, **never a partial zip**: a bundle missing a file, with a README
+  that lists it, claims a completeness it does not have.
+
+**ABSENCES ARE ROWS.** A lift with no floor attribution appears in `rtt_trips.csv` with
+`class=no_floor` and "UNAVAILABLE, not zero" in its reason, exactly as it appears in the table on
+screen. A camera never simply fails to be in the file.
 
 ## Era discipline
 

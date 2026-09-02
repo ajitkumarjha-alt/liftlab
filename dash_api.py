@@ -18,6 +18,7 @@ Every panel carries its own timestamp.
 """
 from __future__ import annotations
 
+import io
 import itertools
 import json
 import os
@@ -3606,6 +3607,563 @@ def dash_rtt_fleet(gw: str, period: str = "all", from_d: str = "", to_d: str = "
     return JSONResponse({**body, "cache": meta}, headers={"Cache-Control": "no-store"})
 
 
+# ============================================================ study bundle (one ZIP)
+# EVERYTHING THE STUDY NEEDS, IN ONE DOWNLOAD, WITH ITS CAVEATS ATTACHED.
+#
+# The individual CSV links already exist and each one is honest on its own. The bundle exists
+# because a study is not assembled one link at a time: seven files arrive in seven downloads, in an
+# order nobody records, and the caveats stay behind on the page they were downloaded from. What
+# gets mailed onward is a folder of numbers with no provenance — and every misreading this file
+# guards against (riders as people, a dark cell as a zero, a measured minimum as a count) becomes
+# available again the moment the sentence is separated from the number.
+#
+# So the README is INSIDE the zip, it names every file, and every file has at least one caveat
+# under its own heading. That is asserted by tools/test_study_bundle.py, not merely intended.
+#
+# PRECOMPUTED WHERE PRECOMPUTED EXISTS, AND THE FILE SAYS WHICH. Four of the seven come straight
+# out of study_matrix / trends_cache. Three must be derived because no aggregate holds them at
+# their grain (one row per episode, one row per round trip, one row per era boundary) — those are
+# bounded, and the bound is written into the file and the README rather than being a silent cap.
+BUNDLE_BUDGET_S = float(os.environ.get("DASH_BUNDLE_BUDGET_S", "60"))
+# The uncompressed ceiling. CSV deflates ~8-12x, so 64 MB of text lands well inside the 10 MB
+# target for the zip; the budget is enforced on TEXT because that is the number the writers can
+# see while they are writing, and stopping after the fact would mean building it all first anyway.
+BUNDLE_TEXT_BUDGET = int(os.environ.get("DASH_BUNDLE_TEXT_BUDGET", str(64 * 1024 * 1024)))
+# Per-camera door rows the RTT trip walk will read. Same number and same rule as RTT_MAX_ROWS: it
+# REFUSES rather than truncating, because a partial walk drops whole round trips and reports a
+# median from part of the window, which is worse than saying no. The refusal lands in the file as
+# a row with a reason, never as an absent camera.
+BUNDLE_RTT_MAX_ROWS = int(os.environ.get("DASH_BUNDLE_RTT_MAX_ROWS", str(RTT_MAX_ROWS)))
+
+DIRECTION_RULE = ("transit_event.direction: 'in' is a BOARDING and ANYTHING ELSE — including a "
+                  "NULL and any unrecognised value — is an ALIGHTING. This is not a tidy-up: the "
+                  "dashboard, the CSV exports and liftlab_report all split the column this way, "
+                  "and a file that split it differently would disagree with every other total "
+                  "drawn from the same table.")
+FLOOR_WHITELIST_NONE_NOTE = (
+    "A camera whose floor_whitelist column reads NONE has NO whitelist in force: every assembled "
+    "string is accepted as a floor read, including impossible ones. That is a config gap, not a "
+    "tower with no floors, and it means the per-floor attribution for that camera is weaker than "
+    "for a camera with an alphabet — the alphabet is derived from evidence and a camera without "
+    "enough evidence has not had one derived yet.")
+# WORDED TO BE TRUE IN EVERY FILE IT APPEARS IN. It first said "the precision_pct column is
+# measured against...", which is a sentence about eras.csv printed under two files that have no
+# such column — a caveat that describes the wrong file is one a reader learns to skip.
+PRECISION_PER_ERA_NOTE = (
+    "PRECISION APPLIES PER COUNTING VERSION, NEVER TO A POOL. Counting precision is measured "
+    "against hand-reviewed episodes for ONE counting build; eras.csv carries that figure and the "
+    "dates each build was in force, and every rider count here is attributable to a build through "
+    "those dates. A range spanning two builds holds counts made by two different instruments — "
+    "there is no precision figure for the mixture, and averaging the two would invent one.")
+OCC_EVIDENCE_NOTE = (
+    "EVIDENCE RULE: only episodes with occupancy_frames > 0 carry a measurement. An episode with "
+    "occupancy_frames NULL or 0 is in this file WITH its empty coverage column, deliberately — "
+    "dropping it would hide how much of the record carries no measurement at all. Filter on the "
+    "`evidence` column to apply the same rule the dashboard applies.")
+BUNDLE_RANGE_NOTE = (
+    "Every file is filtered to the SAME range, the one the dashboard's period selector was showing "
+    "when this was downloaded. A file that quietly spanned all history would disagree with the "
+    "chart it came from, and the chart would get blamed.")
+
+# name -> (one-line description, [caveats]). The README is generated FROM this, so a file cannot be
+# added to the bundle without its caveats arriving with it.
+def _bundle_caveats():
+    return {
+        "riders_per_day.csv": (
+            "rows = IST date, columns = each lift x {riders, boarded, alighted}, plus fleet totals",
+            [RIDERS_CAVEAT, RIDERS_DARK_NOTE, RIDERS_GAP_NOTE, DIRECTION_RULE,
+             PRECISION_PER_ERA_NOTE]),
+        "riders_per_hour.csv": (
+            "one row per lift per HOUR-OF-DAY: boardings, alightings and their sum, summed over "
+            "every day in range",
+            [RIDERS_CAVEAT, DIRECTION_RULE, PRECISION_PER_ERA_NOTE,
+             "HOUR-OF-DAY, NOT A TIMELINE. Each row pools the same clock hour across every day in "
+             "the range; n_days says how many days contributed. It answers 'when is this lift "
+             "busy', never 'what happened on Tuesday'."]),
+        "door_cycles_per_hour.csv": (
+            "one row per lift per HOUR-OF-DAY: door cycles, and close-travel where it is measured",
+            [H3_CYCLE_CAVEAT, H3_TRAVEL_REASON, UNCALIBRATED_NOTE,
+             "CLOSE-TRAVEL COMPARABILITY: only the post-" + CLOSE_TRAVEL_MAX_BOUNDARY[:10]
+             + " regime is included (CLOSE_TRAVEL_MAX 10s->30s, which admits longer real closes). "
+               "The close_instrument column names which instrument produced the figure — the Pi "
+               "door-watch (gw_event, RETIRED " + DOORWATCH_RETIRED_BOUNDARY[:10] + ") and the GPU "
+               "engine (gw_door_event) are DIFFERENT instruments and their travel numbers must "
+               "never be pooled.",
+             "A cycle count of 0 on a camera listed as uncalibrated in eras.csv is UNAVAILABLE, "
+             "not zero. An empty row there is not a lift that stood still."]),
+        "occupancy_per_episode.csv": (
+            "one row per door-open episode: peak car occupancy and the coverage behind it",
+            [OCC_LABEL + " — " + OCC_CALIBRATION, OCC_ANCHOR_NOTE, OCC_EVIDENCE_NOTE,
+             "occupancy_max is a FLOOR, not a count: anyone the detector missed, anyone occluded "
+             "behind another body, and anyone whose foot point fell outside the cabin polygon is "
+             "absent from it. Do not add it to a rider total; they measure different things.",
+             "Occupancy begins with the workers deployed 2026-08-11. Any date before that has NO "
+             "coverage, which is not a measurement of an empty car."]),
+        "rtt_trips.csv": (
+            "one row per ROUND TRIP: home-floor close -> next home-floor open, plausible AND "
+            "anomalous, with the anomaly reason in a column",
+            [(rtt_core_caveat() or "dwell caveat unavailable — rtt_core could not be imported"),
+             (rtt_core_travel_gap() or ""),
+             "PLAUSIBLE AND ANOMALOUS ALIKE. Filtering the anomalies out here would hide the "
+             "quality signal: the anomaly rate is a measurement of FLOOR ATTRIBUTION, and a file "
+             "containing only the trips that worked cannot show it. The `class` column is "
+             "'plausible' or 'anomaly'; `anomaly_reason` says which bound it fell outside "
+             f"({rtt_core_bounds()}).",
+             "BOTH ENDS MUST BE STOPS AT THE HOME FLOOR. A car passing the home floor reads it on "
+             "the panel without its doors opening; counting that as an endpoint would shorten "
+             "every trip containing one.",
+             "A camera with NO floor attribution has no RTT at all — the home floor is what "
+             "defines a trip — which is a different statement from a lift that made no round "
+             "trips. Such a camera appears here as a single row with state and reason set and no "
+             "trip figures, never as an absent camera."]),
+        "eras.csv": (
+            "one row per (lift, era): door_version and counting_version boundaries with dates, "
+            "the precision measured for that build, and the floor whitelist in force",
+            [PRECISION_PER_ERA_NOTE, FLOOR_WHITELIST_NONE_NOTE,
+             "AN ERA IS AN INSTRUMENT. A door_version is templates+engine+geometry; a rebuild "
+             "makes a NEW instrument even though the building did not change. Numbers from two "
+             "eras are two measurements, not more of one.",
+             "Boundaries are MEASURED from the rows themselves (first and last stamp per version), "
+             "never from a hardcoded date."]),
+        "outages.csv": (
+            "one row per known data-gap window: when collection was blind, and for which lifts",
+            ["INSIDE THESE WINDOWS THE DATA IS MISSING, NOT LOW. Rows falling inside a gap are "
+             "EXCLUDED from every count in this bundle and the affected day is not credited as "
+             "observed — an outage is not observation. An hour bucket overlapping a gap is "
+             "undercounted for the same reason.",
+             "This is the list of gaps the system KNOWS about. It is not a proof that no other "
+             "outage occurred."]),
+    }
+
+
+def rtt_core_bounds():
+    try:
+        import rtt_core
+        return f"{rtt_core.RTT_MIN_S:g}-{rtt_core.RTT_MAX_S:g}s"
+    except Exception:
+        return "the plausible band"
+
+
+class _BundleBuilder:
+    """Accumulates the bundle's files under ONE text budget, and remembers what each cost.
+
+    The budget is shared rather than per file on purpose: the question the 10 MB target asks is
+    about the download, not about any one member of it, and seven independent caps cannot answer
+    it. When the budget runs out the file says so IN ITS LAST ROW and the README repeats it — a
+    short file that looks complete is the worst of the three possible outcomes.
+    """
+
+    def __init__(self, budget=BUNDLE_TEXT_BUDGET):
+        self.budget, self.spent = budget, 0
+        self.files, self.meta = {}, {}
+
+    def room(self):
+        return max(0, self.budget - self.spent)
+
+    def add(self, name, header, rows, source, truncated=None):
+        text = _csv_text(rows, header)
+        # The budget is checked AFTER rendering because a row's cost is not knowable before it is
+        # written; the row cap in each writer is what keeps that render bounded in the first place.
+        if len(text) > self.room():
+            keep, out = [], 0
+            for r in rows:
+                line = _csv_text([r], None)
+                if out + len(line) > self.room():
+                    break
+                keep.append(r); out += len(line)
+            rows = keep
+            truncated = (f"stopped after {len(keep)} row(s): the bundle's "
+                         f"{self.budget // (1024 * 1024)} MB text budget was reached. Narrow the "
+                         f"date range, or download this dataset alone from /dash/{{gw}}/export.csv "
+                         f"where it has the budget to itself.")
+            text = _csv_text(rows, header)
+        if truncated:
+            text += "# INCOMPLETE: " + truncated.replace("\n", " ") + "\n"
+        self.files[name] = text
+        self.spent += len(text)
+        self.meta[name] = {"rows": len(rows), "bytes": len(text), "source": source,
+                           "truncated": truncated}
+        return self.meta[name]
+
+
+def _bundle_range_name(gw, t0, t1, first_ts, last_ts):
+    """liftlab_<gw>_<from>_<to>.zip — TWO DATES, always, even for 'all data'.
+
+    An 'all' bundle named liftlab_site-A_start_today.zip stops being true the day after it is
+    downloaded. When the range is unbounded the filename takes the extent of the DATA it actually
+    contains, so the name still describes the file a month later."""
+    d0 = _ist_day(t0) if t0 is not None else (_ist_day(first_ts) if first_ts else "empty")
+    d1 = (_ist_day(t1 - 1) if t1 is not None
+          else (_ist_day(last_ts) if last_ts else _ist_today_str()))
+    tag = f"liftlab_{gw}_{d0}_{d1}"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
+
+
+def _bundle_build(db, gw, period="all", from_d="", to_d=""):
+    """-> (zip_bytes, filename, manifest). Called by the endpoint; does no writing to the DB."""
+    import zipfile
+    t0, t1, range_label = _range_bounds(period, from_d, to_d)
+    custom = bool(from_d or to_d)
+    B = _BundleBuilder()
+    cams = _cameras(db, gw)
+    cam_ids = [c["cam"] for c in cams]
+    labels = {c["cam"]: (c.get("label") or "") for c in cams}
+    extent = {"first": None, "last": None}
+
+    # ── 1. riders_per_day.csv — PRECOMPUTED (study_matrix), all three splits as columns ──
+    _budget_check("bundle:riders_per_day")
+    R, rmeta = (None, None)
+    if not custom and (period or "all") in _TRENDS_CACHEABLE_PERIODS:
+        R, rmeta = _study_read(db, gw, "riders_per_day", period or "all")
+    src = "study_matrix (precomputed off the request path)"
+    if R is None:
+        # Bounded and said so: this is four aggregate queries with the range pushed into SQL, not
+        # a row-by-row walk. It is the one derivation in the bundle that is cheap enough to run.
+        R = _riders_per_day_compute(gw, period=period, from_d=from_d, to_d=to_d)
+        src = ("DERIVED on this request (aggregated in SQL, range pushed down) — no precomputed "
+               "matrix covers this range" + (": a custom date range" if custom
+                                             else f": {(rmeta or {}).get('state')}"))
+    hdr = ["date_ist"]
+    for c in cam_ids:
+        hdr += [f"{c}_riders", f"{c}_boarded", f"{c}_alighted"]
+    hdr += ["total_riders", "total_boarded", "total_alighted", "lifts_observed", "lifts_total"]
+    rows = []
+    for r in (R.get("rows") or []):
+        line = [r["date"]]
+        for c in cam_ids:
+            cell = (r.get("cells") or {}).get(c) or {}
+            if cell.get("observed"):
+                line += [cell.get("riders"), cell.get("b"), cell.get("a")]
+            else:
+                line += [DARK, DARK, DARK]      # dark, not zero — three times, in three columns
+        tot = r.get("total") or {}
+        line += [tot.get("riders"), tot.get("b"), tot.get("a"),
+                 tot.get("cams_observed"), len(cam_ids)]
+        rows.append(tuple(line))
+        _dts = _epoch(f"{r['date']}T12:00:00+05:30")
+        if _dts is not None:
+            extent["first"] = min(extent["first"] or _dts, _dts)
+            extent["last"] = max(extent["last"] or _dts, _dts)
+    ct, g = (R.get("col_total") or {}), (R.get("grand_total") or {})
+    tline = ["TOTAL"]
+    for c in cam_ids:
+        v = ct.get(c) or {}
+        tline += [v.get("riders"), v.get("b"), v.get("a")]
+    tline += [g.get("riders"), g.get("b"), g.get("a"), "", len(cam_ids)]
+    rows.append(tuple(tline))
+    B.add("riders_per_day.csv", hdr, rows, src)
+
+    # ── 2 & 3. the two hour-of-day files — PRECOMPUTED (trends_cache), per camera ──
+    # NO LIVE FALLBACK, unlike riders_per_day. _trends_compute is the 152.8s derivation this whole
+    # precompute layer exists to keep off the request path, and running it for SEVEN cameras inside
+    # one download would be that request seven times over. On a custom range these two files carry
+    # a state and a reason per camera instead of numbers — an unavailable figure is recoverable, a
+    # bundle that never downloads is not.
+    _budget_check("bundle:hour_of_day")
+    rh, dc = [], []
+    for cam in cam_ids:
+        TRp, tmeta = (None, {"state": "custom date range"})
+        if not custom and (period or "all") in _TRENDS_CACHEABLE_PERIODS:
+            TRp, tmeta = _trends_read(db, gw, cam, period or "all")
+        prof = (TRp or {}).get("profile")
+        if not isinstance(prof, list) or not prof:
+            why = ((tmeta or {}).get("detail") or (tmeta or {}).get("state")
+                   or "no precomputed hour-of-day payload for this camera and range")
+            if custom:
+                why = ("hour-of-day profiles are precomputed for the period buttons (Today / 7 / "
+                       "30 days / All) only. Deriving one for a calendar range is the walk that "
+                       "took /trends to 152.8s, so it is refused rather than run inside a "
+                       "download. Re-download using a period button.")
+            rh.append((cam, labels.get(cam) or "", "", "", "", "", "", "unavailable", why))
+            dc.append((cam, labels.get(cam) or "", "", "", "", "", "", "", "", "",
+                       "unavailable", why))
+            continue
+        rng = (TRp or {}).get("range") or {}
+        nd = (TRp or {}).get("n_days")
+        inst = rng.get("close_instrument") or ""
+        unmeasured = cam in (rng.get("travel_unmeasured_cams") or [])
+        uncal = cam in (rng.get("uncalibrated_cams") or [])
+        for p in prof:
+            b, a = (p.get("boarded") or 0), (p.get("alighted") or 0)
+            rh.append((cam, labels.get(cam) or "", p.get("hour"), b, a, b + a, nd, "ok", ""))
+            dc.append((cam, labels.get(cam) or "", p.get("hour"), p.get("cycles"),
+                       p.get("close_median"), p.get("close_p85"), p.get("close_n") or 0,
+                       inst, ("no" if (unmeasured or uncal) else "yes"), nd, "ok",
+                       (H3_TRAVEL_NOTE if unmeasured else (UNCALIBRATED_NOTE if uncal else ""))))
+    B.add("riders_per_hour.csv",
+          ["cam", "lift", "hour_ist", "boarded", "alighted", "riders", "n_days", "state", "reason"],
+          rh, "trends_cache (precomputed off the request path)")
+    B.add("door_cycles_per_hour.csv",
+          ["cam", "lift", "hour_ist", "cycles", "close_median_s", "close_p85_s", "close_n",
+           "close_instrument", "travel_measured", "n_days", "state", "reason"],
+          dc, "trends_cache (precomputed off the request path)")
+
+    # ── 4. occupancy_per_episode.csv — DERIVED, bounded in SQL by the range ──
+    _budget_check("bundle:occupancy")
+    ow, oargs = "", []
+    if t0 is not None:
+        ow += " AND ts_start >= ?"; oargs.append(t0)
+    if t1 is not None:
+        ow += " AND ts_start < ?"; oargs.append(t1)
+    orows = _q(db, "SELECT cam, ts_start, ts_end, machine_boarded, machine_alighted, occupancy_max,"
+                   " occupancy_frames, occupancy_degraded, analysed_frames, human_occupancy, "
+                   "counting_version, status FROM validation_item WHERE gateway_id=?" + ow
+                   + " ORDER BY ts_start", (gw, *oargs))
+    for r in orows:
+        if r["ts_start"] is not None:
+            extent["first"] = min(extent["first"] or r["ts_start"], r["ts_start"])
+            extent["last"] = max(extent["last"] or r["ts_start"], r["ts_start"])
+    B.add("occupancy_per_episode.csv",
+          ["cam", "lift", "ts_start_epoch", "ts_start_ist", "ts_end_epoch",
+           "machine_boarded", "machine_alighted", "occupancy_max_MEASURED_MINIMUM",
+           "occupancy_frames", "occupancy_degraded", "analysed_frames", "human_occupancy",
+           "counting_version", "status", "evidence"],
+          [(r["cam"], labels.get(r["cam"]) or "", r["ts_start"], _iso_ist(r["ts_start"]),
+            r["ts_end"], r["machine_boarded"], r["machine_alighted"], r["occupancy_max"],
+            r["occupancy_frames"], r["occupancy_degraded"], r["analysed_frames"],
+            r["human_occupancy"], r["counting_version"], r["status"],
+            1 if (r["occupancy_frames"] or 0) > 0 else 0) for r in orows],
+          "DERIVED on this request — bounded in SQL to the selected range. One row per episode is "
+          "the natural grain and no aggregate holds it; validation_item is indexed and the read is "
+          "a range scan, not a walk.")
+
+    # ── 5. rtt_trips.csv — DERIVED, and the ONE expensive walk in the bundle ──
+    # BOUNDED PER CAMERA, AND IT REFUSES RATHER THAN TRUNCATES. A partial walk drops whole round
+    # trips and reports a median from part of the window; the refusal carries the row count and the
+    # reason so the file says why a camera is missing instead of the camera simply not being there.
+    _budget_check("bundle:rtt_trips")
+    trips, n_refused = [], 0
+    try:
+        import rtt_core
+    except Exception as e:
+        rtt_core = None
+        trips.append(("", "", "", "", "", "", "unavailable",
+                      f"rtt_core could not be imported ({type(e).__name__}) — the round-trip "
+                      f"derivation lives there and is never reimplemented", RTT_HOME, ""))
+    if rtt_core is not None:
+        for cam in cam_ids:
+            _budget_check(f"bundle:rtt_trips:{cam}")
+            vers = [(r["door_version"], r["mx"]) for r in _q(
+                db, "SELECT door_version, MAX(ts) mx FROM gw_door_event WHERE gateway_id=? "
+                    "AND cam=? AND door_version IS NOT NULL AND door_version<>'' "
+                    "GROUP BY door_version", (gw, cam))]
+            _ov, _esrc = _era_for(db, gw, cam, "")
+            era, err = rtt_core.expand_era(
+                vers, _ov if DOOR_ERA not in ("", "auto") else None)
+            if err or not era:
+                n_refused += 1
+                trips.append((cam, labels.get(cam) or "", "", "", "", "", "unavailable",
+                              err or "no door-engine reads in any era for this camera — RTT is "
+                                     "UNAVAILABLE, not zero", RTT_HOME, ""))
+                continue
+            w, wargs = _ts_clause(t0, t1)
+            n_rows = _q(db, "SELECT COUNT(*) n FROM gw_door_event WHERE gateway_id=? AND cam=? "
+                            "AND door_version = ?" + w, (gw, cam, era, *wargs))[0]["n"]
+            if n_rows > BUNDLE_RTT_MAX_ROWS:
+                n_refused += 1
+                trips.append((cam, labels.get(cam) or "", "", "", "", "", "refused",
+                              f"{n_rows} door rows in this range exceed the "
+                              f"{BUNDLE_RTT_MAX_ROWS} this download will walk. It REFUSES rather "
+                              f"than truncating: a partial walk would drop whole round trips and "
+                              f"report a median from part of the window. Narrow the range, or run "
+                              f"tools/rtt.py off the request path.", RTT_HOME, era))
+                continue
+            rows_ = _q(db, "SELECT ts, floor, door_state FROM gw_door_event WHERE gateway_id=? "
+                           "AND cam=? AND door_version = ?" + w + " ORDER BY ts, id",
+                       (gw, cam, era, *wargs))
+            if rows_ and not any(r["floor"] is not None for r in rows_):
+                n_refused += 1
+                trips.append((cam, labels.get(cam) or "", "", "", "", "", "no_floor",
+                              "no floor attribution on this camera — RTT needs a home-floor read, "
+                              "so it is UNAVAILABLE, not zero. This is not a lift that made no "
+                              "round trips.", RTT_HOME, era))
+                continue
+            n_before = len(trips)
+            for t_a, t_b, dt, ns in rtt_core.trips(rows_, RTT_HOME):
+                why = rtt_core.classify(dt)
+                extent["first"] = min(extent["first"] or t_a, t_a)
+                extent["last"] = max(extent["last"] or t_a, t_a)
+                trips.append((cam, labels.get(cam) or "", t_a, _iso_ist(t_a), round(dt, 1), ns,
+                              "anomaly" if why else "plausible", why or "", RTT_HOME, era))
+            if len(trips) == n_before:
+                trips.append((cam, labels.get(cam) or "", "", "", "", "", "no_trips",
+                              f"the walk completed over {len(rows_)} door rows and found no "
+                              f"round trip: no door CLOSED at {RTT_HOME} was followed by a door "
+                              f"OPEN at {RTT_HOME}. This IS a measurement, unlike the rows above "
+                              f"it that report a refusal or a missing input.", RTT_HOME, era))
+    B.add("rtt_trips.csv",
+          ["cam", "lift", "start_epoch", "start_ist", "rtt_s", "stops", "class", "anomaly_reason",
+           "home_floor", "era"],
+          trips,
+          f"DERIVED on this request — bounded at {BUNDLE_RTT_MAX_ROWS} door rows per camera, which "
+          f"REFUSES rather than truncates. No aggregate holds one row per round trip; rtt_window "
+          f"stores only the summary, and the derivation is rtt_core's, never a second copy.")
+
+    # ── 6. eras.csv — DERIVED, and cheap: two GROUP BYs and the stored alphabet ──
+    _budget_check("bundle:eras")
+    erows = []
+    vals = _validations(db, gw)          # once for the gateway, not once per camera
+    for cam in cam_ids:
+        n_before_cam = len(erows)
+        cv_now, dv_now = _current_keys(db, gw, cam)
+        alpha, _detail, ameta = _alphabet_read(db, gw, cam)
+        whitelist = (" ".join(sorted(alpha)) if alpha else "NONE")
+        val = vals.get(cam) or {}
+        for r in _q(db, "SELECT door_version v, MIN(ts) lo, MAX(ts) hi, COUNT(*) n "
+                        "FROM gw_door_event WHERE gateway_id=? AND cam=? AND door_version "
+                        "IS NOT NULL AND door_version<>'' GROUP BY door_version ORDER BY MIN(ts)",
+                    (gw, cam)):
+            erows.append((cam, labels.get(cam) or "", "door_version", r["v"],
+                          _iso_ist(r["lo"]), _iso_ist(r["hi"]), r["n"],
+                          "yes" if r["v"] == dv_now else "no",
+                          "", "", "", whitelist, (ameta or {}).get("state") or ""))
+        for r in _q(db, "SELECT counting_version v, MIN(ts_start) lo, MAX(ts_start) hi, COUNT(*) n "
+                        "FROM validation_item WHERE gateway_id=? AND cam=? AND counting_version "
+                        "IS NOT NULL AND counting_version<>'' GROUP BY counting_version "
+                        "ORDER BY MIN(ts_start)", (gw, cam)):
+            cur = (r["v"] == (val.get("counting_version") or cv_now))
+            erows.append((cam, labels.get(cam) or "", "counting_version", r["v"],
+                          _iso_ist(r["lo"]), _iso_ist(r["hi"]), r["n"],
+                          "yes" if cur else "no",
+                          (val.get("precision") if cur else ""),
+                          (val.get("n_reviewed") if cur else ""),
+                          (val.get("n_exact") if cur else ""), whitelist,
+                          (ameta or {}).get("state") or ""))
+        if len(erows) == n_before_cam:
+            erows.append((cam, labels.get(cam) or "", "none", "", "", "", 0, "no", "", "", "",
+                          whitelist, "no era of either kind has ever been recorded for this "
+                                     "camera — it is UNCALIBRATED, not idle"))
+    B.add("eras.csv",
+          ["cam", "lift", "kind", "version", "first_ist", "last_ist", "n_rows", "is_current",
+           "precision_pct", "n_reviewed", "n_exact", "floor_whitelist", "floor_alphabet_state"],
+          erows,
+          "DERIVED on this request — two GROUP BYs per camera plus the stored floor alphabet. "
+          "Boundaries are measured from the rows, never from a hardcoded date. NOT range-filtered: "
+          "an era that started before the range is what the range's rows were measured by.")
+
+    # ── 7. outages.csv — a constant, no query at all ──
+    B.add("outages.csv",
+          ["start_utc", "end_utc", "start_ist", "end_ist", "start_epoch", "end_epoch", "cause",
+           "cams", "overlaps_selected_range", "note"],
+          [(g["start"], g["end"], _iso_ist(g["start_epoch"]), _iso_ist(g["end_epoch"]),
+            g["start_epoch"], g["end_epoch"], g.get("cause") or "",
+            " ".join(g.get("cams") or []) or "ALL",
+            ("yes" if ((t0 is None or g["end_epoch"] > t0)
+                       and (t1 is None or g["start_epoch"] < t1)) else "no"),
+            g.get("note") or "") for g in DATA_GAPS],
+          "DATA_GAPS, a reviewed constant in dash_api.py — no query, and not derived from the data")
+
+    name = _bundle_range_name(gw, t0, t1, extent["first"], extent["last"])
+    readme = _bundle_readme(gw, range_label, period, from_d, to_d, B, cams, custom)
+    B.files["README.md"] = readme
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        # README FIRST in the archive, so a reader unzipping to a terminal meets the caveats before
+        # the numbers rather than after them.
+        z.writestr(f"{name}/README.md", readme)
+        for fn in _bundle_caveats():
+            if fn in B.files:
+                z.writestr(f"{name}/{fn}", B.files[fn])
+    return buf.getvalue(), f"{name}.zip", B.meta
+
+
+def _bundle_readme(gw, range_label, period, from_d, to_d, B, cams, custom):
+    """The README, generated FROM the caveat registry — a file cannot enter the bundle without it.
+
+    VERBATIM, not paraphrased. Every sentence below is the same string the dashboard prints beside
+    the same number; a bundle whose caveats were reworded for the file would be a second, drifting
+    statement of the same limitation, and the first thing to drift is always the qualifier."""
+    cav = _bundle_caveats()
+    out = [f"# liftlab study bundle — {gw}", "",
+           f"Range: **{range_label}**"
+           + (f" (explicit dates {from_d or 'start'} to {to_d or 'today'})" if custom
+              else f" (period `{period or 'all'}`)"),
+           f"Downloaded: {_iso_ist(time.time())} IST", "",
+           BUNDLE_RANGE_NOTE, "",
+           "## Read this first", "",
+           "Every number in this bundle is a MEASUREMENT with a stated limitation. The limitations "
+           "are not disclaimers — they change what the numbers mean, and each one below is printed "
+           "verbatim from the dashboard that produced the file, so the sentence beside a number on "
+           "screen is the same sentence beside it here.", "",
+           "Three that are misread most often, stated once here and again under their files:", "",
+           f"- **{RIDERS_CAVEAT}**",
+           f"- **{RIDERS_DARK_NOTE}**",
+           f"- **{OCC_LABEL} — {OCC_CALIBRATION}**", "",
+           "## Lifts in this bundle", "",
+           "| cam | label |", "|---|---|"]
+    out += [f"| `{c['cam']}` | {c.get('label') or '—'} |" for c in cams]
+    out += ["", "## Manifest", "",
+            "| file | rows | source |", "|---|---|---|"]
+    for fn in cav:
+        m = B.meta.get(fn) or {}
+        out.append(f"| `{fn}` | {m.get('rows', 0):,} | {m.get('source', 'not written')} |")
+    inc = [fn for fn in cav if (B.meta.get(fn) or {}).get("truncated")]
+    if inc:
+        out += ["", "> **INCOMPLETE FILES IN THIS BUNDLE.** The following stopped short of the "
+                "full range and say so in their last line: " + ", ".join(f"`{f}`" for f in inc)
+                + ". A short file that looks complete is worse than either a complete one or an "
+                  "honest refusal, so this is repeated here and in the file itself."]
+    out += ["", "---", ""]
+    for fn, (desc, caveats) in cav.items():
+        m = B.meta.get(fn) or {}
+        out += [f"## `{fn}`", "", desc + ".", "",
+                f"*{m.get('rows', 0):,} row(s). Source: {m.get('source', 'not written')}*", ""]
+        if m.get("truncated"):
+            out += [f"> **INCOMPLETE** — {m['truncated']}", ""]
+        out += ["**Caveats**", ""]
+        out += [f"- {c}" for c in caveats if c]
+        out += [""]
+    out += ["---", "",
+            "## Where these numbers come from", "",
+            "Files marked *precomputed* are read from a table the `liftlab-precompute` timer fills "
+            "off the request path. A read never triggers a derivation on this system — that rule "
+            "is what keeps the dashboard loadable — so a precomputed file carries the age of its "
+            "table, not of this download. Files marked *DERIVED on this request* had no aggregate "
+            "at their grain; each one names the bound it ran under above.", "",
+            "Nothing in this bundle is modelled, estimated or interpolated. Where a number could "
+            "not be measured, the file says so in a `state` or `reason` column rather than leaving "
+            "a blank — a blank cell cannot distinguish 'this did not happen' from 'this could not "
+            "be measured', and those are opposite claims."]
+    return "\n".join(out) + "\n"
+
+
+@dash_router.get("/dash/{gw}/bundle")
+def dash_bundle(gw: str, period: str = "all", from_d: str = "", to_d: str = ""):
+    """The whole study, one ZIP, caveats included — filtered to the range the screen is showing.
+
+    ON A BUDGET, like /data. The RTT trip walk is the one genuinely expensive member and it is
+    capped per camera, but a cap on rows is not a cap on time; the wall-clock budget is what
+    guarantees this returns. A timeout is a 503 that names the phase, never a partial zip — half a
+    bundle with a full README would claim completeness it does not have.
+    """
+    if period and period not in _TRENDS_CACHEABLE_PERIODS and not (from_d or to_d):
+        return JSONResponse({"error": f"unknown period {period!r}",
+                             "periods": [p for p in _TRENDS_CACHEABLE_PERIODS if p]},
+                            status_code=400)
+    db = _db()
+    _budget_arm(db, BUNDLE_BUDGET_S)
+    try:
+        blob, name, manifest = _bundle_build(db, gw, period=period, from_d=from_d, to_d=to_d)
+    except DashTimeout as e:
+        return JSONResponse(
+            {"error": "timeout",
+             "detail": (f"the study bundle exceeded its {BUNDLE_BUDGET_S:g}s budget and was "
+                        f"abandoned during '{e}'. No partial zip is returned: a bundle missing a "
+                        f"file, with a README that lists it, would claim a completeness it does "
+                        f"not have. Narrow the date range and try again."),
+             "phase": str(e), "budget_s": BUNDLE_BUDGET_S, "elapsed_s": _budget_elapsed()},
+            status_code=503, headers={"Retry-After": "30"})
+    finally:
+        _budget_disarm(db)
+        db.close()
+    return Response(blob, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"',
+                             "Cache-Control": "no-store",
+                             "X-Bundle-Bytes": str(len(blob)),
+                             "X-Bundle-Files": str(len(manifest) + 1)})
+
+
 # ============================================================ CSV export
 # The rows BEHIND every chart and table, filtered to the same range (and, for floor data, the same
 # door era) the screen is showing. Anything else is a different dataset wearing the same name: an
@@ -3634,24 +4192,33 @@ _EXPORT = {
 # The episode is the natural grain anyway: one door-open, one peak, one coverage denominator.
 
 
-def _csv(rows, header, name, notes=()):
-    """notes ride INSIDE the file as '#'-prefixed lines, the convention demand_log already uses.
+def _csv_text(rows, header, notes=()):
+    """The CSV as TEXT. One writer for the downloads and for the members of the study bundle —
+    two renderers of the same rows would eventually quote or line-end them differently, and a
+    spreadsheet is exactly where that shows up as a column shifting by one.
 
-    A table mailed onward without its caveats will be misread — "riders" as a headcount of people,
-    a dark cell as a zero — and a note in the download link does not travel with the attachment.
+    header=None writes rows only, which is how the bundle measures a single row's cost.
+
+    notes ride INSIDE the file as '#'-prefixed lines, the convention demand_log already uses. A
+    table mailed onward without its caveats will be misread — "riders" as a headcount of people, a
+    dark cell as a zero — and a note in the download link does not travel with the attachment.
     Comment lines are skipped by every CSV reader that honours '#', and the data below them still
     parses as ordinary CSV either way."""
     import csv
-    import io
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
     for n in (notes or ()):
         for line in str(n).splitlines():
             buf.write("# " + line + "\n")
-    w.writerow(header)
+    if header is not None:
+        w.writerow(header)
     for r in rows:
         w.writerow(r)
-    return Response(buf.getvalue(), media_type="text/csv; charset=utf-8",
+    return buf.getvalue()
+
+
+def _csv(rows, header, name, notes=()):
+    return Response(_csv_text(rows, header, notes), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="{name}"',
                              "Cache-Control": "no-store"})
 
@@ -4108,6 +4675,12 @@ table.mtx td.pend{background:rgba(102,102,119,.07);border-left:3px solid #667;
   text-align:left;white-space:normal;font-size:11px;padding:6px 8px}
 .swatch{display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:-1px;
   border:1px solid #ddd}
+/* The bundle is the PRIMARY download — one file with the caveats inside it — so it reads as the
+   default action and the seven single-dataset links beside it as the specialist ones. A study
+   assembled link by link arrives as a folder of numbers with no provenance. */
+.bundlebtn{font:600 11px var(--mono);padding:4px 10px;border:1px solid #2a6db0;border-radius:12px;
+  text-decoration:none;color:#fff;background:#2a6db0}
+.bundlebtn:hover{background:#1f5590;text-decoration:none}
 </style>
 __NAV__
 <h1 style="padding:0 2px">liftlab · dash <span class=mut id=stamp></span></h1>
@@ -4913,6 +5486,16 @@ function periodBar(extra){
       :('<button class="tog'+(trTable?' on':'')+'" onclick="toggleTable()">'+(trTable?'charts':'table')+'</button>'))
     +'<span class=mut id="rangelab-'+mode+'" style="font-size:11px;margin-left:6px"></span></div>';
 }
+// THE WHOLE STUDY, ONE FILE. Defined once and dropped into every download bar: only one view is
+// ever visible, so the reader sees exactly one of these. It carries the range the screen is
+// showing, like every other download here, and it is deliberately NOT per camera — the bundle is
+// the fleet, and a per-camera bundle would be seven folders to reconcile by hand.
+function bundleBtn(){
+  return '<a class=bundlebtn href="/dash/'+GW+'/bundle?'+fleetQuery()+'" '
+    +'title="one ZIP: riders per day, riders and door cycles per hour, occupancy per episode, '
+    +'round trips, era boundaries, outages \u2014 and a README carrying every caveat verbatim">'
+    +'\u2b07 Download study bundle</a>';
+}
 // Every download carries the SAME cam/period/date-range the screen is showing, so a spreadsheet
 // and the chart above it cannot disagree about which rows they describe.
 function dl(ds,label){
@@ -4925,7 +5508,7 @@ function exportBar(){
     +'&period='+encodeURIComponent(trPeriod||'all')
     +(trFrom?('&from_d='+encodeURIComponent(trFrom)):'')+(trTo?('&to_d='+encodeURIComponent(trTo)):'')
     +(trCam?('&cam='+encodeURIComponent(trCam)):'')+'">⤓ floor events — ALL eras, labelled</a>';
-  return '<div class=dlbar>'+dl('door_cycles','door cycles')+dl('transits','transits')
+  return '<div class=dlbar>'+bundleBtn()+dl('door_cycles','door cycles')+dl('transits','transits')
     +dl('floor_events','floor events')+dl('per_floor','per-floor')
     +dl('episodes','episodes + occupancy')+dl('rtt','round trips')+allEras
     +'<span class=mut style="font-size:11px">CSV — the rows behind these charts, same range'+(trCam?'':' (fleet)')+'</span></div>';
@@ -5508,7 +6091,8 @@ function renderRiders(){
     +(cst.state==='ok'?(' · as of '+age(cst.age_s)+(cst.stale?' <b class=stale>STALE</b>':'')):'')
     +(cst.state==='derived live'?' · derived live (custom date range)':'')
     +'</div>'
-    +'<div class=dlbar><a class=dlbtn href="/dash/'+GW+'/export.csv?dataset=riders_per_day&split='
+    +'<div class=dlbar>'+bundleBtn()
+    +'<a class=dlbtn href="/dash/'+GW+'/export.csv?dataset=riders_per_day&split='
       +encodeURIComponent(ridersSplit)+'&'+fleetQuery()+'">⤓ this matrix ('+esc(ridersSplit)+')</a>'
     +'<a class=dlbtn href="/dash/'+GW+'/export.csv?dataset=riders_per_day_long&'+fleetQuery()
       +'">⤓ one cell per row — boarded/alighted split, observation flag, counting build</a>'
@@ -5649,7 +6233,8 @@ function renderRttFleet(){
     +' · '+RF.rows.length+' lift(s), '+nAbs+' with no round-trip measurement'
     +(cst.state==='ok'?(' · as of '+age(cst.age_s)+(cst.stale?' <b class=stale>STALE</b>':'')):'')
     +'</div>'
-    +'<div class=dlbar><a class=dlbtn href="/dash/'+GW+'/export.csv?dataset=rtt_per_hour&'
+    +'<div class=dlbar>'+bundleBtn()
+    +'<a class=dlbtn href="/dash/'+GW+'/export.csv?dataset=rtt_per_hour&'
       +fleetQuery()+'">⤓ lift × hour, one cell per row</a>'
     +'<span class=mut style="font-size:11px">CSV — the cells behind this table; a lift with no '
     +'measurement still has 24 rows, each carrying its reason</span></div>'
