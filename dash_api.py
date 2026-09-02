@@ -1612,13 +1612,16 @@ def _precompute_run_table(db):
         -- different fixes. trends_fleet_s and trends_cams_s read the SAME era rows twice: that
         -- duplication is the first lever if this ever approaches the interval.
         alphabet_s REAL, aggregate_s REAL, rtt_s REAL, trends_cams_s REAL, trends_fleet_s REAL,
+        study_s REAL,
         n_ok INTEGER, n_err INTEGER,
         PRIMARY KEY (gateway_id, started_at))""")
     db.execute("CREATE INDEX IF NOT EXISTS ix_precompute_run ON precompute_run(gateway_id, started_at)")
     # ALTER, not a recreate: the table already holds sweep history on any box that ran the previous
     # build, and that history is the only record of how the fill time is trending.
-    if "rtt_s" not in {r[1] for r in db.execute("PRAGMA table_info(precompute_run)")}:
-        db.execute("ALTER TABLE precompute_run ADD COLUMN rtt_s REAL")
+    _cols = {r[1] for r in db.execute("PRAGMA table_info(precompute_run)")}
+    for _c in ("rtt_s", "study_s"):
+        if _c not in _cols:
+            db.execute(f"ALTER TABLE precompute_run ADD COLUMN {_c} REAL")
 
 
 def precompute_run_record(db, gw, started_at, stages, n_ok, n_err):
@@ -1626,12 +1629,13 @@ def precompute_run_record(db, gw, started_at, stages, n_ok, n_err):
     _precompute_run_table(db)
     fin = time.time()
     db.execute("INSERT OR REPLACE INTO precompute_run (gateway_id, started_at, finished_at, "
-               "total_s, alphabet_s, aggregate_s, rtt_s, trends_cams_s, trends_fleet_s, n_ok, "
-               "n_err) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+               "total_s, alphabet_s, aggregate_s, rtt_s, trends_cams_s, trends_fleet_s, study_s, "
+               "n_ok, n_err) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                (gw, started_at, fin, fin - started_at,
                 stages.get("alphabet", 0.0), stages.get("aggregate", 0.0),
                 stages.get("rtt", 0.0),
-                stages.get("trends_cams", 0.0), stages.get("trends_fleet", 0.0), n_ok, n_err))
+                stages.get("trends_cams", 0.0), stages.get("trends_fleet", 0.0),
+                stages.get("study", 0.0), n_ok, n_err))
     db.commit()
     # Two weeks is enough to see a trend across an era rollover (observed era ages: 1.1-20.0 days)
     # and short enough that the table never becomes something to manage.
@@ -1644,15 +1648,26 @@ def precompute_run_record(db, gw, started_at, stages, n_ok, n_err):
 def precompute_run_latest(db, gw):
     """-> the most recent recorded sweep, or None. READ ONLY."""
     try:
-        r = db.execute("SELECT started_at, finished_at, total_s, alphabet_s, aggregate_s, "
-                       "rtt_s, trends_cams_s, trends_fleet_s, n_ok, n_err FROM precompute_run "
+        # COLUMNS AS THEY EXIST, not as this build wishes they did. The ALTER that adds a new
+        # stage column runs in _precompute_run_table, which only the JOB calls — so between a
+        # deploy and the first sweep a box carries rows without the newest column. Naming it in
+        # the SELECT would raise OperationalError and this function would report "never run" on a
+        # gateway with two weeks of sweep history. A missing column is a missing NUMBER, not a
+        # missing record.
+        want = ("started_at", "finished_at", "total_s", "alphabet_s", "aggregate_s", "rtt_s",
+                "trends_cams_s", "trends_fleet_s", "study_s", "n_ok", "n_err")
+        have = [c for c in want
+                if c in {x[1] for x in db.execute("PRAGMA table_info(precompute_run)")}]
+        if not have:
+            return None
+        r = db.execute(f"SELECT {', '.join(have)} FROM precompute_run "
                        "WHERE gateway_id=? ORDER BY started_at DESC LIMIT 1", (gw,)).fetchone()
     except sqlite3.OperationalError:
         return None          # the job has never run on this schema — NOT an error, and not a breach
     if not r:
         return None
-    d = dict(zip(("started_at", "finished_at", "total_s", "alphabet_s", "aggregate_s", "rtt_s",
-                  "trends_cams_s", "trends_fleet_s", "n_ok", "n_err"), tuple(r)))
+    d = {k: None for k in want}
+    d.update(dict(zip(have, tuple(r))))
     d["age_s"] = round(time.time() - (d["finished_at"] or 0), 1)
     return d
 
@@ -3039,6 +3054,558 @@ def dash_trends(gw: str, cam: str = "", from_h: int = -1, to_h: int = -1,
                         headers={"Cache-Control": "no-store"})
 
 
+# ============================================================ study matrices
+# TWO FLEET-WIDE TABLES the MEP-02 study asks for directly, and neither is a new measurement:
+#
+#   riders_per_day  rows = IST date, cols = lift, cells = riders. A re-shape of transit_event.
+#   rtt_per_hour    rows = lift, cols = hour-of-day, cells = median RTT with n. A re-shape of what
+#                   rtt_refresh already stored in rtt_window — NOT a second walk of the door rows.
+#
+# WHY THEY ARE PRECOMPUTED LIKE EVERYTHING ELSE. The rule this file states in five places is that a
+# READ MAY NEVER TRIGGER A DERIVATION, and a fleet view is the shape most likely to break it: it
+# touches every camera, so whatever a per-camera panel costs, this costs seven times. The riders
+# matrix is aggregated in SQL and would probably survive the request path; the RTT matrix reads
+# seven stored payloads and certainly would. Both go on the timer anyway, because "probably fast
+# enough" is how /trends got to 152.8 s one camera at a time.
+#
+# ONE TABLE, TWO KINDS. They share the fleet era key (_trends_key(gw, '') — every camera's counting
+# and door version joined), so ANY camera rolling an era invalidates both rather than leaving a
+# fleet row half-current. That is the same rule the fleet trends payload already follows.
+STUDY_KINDS = ("riders_per_day", "rtt_per_hour")
+# The periods the timer fills, same set and same reason as TRENDS_FILL_PERIODS: filling 'all' alone
+# leaves every other button on the picker serving the not-computed skeleton for ever.
+STUDY_FILL_PERIODS = TRENDS_FILL_PERIODS
+
+# DARK IS NOT ZERO, and the glyph is demand_log's so the two surfaces cannot disagree about it.
+# 0 means "this lift was watched and carried nobody"; '—' means "nobody was watching". Reading the
+# second as the first understates demand exactly where coverage is worst — which is the same defect
+# class as the 0-cycles bug and the empty-axis bug this file has now hit three times.
+DARK = "—"
+RIDERS_CAVEAT = ("USAGE VOLUME, NOT UNIQUE PEOPLE. A rider here is one counted crossing of the "
+                 "door line: boardings plus alightings. One person making a round trip counts "
+                 "twice, once in each direction, and a person who rides four times a day counts "
+                 "four times. Nothing in this table is a headcount of individuals, and it must "
+                 "never be read as one.")
+RIDERS_DARK_NOTE = ("a cell reading '" + DARK + "' is a day this camera produced no rows in ANY "
+                    "stream — nobody was watching. It is NOT a day the lift carried nobody, which "
+                    "is what a 0 in the same cell would mean.")
+RIDERS_GAP_NOTE = ("transits inside a known outage window (DATA_GAPS) are excluded and the day is "
+                   "not credited as observed — an outage is not observation")
+
+
+def _ist_day(ts):
+    """Epoch -> 'YYYY-MM-DD' on the building's clock."""
+    try:
+        return datetime.fromtimestamp(ts, IST).date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+# IST has no DST, so the offset is a constant and SQLite can do the day bucketing itself. That is
+# what keeps this an aggregate instead of a fetch: the riders matrix never materialises a transit
+# row in Python, which is the whole reason a fleet-wide daily table is affordable at all.
+_IST_OFFSET_S = 19800                                   # +05:30, fixed
+_SQL_IST_DAY = "strftime('%%Y-%%m-%%d', %s + %d, 'unixepoch')" % ("ts", _IST_OFFSET_S)
+
+
+def _gap_clause(cams=None):
+    """SQL fragment + args excluding rows inside a known outage window, per camera.
+
+    Applied to the COUNT as well as to the observation evidence, so a gap day is dark rather than a
+    day the lift carried nobody. demand_log excludes the same rows for the same reason; a fleet
+    table that counted them would disagree with the study workbook about the same outage.
+    """
+    sql, args = "", []
+    for g in DATA_GAPS:
+        gcams = g.get("cams") or []
+        if cams is not None and gcams and not set(gcams) & set(cams):
+            continue
+        if gcams:
+            marks = ",".join("?" for _ in gcams)
+            sql += f" AND NOT (cam IN ({marks}) AND ts >= ? AND ts < ?)"
+            args += list(gcams) + [g["start_epoch"], g["end_epoch"]]
+        else:
+            sql += " AND NOT (ts >= ? AND ts < ?)"
+            args += [g["start_epoch"], g["end_epoch"]]
+    return sql, args
+
+
+def _counting_spans(db, gw):
+    """{cam: [(version, lo, hi, n_episodes)]} — when each counting build was in effect, MEASURED.
+
+    Derived from validation_item episode stamps, never from a hardcoded date, exactly as
+    _trends_compute derives counting_eras. A version's span is the first and last episode it
+    stamped; that is the only record of when a counting build was live.
+    """
+    out = {}
+    for r in _q(db, "SELECT cam, counting_version v, MIN(ts_start) lo, MAX(ts_start) hi, COUNT(*) n "
+                    "FROM validation_item WHERE gateway_id=? AND counting_version IS NOT NULL "
+                    "AND counting_version<>'' AND ts_start IS NOT NULL "
+                    "GROUP BY cam, counting_version", (gw,)):
+        out.setdefault(r["cam"], []).append((r["v"], r["lo"], r["hi"], r["n"]))
+    for c in out:
+        out[c].sort(key=lambda s: s[1])
+    return out
+
+
+def _version_at(spans, cam, ts):
+    """The counting build in effect for this camera at this moment, or None if nothing says.
+
+    None is a real answer and is reported as one. Guessing the current version for a day that
+    predates every episode would label old counts with a build that did not produce them, which is
+    the pooling this table exists to prevent.
+    """
+    for v, lo, hi, _n in spans.get(cam) or ():
+        if lo is not None and hi is not None and lo <= ts <= hi:
+            return v
+    return None
+
+
+def _riders_per_day_compute(gw, period="all", from_d="", to_d=""):
+    """rows = IST date, cols = lift, cells = riders. AGGREGATED IN SQL, never a row-by-row fetch.
+
+    NOT A REQUEST HANDLER. study_refresh calls this on the timer; the endpoint reads the table.
+
+    THE THREE RULES ARE demand_log's, deliberately — this is the same count on a different surface,
+    and the study workbook and the dashboard must not be able to disagree about a day's riders:
+
+      1. DARK IS NOT ZERO. Observation comes from ANY row in ANY stream (transits, door reads,
+         validated episodes), not from transit rows — so a lift that was up and genuinely idle
+         reads 0, and a lift nobody was watching reads '—'.
+      2. NEVER POOL COUNTING VERSIONS SILENTLY. Every cell carries the counting build in effect,
+         and a day that spans two builds is marked rather than blended into one number.
+      3. GAP ROWS ARE EXCLUDED, and their day is not credited as observed.
+
+    The direction rule is _transit_by_cam's, verbatim: 'in' is a boarding and ANYTHING ELSE —
+    including NULL — is an alighting. Two counters that split the same column differently produce
+    two different totals from one table.
+    """
+    db = _db()
+    try:
+        _cams = _cameras(db, gw)
+        cams = [c["cam"] for c in _cams]
+        labels = {c["cam"]: (c.get("label") or "") for c in _cams}
+        t0, t1, range_label = _range_bounds(period, from_d, to_d)
+        tw, targs = _ts_clause(t0, t1)
+        gw_sql, gargs = _gap_clause(cams)
+
+        # ── the counts ────────────────────────────────────────────────────────────────────
+        counted = {}
+        for r in _q(db, f"SELECT cam, {_SQL_IST_DAY} d, "
+                        "SUM(direction='in') b, "
+                        "SUM(direction IS NULL OR direction<>'in') a "
+                        "FROM transit_event WHERE gateway_id=? AND ts IS NOT NULL"
+                        + tw + gw_sql + " GROUP BY cam, d",
+                    (gw, *targs, *gargs)):
+            counted[(r["d"], r["cam"])] = {"b": r["b"] or 0, "a": r["a"] or 0}
+
+        # ── OBSERVATION, from every stream this gateway writes ────────────────────────────
+        # A camera is observed on a day if it produced ANY row that day, in ANY of the three
+        # tables — not merely a transit. Deriving observation from transits alone would make a
+        # working, empty lift indistinguishable from a dead one, which is the whole point of the
+        # dark/zero distinction.
+        observed = {}
+        for tbl, tcol, camcol in (("transit_event", "ts", "cam"),
+                                  ("gw_door_event", "ts", "cam"),
+                                  ("validation_item", "ts_start", "cam")):
+            _day = "strftime('%%Y-%%m-%%d', %s + %d, 'unixepoch')" % (tcol, _IST_OFFSET_S)
+            _tw, _ta = "", []
+            if t0 is not None:
+                _tw += f" AND {tcol} >= ?"; _ta.append(t0)
+            if t1 is not None:
+                _tw += f" AND {tcol} < ?"; _ta.append(t1)
+            # The gap exclusion is written against `ts`; validation_item's column is ts_start, so
+            # the fragment is rebuilt per table rather than reused with the wrong column name.
+            _gs, _ga = "", []
+            for g in DATA_GAPS:
+                gcams = g.get("cams") or []
+                if gcams:
+                    marks = ",".join("?" for _ in gcams)
+                    _gs += f" AND NOT ({camcol} IN ({marks}) AND {tcol} >= ? AND {tcol} < ?)"
+                    _ga += list(gcams) + [g["start_epoch"], g["end_epoch"]]
+                else:
+                    _gs += f" AND NOT ({tcol} >= ? AND {tcol} < ?)"
+                    _ga += [g["start_epoch"], g["end_epoch"]]
+            for r in _q(db, f"SELECT {camcol} cam, {_day} d FROM {tbl} WHERE gateway_id=? "
+                            f"AND {tcol} IS NOT NULL" + _tw + _gs + f" GROUP BY {camcol}, d",
+                        (gw, *_ta, *_ga)):
+                if r["d"]:
+                    observed.setdefault(r["cam"], set()).add(r["d"])
+
+        # ── which counting build produced each day's count ────────────────────────────────
+        spans = _counting_spans(db, gw)
+        cur_ver = {}
+        for r in _q(db, "SELECT cam, counting_version v FROM camera_validation WHERE gateway_id=?",
+                    (gw,)):
+            if r["v"]:
+                cur_ver[r["cam"]] = r["v"]
+        # DIRECT EVIDENCE FIRST. A day with validated episodes states its own version; only a day
+        # without one is resolved from the span, and the payload says which of the two it was.
+        day_ver = {}
+        _dw, _da = "", []
+        if t0 is not None:
+            _dw += " AND ts_start >= ?"; _da.append(t0)
+        if t1 is not None:
+            _dw += " AND ts_start < ?"; _da.append(t1)
+        _dday = "strftime('%%Y-%%m-%%d', ts_start + %d, 'unixepoch')" % (_IST_OFFSET_S,)
+        for r in _q(db, f"SELECT cam, {_dday} d, counting_version v FROM validation_item "
+                        "WHERE gateway_id=? AND counting_version IS NOT NULL "
+                        "AND counting_version<>'' AND ts_start IS NOT NULL" + _dw
+                        + " GROUP BY cam, d, counting_version", (gw, *_da)):
+            day_ver.setdefault((r["d"], r["cam"]), set()).add(r["v"])
+    finally:
+        db.close()
+
+    days = sorted({d for d, _c in counted} | {d for c in observed for d in observed[c]})
+    rows, col_tot = [], {c: {"b": 0, "a": 0, "riders": 0, "days_observed": 0} for c in cams}
+    vers_seen = set()
+    for d in days:
+        cells, tot = {}, {"b": 0, "a": 0, "riders": 0, "cams_observed": 0}
+        for c in cams:
+            seen = d in (observed.get(c) or ())
+            got = counted.get((d, c))
+            direct = sorted(day_ver.get((d, c)) or ())
+            if direct:
+                ver, vsrc = (direct[0] if len(direct) == 1 else None), "validated episodes that day"
+            else:
+                # Midday, not midnight: a day is attributed to the build that was live through it,
+                # and a span boundary at 00:00 would otherwise decide the whole day.
+                _mid = _epoch(f"{d}T12:00:00+05:30")
+                ver = _version_at(spans, c, _mid) if _mid is not None else None
+                vsrc = ("inferred from the counting-version span" if ver
+                        else "no episode and no span covers this day")
+            vers_seen.update(direct or ([ver] if ver else []))
+            if not seen:
+                # DARK. Not a zero, and deliberately carrying no b/a either: a split of a
+                # measurement nobody made is still not a measurement.
+                cells[c] = {"riders": None, "b": None, "a": None, "observed": False,
+                            "counting_version": ver, "version_source": vsrc,
+                            "mixed_versions": (sorted(direct) if len(direct) > 1 else None),
+                            "off_era": None}
+                continue
+            b, a = ((got or {}).get("b", 0), (got or {}).get("a", 0))
+            cells[c] = {"riders": b + a, "b": b, "a": a, "observed": True,
+                        "counting_version": ver, "version_source": vsrc,
+                        "mixed_versions": (sorted(direct) if len(direct) > 1 else None),
+                        # OFF-ERA IS A LABEL, NOT A FILTER. The day happened and its count is real;
+                        # what is NOT true is that it is comparable with today's. Dropping the row
+                        # would hide history (the 07-30 "where did my 41,789 rows go"); pooling it
+                        # unlabelled would compare two instruments. So it is shown, and marked.
+                        "off_era": bool(ver and cur_ver.get(c) and ver != cur_ver[c])}
+            tot["b"] += b; tot["a"] += a; tot["riders"] += b + a; tot["cams_observed"] += 1
+            col_tot[c]["b"] += b; col_tot[c]["a"] += a
+            col_tot[c]["riders"] += b + a; col_tot[c]["days_observed"] += 1
+        rows.append({"date": d, "cells": cells, "total": tot})
+
+    grand = {"b": sum(v["b"] for v in col_tot.values()),
+             "a": sum(v["a"] for v in col_tot.values()),
+             "riders": sum(v["riders"] for v in col_tot.values())}
+    eras_in_range = sorted(v for v in vers_seen if v)
+    return {
+        "gw": gw, "kind": "riders_per_day", "cams": cams, "labels": labels,
+        "rows": rows, "col_total": col_tot, "grand_total": grand,
+        "n_days": len(days),
+        "range": {"period": period, "from_d": from_d, "to_d": to_d, "label": range_label,
+                  "t0": t0, "t1": t1},
+        "caveat": RIDERS_CAVEAT,
+        "dark_note": RIDERS_DARK_NOTE,
+        "gap_note": RIDERS_GAP_NOTE,
+        "data_gaps": list(DATA_GAPS),
+        "counting_eras": {
+            "in_range": eras_in_range, "current": cur_ver,
+            "crossing": len(eras_in_range) > 1,
+            "note": "cells carry the counting build that produced them; a range spanning more than "
+                    "one build pools counts made by different logic, and validated precision "
+                    "applies per build, never to the pool"},
+        "definition": "riders = boardings + alightings = counted crossings of the door line "
+                      "(transit_event). 'in' is a boarding; anything else, including a NULL "
+                      "direction, is an alighting.",
+    }
+
+
+def _rtt_per_hour_compute(db, gw, period="all"):
+    """rows = lift, cols = hour-of-day, cells = median RTT with n. READS rtt_window, never walks.
+
+    NO DERIVATION HAPPENS HERE AT ALL, and that is the design. rtt_refresh already walks each
+    camera's era once per window and stores rtt_core.summarise()'s output, whose by_hour is exactly
+    this row. Walking again would be a second RTT derivation — the thing rtt_core exists to prevent
+    — and it would cost the fleet's whole door history per period.
+
+    EVERY CAMERA GETS A ROW, and every row that has no numbers carries the REASON in its own words.
+    A camera with no floor attribution cannot have an RTT at all (the home floor is what defines a
+    trip), which is a different statement from "this lift made no round trips" — and a blank cell
+    makes them identical. The reason is taken from the stored payload's own note, so a state this
+    build has never heard of still arrives with an explanation rather than an empty row.
+    """
+    wd = RTT_PERIOD_DAYS.get(period if period in RTT_PERIOD_DAYS else "all", 0.0)
+    _, _, window = _window(wd)
+    _cams = _cameras(db, gw)
+    cams = [c["cam"] for c in _cams]
+    labels = {c["cam"]: (c.get("label") or "") for c in _cams}
+    rows = []
+    for cam in cams:
+        S, meta = _rtt_read(db, gw, cam, wd)
+        row = {"cam": cam, "label": labels.get(cam) or "",
+               "state": ((S or {}).get("state") or (meta or {}).get("state")),
+               "delivery_state": (meta or {}).get("state"),
+               "era": (S or {}).get("era"), "computed_at": (meta or {}).get("computed_at"),
+               "by_hour": None, "reason": None,
+               "n_trips": (S or {}).get("n_trips"), "n_plausible": (S or {}).get("n_plausible"),
+               "anomaly_rate": (S or {}).get("anomaly_rate"),
+               "all_day": (S or {}).get("all_day"),
+               "floor_attributed_pct": (S or {}).get("floor_attributed_pct"),
+               "home": (S or {}).get("home") or RTT_HOME}
+        # GUARD ON THE DATA THIS ROW NEEDS, NOT ON A LIST OF KNOWN-BAD STATES. A whitelist of bad
+        # states drifts out of date the moment the server gains one — that is exactly how
+        # too_many_rows took the whole trends view down on 2026-08-19. Asking "do I have the array
+        # I am about to walk" cannot drift.
+        bh = (S or {}).get("by_hour")
+        if isinstance(bh, list) and bh:
+            row["by_hour"] = [{"hour": h.get("hour"), "median": h.get("median"),
+                               "p85": h.get("p85"), "n": h.get("n") or 0,
+                               "anom": h.get("anom") or 0} for h in bh]
+        else:
+            # THE REASON MUST MATCH THE FAULT, and it must name which KIND of absence this is.
+            # These four are not shades of one thing — they are four different claims, and the one
+            # the reader draws decides whether they go and look at a lift, a camera, or a timer:
+            #
+            #   uncalibrated  no door engine has ever posted for this camera. Nothing to measure.
+            #   designed      the engine posts, but not the input RTT needs (no floor read, no era,
+            #                 no rows in the window). UNAVAILABLE, not zero.
+            #   pending       nobody has computed it yet. Says nothing about the lift at all.
+            #   refused       the server declined to answer (a cap, an ambiguity). Not an answer.
+            #
+            # Collapsing these into one blank is the defect this table exists to avoid; collapsing
+            # them into one WORD would only move it.
+            _st = (S or {}).get("state")
+            _ms = str((meta or {}).get("state") or "")
+            # THE MEASUREMENT'S REASON, NOT THE DELIVERY'S. Falling through to meta.state whenever
+            # the payload carried no `note` printed the word "ok" as the reason for a no_rows
+            # camera — because the payload WAS found and parsed, which is a true answer to a
+            # different question. That is the same two-fields-one-noun confusion rtt_state was
+            # corrected for; delivery may only speak when there is no payload at all.
+            _why = {
+                "no_rows": ("no door rows in this window for era "
+                            + str((S or {}).get("era") or "")[:24]
+                            + " — the engine has posted nothing here, which is not a lift that "
+                              "made no journeys"),
+                "no_era": "no door-engine reads in any era for this camera",
+            }
+            row["reason"] = ((S or {}).get("note")
+                             or (_why.get(_st) if S is not None else None)
+                             or (f"the stored payload reports state {_st!r} and carried no "
+                                 f"explanation" if _st else None)
+                             or (meta or {}).get("detail")
+                             or (meta or {}).get("state")
+                             or "no round-trip summary stored for this lift and window, and the "
+                                "stored payload carried no reason")
+            if _ms.startswith("no door rows"):
+                row["absence"] = "uncalibrated"
+            elif _st in ("no_floor", "no_era", "no_rows"):
+                row["absence"] = "designed"
+            elif "not yet computed" in _ms or "never run" in _ms or "unreadable" in _ms:
+                row["absence"] = "pending"
+            else:
+                row["absence"] = "refused"
+        rows.append(row)
+    return {
+        "gw": gw, "kind": "rtt_per_hour", "cams": cams, "labels": labels, "rows": rows,
+        "period": period, "window": window, "window_days": wd,
+        "home": RTT_HOME,
+        "definition": f"door CLOSED at {RTT_HOME} -> next door OPEN at {RTT_HOME}; both ends a "
+                      f"STOP, not a pass. Cells are the MEDIAN of the plausible trips starting in "
+                      f"that hour, with n beside them.",
+        "caveat": rtt_core_caveat(),
+        "travel_gap": rtt_core_travel_gap(),
+        # THE WINDOW IS THE STORED ONE, NOT THE PICKER'S. RTT is a rolling-window figure and is not
+        # re-derived to the picker's IST-aligned bounds; saying which window it describes is what
+        # stops a 7-day median being read under an "all data" heading.
+        "window_note": "each row is the rolling window named above, on that camera's CURRENT era — "
+                       "not the picker's exact calendar bounds, and never across an era boundary",
+        "fleet_note": "rows are NOT pooled: each lift is its own shaft and its own instrument. This "
+                      "table sets them side by side for comparison; it never sums them.",
+    }
+
+
+def rtt_core_caveat():
+    try:
+        import rtt_core
+        return rtt_core.RTT_CAVEAT
+    except Exception:
+        return None
+
+
+def rtt_core_travel_gap():
+    try:
+        import rtt_core
+        return rtt_core.TRAVEL_GAP
+    except Exception:
+        return None
+
+
+def _study_table(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS study_matrix (
+        gateway_id TEXT, kind TEXT, period TEXT,
+        counting_version TEXT, door_version TEXT,   -- FLEET era key: every camera's, joined
+        payload TEXT, computed_at REAL, compute_ms INTEGER,
+        PRIMARY KEY (gateway_id, kind, period, counting_version, door_version))""")
+
+
+def study_refresh(db, gw, kind, period="all"):
+    """Compute and STORE. Scheduler/CLI ONLY — never a request handler."""
+    if kind not in STUDY_KINDS:
+        raise ValueError(f"unknown study matrix {kind!r}")
+    _study_table(db)
+    cv, dv = _trends_key(db, gw, "")
+    t_start = time.time()
+    if kind == "riders_per_day":
+        body = _riders_per_day_compute(gw, period=period)
+    else:
+        body = _rtt_per_hour_compute(db, gw, period=period)
+    ms = int((time.time() - t_start) * 1000)
+    db.execute("INSERT INTO study_matrix (gateway_id,kind,period,counting_version,door_version,"
+               "payload,computed_at,compute_ms) VALUES (?,?,?,?,?,?,?,?) "
+               "ON CONFLICT(gateway_id,kind,period,counting_version,door_version) DO UPDATE SET "
+               "payload=excluded.payload, computed_at=excluded.computed_at, "
+               "compute_ms=excluded.compute_ms",
+               (gw, kind, period, cv, dv, json.dumps(body), time.time(), ms))
+    db.commit()
+    # One era per (kind, period): the key is the CURRENT one, so a retired era's row can never be
+    # read back and keeping it only grows the table.
+    db.execute("DELETE FROM study_matrix WHERE gateway_id=? AND kind=? AND period=? AND NOT "
+               "(counting_version=? AND door_version=?)", (gw, kind, period, cv, dv))
+    db.commit()
+    return {"gw": gw, "kind": kind, "period": period, "compute_ms": ms,
+            "bytes": len(json.dumps(body)),
+            "n_rows": len(body.get("rows") or [])}
+
+
+def _study_read(db, gw, kind, period):
+    """Serve the stored matrix. NEVER computes. -> (payload|None, meta).
+
+    A miss is PENDING, never "no riders" or "no round trips". Those are opposite claims and the
+    page must not print the second when the first is true."""
+    # _trends_key IS INSIDE THE try. It calls _current_keys, which uses a raw db.execute against
+    # gw_door_event and analyzer_status — so on a database missing either, the OperationalError
+    # escaped this function entirely and sailed past dash_export's db.close(), leaking the
+    # connection. The rule this function states is that a missing table is an honest empty.
+    dv = None
+    try:
+        cv, dv = _trends_key(db, gw, "")
+        r = db.execute("SELECT payload, computed_at, compute_ms FROM study_matrix WHERE "
+                       "gateway_id=? AND kind=? AND period=? AND counting_version=? "
+                       "AND door_version=?", (gw, kind, period or "all", cv, dv)).fetchone()
+    except sqlite3.OperationalError:
+        return None, {"state": "not yet computed — the precompute job has never run on this schema"}
+    if not r:
+        return None, {"state": "not yet computed for the current era",
+                      "detail": "the precompute job (liftlab-precompute.timer) fills this off the "
+                                "request path; this is pending computation, NOT an absence of data",
+                      "current_door_version": dv}
+    try:
+        body = json.loads(r["payload"])
+    except (ValueError, TypeError):
+        return None, {"state": "stored matrix unreadable", "computed_at": r["computed_at"]}
+    age = (time.time() - r["computed_at"]) if r["computed_at"] else None
+    return body, {"state": "ok", "computed_at": r["computed_at"],
+                  "age_s": (round(age, 1) if age is not None else None),
+                  "stale": bool(age is not None and age > TRENDS_STALE_S),
+                  "compute_ms": r["compute_ms"],
+                  "source": "study_matrix (precomputed off the request path)"}
+
+
+def _study_skeleton(gw, kind, meta):
+    """The payload shape with every value NULL and state='not_computed'.
+
+    STRUCTURALLY COMPLETE, for the reason _trends_skeleton records: a payload that omits keys is not
+    a smaller answer, it is a crash — and it would ship as "the view is broken after deploy",
+    indistinguishable from the thing precompute was meant to fix.
+    """
+    common = {"gw": gw, "kind": kind, "state": "not_computed", "cache": meta,
+              "note": "this view is precomputed off the request path and has not been computed for "
+                      "the current era yet. It is NOT a report that there is no data — run "
+                      "precompute_job.py, or wait for liftlab-precompute.timer.",
+              "cams": [], "labels": {}, "rows": []}
+    if kind == "riders_per_day":
+        return {**common, "col_total": {}, "grand_total": None, "n_days": None,
+                "range": {"period": None, "from_d": None, "to_d": None, "label": None,
+                          "t0": None, "t1": None},
+                "caveat": RIDERS_CAVEAT, "dark_note": RIDERS_DARK_NOTE,
+                "gap_note": RIDERS_GAP_NOTE, "data_gaps": [],
+                "counting_eras": {"in_range": [], "current": {}, "crossing": False, "note": None},
+                "definition": None}
+    return {**common, "period": None, "window": None, "window_days": None, "home": RTT_HOME,
+            "definition": None, "caveat": rtt_core_caveat(), "travel_gap": rtt_core_travel_gap(),
+            "window_note": None, "fleet_note": None}
+
+
+@dash_router.get("/dash/{gw}/riders_per_day")
+def dash_riders_per_day(gw: str, period: str = "all", from_d: str = "", to_d: str = ""):
+    """RIDERS PER LIFT PER DAY — rows = date, cols = lift, cells = riders.
+
+    Aggregation of data that already exists; no new measurement, and no request-path derivation for
+    the periods the picker offers. A CUSTOM DATE RANGE still derives, on the same rule dash_trends
+    follows: that is a deliberate question someone has asked, it is not what the page loads, and it
+    is bounded in SQL rather than being a row-by-row walk.
+    """
+    # AN UNRECOGNISED PERIOD IS REFUSED, not answered. _range_bounds maps anything it does not
+    # know to (None, None, "all data"), so ?period=ALL or ?period=1 fell straight past the cache
+    # and ran a FLEET-WIDE all-history aggregation on the request path — while the response called
+    # itself "derived live: custom date range", which was not true either. A typo must not be able
+    # to buy the most expensive answer in the system under a label that hides it.
+    if period and period not in _TRENDS_CACHEABLE_PERIODS and not (from_d or to_d):
+        return JSONResponse({"error": f"unknown period {period!r}",
+                             "periods": [p for p in _TRENDS_CACHEABLE_PERIODS if p],
+                             "detail": "pass one of the periods above, or an explicit from_d/to_d "
+                                       "pair (YYYY-MM-DD). An unrecognised period would otherwise "
+                                       "be answered from ALL history, fleet-wide, on the request "
+                                       "path."}, status_code=400)
+    cacheable = (not from_d and not to_d and (period or "all") in _TRENDS_CACHEABLE_PERIODS)
+    db = _db()
+    try:
+        if cacheable:
+            body, meta = _study_read(db, gw, "riders_per_day", period or "all")
+            if body is not None:
+                return JSONResponse({**body, "cache": meta}, headers={"Cache-Control": "no-store"})
+            return JSONResponse(_study_skeleton(gw, "riders_per_day", meta),
+                                headers={"Cache-Control": "no-store"})
+    finally:
+        db.close()
+    body = _riders_per_day_compute(gw, period=period, from_d=from_d, to_d=to_d)
+    return JSONResponse({**body, "cache": {"state": "derived live",
+                                           "why": "explicit from_d/to_d date range"}},
+                        headers={"Cache-Control": "no-store"})
+
+
+@dash_router.get("/dash/{gw}/rtt_fleet")
+def dash_rtt_fleet(gw: str, period: str = "all", from_d: str = "", to_d: str = ""):
+    """RTT PER HOUR PER LIFT — rows = lift, cols = hour, cells = median RTT with n.
+
+    READ ONLY, ALWAYS, including for a custom range — and this endpoint refuses one rather than
+    deriving it. RTT is stored per rolling window on each camera's current era; a calendar range has
+    no stored answer, and walking seven cameras' door history to invent one is precisely the 152.8 s
+    request that moved RTT onto the timer in the first place. dash_rtt refuses the same way.
+    """
+    if from_d or to_d:
+        return JSONResponse(
+            {"gw": gw, "kind": "rtt_per_hour", "state": "not served for this range", "rows": [],
+             "cams": [], "labels": {},
+             "error": "round trips are precomputed for the rolling windows the period buttons name "
+                      "(1, 7, 30 days and all history), on each camera's current era. Deriving one "
+                      "for a calendar range would put a seven-camera door walk back on the request "
+                      "path. Use the period buttons, or tools/rtt.py off the request path."},
+            headers={"Cache-Control": "no-store"})
+    db = _db()
+    try:
+        body, meta = _study_read(db, gw, "rtt_per_hour", period or "all")
+    finally:
+        db.close()
+    if body is None:
+        return JSONResponse(_study_skeleton(gw, "rtt_per_hour", meta),
+                            headers={"Cache-Control": "no-store"})
+    return JSONResponse({**body, "cache": meta}, headers={"Cache-Control": "no-store"})
+
+
 # ============================================================ CSV export
 # The rows BEHIND every chart and table, filtered to the same range (and, for floor data, the same
 # door era) the screen is showing. Anything else is a different dataset wearing the same name: an
@@ -3051,6 +3618,12 @@ _EXPORT = {
     "per_floor":   "the Tier-2 per-floor aggregate — stops, direction split, riders",
     "episodes":    "one row per door-open episode (validation_item): peak car occupancy + its coverage",
     "rtt":         "one row per ROUND TRIP: home-floor close -> next home-floor open, with stops",
+    "riders_per_day": "the RIDERS PER LIFT PER DAY matrix as displayed: rows = date, columns = "
+                      "lift, cells = the selected measure (split=riders|boarded|alighted)",
+    "riders_per_day_long": "the same matrix one cell per row, with the boardings/alightings split, "
+                           "the observation flag and the counting build, all on every row",
+    "rtt_per_hour": "the RTT PER HOUR PER LIFT matrix, one cell per row: lift x hour, median RTT "
+                    "with n — and the absence REASON on every cell of a lift that has none",
 }
 
 # WHY OCCUPANCY IS ITS OWN DATASET AND NOT COLUMNS ON door_cycles. door_cycles is gw_event — the Pi
@@ -3061,11 +3634,20 @@ _EXPORT = {
 # The episode is the natural grain anyway: one door-open, one peak, one coverage denominator.
 
 
-def _csv(rows, header, name):
+def _csv(rows, header, name, notes=()):
+    """notes ride INSIDE the file as '#'-prefixed lines, the convention demand_log already uses.
+
+    A table mailed onward without its caveats will be misread — "riders" as a headcount of people,
+    a dark cell as a zero — and a note in the download link does not travel with the attachment.
+    Comment lines are skipped by every CSV reader that honours '#', and the data below them still
+    parses as ordinary CSV either way."""
     import csv
     import io
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
+    for n in (notes or ()):
+        for line in str(n).splitlines():
+            buf.write("# " + line + "\n")
     w.writerow(header)
     for r in rows:
         w.writerow(r)
@@ -3160,8 +3742,13 @@ def dash_cams(gw: str):
 
 @dash_router.get("/dash/{gw}/export.csv")
 def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
-                period: str = "all", from_d: str = "", to_d: str = "", era: str = ""):
-    """Download the underlying rows. dataset = door_cycles | transits | floor_events | per_floor.
+                period: str = "all", from_d: str = "", to_d: str = "", era: str = "",
+                split: str = "riders"):
+    """Download the underlying rows. dataset = one of _EXPORT (see it for the full list).
+
+    split applies to the WIDE riders_per_day file only and chooses what the cells hold —
+    riders (the default), boarded or alighted — so the download matches whichever measure the
+    screen is showing rather than quietly exporting a different one.
 
     era applies to the era-scoped datasets (floor_events, per_floor): "" = each camera's current
     era exactly as the panel resolves it; an explicit spec ("ch16=abc123h1" or a bare era) selects
@@ -3222,6 +3809,140 @@ def dash_export(gw: str, dataset: str = "door_cycles", cam: str = "",
         db.close()
         return _csv(out, ["cam", "start_epoch", "start_ist", "end_epoch", "rtt_s", "stops",
                           "class", "anomaly_reason", "home_floor", "era"], f"{tag}.csv")
+
+    # ── the two study matrices, from the SAME payload the screen draws ──────────────────────
+    # NOT a second aggregation. If the file were built by its own query it could disagree with the
+    # table above it about a day's riders, and the table would get blamed — which is the whole
+    # reason this endpoint exists in the shape it does.
+    if dataset in ("riders_per_day", "riders_per_day_long"):
+        if period and period not in _TRENDS_CACHEABLE_PERIODS and not (from_d or to_d):
+            db.close()
+            return JSONResponse({"error": f"unknown period {period!r}",
+                                 "periods": [p for p in _TRENDS_CACHEABLE_PERIODS if p]},
+                                status_code=400)
+        cacheable = (not from_d and not to_d and (period or "all") in _TRENDS_CACHEABLE_PERIODS)
+        body, meta = (None, None)
+        if cacheable:
+            body, meta = _study_read(db, gw, "riders_per_day", period or "all")
+        db.close()
+        if body is None:
+            if cacheable and (meta or {}).get("state") != "ok":
+                # PENDING IS NOT AN EMPTY TABLE. A zero-row file reads as "this fleet carried
+                # nobody"; the truth is that nobody has computed it yet, and the file says so.
+                return _csv([], ["state", "detail"], f"{tag}.csv",
+                            notes=[f"NOT COMPUTED YET — {(meta or {}).get('state')}",
+                                   (meta or {}).get("detail") or "",
+                                   "This file is EMPTY because the precompute job has not filled "
+                                   "this range for the current era. It is NOT a report that no "
+                                   "rider was counted."])
+            body = _riders_per_day_compute(gw, period=period, from_d=from_d, to_d=to_d)
+            meta = {"state": "derived live", "why": "custom date range"}
+        cams = body.get("cams") or []
+        head_notes = [
+            "RIDERS PER LIFT PER DAY — " + str(body.get("definition") or ""),
+            "CAVEAT: " + str(body.get("caveat") or ""),
+            "DARK: " + str(body.get("dark_note") or ""),
+            "GAPS: " + str(body.get("gap_note") or ""),
+            "RANGE: " + str(((body.get("range") or {}).get("label")) or ""),
+            "COUNTING BUILDS IN RANGE: "
+            + (", ".join((body.get("counting_eras") or {}).get("in_range") or []) or "none recorded")
+            + ((". THIS RANGE CROSSES A COUNTING BUILD — counts made by different logic are in one "
+                "table and validated precision applies per build, never to the pool.")
+               if (body.get("counting_eras") or {}).get("crossing") else ""),
+            "SOURCE: " + str((meta or {}).get("source") or (meta or {}).get("state") or ""),
+        ]
+        if dataset == "riders_per_day_long":
+            out = []
+            for r in body.get("rows") or []:
+                for c in cams:
+                    cell = (r.get("cells") or {}).get(c) or {}
+                    out.append((r["date"], c, (body.get("labels") or {}).get(c) or "",
+                                DARK if not cell.get("observed") else (cell.get("b")),
+                                DARK if not cell.get("observed") else (cell.get("a")),
+                                DARK if not cell.get("observed") else (cell.get("riders")),
+                                "yes" if cell.get("observed") else "no",
+                                cell.get("counting_version") or "",
+                                cell.get("version_source") or "",
+                                "yes" if cell.get("off_era") else "no",
+                                " ".join(cell.get("mixed_versions") or [])))
+            return _csv(out, ["date_ist", "cam", "lift", "boarded", "alighted", "riders",
+                              "observed", "counting_version", "counting_version_source",
+                              "off_current_era", "mixed_versions"], f"{tag}.csv", notes=head_notes)
+        # WIDE — the matrix exactly as displayed, in whichever measure the screen is showing.
+        sp = (split or "riders").strip().lower()
+        if sp not in ("riders", "boarded", "alighted"):
+            sp = "riders"
+        key = {"riders": "riders", "boarded": "b", "alighted": "a"}[sp]
+        # THE MEASURE GOES IN THE FILENAME. Three downloads of three different measures all landed
+        # as one name, in a folder of files whose whole purpose is to be mailed onward.
+        tag = f"{tag}_{sp}"
+        head_notes.insert(1, f"CELLS ARE: {sp} (split=riders|boarded|alighted selects this)")
+        out = []
+        for r in body.get("rows") or []:
+            tot = r.get("total") or {}
+            out.append((r["date"],
+                        *[(DARK if not ((r.get("cells") or {}).get(c) or {}).get("observed")
+                           else ((r.get("cells") or {}).get(c) or {}).get(key))
+                          for c in cams],
+                        tot.get(key), tot.get("cams_observed")))
+        ct = body.get("col_total") or {}
+        g = body.get("grand_total") or {}
+        out.append(("TOTAL", *[(ct.get(c) or {}).get(key) for c in cams], g.get(key), ""))
+        out.append(("days observed", *[(ct.get(c) or {}).get("days_observed") for c in cams],
+                    body.get("n_days"), ""))
+        return _csv(out, ["date_ist", *cams, "total", "lifts_observed"], f"{tag}.csv",
+                    notes=head_notes)
+
+    if dataset == "rtt_per_hour":
+        if from_d or to_d:
+            db.close()
+            return _csv([], ["state", "detail"], f"{tag}.csv",
+                        notes=["NOT SERVED FOR THIS RANGE — round trips are precomputed for the "
+                               "rolling windows the period buttons name (1, 7, 30 days and all "
+                               "history), on each camera's current era.",
+                               "Deriving one for a calendar range would put a seven-camera door "
+                               "walk back on the request path. This file is EMPTY for that reason "
+                               "and NOT because no lift made a round trip."])
+        body, meta = _study_read(db, gw, "rtt_per_hour", period or "all")
+        db.close()
+        if body is None:
+            return _csv([], ["state", "detail"], f"{tag}.csv",
+                        notes=[f"NOT COMPUTED YET — {(meta or {}).get('state')}",
+                               (meta or {}).get("detail") or "",
+                               "This file is EMPTY because the precompute job has not filled this "
+                               "window for the current era. It is NOT a report that no lift made a "
+                               "round trip."])
+        notes = ["RTT PER HOUR PER LIFT — " + str(body.get("definition") or ""),
+                 "WINDOW: " + str(((body.get("window") or {}).get("label")) or "")
+                 + ". " + str(body.get("window_note") or ""),
+                 "FLEET: " + str(body.get("fleet_note") or ""),
+                 "CAVEAT: " + str(body.get("caveat") or ""),
+                 "TRAVEL: " + str(body.get("travel_gap") or ""),
+                 "ABSENCE: a lift with no round-trip summary still has 24 rows here, each carrying "
+                 "the REASON in the reason column. An empty cell in a pivot cannot say whether the "
+                 "lift made no journeys or could not be measured; the reason can."]
+        out = []
+        for r in body.get("rows") or []:
+            bh = r.get("by_hour")
+            if isinstance(bh, list) and bh:
+                for h in bh:
+                    out.append((r["cam"], r.get("label") or "", h.get("hour"),
+                                h.get("median"), h.get("p85"), h.get("n") or 0,
+                                h.get("anom") or 0, r.get("state") or "", "",
+                                r.get("era") or "", r.get("home") or RTT_HOME,
+                                body.get("window_days")))
+            else:
+                # THE REASON ON EVERY CELL, ON PURPOSE. One summary row per camera would vanish the
+                # moment the file is pivoted to lift x hour — which is the shape this dataset is
+                # for — and the pivot would show 24 blanks with no explanation anywhere in it.
+                for hh in range(24):
+                    out.append((r["cam"], r.get("label") or "", hh, "", "", "", "",
+                                r.get("state") or "", r.get("reason") or "",
+                                r.get("era") or "", r.get("home") or RTT_HOME,
+                                body.get("window_days")))
+        return _csv(out, ["cam", "lift", "hour_ist", "rtt_median_s", "rtt_p85_s", "n_trips",
+                          "n_anomalies", "state", "reason", "era", "home_floor", "window_days"],
+                    f"{tag}.csv", notes=notes)
 
     if dataset == "episodes":
         rows = _q(db, "SELECT cam, ts_start, ts_end, machine_boarded, machine_alighted, "
@@ -3373,6 +4094,20 @@ table.t2 th{text-align:right;color:#888;font-weight:500;padding:2px 6px;border-b
 table.t2 th:first-child,table.t2 td:first-child{text-align:left}
 table.t2 td{text-align:right;padding:2px 6px;border-bottom:1px solid #f2f5f7;font-variant-numeric:tabular-nums}
 .foot{margin-top:14px;font-size:12px}
+/* MATRIX TABLES — riders/lift/day and RTT/hour/lift. Numeric cells are tight and tabular so a
+   seven-lift x 24-hour grid stays readable; the DARK class is deliberately NOT the same visual as
+   a zero cell, because that is the one confusion these tables exist to prevent. */
+table.mtx td,table.mtx th{padding:2px 4px;font-size:11px;white-space:nowrap}
+table.mtx th{position:sticky;top:0;background:#fff}
+table.mtx td.dark{background:repeating-linear-gradient(45deg,#eee,#eee 3px,#fafafa 3px,#fafafa 6px);
+  color:#999}
+table.mtx td.offera{box-shadow:inset 0 0 0 2px #b06a00}
+table.mtx td.noabs{background:rgba(176,106,0,.07);border-left:3px solid #b06a00;
+  text-align:left;white-space:normal;font-size:11px;padding:6px 8px}
+table.mtx td.pend{background:rgba(102,102,119,.07);border-left:3px solid #667;
+  text-align:left;white-space:normal;font-size:11px;padding:6px 8px}
+.swatch{display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:-1px;
+  border:1px solid #ddd}
 </style>
 __NAV__
 <h1 style="padding:0 2px">liftlab · dash <span class=mut id=stamp></span></h1>
@@ -3383,6 +4118,8 @@ __NAV__
 <div id=unavail></div>
 <div id=camview><div class=tabs id=tabs></div><div id=panel></div></div>
 <div id=trendview style="display:none"></div>
+<div id=ridersview style="display:none"></div>
+<div id=rttfleetview style="display:none"></div>
 <div id=tip></div>
 <div class=foot mut>deep views: <a href="__FLEET__">Pi fleet</a> · <a href="/ops/__GW__">/ops</a> ·
   <a href="/events">/events</a> · <a href="/validate">/validate</a> ·
@@ -3395,8 +4132,22 @@ var GW="__GW__", cur=null, DATA=null;
 // ?view=trends was WRITTEN by selectCam and read by nothing — a URL parameter the page emitted and
 // then ignored, so a shared link always landed on Cameras. Read here, applied once the first data
 // load has run (setMode needs the DOM nodes and the camera list).
-var WANT_VIEW=(/[?&]view=trends\b/.test(location.search))?'trends':'cams';
-function esc(s){return s==null?'':(''+s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
+// ?view= names ONE of the views. This was a boolean ('trends' or not) and adding a third view to
+// a boolean is how a shared link silently lands on the wrong page — the same defect the parameter
+// was added to fix. Anything unrecognised falls back to Cameras rather than to a blank pane.
+var WANT_VIEW=(function(){
+  var m=/[?&]view=([a-z]+)/.exec(location.search);
+  var v=m?m[1]:'cams';
+  return (v==='trends'||v==='riders'||v==='rttfleet')?v:'cams';
+})();
+// ESCAPES QUOTES TOO, and that is not cosmetic. Camera labels are operator-supplied and stored
+// verbatim (survey_api only strips and truncates them), and the matrix views are the first code
+// here to put a database string inside an HTML ATTRIBUTE — title=, data-tip=. A label containing a
+// double quote closes the attribute early and everything after it is parsed as markup. In a TEXT
+// node &quot;/&#39; render as the characters themselves, so nothing that already used esc() looks
+// any different.
+function esc(s){return s==null?'':(''+s).replace(/[&<>"']/g,function(c){
+  return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function age(s){return s==null?'—':(s<90?Math.round(s)+'s':Math.round(s/60)+'m')+' ago'}
 function kv(k,v,c){return '<div class=kv><span class=mut>'+k+'</span><b class="'+(c||'')+'">'+v+'</b></div>'}
 function staleCls(s,lim){return s==null?'stale':(s>lim?'stale':'ok')}
@@ -3920,15 +4671,22 @@ function loadRTT(cam){
 // trCam is seeded from `cur` (which reads ?cam= above) by tabs(), and thereafter only ever written
 // by selectCam. It is deliberately NOT parsed from the URL a second time: two independent readers of
 // one parameter is how they drifted in the first place.
+var VIEWS=[['cams','Cameras','camview'],['trends','Trends','trendview'],
+           ['riders','Riders / day','ridersview'],['rttfleet','RTT / lift','rttfleetview']];
 function nav(){
-  document.getElementById('nav').innerHTML=
-    '<div class="tab'+(mode==='cams'?' on':'')+'" onclick="setMode(\'cams\')">Cameras</div>'
-   +'<div class="tab'+(mode==='trends'?' on':'')+'" onclick="setMode(\'trends\')">Trends</div>';
+  document.getElementById('nav').innerHTML=VIEWS.map(function(v){
+    return '<div class="tab'+(mode===v[0]?' on':'')+'" onclick="setMode(\''+v[0]+'\')">'
+      +esc(v[1])+'</div>';}).join('');
 }
 function setMode(m){mode=m;
-  document.getElementById('camview').style.display=(m==='cams')?'':'none';
-  document.getElementById('trendview').style.display=(m==='trends')?'':'none';
-  nav(); if(m==='trends')loadTrends();
+  // EVERY view is hidden and exactly one shown, from the one list. Two hardcoded style lines per
+  // view is how a third view arrives on top of a second one.
+  VIEWS.forEach(function(v){var e=document.getElementById(v[2]);
+    if(e)e.style.display=(mode===v[0])?'':'none';});
+  nav();
+  if(m==='trends')loadTrends();
+  else if(m==='riders')loadRiders();
+  else if(m==='rttfleet')loadRttFleet();
 }
 
 // ---- inline SVG charts (CSP-safe, no libs) ----
@@ -4107,14 +4865,26 @@ function trCams(){
 // A picked date pair OVERRIDES the period buttons (the server prefers from_d/to_d too); picking a
 // period clears the dates so the two can never silently disagree about what the screen shows.
 var trPeriod='all', trFrom='', trTo='', trTable=false;
-function setPeriod(p){trPeriod=p;trFrom='';trTo='';loadTrends();}
-function setDates(){
-  trFrom=(document.getElementById('dfrom')||{}).value||'';
-  trTo=(document.getElementById('dto')||{}).value||'';
-  if(trFrom||trTo)trPeriod='';
-  loadTrends();
+// ONE PICKER, WHICHEVER VIEW IS SHOWING. These called loadTrends() by name, so picking a period
+// on the Riders or RTT tab reloaded a view the reader was not looking at and left the one they
+// were on describing the old range — a chart under the wrong heading, one tab along.
+function reloadView(){
+  if(mode==='riders')loadRiders();
+  else if(mode==='rttfleet')loadRttFleet();
+  else loadTrends();
 }
-function clearDates(){trFrom='';trTo='';trPeriod='all';loadTrends();}
+function setPeriod(p){trPeriod=p;trFrom='';trTo='';reloadView();}
+function setDates(){
+  // THE ID IS PER VIEW. periodBar() is rendered into three panes that are HIDDEN, not removed, so
+  // a bare id='dfrom' existed up to three times and getElementById returned the FIRST in tree
+  // order — Trends'. Picking a date on the Riders tab then read Trends' empty box, trFrom never
+  // changed, and the date visibly reverted on redraw.
+  trFrom=(document.getElementById('dfrom-'+mode)||{}).value||'';
+  trTo=(document.getElementById('dto-'+mode)||{}).value||'';
+  if(trFrom||trTo)trPeriod='';
+  reloadView();
+}
+function clearDates(){trFrom='';trTo='';trPeriod='all';reloadView();}
 // ONE query builder for the trends fetch AND every CSV link — the chart and its export can never
 // describe different rows. from_d/to_d are YYYY-MM-DD (IST calendar days, inclusive both ends).
 function trQuery(){
@@ -4126,19 +4896,22 @@ function trQuery(){
     +(eq?('&'+eq):'');
 }
 function toggleTable(){trTable=!trTable;renderTrends();}
-function periodBar(){
+function periodBar(extra){
+  // `extra` replaces the chart/table toggle, which is a Trends concept. Passing '' means "no
+  // control here"; omitting the argument keeps the toggle, so every existing caller is unchanged.
   var opts=[['day','Today'],['week','7 days'],['month','30 days'],['all','All']];
   var dstyle='font:inherit;font-size:11px;padding:2px 4px;border:1px solid #bbb;border-radius:4px;background:transparent;color:inherit';
   return '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:2px 0 8px">'
     +opts.map(function(o){return '<button class="tog'+(trPeriod===o[0]?' on':'')+'" onclick="setPeriod(\''+o[0]+'\')">'+o[1]+'</button>';}).join('')
     +'<span style="width:10px"></span>'
-    +'<input type=date id=dfrom value="'+trFrom+'" onchange="setDates()" style="'+dstyle+'">'
+    +'<input type=date id="dfrom-'+mode+'" value="'+esc(trFrom)+'" onchange="setDates()" style="'+dstyle+'">'
     +'<span class=mut style="font-size:11px">to</span>'
-    +'<input type=date id=dto value="'+trTo+'" onchange="setDates()" style="'+dstyle+'">'
+    +'<input type=date id="dto-'+mode+'" value="'+esc(trTo)+'" onchange="setDates()" style="'+dstyle+'">'
     +((trFrom||trTo)?'<button class=tog onclick="clearDates()">✕ dates</button>':'')
     +'<span style="width:10px"></span>'
-    +'<button class="tog'+(trTable?' on':'')+'" onclick="toggleTable()">'+(trTable?'charts':'table')+'</button>'
-    +'<span class=mut id=rangelab style="font-size:11px;margin-left:6px"></span></div>';
+    +((extra!==undefined)?extra
+      :('<button class="tog'+(trTable?' on':'')+'" onclick="toggleTable()">'+(trTable?'charts':'table')+'</button>'))
+    +'<span class=mut id="rangelab-'+mode+'" style="font-size:11px;margin-left:6px"></span></div>';
 }
 // Every download carries the SAME cam/period/date-range the screen is showing, so a spreadsheet
 // and the chart above it cannot disagree about which rows they describe.
@@ -4498,7 +5271,24 @@ function render(){ if(!DATA)return;
   if(!cur){ cur=(DATA.cameras[0]&&DATA.cameras[0].cam)||''; }
   if(cur && trCam !== cur){ trCam = cur; }
   nav(); healthbar(DATA); strip(DATA); headline(DATA); unavail(DATA);
-  if(mode==='cams'){tabs(DATA); panel(DATA);} }
+  if(mode==='cams'){tabs(DATA); panel(DATA);}
+  // The fleet matrices are redrawn from their OWN cached payload, never refetched here: the 15s
+  // /data refresh must not turn into a second request loop against two more endpoints.
+  //
+  // AND A THROW HERE IS CAUGHT. render() runs inside load()'s .then(), whose .catch counts
+  // consecutive failures and calls dataUnavailable() after three — so a payload shape either
+  // matrix could not draw would stop the WHOLE dashboard refreshing and report it as a network
+  // fault. Same split as loadRiders/loadTrends: the render fault is labelled as one, in its own
+  // pane, and the page keeps refreshing.
+  else if(mode==='riders'||mode==='rttfleet'){
+    var _f=(mode==='riders')?renderRiders:renderRttFleet;
+    try{_f();}
+    catch(e){
+      var _m=String((e&&e.message)||e||'the payload could not be drawn');
+      if(mode==='riders'){RD={render_error:_m}; renderRiders();}
+      else {RF={render_error:_m}; renderRttFleet();}
+    }
+  } }
 
 /* ── DATA REFRESH: one in flight, bounded failures, backoff ────────────────────
    This was `load(); setInterval(load, 15000);` — a fixed timer with NO in-flight guard and no
@@ -4564,7 +5354,7 @@ function load(){
       // Apply ?view=trends ONCE, after the first payload: setMode needs the camera list, and render()
       // above has just seeded trCam from cur, so the trends fetch goes out for the camera in the URL
       // rather than for whatever was selected last.
-      if(WANT_VIEW==='trends' && mode!=='trends'){ WANT_VIEW='cams'; setMode('trends'); }
+      if(WANT_VIEW!=='cams' && mode!==WANT_VIEW){ var _w=WANT_VIEW; WANT_VIEW='cams'; setMode(_w); }
       scheduleLoad(REFRESH_MS);
     })
     .catch(function(err){
@@ -4576,6 +5366,320 @@ function load(){
       scheduleLoad(wait);
     });
 }
+
+// ── STUDY VIEW 1: RIDERS PER LIFT PER DAY ─────────────────────────────────────────────────
+// rows = IST date, cols = lift, cells = riders. An aggregation of transit_event, not a new
+// measurement, and it is precomputed for the same reason everything else here is: a fleet table
+// touches every camera, so whatever a per-camera panel costs, this costs seven times.
+//
+// THE TWO THINGS THIS VIEW MUST NEVER GET WRONG, both of which the rest of this file has been
+// corrected for at least once:
+//   * DARK IS NOT ZERO. '—' means nobody was watching; 0 means the lift was watched and carried
+//     nobody. They are drawn differently and the legend says so, because a reader who takes the
+//     first for the second understates demand exactly where coverage is worst.
+//   * RIDERS ARE NOT PEOPLE. Every crossing counts, so a round trip counts twice. The caveat sits
+//     under the table, not in a tooltip, because the table is what gets screenshotted.
+var RD=null, ridersSplit='riders';
+function setRidersSplit(s){ridersSplit=s;renderRiders();}
+function fleetQuery(){
+  // The SAME range the screen is showing, minus the camera: these are fleet tables and a cam
+  // parameter on the download would name a lift the file does not describe.
+  return 'period='+encodeURIComponent(trPeriod||'all')
+    +(trFrom?('&from_d='+encodeURIComponent(trFrom)):'')
+    +(trTo?('&to_d='+encodeURIComponent(trTo)):'');
+}
+function studyMiss(title,body,detail){
+  return '<div style="padding:12px;border:1px dashed #667;border-radius:6px">'
+    +'<b>'+esc(title)+'</b><div class=mut style="font-size:12px;margin-top:4px">'+esc(body)
+    +(detail?(' '+esc(detail)):'')+'</div></div>';
+}
+function studyFail(P,what,again){
+  var isFetch=!!P.fetch_error;
+  return '<div style="padding:12px;border:1px dashed #b00;border-radius:6px">'
+    +'<b>'+esc(what)+(isFetch?' REQUEST FAILED':' RENDER FAILED')+'</b>'
+    +'<div class=mut style="font-size:12px;margin-top:4px">'+esc(P.fetch_error||P.render_error)
+    +(isFetch?'':' — the request SUCCEEDED and the payload could not be drawn. This is a bug in '
+      +'the page or a payload shape it does not handle, not a slow or unreachable server.')
+    +'</div>'
+    // RETRY THE VIEW THAT FAILED. This was hardcoded to loadRiders(), so a failed RTT fetch
+    // offered a button that refetched the OTHER matrix into a hidden pane and left this panel on
+    // "REQUEST FAILED" for ever — and the panel replaces the period bar, so there was no other
+    // way back.
+    +(isFetch?('<div style="margin-top:8px"><button onclick="'+again+'()">retry</button></div>'):'')
+    +'</div>';
+}
+function ridersCell(c){
+  // A DARK CELL AND A ZERO CELL ARE DRAWN DIFFERENTLY, deliberately. Same glyph for both is the
+  // whole defect; the tooltip states which absence this is in words as well.
+  if(!c||!c.observed){
+    return '<td class=dark title="not observed — this camera produced no rows in any stream '
+      +'that day. This is NOT a day the lift carried nobody.">'+esc(DARKG)+'</td>';
+  }
+  var key=(ridersSplit==='boarded')?'b':(ridersSplit==='alighted')?'a':'riders';
+  var v=c[key], mx=RDMAX||1;
+  var tip=c.riders+' riders ('+c.b+' boarded, '+c.a+' alighted)'
+    +(c.counting_version?(' · counted by '+c.counting_version):'')
+    +(c.off_era?' — NOT the build now in use on this lift':'');
+  return '<td'+(c.off_era?' class=offera':'')+' style="background:'+heatColor(v/mx,'riders')+'"'
+    +' data-tip="'+esc(tip)+'" title="'+esc(tip)+'">'+v+'</td>';
+}
+var DARKG='—', RDMAX=1;
+function renderRiders(){
+  var el=document.getElementById('ridersview'); if(!el)return;
+  if(!RD){el.innerHTML='<div class=mut>loading…</div>';return;}
+  if(RD.fetch_error||RD.render_error){el.innerHTML=studyFail(RD,'RIDERS PER DAY','loadRiders');return;}
+  if(RD.state==='not_computed'){
+    // NOT COMPUTED YET is not "no riders". Drawing an empty grid here would report a fleet that
+    // carried nobody, which is the same misreading as the 0-cycles bug three panels over.
+    el.innerHTML=periodBar(ridersBtns())
+      +studyMiss('NOT COMPUTED YET',RD.note||'',(RD.cache||{}).detail);
+    return;
+  }
+  if(!Array.isArray(RD.rows)||!Array.isArray(RD.cams)){
+    el.innerHTML=periodBar(ridersBtns())
+      +'<div style="padding:12px;border:1px dashed #b00;border-radius:6px">'
+      +'<b>RIDERS PAYLOAD INCOMPLETE</b><div class=mut style="font-size:12px;margin-top:4px">'
+      +'the response is missing fields this view requires (rows / cams), so it is being reported '
+      +'rather than drawn.</div></div>';
+    return;
+  }
+  if(!RD.rows.length){
+    // AN EMPTY RANGE IS NOT AN EMPTY FLEET. No row at all means no camera produced a row in ANY
+    // stream anywhere in this range — nobody was watching — and drawing a grid of zeros here would
+    // say the building did not use its lifts. Same rule as the dark cell, one level up.
+    document.getElementById('ridersview').innerHTML=periodBar(ridersBtns())
+      +studyMiss('NO OBSERVED DAY IN THIS RANGE',
+        'No camera produced a row in any stream between '
+        +((RD.range||{}).label||'these dates')+'. Every day in the range would be '+DARKG+', so '
+        +'the table has nothing to draw. This is NOT a report that the lifts carried nobody — it '
+        +'is a report that nothing was watching.',
+        (RD.data_gaps||[]).length?('A known outage overlaps this period: '
+          +(RD.data_gaps||[]).map(function(x){return x.note}).join(' · ')):'');
+    return;
+  }
+  var cams=RD.cams, key=(ridersSplit==='boarded')?'b':(ridersSplit==='alighted')?'a':'riders';
+  RDMAX=1;
+  RD.rows.forEach(function(r){cams.forEach(function(c){
+    var cell=(r.cells||{})[c]; if(cell&&cell.observed&&cell[key]>RDMAX)RDMAX=cell[key];});});
+  var nDark=0,nCells=0,nOff=0;
+  RD.rows.forEach(function(r){cams.forEach(function(c){
+    var cell=(r.cells||{})[c]; nCells++;
+    if(!cell||!cell.observed)nDark++; else if(cell.off_era)nOff++;});});
+
+  var head='<tr><th>date</th>'+cams.map(function(c){
+      var lbl=(RD.labels||{})[c]||'';
+      return '<th title="'+esc(lbl)+'">'+esc(c)+(lbl?('<div class=mut style="font-weight:400;'
+        +'font-size:9px">'+esc(lbl)+'</div>'):'')+'</th>';}).join('')
+    +'<th>total</th><th title="how many lifts were observed that day — a total over fewer '
+    +'lifts is not a smaller day">lifts</th></tr>';
+  var body=RD.rows.map(function(r){
+    return '<tr><td class=mono>'+esc(r.date)+'</td>'
+      +cams.map(function(c){return ridersCell((r.cells||{})[c])}).join('')
+      +'<td><b>'+((r.total||{})[key])+'</b></td>'
+      +'<td class=mut>'+((r.total||{}).cams_observed)+'/'+cams.length+'</td></tr>';}).join('');
+  var ct=RD.col_total||{}, g=RD.grand_total||{};
+  var foot='<tr class=tot><td>total</td>'
+    +cams.map(function(c){return '<td>'+(((ct[c]||{})[key])==null?DARKG:(ct[c]||{})[key])+'</td>'}).join('')
+    +'<td>'+(g[key]==null?DARKG:g[key])+'</td><td></td></tr>'
+    +'<tr class=tot><td class=mut>days observed</td>'
+    +cams.map(function(c){return '<td class=mut>'+((ct[c]||{}).days_observed||0)+'</td>'}).join('')
+    +'<td class=mut>'+(RD.n_days||0)+'</td><td></td></tr>';
+
+  var eras=((RD.counting_eras||{}).in_range)||[];
+  var erabanner=((RD.counting_eras||{}).crossing)
+    ? ('<div class=mut style="font-size:12px;margin:2px 0 6px;padding:4px 8px;border-left:3px '
+       +'solid #b06a00;background:rgba(176,106,0,.07)"><b>COUNTING BUILD BOUNDARY IN RANGE</b> '
+       +'— this table holds counts made by '+eras.length+' different counting builds ('
+       +eras.map(function(v){return '<b>'+esc(v)+'</b>'}).join(' · ')
+       +'). Cells outlined in orange were counted by a build that is NOT the one now running on '
+       +'that lift. Validated precision applies per build, never to the pool — narrow the '
+       +'dates to one build for comparable numbers.</div>')
+    : '';
+  var gaps=(RD.data_gaps||[]);
+  var gapbanner=gaps.length?('<div class=mut style="font-size:12px;margin:2px 0 6px;padding:4px 8px;'
+    +'border-left:3px solid #b00;background:rgba(176,0,0,.06)"><b>DATA GAP</b> — '
+    +gaps.map(function(x){return esc(x.note)}).join(' · ')
+    +'. Those rows are EXCLUDED and their days are not credited as observed.</div>'):'';
+  var cst=RD.cache||{};
+  el.innerHTML=periodBar(ridersBtns())
+    +'<div class=mut style="font-size:12px;margin:2px 0 6px">fleet · '+(RD.n_days||0)
+    +' day(s) · '+esc((RD.range||{}).label||'')+' · '
+    +'<b>'+(g.riders||0)+'</b> riders ('+(g.b||0)+' boarded, '+(g.a||0)+' alighted)'
+    +(cst.state==='ok'?(' · as of '+age(cst.age_s)+(cst.stale?' <b class=stale>STALE</b>':'')):'')
+    +(cst.state==='derived live'?' · derived live (custom date range)':'')
+    +'</div>'
+    +'<div class=dlbar><a class=dlbtn href="/dash/'+GW+'/export.csv?dataset=riders_per_day&split='
+      +encodeURIComponent(ridersSplit)+'&'+fleetQuery()+'">⤓ this matrix ('+esc(ridersSplit)+')</a>'
+    +'<a class=dlbtn href="/dash/'+GW+'/export.csv?dataset=riders_per_day_long&'+fleetQuery()
+      +'">⤓ one cell per row — boarded/alighted split, observation flag, counting build</a>'
+    +'<span class=mut style="font-size:11px">CSV — the rows behind this table, same range, '
+    +'caveats inside the file</span></div>'
+    +gapbanner+erabanner
+    +'<div class=hmwrap><table class="t2 mtx">'+head+body+foot+'</table></div>'
+    +'<div class=mut style="font-size:11px;margin-top:6px">'
+    +'<span class=swatch style="background:'+heatColor(0.75,'riders')+'"></span> '
+    +esc(ridersSplit)+' · 0 → '+RDMAX+' per lift-day &nbsp; '
+    +'<span class=swatch dark-swatch style="background:repeating-linear-gradient(45deg,'
+    +'#eee,#eee 3px,#fafafa 3px,#fafafa 6px)"></span> '+esc(DARKG)+' not observed'
+    +(nOff?(' &nbsp; <span class=swatch style="box-shadow:inset 0 0 0 2px #b06a00"></span> counted '
+      +'by an earlier build'):'')
+    +'</div>'
+    +'<div class=mut style="font-size:11px;margin-top:6px"><b>'+esc(RD.caveat||'')+'</b></div>'
+    +'<div class=mut style="font-size:11px;margin-top:3px">'+nDark+' of '+nCells+' cells are '
+    +esc(DARKG)+': '+esc(RD.dark_note||'')+'</div>'
+    +'<div class=mut style="font-size:11px;margin-top:3px">'+esc(RD.definition||'')+'</div>'
+    +'<div class=mut style="font-size:11px;margin-top:3px">'+esc(RD.gap_note||'')+'</div>';
+}
+function ridersBtns(){
+  return ['riders','boarded','alighted'].map(function(s){
+    return '<button class="tog'+(ridersSplit===s?' on':'')+'" onclick="setRidersSplit(\''+s+'\')">'
+      +s+'</button>';}).join('');
+}
+function loadRiders(){
+  RD=null; renderRiders();
+  var q=fleetQuery();
+  fetch('/dash/'+GW+'/riders_per_day?'+q).then(function(r){return r.json()}).then(function(d){
+    if(q!==fleetQuery())return;                 // the range moved on; a late answer is the wrong one
+    RD=d;
+    // A THROW WHILE DRAWING IS NOT A NETWORK FAULT, and labelling it as one sends the reader to the
+    // network tab for a bug in the payload or the renderer. Same split as loadTrends.
+    try{renderRiders();}
+    catch(e){RD={render_error:String((e&&e.message)||e||'the payload could not be drawn')};
+             renderRiders();}
+  }).catch(function(e){
+    if(q!==fleetQuery())return;
+    RD={fetch_error:String((e&&e.message)||e||'the request did not complete')}; renderRiders();
+  });
+}
+
+// ── STUDY VIEW 2: RTT PER HOUR PER LIFT ───────────────────────────────────────────────────
+// rows = lift, cols = hour-of-day, cells = median RTT with n. The per-camera chart already exists;
+// this is the same numbers set side by side so the shafts can be COMPARED, which a chart per tab
+// cannot do.
+//
+// IT IS A RE-SHAPE, NOT A SECOND DERIVATION. Every cell comes from the rtt_core summary the timer
+// already stored per camera per window, which is why the page can afford a fleet-wide view of the
+// most expensive number in the system.
+//
+// AND EVERY LIFT GETS A ROW. A camera with no floor attribution cannot have an RTT at all — the
+// home floor is what defines a trip — and that is a different statement from "this lift made no
+// round trips". A blank row makes them identical, so the reason goes IN the row, in its own words.
+var RF=null;
+function rttColor(t){
+  if(!(t>0))return 'rgba(128,128,128,0.10)';
+  return 'rgba(122,31,92,'+(0.12+0.70*Math.pow(t,0.65)).toFixed(3)+')';
+}
+function rttFleetRow(r,mx){
+  var lbl='<td class=mono title="'+esc(r.label||'')+'">'+esc(r.cam)
+    +(r.label?('<div class=mut style="font-size:9px">'+esc(r.label)+'</div>'):'')+'</td>';
+  if(!Array.isArray(r.by_hour)||!r.by_hour.length){
+    // THE REASON IS THE CELL. Not a tooltip, not a footnote: 24 blanks with the explanation
+    // somewhere else is the defect. The absence KIND is named too, because "pending" and
+    // "cannot be measured" are opposite claims that a reader must not have to guess between.
+    var KIND={uncalibrated:'NOT CALIBRATED',designed:'DESIGNED ABSENCE',pending:'PENDING',
+              refused:'REFUSED'};
+    var WHY={
+      uncalibrated:' No door engine has ever posted for this camera, so there is no floor read and '
+        +'no cycle to build a trip from. UNAVAILABLE until the camera is calibrated — this is NOT '
+        +'a lift that made no journeys.',
+      designed:' RTT is defined by the home floor; without a floor read there is no trip to '
+        +'measure. This is NOT a lift that made no journeys.',
+      pending:' Nobody has computed it yet — this is not a measurement of zero.',
+      refused:' This is a refusal to answer, not an answer of none.'};
+    var kind=KIND[r.absence]||'NO MEASUREMENT', cls=(r.absence==='pending')?'pend':'noabs';
+    return '<tr>'+lbl+'<td class="'+cls+'" colspan=25><b>'+kind+' — no RTT for this lift'
+      +(r.state?(' ('+esc(r.state)+')'):'')+'</b> <span class=mut>'+esc(r.reason||'')
+      +(WHY[r.absence]||' The stored payload gave a state this page has not seen before; it is '
+        +'reported verbatim above rather than guessed at.')
+      +'</span></td></tr>';
+  }
+  var cells=r.by_hour.map(function(h){
+    if(h.median==null||!h.n){
+      // A real hour with no plausible trip. Distinct from the row-level absences above, and it
+      // says so on hover rather than sharing their glyph silently.
+      return '<td class=dark title="no plausible round trip started in this hour'
+        +(h.anom?(' — '+h.anom+' trip(s) fell outside 30–600s and were excluded'):'')
+        +'">'+DARKG+'</td>';
+    }
+    var tip=r.cam+' · '+pad2(h.hour)+':00 — median '+h.median+'s, p85 '
+      +(h.p85==null?'—':h.p85+'s')+', n='+h.n+' plausible trip(s)'
+      +(h.anom?(' · '+h.anom+' anomal'+(h.anom===1?'y':'ies')+' excluded'):'');
+    return '<td style="background:'+rttColor(h.median/mx)+'" data-tip="'+esc(tip)+'" title="'
+      +esc(tip)+'">'+h.median+'<div class=mut style="font-size:9px">n='+h.n+'</div></td>';}).join('');
+  var ad=r.all_day||{};
+  return '<tr>'+lbl+cells+'<td><b>'+(ad.median==null?DARKG:ad.median)+'</b>'
+    +'<div class=mut style="font-size:9px">n='+(ad.n||0)+'</div></td></tr>';
+}
+function renderRttFleet(){
+  var el=document.getElementById('rttfleetview'); if(!el)return;
+  if(!RF){el.innerHTML='<div class=mut>loading…</div>';return;}
+  if(RF.fetch_error||RF.render_error){el.innerHTML=studyFail(RF,'RTT PER LIFT','loadRttFleet');return;}
+  var bar=periodBar('');
+  if(RF.state==='not served for this range'){
+    // A REFUSAL, STATED AS ONE. The alternative is putting a seven-camera door walk back on the
+    // request path, which is the 152.8s request RTT was moved off the request path to prevent.
+    el.innerHTML=bar+studyMiss('NOT SERVED FOR THIS RANGE',RF.error||'',
+      'Use the period buttons above (Today / 7 days / 30 days / All), which name the rolling '
+      +'windows RTT is stored under.');
+    return;
+  }
+  if(RF.state==='not_computed'){
+    el.innerHTML=bar+studyMiss('NOT COMPUTED YET',RF.note||'',(RF.cache||{}).detail);
+    return;
+  }
+  if(!Array.isArray(RF.rows)){
+    el.innerHTML=bar+'<div style="padding:12px;border:1px dashed #b00;border-radius:6px">'
+      +'<b>RTT PAYLOAD INCOMPLETE</b><div class=mut style="font-size:12px;margin-top:4px">'
+      +'the response is missing the rows this view requires, so it is being reported rather than '
+      +'drawn.</div></div>';
+    return;
+  }
+  var mx=1;
+  RF.rows.forEach(function(r){(r.by_hour||[]).forEach(function(h){
+    if(h.median!=null&&h.median>mx)mx=h.median;});});
+  var head='<tr><th>lift</th>';
+  for(var h=0;h<24;h++)head+='<th>'+pad2(h)+'</th>';
+  head+='<th title="all-day median over the whole window, not the mean of the hour cells">all day</th></tr>';
+  var body=RF.rows.map(function(r){return rttFleetRow(r,mx)}).join('');
+  var nAbs=RF.rows.filter(function(r){return !Array.isArray(r.by_hour)||!r.by_hour.length}).length;
+  var cst=RF.cache||{};
+  el.innerHTML=bar
+    +'<div class=mut style="font-size:12px;margin:2px 0 6px">fleet · '
+    +esc((RF.window||{}).label||'')+' · home floor '+esc(RF.home||'')
+    +' · '+RF.rows.length+' lift(s), '+nAbs+' with no round-trip measurement'
+    +(cst.state==='ok'?(' · as of '+age(cst.age_s)+(cst.stale?' <b class=stale>STALE</b>':'')):'')
+    +'</div>'
+    +'<div class=dlbar><a class=dlbtn href="/dash/'+GW+'/export.csv?dataset=rtt_per_hour&'
+      +fleetQuery()+'">⤓ lift × hour, one cell per row</a>'
+    +'<span class=mut style="font-size:11px">CSV — the cells behind this table; a lift with no '
+    +'measurement still has 24 rows, each carrying its reason</span></div>'
+    +'<div class=hmwrap><table class="t2 mtx">'+head+body+'</table></div>'
+    +'<div class=mut style="font-size:11px;margin-top:6px">'
+    +'<span class=swatch style="background:'+rttColor(0.75)+'"></span> median seconds · 0 → '
+    +mx+'s &nbsp; <span class=swatch style="background:repeating-linear-gradient(45deg,#eee,#eee 3px,'
+    +'#fafafa 3px,#fafafa 6px)"></span> '+esc(DARKG)+' no plausible trip started in that hour'
+    +'</div>'
+    +'<div class=mut style="font-size:11px;margin-top:6px">'+esc(RF.definition||'')+'</div>'
+    +'<div class=mut style="font-size:11px;margin-top:3px">'+esc(RF.fleet_note||'')+'</div>'
+    +'<div class=mut style="font-size:11px;margin-top:3px">'+esc(RF.window_note||'')+'</div>'
+    +'<div class=mut style="font-size:11px;margin-top:3px"><b>'+esc(RF.caveat||'')+'</b></div>'
+    +'<div class=mut style="font-size:11px;margin-top:3px">'+esc(RF.travel_gap||'')+'</div>';
+}
+function loadRttFleet(){
+  RF=null; renderRttFleet();
+  var q=fleetQuery();
+  fetch('/dash/'+GW+'/rtt_fleet?'+q).then(function(r){return r.json()}).then(function(d){
+    if(q!==fleetQuery())return;
+    RF=d;
+    try{renderRttFleet();}
+    catch(e){RF={render_error:String((e&&e.message)||e||'the payload could not be drawn')};
+             renderRttFleet();}
+  }).catch(function(e){
+    if(q!==fleetQuery())return;
+    RF={fetch_error:String((e&&e.message)||e||'the request did not complete')}; renderRttFleet();
+  });
+}
+
 load();
 </script>"""
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Precompute everything /dash used to derive on the request path. RUNS OFF THE REQUEST PATH.
 
-Three stages, and the ORDER IS LOAD-BEARING:
+Four stages, and the ORDER IS LOAD-BEARING:
   1. floor alphabet   -> floor_alphabet   (the all-era admission evidence)
   2. per-camera aggregate -> door_aggregate (door_gpu + tier2 for the default window)
   2b. RTT per window  -> rtt_window       (one entry per period the picker offers)
   3. trends payload   -> trends_cache     (per camera AND the fleet; reads what 1-2 just wrote)
+  4. study matrices   -> study_matrix     (riders/lift/day + RTT/hour/lift; reads 2b, per period)
 
 Stage 2 depends on stage 1: _tier2 reads the stored alphabet to decide which floor reads are
 admissible. Running them as two independent timers would let an aggregate be computed against a
@@ -58,7 +59,7 @@ def main():
         # sweep still fits inside its timer interval.
         t_gw = time.time()
         stages = {"alphabet": 0.0, "aggregate": 0.0, "rtt": 0.0,
-                  "trends_cams": 0.0, "trends_fleet": 0.0}
+                  "trends_cams": 0.0, "trends_fleet": 0.0, "study": 0.0}
         gw_ok = gw_err = 0
 
         # ── stage 1: alphabet (must complete before any aggregate for this camera) ──
@@ -137,7 +138,7 @@ def main():
                 stages["rtt"] += time.time() - t0
 
         # ── stage 3: the trends payload, per camera AND for the fleet ──
-        # LAST, because it reads the aggregates stages 1-2 just wrote: a trends payload built before
+        # AFTER 1-2, because it reads the aggregates they just wrote: a trends payload built before
         # them would cache the "not yet computed" tier2/RTT states for a whole timer interval.
         for cam in cams + ([""] if not only_cam else []):
           # EVERY PERIOD THE PICKER OFFERS. Filling 'all' alone left Today / 7 days / 30 days on the
@@ -160,11 +161,34 @@ def main():
             # BEFORE incremental fill. A single trends total would hide the duplication entirely.
             stages["trends_fleet" if not cam else "trends_cams"] += time.time() - t0
 
+        # ── stage 4: the two fleet study matrices, one entry per kind per period ──
+        # AFTER stage 2b, because rtt_per_hour is a RE-SHAPE of what rtt_refresh stored — running
+        # it first would cache "not yet computed" for every lift for a whole timer interval, which
+        # is exactly the defect the trends stage carries a comment about one stage up.
+        #
+        # NOT SKIPPED WHEN only_cam IS SET. These are FLEET tables: computing one from a database
+        # where a single camera was just refreshed is fine (they read every camera's stored state),
+        # and skipping them would leave the fleet views describing the era before this run.
+        for _kind in D.STUDY_KINDS:
+            for _period in D.STUDY_FILL_PERIODS:
+                t0 = time.time()
+                try:
+                    m = D.study_refresh(db, gw, _kind, _period)
+                    print(f"[precompute] study {gw}/{_kind} p={_period}: {m['n_rows']} rows, "
+                          f"{m['bytes']//1024}KB in {time.time()-t0:.2f}s", flush=True)
+                    ok += 1; gw_ok += 1
+                except Exception as e:
+                    err += 1; gw_err += 1
+                    print(f"[precompute] study {gw}/{_kind} p={_period}: "
+                          f"FAILED {type(e).__name__}: {e}", flush=True)
+                stages["study"] += time.time() - t0
+
         m = D.precompute_run_record(db, gw, t_gw, stages, gw_ok, gw_err)
         print(f"[precompute] {gw} sweep: {m['total_s']:.1f}s total "
               f"(alphabet {stages['alphabet']:.1f}s, aggregate {stages['aggregate']:.1f}s, "
               f"rtt {stages['rtt']:.1f}s, "
-              f"trends {stages['trends_cams']:.1f}s per-camera + {stages['trends_fleet']:.1f}s fleet)"
+              f"trends {stages['trends_cams']:.1f}s per-camera + {stages['trends_fleet']:.1f}s fleet, "
+              f"study {stages['study']:.1f}s)"
               f" — recorded to precompute_run", flush=True)
 
     db.close()

@@ -374,8 +374,15 @@ def main():
     src_js = D.dash_page()
     if "WANT_VIEW" not in src_js:
         fails.append("?view=trends is still written by selectCam and read by nothing")
-    if "if(WANT_VIEW==='trends' && mode!=='trends')" not in src_js:
-        fails.append("?view=trends is parsed but never applied after the first data load")
+    # The parameter now NAMES a view rather than being a trends-or-not boolean — Riders / day and
+    # RTT / lift are shareable links too, and adding a third value to a boolean is how a shared
+    # link silently lands on the wrong page, which is the defect this parameter was added to fix.
+    # The property asserted is unchanged: parsed, and APPLIED once the first data load has run.
+    if "if(WANT_VIEW!=='cams' && mode!==WANT_VIEW)" not in src_js:
+        fails.append("?view= is parsed but never applied after the first data load")
+    if "view==='trends'||v==='riders'||v==='rttfleet'".replace("view", "v") not in src_js:
+        fails.append("?view= no longer accepts every view on the tab strip, so at least one of "
+                     "them cannot be linked to")
 
     print("  mid-flight, with a stale ch29 payload cached and ch27 selected:")
     o = render(tmp, D, data, tr27, select="ch27", view="trends", stale=tr16)

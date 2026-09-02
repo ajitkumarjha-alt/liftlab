@@ -206,19 +206,31 @@ def _precompute_slow(db, gw, now=None):
     absent record is an unknown, and an unknown is not a breach.
     """
     try:
-        r = db.execute("SELECT started_at, finished_at, total_s, alphabet_s, aggregate_s, "
-                       "COALESCE(rtt_s,0) rtt_s, trends_cams_s, trends_fleet_s FROM precompute_run "
+        # COALESCE on every stage column added after the table shipped, and the column list read
+        # from the schema rather than asserted: a box that has not yet run the sweep carrying the
+        # newest column would otherwise raise here and the whole precompute line would go silent —
+        # reported as "the job has never run" on a gateway with two weeks of history.
+        _have = {x[1] for x in db.execute("PRAGMA table_info(precompute_run)")}
+        _stages = [c for c in ("alphabet_s", "aggregate_s", "rtt_s", "trends_cams_s",
+                               "trends_fleet_s", "study_s") if c in _have]
+        # A TRAILING COMMA IS A SYNTAX ERROR, and this except-clause swallows it as "the job has
+        # never run" — the exact outcome the column-list read exists to prevent. With no stage
+        # column at all the sweep TOTAL is still a record worth reporting.
+        r = db.execute("SELECT started_at, finished_at, total_s"
+                       + ("".join(f", COALESCE({c},0) {c}" for c in _stages))
+                       + " FROM precompute_run "
                        "WHERE gateway_id=? ORDER BY started_at DESC LIMIT 1", (gw,)).fetchone()
     except sqlite3.OperationalError:
         return None, None
     if not r or r["total_s"] is None:
         return None, None
-    pc = {k: r[k] for k in ("started_at", "finished_at", "total_s", "alphabet_s", "aggregate_s",
-                            "rtt_s", "trends_cams_s", "trends_fleet_s")}
+    pc = {k: 0.0 for k in ("alphabet_s", "aggregate_s", "rtt_s", "trends_cams_s",
+                           "trends_fleet_s", "study_s")}
+    pc.update({k: r[k] for k in ("started_at", "finished_at", "total_s", *_stages)})
     pc["age_s"] = round((now or time.time()) - (r["finished_at"] or 0), 1)
     if r["total_s"] <= PRECOMPUTE_SLOW_S:
         return None, pc                    # carried on the payload regardless, so the dash can plot it
-    tc, tf = (r["trends_cams_s"] or 0.0), (r["trends_fleet_s"] or 0.0)
+    tc, tf = (pc["trends_cams_s"] or 0.0), (pc["trends_fleet_s"] or 0.0)
     tot = r["total_s"] or 1.0
     # THE PHRASE NAMES THE BIGGEST STAGE, not a favourite fix. A duration alone tells the reader to
     # worry without telling them where to look, and the stage that dominates is not the one the
@@ -226,8 +238,9 @@ def _precompute_slow(db, gw, now=None):
     # 28.7%. The shared read IS the first lever *within trends* — fleet and per-camera derive the
     # same era rows twice, so ~2x on that stage — but that is ~14% of the sweep, not ~2x of it.
     # Quoting the whole-sweep saving as 2x would send the next person to the smaller half.
-    parts = sorted((("aggregate", r["aggregate_s"] or 0.0), ("alphabet", r["alphabet_s"] or 0.0),
-                    ("rtt", r["rtt_s"] or 0.0), ("trends", tc + tf)), key=lambda x: -x[1])
+    parts = sorted((("aggregate", pc["aggregate_s"] or 0.0), ("alphabet", pc["alphabet_s"] or 0.0),
+                    ("rtt", pc["rtt_s"] or 0.0), ("trends", tc + tf),
+                    ("study", pc["study_s"] or 0.0)), key=lambda x: -x[1])
     phrase = (f"precompute sweep {_age_phrase(tot)} — over the "
               f"{_age_phrase(PRECOMPUTE_SLOW_S)} threshold (default: half the 1h timer interval). "
               f"Stages: "
