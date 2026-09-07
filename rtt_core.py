@@ -20,6 +20,7 @@ sign, and STOPS_PER_TRIP is reported beside it because a fragmented trip shows u
 """
 from __future__ import annotations
 
+import bisect
 import statistics
 from datetime import datetime, timedelta, timezone
 
@@ -75,6 +76,14 @@ def trips(rows, home="G"):
     n_stops is the cycle count strictly inside the trip. A round trip on a 70-floor tower that
     reports 2 stops is either a very short journey or a FRAGMENT of a longer one, which is why this
     is carried per trip rather than averaged away.
+
+    n_stops IS COUNTED BY BISECTION, and the answer is identical to the scan it replaces. It was
+    `sum(1 for c in cyc if t0 < c <= t1)` — a full pass over every cycle in the era, for every
+    trip, which makes this function QUADRATIC in era size. On a 200,000-row era that is ~11k trips
+    x ~33k cycles = 360 million comparisons for a number each trip needs once, and it is the
+    reason the precompute sweep's RTT stage grows so much faster than the row count. `cyc` is
+    built in row order from a query that is ORDER BY ts, so it is non-decreasing and
+    bisect_right(cyc, t1) - bisect_right(cyc, t0) is exactly the count of c in (t0, t1].
     """
     closes = cycles_with_floor(rows)
     opens = opens_with_floor(rows)
@@ -88,7 +97,7 @@ def trips(rows, home="G"):
         for j in range(oi, len(opens)):
             t1, f1 = opens[j]
             if f1 == home:
-                n_stops = sum(1 for c in cyc if t0 < c <= t1)
+                n_stops = bisect.bisect_right(cyc, t1) - bisect.bisect_right(cyc, t0)
                 out.append((t0, t1, t1 - t0, n_stops))
                 break
     return out
@@ -102,8 +111,15 @@ def classify(dt):
     return None
 
 
-def summarise(rows, home="G"):
-    """Everything a surface needs: plausible trips, anomalies, per-hour, windows, stops-per-trip."""
+def summarise(rows, home="G", with_trips=False):
+    """Everything a surface needs: plausible trips, anomalies, per-hour, windows, stops-per-trip.
+
+    with_trips ADDS the per-trip rows to the return; it changes nothing else. The study bundle
+    needs that grain and used to get it by calling trips() a SECOND time on the same rows, which
+    walked the era twice for one answer — pure duplicate work on the most expensive number in the
+    system, and a second call site of the derivation this module exists to keep singular. The
+    walk below already has them.
+    """
     tr = trips(rows, home)
     good, anom = [], {}
     per_hour = {h: {"rtt": [], "anom": 0} for h in range(24)}
@@ -145,6 +161,11 @@ def summarise(rows, home="G"):
                                       key=lambda kv: (len(kv[0]), kv[0])))},
         "caveat": RTT_CAVEAT, "travel_gap": TRAVEL_GAP, "dwell_s": DWELL_S,
         "home": home,
+        # PLAUSIBLE AND ANOMALOUS ALIKE, each labelled. Filtering here would hide the quality
+        # signal: the anomaly rate is a measurement of floor attribution.
+        **({"trips": [(t_a, t_b, round(dt, 1), ns,
+                       ("anomaly" if classify(dt) else "plausible"), classify(dt) or "")
+                      for t_a, t_b, dt, ns in tr]} if with_trips else {}),
     }
 
 

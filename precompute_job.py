@@ -23,12 +23,77 @@ usage:
   ALPHABET_ONLY=1 precompute_job.py # stage 1 only
 """
 import os
+import sqlite3
 import sys
 import time
 
 sys.path.insert(0, os.environ.get("LIFTLAB_APP", "/opt/liftlab-b3/cloud"))
 
 import dash_api as D  # noqa: E402
+
+# ── LOCK RETRY. Under WAL there is exactly ONE writer at a time, and busy_timeout only covers the
+# wait INSIDE a single statement. A sweep stage that loses the race for 30 seconds still raises,
+# and on 2026-09-07 every study stage did, 5m41s in, while seven workers posted their restart
+# backlog. Retrying the STAGE is the missing layer: the work is idempotent (every refresh is an
+# upsert keyed on the era), so a second attempt a few seconds later is exactly as correct as the
+# first and is usually all it takes.
+#
+# BACKOFF, NOT A TIGHT LOOP. A retry that returns immediately joins the contention it is waiting
+# out. 2s, 6s, 18s — bounded, and ~26s of extra waiting per stage in the worst case, against an
+# hourly timer.
+RETRY_DELAYS = [float(x) for x in os.environ.get("PRECOMPUTE_RETRY_S", "2,6,18").split(",") if x]
+LOCK_STATS = {"n_locked": 0, "lock_wait_s": 0.0}
+# WHERE THE MEMORY GOES, not just how much. The 2026-09-07 sweep peaked at 943 MB and nothing
+# recorded which stage was holding it, so the only available answer was a guess. Profiled at
+# fixture scale, ONE camera at 200,000 door rows peaks at 42 MB — 27 MB above baseline — so the
+# live figure is not one camera's working set and the question is genuinely open. A high-water
+# mark sampled after every stage, with the stage that set it, closes it from the next sweep on.
+RSS_PEAK = {"mb": 0.0, "stage": None}
+
+
+def _rss_mb():
+    """Current resident set, MB. /proc first — it is the number the OOM killer reads."""
+    try:
+        with open("/proc/self/statm") as fh:
+            return round(int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576.0, 1)
+    except (OSError, ValueError, IndexError):
+        try:
+            import resource
+            return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)
+        except Exception:
+            return None
+
+
+def _note_rss(label):
+    r = _rss_mb()
+    if r is not None and r > RSS_PEAK["mb"]:
+        RSS_PEAK.update({"mb": r, "stage": label})
+    return r
+
+
+def run_stage(label, fn, *args, **kwargs):
+    """Call one refresh, retrying ONLY a held lock. -> (result, error_or_None).
+
+    A lock is the one error worth retrying: it says nothing about the work, only about who else was
+    writing. Everything else — a missing table, a bad era, a bug — reproduces exactly on the next
+    attempt, so retrying it burns the timer and buries the real message under three copies.
+    """
+    for i, delay in enumerate([0.0] + RETRY_DELAYS):
+        if delay:
+            LOCK_STATS["lock_wait_s"] += delay
+            time.sleep(delay)
+        try:
+            out = fn(*args, **kwargs)
+            _note_rss(label)
+            return out, None
+        except Exception as e:
+            if not D.is_locked(e) or i >= len(RETRY_DELAYS):
+                return None, e
+            LOCK_STATS["n_locked"] += 1
+            nxt = RETRY_DELAYS[i]
+            print(f"[precompute] {label}: DATABASE LOCKED ({e}) — retry {i + 1}/"
+                  f"{len(RETRY_DELAYS)} in {nxt:g}s. {D.lock_diagnostics()}", flush=True)
+    return None, RuntimeError("unreachable")
 
 
 def gateways(db):
@@ -46,7 +111,11 @@ def main():
     only_cam = argv[1] if len(argv) > 1 else None
     alphabet_only = bool(os.environ.get("ALPHABET_ONLY"))
 
-    db = D._db()
+    # THE TIMER'S BUSY TIMEOUT, not the request path's. This connection had none at all, which is
+    # what killed the 2026-09-07 sweep: with busy_timeout=0 a writer that meets a held lock gives
+    # up on contact, and seven workers were posting their restart backlog. 30s matches what the
+    # ingest path already waits; nobody is watching this job, so waiting is free.
+    db = D._db(busy_ms=D.PRECOMPUTE_BUSY_MS)
     D._alphabet_table(db)
     D._aggregate_table(db)
     t_all = time.time()
@@ -65,13 +134,13 @@ def main():
         # ── stage 1: alphabet (must complete before any aggregate for this camera) ──
         for cam in cams:
             t0 = time.time()
-            try:
-                m = D.alphabet_refresh(db, gw, cam)
+            m, e = run_stage(f"alphabet {gw}/{cam}", D.alphabet_refresh, db, gw, cam)
+            if e is None:
                 print(f"[precompute] alphabet {gw}/{cam}: {m['n_admitted']} floors from "
                       f"{m['evidence_rows']} rows, era={m['era']} in {time.time()-t0:.2f}s",
                       flush=True)
                 ok += 1; gw_ok += 1
-            except Exception as e:                 # one bad camera must not stop the sweep
+            else:                                  # one bad camera must not stop the sweep
                 err += 1; gw_err += 1
                 print(f"[precompute] alphabet {gw}/{cam}: FAILED {type(e).__name__}: {e}", flush=True)
             stages["alphabet"] += time.time() - t0
@@ -85,8 +154,8 @@ def main():
         # ── stage 2: aggregates ──
         for cam in cams:
             t0 = time.time()
-            try:
-                m = D.aggregate_refresh(db, gw, cam)
+            m, e = run_stage(f"aggregate {gw}/{cam}", D.aggregate_refresh, db, gw, cam)
+            if e is None:
                 if m.get("skipped"):
                     print(f"[precompute] aggregate {gw}/{cam}: skipped ({m['skipped']})", flush=True)
                 else:
@@ -103,7 +172,7 @@ def main():
                           f"cv={m['counting_version'] or '-'} dv={m['door_version']} "
                           f"window={m['window_days']}d in {time.time()-t0:.2f}s", flush=True)
                 ok += 1; gw_ok += 1
-            except Exception as e:
+            else:
                 err += 1; gw_err += 1
                 print(f"[precompute] aggregate {gw}/{cam}: FAILED {type(e).__name__}: {e}", flush=True)
             stages["aggregate"] += time.time() - t0
@@ -118,8 +187,8 @@ def main():
         for cam in cams:
             for wd in D.RTT_WINDOWS:
                 t0 = time.time()
-                try:
-                    m = D.rtt_refresh(db, gw, cam, wd)
+                m, e = run_stage(f"rtt {gw}/{cam} w={wd:g}d", D.rtt_refresh, db, gw, cam, wd)
+                if e is None:
                     if m.get("skipped"):
                         print(f"[precompute] rtt {gw}/{cam} w={wd:g}d: skipped ({m['skipped']})",
                               flush=True)
@@ -137,7 +206,7 @@ def main():
                               f"in {time.time()-t0:.2f}s"
                               + (f" [{m['error']}]" if m.get("error") else ""), flush=True)
                     ok += 1; gw_ok += 1
-                except Exception as e:
+                else:
                     err += 1; gw_err += 1
                     print(f"[precompute] rtt {gw}/{cam} w={wd:g}d: FAILED {type(e).__name__}: {e}",
                           flush=True)
@@ -152,13 +221,14 @@ def main():
           # deliberate cache miss — and the request path will not derive, by design.
           for _period in D.TRENDS_FILL_PERIODS:
             t0 = time.time()
-            try:
-                m = D.trends_refresh(db, gw, cam, _period)
+            m, e = run_stage(f"trends {gw}/{cam or 'fleet'} p={_period}",
+                             D.trends_refresh, db, gw, cam, _period)
+            if e is None:
                 print(f"[precompute] trends {gw}/{m['gw'] and (cam or 'fleet')} p={_period}: "
                       f"{m['bytes']//1024}KB in {time.time()-t0:.2f}s "
                       f"(dv={(m['door_version'] or '-')[:24]})", flush=True)
                 ok += 1; gw_ok += 1
-            except Exception as e:
+            else:
                 err += 1; gw_err += 1
                 print(f"[precompute] trends {gw}/{cam or 'fleet'} p={_period}: "
                       f"FAILED {type(e).__name__}: {e}", flush=True)
@@ -178,18 +248,38 @@ def main():
         for _kind in D.STUDY_KINDS:
             for _period in D.STUDY_FILL_PERIODS:
                 t0 = time.time()
-                try:
-                    m = D.study_refresh(db, gw, _kind, _period)
+                m, e = run_stage(f"study {gw}/{_kind} p={_period}",
+                                 D.study_refresh, db, gw, _kind, _period)
+                if e is None:
                     print(f"[precompute] study {gw}/{_kind} p={_period}: {m['n_rows']} rows, "
-                          f"{m['bytes']//1024}KB in {time.time()-t0:.2f}s", flush=True)
+                          f"{m['bytes']//1024}KB in {time.time()-t0:.2f}s "
+                          f"rss={_rss_mb()}MB", flush=True)
                     ok += 1; gw_ok += 1
-                except Exception as e:
+                else:
                     err += 1; gw_err += 1
                     print(f"[precompute] study {gw}/{_kind} p={_period}: "
                           f"FAILED {type(e).__name__}: {e}", flush=True)
                 stages["study"] += time.time() - t0
 
-        m = D.precompute_run_record(db, gw, t_gw, stages, gw_ok, gw_err)
+        _rss = _note_rss("end of sweep")
+        _lock = D.lock_diagnostics()
+        m = D.precompute_run_record(db, gw, t_gw, stages, gw_ok, gw_err,
+                                    extra={"n_locked": LOCK_STATS["n_locked"],
+                                           "lock_wait_s": round(LOCK_STATS["lock_wait_s"], 1),
+                                           "rss_peak_mb": RSS_PEAK["mb"] or _rss,
+                                           "rss_peak_stage": RSS_PEAK["stage"],
+                                           "wal_mb": _lock.get("wal_mb")})
+        # THE CONTENTION AND THE FOOTPRINT, ON THE SAME LINE AS THE DURATION. A sweep that took an
+        # hour because it spent 40 minutes waiting for a lock is a different problem from one that
+        # spent 40 minutes computing, and until 2026-09-07 the line could not tell them apart.
+        print(f"[precompute] {gw} contention: {LOCK_STATS['n_locked']} lock retr"
+              f"{'y' if LOCK_STATS['n_locked'] == 1 else 'ies'}, "
+              f"{LOCK_STATS['lock_wait_s']:.0f}s waited · rss now {_rss}MB, "
+              f"peak {RSS_PEAK['mb']}MB at [{RSS_PEAK['stage']}] · "
+              f"wal {_lock.get('wal_mb')}MB · litestream {_lock.get('litestream')}", flush=True)
+        if m.get("record_error"):
+            print(f"[precompute] {gw} sweep NOT recorded: {m['record_error']} — the work above "
+                  f"still happened; only the durable row is missing", flush=True)
         print(f"[precompute] {gw} sweep: {m['total_s']:.1f}s total "
               f"(alphabet {stages['alphabet']:.1f}s, aggregate {stages['aggregate']:.1f}s, "
               f"rtt {stages['rtt']:.1f}s, "

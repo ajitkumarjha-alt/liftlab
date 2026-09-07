@@ -136,10 +136,68 @@ FRAME_SIZE_DEFAULT = (704, 576)
 dash_router = APIRouter()
 
 
-def _db():
+# ── BUSY TIMEOUT. The default is 0: a writer that meets a held lock gives up IMMEDIATELY. ──────
+# This connection had none at all, and on 2026-09-07 the precompute sweep died of it — every study
+# stage raised OperationalError("database is locked") 5m41s in, while seven workers posted their
+# backlog after a fleet restart. Under WAL there is exactly ONE writer at a time; the ingest path
+# sets 30000 and therefore WAITS, and the sweep, setting nothing, failed on contact. door_event_api
+# records the same reasoning next to its own PRAGMA — this connection was simply never given it.
+#
+# TWO VALUES, AND THE DIFFERENCE IS DELIBERATE. A busy wait sleeps inside SQLite, where the request
+# budget's progress handler does NOT fire, so a 30s wait on a request path would silently outlast
+# the 25s budget it is supposed to be bounded by. Requests get a timeout comfortably inside that
+# budget; the TIMER, which has an hour and no user waiting, gets the full 30s the ingest side uses.
+BUSY_TIMEOUT_MS = int(os.environ.get("DASH_BUSY_TIMEOUT_MS", "5000"))
+PRECOMPUTE_BUSY_MS = int(os.environ.get("DASH_PRECOMPUTE_BUSY_MS", "30000"))
+
+
+def _db(busy_ms=None):
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
+    db.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_MS if busy_ms is None else busy_ms)}")
     return db
+
+
+def is_locked(exc):
+    """Is this the contended-write error, as opposed to a real fault?
+
+    Matched on the MESSAGE because sqlite3 does not expose SQLITE_BUSY separately on this Python
+    version — OperationalError covers a missing table, a syntax error and a held lock alike, and
+    retrying a syntax error forever is how a retry loop becomes an outage of its own."""
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "locked" in str(exc).lower() or "busy" in str(exc).lower())
+
+
+def lock_diagnostics(db=None):
+    """What we can cheaply say about WHO held the lock, at the moment we failed to get it.
+
+    Deliberately NOT a query: anything that needs the database is exactly the thing we could not
+    get. The WAL size is a file stat and it is the most informative single number — a WAL that has
+    grown far past its checkpoint threshold means checkpoints are not completing, which under
+    litestream (which disables SQLite's autocheckpoint and runs its own) means the next one will
+    pause writers for longer, and a long-running READER is what stops a checkpoint reclaiming.
+    Readers do NOT block writers under WAL, so a reader is never the direct cause — it is the
+    reason the checkpoint that IS the cause could not finish."""
+    out = {}
+    try:
+        st = os.stat(DB_PATH)
+        out["db_mb"] = round(st.st_size / 1048576.0, 1)
+    except OSError:
+        pass
+    for suffix, key in (("-wal", "wal_mb"), ("-shm", "shm_kb")):
+        try:
+            n = os.stat(DB_PATH + suffix).st_size
+            out[key] = round(n / (1048576.0 if key.endswith("_mb") else 1024.0), 1)
+        except OSError:
+            out[key] = None
+    try:
+        import subprocess
+        out["litestream"] = subprocess.run(
+            ["systemctl", "is-active", "litestream"], capture_output=True, text=True,
+            timeout=5).stdout.strip() or "unknown"
+    except Exception:
+        out["litestream"] = "unknown"
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1503,7 +1561,7 @@ def rtt_refresh(db, gw, cam, window_days):
                "n_trips_stored=excluded.n_trips_stored",
                (gw, cam, d, cv or "", dv or "", json.dumps(S) if S else None, time.time(), ms,
                 json.dumps(trips) if trips is not None else None, n_trips_stored))
-    db.commit()
+    # ONE TRANSACTION, insert and cleanup together — see aggregate_refresh.
     # One era per (cam, window): a retired era is never served, so keeping it only grows the table.
     db.execute("DELETE FROM rtt_window WHERE gateway_id=? AND cam=? AND window_days=? AND NOT "
                "(counting_version=? AND door_version=?)", (gw, cam, d, cv or "", dv or ""))
@@ -1661,8 +1719,9 @@ def aggregate_refresh(db, gw, cam, window_days=None):
                "source_rows=excluded.source_rows, compute_ms=excluded.compute_ms",
                (gw, cam, cv, dv, d, json.dumps(dg) if dg else None,
                 json.dumps(t2) if t2 else None, time.time(), src, ms))
-    db.commit()
-    # Keep the table from growing an entry per retired era forever.
+    # ONE TRANSACTION. The retired-era cleanup rides with the write it belongs to: two commits took
+    # the WAL's single write lock twice per camera per window, doubling the contention points for a
+    # DELETE that almost never removes a row.
     db.execute("DELETE FROM door_aggregate WHERE gateway_id=? AND cam=? AND NOT "
                "(counting_version=? AND door_version=?)", (gw, cam, cv, dv))
     db.commit()
@@ -1713,30 +1772,68 @@ def _precompute_run_table(db):
     # ALTER, not a recreate: the table already holds sweep history on any box that ran the previous
     # build, and that history is the only record of how the fill time is trending.
     _cols = {r[1] for r in db.execute("PRAGMA table_info(precompute_run)")}
-    for _c in ("rtt_s", "study_s"):
+    # n_locked / lock_wait_s: how often a stage met a held lock and how long it waited in total.
+    # rss_peak_mb / wal_mb: the two numbers nobody had when a 943 MB sweep died of contention.
+    for _c in ("rtt_s", "study_s", "lock_wait_s", "rss_peak_mb", "wal_mb"):
         if _c not in _cols:
             db.execute(f"ALTER TABLE precompute_run ADD COLUMN {_c} REAL")
+    if "n_locked" not in _cols:
+        db.execute("ALTER TABLE precompute_run ADD COLUMN n_locked INTEGER")
+    # WHICH STAGE held the peak. A number with no owner is the position the 943 MB sweep left us
+    # in: the total was known and nothing said what was holding it.
+    if "rss_peak_stage" not in _cols:
+        db.execute("ALTER TABLE precompute_run ADD COLUMN rss_peak_stage TEXT")
 
 
-def precompute_run_record(db, gw, started_at, stages, n_ok, n_err):
-    """Store one sweep's wall time. Scheduler ONLY — /dash never writes this."""
-    _precompute_run_table(db)
+def precompute_run_record(db, gw, started_at, stages, n_ok, n_err, extra=None):
+    """Store one sweep's wall time. Scheduler ONLY — /dash never writes this.
+
+    IT CANNOT RAISE, AND THAT IS THE POINT. On 2026-09-07 this write met the same held lock the
+    study stage had been failing on and took the whole job down WITH IT — the sweep had completed
+    most of its work, and the bookkeeping entry killed the process before any of it was reported.
+    A record of what happened must never be able to destroy the thing it is recording. A failure
+    here is logged and returned as an error field; the caller's exit status is decided by the
+    STAGES, which are the actual work.
+    """
     fin = time.time()
+    try:
+        return _precompute_run_write(db, gw, started_at, stages, n_ok, n_err, fin, extra)
+    except Exception as e:
+        print(f"[precompute] WARNING: could not record the sweep to precompute_run "
+              f"({type(e).__name__}: {e}). The sweep itself is unaffected and its stage timings "
+              f"are on the lines above; only the durable record is missing"
+              + (" — this was a LOCK, so the same contention that hit the stages hit the record"
+                 if is_locked(e) else "") + ".", flush=True)
+        return {"gw": gw, "total_s": round(fin - started_at, 1), "stages": stages,
+                "record_error": f"{type(e).__name__}: {e}",
+                "record_error_locked": is_locked(e),
+                "lock": (lock_diagnostics() if is_locked(e) else None)}
+
+
+def _precompute_run_write(db, gw, started_at, stages, n_ok, n_err, fin, extra=None):
+    _precompute_run_table(db)
+    ex = extra or {}
     db.execute("INSERT OR REPLACE INTO precompute_run (gateway_id, started_at, finished_at, "
                "total_s, alphabet_s, aggregate_s, rtt_s, trends_cams_s, trends_fleet_s, study_s, "
-               "n_ok, n_err) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+               "n_ok, n_err, n_locked, lock_wait_s, rss_peak_mb, rss_peak_stage, wal_mb) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (gw, started_at, fin, fin - started_at,
                 stages.get("alphabet", 0.0), stages.get("aggregate", 0.0),
                 stages.get("rtt", 0.0),
                 stages.get("trends_cams", 0.0), stages.get("trends_fleet", 0.0),
-                stages.get("study", 0.0), n_ok, n_err))
-    db.commit()
-    # Two weeks is enough to see a trend across an era rollover (observed era ages: 1.1-20.0 days)
-    # and short enough that the table never becomes something to manage.
+                stages.get("study", 0.0), n_ok, n_err,
+                ex.get("n_locked"), ex.get("lock_wait_s"), ex.get("rss_peak_mb"),
+                ex.get("rss_peak_stage"), ex.get("wal_mb")))
+    # ONE TRANSACTION — see aggregate_refresh. Two weeks of retention is enough to see a trend
+    # across an era rollover (observed era ages: 1.1-20.0 days) and short enough that the table
+    # never becomes something to manage.
     db.execute("DELETE FROM precompute_run WHERE gateway_id=? AND started_at < ?",
                (gw, fin - 14 * 86400))
     db.commit()
-    return {"gw": gw, "total_s": round(fin - started_at, 1), "stages": stages}
+    return {"gw": gw, "total_s": round(fin - started_at, 1), "stages": stages,
+            "record_error": None, **{k: ex.get(k) for k in
+                                     ("n_locked", "lock_wait_s", "rss_peak_mb",
+                                      "rss_peak_stage", "wal_mb")}}
 
 
 def precompute_run_latest(db, gw):
@@ -1749,7 +1846,8 @@ def precompute_run_latest(db, gw):
         # gateway with two weeks of sweep history. A missing column is a missing NUMBER, not a
         # missing record.
         want = ("started_at", "finished_at", "total_s", "alphabet_s", "aggregate_s", "rtt_s",
-                "trends_cams_s", "trends_fleet_s", "study_s", "n_ok", "n_err")
+                "trends_cams_s", "trends_fleet_s", "study_s", "n_ok", "n_err",
+                "n_locked", "lock_wait_s", "rss_peak_mb", "rss_peak_stage", "wal_mb")
         have = [c for c in want
                 if c in {x[1] for x in db.execute("PRAGMA table_info(precompute_run)")}]
         if not have:
@@ -2215,19 +2313,13 @@ def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override="", max_rows=None,
                         "note": "no floor attribution on this camera — RTT needs a home-floor read, "
                                 "so it is UNAVAILABLE, not zero"}
             continue
-        S = rtt_core.summarise(rows, home=RTT_HOME)
+        # ONE WALK. want_trips used to call rtt_core.trips() again on the same rows, after
+        # summarise() had already walked them — a second full pass over the most expensive number
+        # in the system, and a second call site of the derivation rtt_core exists to keep singular.
+        # summarise() carries them out now.
+        S = rtt_core.summarise(rows, home=RTT_HOME, with_trips=want_trips)
         S.update({"state": "ok", "era": era, "n_rows": len(rows),
                   "floor_attributed_pct": round(100.0 * n_floor / len(rows), 1)})
-        if want_trips:
-            # THE SAME rtt_core.trips() summarise() JUST WALKED, over the same rows, in the same
-            # call. Not a second derivation and not a second read: the per-trip grain is simply not
-            # in the summary, and the only alternative to carrying it out of here is walking the
-            # era again somewhere else — which is exactly the request-path walk that timed the
-            # study bundle out at 60.26s on a Monday morning.
-            S["trips"] = [(t_a, t_b, round(dt, 1), ns,
-                           ("anomaly" if rtt_core.classify(dt) else "plausible"),
-                           rtt_core.classify(dt) or "")
-                          for t_a, t_b, dt, ns in rtt_core.trips(rows, RTT_HOME)]
         out[cam] = S
     return out, None
 
@@ -3078,7 +3170,7 @@ def trends_refresh(db, gw, cam="", period="all"):
                "payload=excluded.payload, computed_at=excluded.computed_at, "
                "compute_ms=excluded.compute_ms",
                (gw, cam, period, cv, dv, json.dumps(body), time.time(), ms))
-    db.commit()
+    # ONE TRANSACTION, insert and cleanup together — see aggregate_refresh.
     # One era per (cam, period): retired eras are not viewable through the cache anyway, because the
     # key is the CURRENT one, and keeping them grows the table without ever being read.
     db.execute("DELETE FROM trends_cache WHERE gateway_id=? AND cam=? AND period=? AND NOT "
@@ -3579,7 +3671,7 @@ def study_refresh(db, gw, kind, period="all"):
                "payload=excluded.payload, computed_at=excluded.computed_at, "
                "compute_ms=excluded.compute_ms",
                (gw, kind, period, cv, dv, json.dumps(body), time.time(), ms))
-    db.commit()
+    # ONE TRANSACTION, insert and cleanup together — see aggregate_refresh.
     # One era per (kind, period): the key is the CURRENT one, so a retired era's row can never be
     # read back and keeping it only grows the table.
     db.execute("DELETE FROM study_matrix WHERE gateway_id=? AND kind=? AND period=? AND NOT "
