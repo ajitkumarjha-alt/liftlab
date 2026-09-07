@@ -124,10 +124,16 @@ def main():
                         print(f"[precompute] rtt {gw}/{cam} w={wd:g}d: skipped ({m['skipped']})",
                               flush=True)
                     else:
+                        # n_trips_stored is reported separately from n_trips: the first is what
+                        # the study bundle will be able to serve, the second is what the walk
+                        # found, and they differ when RTT_STORE_MAX_TRIPS bites.
+                        _nt = m.get("n_trips")
+                        _ns = m.get("n_trips_stored")
                         print(f"[precompute] rtt {gw}/{cam} w={wd:g}d: "
                               f"{m.get('n_rows') if m.get('n_rows') is not None else '-'} rows, "
                               f"state={m.get('state')}, "
-                              f"trips={m.get('n_trips') if m.get('n_trips') is not None else '-'} "
+                              f"trips={_nt if _nt is not None else '-'} "
+                              f"(stored {_ns if _ns is not None else '-'}) "
                               f"in {time.time()-t0:.2f}s"
                               + (f" [{m['error']}]" if m.get("error") else ""), flush=True)
                     ok += 1; gw_ok += 1

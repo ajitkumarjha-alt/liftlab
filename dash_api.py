@@ -682,6 +682,10 @@ RTT_MAX_ROWS = int(os.environ.get("DASH_RTT_MAX_ROWS", "120000"))
 # travels on the payload) — it is not re-derived to the picker's exact IST-aligned bounds, and the
 # panel says which window it describes rather than implying it matches the range above it.
 RTT_PERIOD_DAYS = {"day": 1.0, "week": 7.0, "month": 30.0, "all": 0.0, "": 0.0}
+# Per-trip rows kept per (camera, window) for the study bundle. A ceiling on the STORED rows, not
+# on the walk: the timer walks the whole era either way, and this only bounds what one download can
+# be asked to carry. Measured order of magnitude: ch29 ran 1,569 trips in a week.
+RTT_STORE_MAX_TRIPS = int(os.environ.get("DASH_RTT_STORE_MAX_TRIPS", "200000"))
 RTT_WINDOWS = (1.0, 7.0, 30.0, 0.0)
 # How old a cached trends payload may be before the UI is told to call it stale. It is still SERVED
 # past this — a stale number that renders beats a fresh one that times out — but it is labelled.
@@ -1455,6 +1459,15 @@ def _rtt_window_table(db):
         counting_version TEXT, door_version TEXT,   -- era key, same rule as door_aggregate
         payload TEXT, computed_at REAL, compute_ms INTEGER,
         PRIMARY KEY (gateway_id, cam, window_days, counting_version, door_version))""")
+    # PER-TRIP ROWS IN THEIR OWN COLUMN, NOT INSIDE `payload`. _rtt_read's payload is embedded in
+    # every trends_cache entry and parsed on every trends request; folding a few thousand trips
+    # into it would inflate the hot path to serve one download. This column is read by the study
+    # bundle alone. ALTER, not a recreate: the table already holds every gateway's current era.
+    _c = {r[1] for r in db.execute("PRAGMA table_info(rtt_window)")}
+    if "trips" not in _c:
+        db.execute("ALTER TABLE rtt_window ADD COLUMN trips TEXT")
+    if "n_trips_stored" not in _c:
+        db.execute("ALTER TABLE rtt_window ADD COLUMN n_trips_stored INTEGER")
 
 
 def rtt_refresh(db, gw, cam, window_days):
@@ -1470,15 +1483,26 @@ def rtt_refresh(db, gw, cam, window_days):
     if dv is None:
         return {"gw": gw, "cam": cam, "window_days": d, "skipped": "no door rows"}
     t_start = time.time()
-    got, err = _rtt_by_cam(db, gw, [cam], t0, t1, max_rows=None)
+    got, err = _rtt_by_cam(db, gw, [cam], t0, t1, max_rows=None, want_trips=True)
     S = (got or {}).get(cam)
+    # POPPED BEFORE THE SUMMARY IS STORED, so `payload` stays byte-identical to what every existing
+    # reader already gets. Adding a key to it would land in every trends_cache entry too.
+    trips = (S or {}).pop("trips", None)
+    if S is not None and trips is None:
+        trips = []
+    n_trips_stored = (len(trips) if trips is not None else None)
+    if trips is not None and len(trips) > RTT_STORE_MAX_TRIPS:
+        trips = trips[:RTT_STORE_MAX_TRIPS]
+        n_trips_stored = RTT_STORE_MAX_TRIPS
     ms = int((time.time() - t_start) * 1000)
     db.execute("INSERT INTO rtt_window (gateway_id,cam,window_days,counting_version,door_version,"
-               "payload,computed_at,compute_ms) VALUES (?,?,?,?,?,?,?,?) "
+               "payload,computed_at,compute_ms,trips,n_trips_stored) VALUES (?,?,?,?,?,?,?,?,?,?) "
                "ON CONFLICT(gateway_id,cam,window_days,counting_version,door_version) DO UPDATE SET "
                "payload=excluded.payload, computed_at=excluded.computed_at, "
-               "compute_ms=excluded.compute_ms",
-               (gw, cam, d, cv or "", dv or "", json.dumps(S) if S else None, time.time(), ms))
+               "compute_ms=excluded.compute_ms, trips=excluded.trips, "
+               "n_trips_stored=excluded.n_trips_stored",
+               (gw, cam, d, cv or "", dv or "", json.dumps(S) if S else None, time.time(), ms,
+                json.dumps(trips) if trips is not None else None, n_trips_stored))
     db.commit()
     # One era per (cam, window): a retired era is never served, so keeping it only grows the table.
     db.execute("DELETE FROM rtt_window WHERE gateway_id=? AND cam=? AND window_days=? AND NOT "
@@ -1486,7 +1510,49 @@ def rtt_refresh(db, gw, cam, window_days):
     db.commit()
     return {"gw": gw, "cam": cam, "window_days": d, "compute_ms": ms, "error": err,
             "state": (S or {}).get("state"), "n_rows": (S or {}).get("n_rows"),
-            "n_trips": (S or {}).get("n_trips")}
+            "n_trips": (S or {}).get("n_trips"), "n_trips_stored": n_trips_stored}
+
+
+def _rtt_trips_read(db, gw, cam, window_days):
+    """Serve the STORED per-trip rows. NEVER walks. -> (list|None, meta).
+
+    Same era key and same never-across-boundaries rule as _rtt_read. A miss is PENDING, never "this
+    lift made no round trips" — those are opposite claims.
+
+    This exists because the study bundle needs the per-trip grain and rtt_window used to hold only
+    the summary, so the bundle walked the era itself, on the request path, for seven cameras. It
+    timed out at 60.26s on a 7-day range on a Monday morning — the exact shape of failure that took
+    RTT off the request path in the first place, reintroduced by a download.
+    """
+    cv, dv = _current_keys(db, gw, cam)
+    if dv is None:
+        return None, {"state": "no door rows for this camera in any era"}
+    try:
+        r = db.execute("SELECT trips, n_trips_stored, computed_at FROM rtt_window "
+                       "WHERE gateway_id=? AND cam=? AND window_days=? AND counting_version=? "
+                       "AND door_version=?",
+                       (gw, cam, float(window_days), cv or "", dv or "")).fetchone()
+    except sqlite3.OperationalError:
+        # The column arrives with this build; a box between deploy and the first sweep has the
+        # table but not the column, which is pending, not empty.
+        return None, {"state": "not yet computed — the precompute job has not run on this schema",
+                      "detail": "per-trip rows are stored by rtt_refresh on the precompute timer; "
+                                "this build added the column and the sweep has not run since",
+                      "current_door_version": dv}
+    if not r or r["trips"] is None:
+        return None, {"state": "not yet computed for the current era/window",
+                      "current_door_version": dv, "window_days": window_days,
+                      "detail": "the precompute job (liftlab-precompute.timer) stores the per-trip "
+                                "rows off the request path; this is pending computation, NOT an "
+                                "absence of round trips"}
+    try:
+        return json.loads(r["trips"]), {
+            "state": "ok", "computed_at": r["computed_at"], "door_version": dv,
+            "window_days": window_days, "n_trips_stored": r["n_trips_stored"],
+            "truncated": bool((r["n_trips_stored"] or 0) >= RTT_STORE_MAX_TRIPS),
+            "source": "rtt_window.trips (precomputed off the request path)"}
+    except (ValueError, TypeError):
+        return None, {"state": "stored trips unreadable", "computed_at": r["computed_at"]}
 
 
 def _rtt_read(db, gw, cam, window_days):
@@ -2046,7 +2112,8 @@ def _transit_by_cam(db, gw):
             for r in rows}
 
 
-def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override="", max_rows=None):
+def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override="", max_rows=None,
+                want_trips=False):
     """ROUND TRIP TIME per camera — the derivation is rtt_core's, never a second copy here.
 
     RTT is what the whole MEP-02 sheet resolves to, so it must not be computable two ways. This
@@ -2124,6 +2191,16 @@ def _rtt_by_cam(db, gw, cams, t0=None, t1=None, era_override="", max_rows=None):
         S = rtt_core.summarise(rows, home=RTT_HOME)
         S.update({"state": "ok", "era": era, "n_rows": len(rows),
                   "floor_attributed_pct": round(100.0 * n_floor / len(rows), 1)})
+        if want_trips:
+            # THE SAME rtt_core.trips() summarise() JUST WALKED, over the same rows, in the same
+            # call. Not a second derivation and not a second read: the per-trip grain is simply not
+            # in the summary, and the only alternative to carrying it out of here is walking the
+            # era again somewhere else — which is exactly the request-path walk that timed the
+            # study bundle out at 60.26s on a Monday morning.
+            S["trips"] = [(t_a, t_b, round(dt, 1), ns,
+                           ("anomaly" if rtt_core.classify(dt) else "plausible"),
+                           rtt_core.classify(dt) or "")
+                          for t_a, t_b, dt, ns in rtt_core.trips(rows, RTT_HOME)]
         out[cam] = S
     return out, None
 
@@ -3625,6 +3702,10 @@ def dash_rtt_fleet(gw: str, period: str = "all", from_d: str = "", to_d: str = "
 # their grain (one row per episode, one row per round trip, one row per era boundary) — those are
 # bounded, and the bound is written into the file and the README rather than being a silent cap.
 BUNDLE_BUDGET_S = float(os.environ.get("DASH_BUNDLE_BUDGET_S", "60"))
+# PER FILE, not just per bundle. One deadline across the whole build meant the first slow file ate
+# the budget and every later one died of someone else's cost while reporting its own name. With a
+# slice each, the blame lands where it belongs and the later files are attempted at all.
+BUNDLE_FILE_BUDGET_S = float(os.environ.get("DASH_BUNDLE_FILE_BUDGET_S", "15"))
 # The uncompressed ceiling. CSV deflates ~8-12x, so 64 MB of text lands well inside the 10 MB
 # target for the zip; the budget is enforced on TEXT because that is the number the writers can
 # see while they are writing, and stopping after the fact would mean building it all first anyway.
@@ -3800,7 +3881,22 @@ def _bundle_range_name(gw, t0, t1, first_ts, last_ts):
 
 
 def _bundle_build(db, gw, period="all", from_d="", to_d=""):
-    """-> (zip_bytes, filename, manifest). Called by the endpoint; does no writing to the DB."""
+    """-> (zip_bytes, filename, manifest, phases). Called by the endpoint; writes nothing.
+
+    ONE FILE FAILING WITHHOLDS ONE FILE. The first version raised on any failure and returned no
+    zip at all, on the theory that a bundle missing a file with a README that lists it claims a
+    completeness it does not have. That reasoning was right about the README and wrong about the
+    remedy: the fix is to say so in the README, not to throw away six good datasets because the
+    seventh could not be produced. A NAMED ABSENCE INSIDE THE ARTEFACT IS HONEST — it is the same
+    rule every panel on this dashboard already follows — and it is what the reader can actually
+    use. So each file is produced independently, a failure becomes <name>.UNAVAILABLE.txt carrying
+    the reason and the phase, and the README lists it under 'Withheld'.
+
+    EACH FILE GETS ITS OWN SLICE OF THE CLOCK. A single deadline across the whole build meant the
+    first slow file consumed the budget and every later one died of someone else's cost, reported
+    as its own failure. Per-file deadlines keep the blame where it belongs and guarantee the later
+    files are attempted at all.
+    """
     import zipfile
     t0, t1, range_label = _range_bounds(period, from_d, to_d)
     custom = bool(from_d or to_d)
@@ -3809,293 +3905,381 @@ def _bundle_build(db, gw, period="all", from_d="", to_d=""):
     cam_ids = [c["cam"] for c in cams]
     labels = {c["cam"]: (c.get("label") or "") for c in cams}
     extent = {"first": None, "last": None}
+    t_build = time.monotonic()
+    phases = {}
+
+    class _Withheld(Exception):
+        """A file this build DECLINES to produce, with the reason a reader needs. Not an error."""
+
+    def _note_extent(ts):
+        if ts is None:
+            return
+        extent["first"] = min(extent["first"] or ts, ts)
+        extent["last"] = max(extent["last"] or ts, ts)
 
     # ── 1. riders_per_day.csv — PRECOMPUTED (study_matrix), all three splits as columns ──
-    _budget_check("bundle:riders_per_day")
-    R, rmeta = (None, None)
-    if not custom and (period or "all") in _TRENDS_CACHEABLE_PERIODS:
-        R, rmeta = _study_read(db, gw, "riders_per_day", period or "all")
-    src = "study_matrix (precomputed off the request path)"
-    if R is None:
-        # Bounded and said so: this is four aggregate queries with the range pushed into SQL, not
-        # a row-by-row walk. It is the one derivation in the bundle that is cheap enough to run.
-        R = _riders_per_day_compute(gw, period=period, from_d=from_d, to_d=to_d)
-        src = ("DERIVED on this request (aggregated in SQL, range pushed down) — no precomputed "
-               "matrix covers this range" + (": a custom date range" if custom
-                                             else f": {(rmeta or {}).get('state')}"))
-    hdr = ["date_ist"]
-    for c in cam_ids:
-        hdr += [f"{c}_riders", f"{c}_boarded", f"{c}_alighted"]
-    hdr += ["total_riders", "total_boarded", "total_alighted", "lifts_observed", "lifts_total"]
-    rows = []
-    for r in (R.get("rows") or []):
-        line = [r["date"]]
+    def f_riders_per_day():
+        R, rmeta = (None, None)
+        if not custom and (period or "all") in _TRENDS_CACHEABLE_PERIODS:
+            R, rmeta = _study_read(db, gw, "riders_per_day", period or "all")
+        src = "study_matrix (precomputed off the request path)"
+        if R is None:
+            # Bounded and said so: seven aggregate queries with the range pushed into SQL, not a
+            # row-by-row walk. It is the one derivation here cheap enough to run on a request.
+            R = _riders_per_day_compute(gw, period=period, from_d=from_d, to_d=to_d)
+            src = ("DERIVED on this request (aggregated in SQL, range pushed down) — no "
+                   "precomputed matrix covers this range"
+                   + (": a custom date range" if custom else f": {(rmeta or {}).get('state')}"))
+        hdr = ["date_ist"]
         for c in cam_ids:
-            cell = (r.get("cells") or {}).get(c) or {}
-            if cell.get("observed"):
-                line += [cell.get("riders"), cell.get("b"), cell.get("a")]
-            else:
-                line += [DARK, DARK, DARK]      # dark, not zero — three times, in three columns
-        tot = r.get("total") or {}
-        line += [tot.get("riders"), tot.get("b"), tot.get("a"),
-                 tot.get("cams_observed"), len(cam_ids)]
-        rows.append(tuple(line))
-        _dts = _epoch(f"{r['date']}T12:00:00+05:30")
-        if _dts is not None:
-            extent["first"] = min(extent["first"] or _dts, _dts)
-            extent["last"] = max(extent["last"] or _dts, _dts)
-    ct, g = (R.get("col_total") or {}), (R.get("grand_total") or {})
-    tline = ["TOTAL"]
-    for c in cam_ids:
-        v = ct.get(c) or {}
-        tline += [v.get("riders"), v.get("b"), v.get("a")]
-    tline += [g.get("riders"), g.get("b"), g.get("a"), "", len(cam_ids)]
-    rows.append(tuple(tline))
-    B.add("riders_per_day.csv", hdr, rows, src)
+            hdr += [f"{c}_riders", f"{c}_boarded", f"{c}_alighted"]
+        hdr += ["total_riders", "total_boarded", "total_alighted", "lifts_observed", "lifts_total"]
+        rows = []
+        for r in (R.get("rows") or []):
+            line = [r["date"]]
+            for c in cam_ids:
+                cell = (r.get("cells") or {}).get(c) or {}
+                if cell.get("observed"):
+                    line += [cell.get("riders"), cell.get("b"), cell.get("a")]
+                else:
+                    line += [DARK, DARK, DARK]   # dark, not zero — three times, in three columns
+            tot = r.get("total") or {}
+            line += [tot.get("riders"), tot.get("b"), tot.get("a"),
+                     tot.get("cams_observed"), len(cam_ids)]
+            rows.append(tuple(line))
+            _note_extent(_epoch(f"{r['date']}T12:00:00+05:30"))
+        ct, g = (R.get("col_total") or {}), (R.get("grand_total") or {})
+        tline = ["TOTAL"]
+        for c in cam_ids:
+            v = ct.get(c) or {}
+            tline += [v.get("riders"), v.get("b"), v.get("a")]
+        tline += [g.get("riders"), g.get("b"), g.get("a"), "", len(cam_ids)]
+        rows.append(tuple(tline))
+        return hdr, rows, src
 
     # ── 2 & 3. the two hour-of-day files — PRECOMPUTED (trends_cache), per camera ──
-    # NO LIVE FALLBACK, unlike riders_per_day. _trends_compute is the 152.8s derivation this whole
-    # precompute layer exists to keep off the request path, and running it for SEVEN cameras inside
-    # one download would be that request seven times over. On a custom range these two files carry
-    # a state and a reason per camera instead of numbers — an unavailable figure is recoverable, a
-    # bundle that never downloads is not.
-    _budget_check("bundle:hour_of_day")
-    rh, dc = [], []
-    for cam in cam_ids:
-        TRp, tmeta = (None, {"state": "custom date range"})
-        if not custom and (period or "all") in _TRENDS_CACHEABLE_PERIODS:
-            TRp, tmeta = _trends_read(db, gw, cam, period or "all")
-        prof = (TRp or {}).get("profile")
-        if not isinstance(prof, list) or not prof:
-            why = ((tmeta or {}).get("detail") or (tmeta or {}).get("state")
-                   or "no precomputed hour-of-day payload for this camera and range")
-            if custom:
-                why = ("hour-of-day profiles are precomputed for the period buttons (Today / 7 / "
-                       "30 days / All) only. Deriving one for a calendar range is the walk that "
-                       "took /trends to 152.8s, so it is refused rather than run inside a "
-                       "download. Re-download using a period button.")
-            rh.append((cam, labels.get(cam) or "", "", "", "", "", "", "unavailable", why))
-            dc.append((cam, labels.get(cam) or "", "", "", "", "", "", "", "", "",
-                       "unavailable", why))
-            continue
-        rng = (TRp or {}).get("range") or {}
-        nd = (TRp or {}).get("n_days")
-        inst = rng.get("close_instrument") or ""
-        unmeasured = cam in (rng.get("travel_unmeasured_cams") or [])
-        uncal = cam in (rng.get("uncalibrated_cams") or [])
-        for p in prof:
-            b, a = (p.get("boarded") or 0), (p.get("alighted") or 0)
-            rh.append((cam, labels.get(cam) or "", p.get("hour"), b, a, b + a, nd, "ok", ""))
-            dc.append((cam, labels.get(cam) or "", p.get("hour"), p.get("cycles"),
-                       p.get("close_median"), p.get("close_p85"), p.get("close_n") or 0,
-                       inst, ("no" if (unmeasured or uncal) else "yes"), nd, "ok",
-                       (H3_TRAVEL_NOTE if unmeasured else (UNCALIBRATED_NOTE if uncal else ""))))
-    B.add("riders_per_hour.csv",
-          ["cam", "lift", "hour_ist", "boarded", "alighted", "riders", "n_days", "state", "reason"],
-          rh, "trends_cache (precomputed off the request path)")
-    B.add("door_cycles_per_hour.csv",
-          ["cam", "lift", "hour_ist", "cycles", "close_median_s", "close_p85_s", "close_n",
-           "close_instrument", "travel_measured", "n_days", "state", "reason"],
-          dc, "trends_cache (precomputed off the request path)")
+    # NO LIVE FALLBACK. _trends_compute is the 152.8s derivation this whole precompute layer keeps
+    # off the request path; running it for seven cameras inside one download is that request seven
+    # times over. On a custom range these carry a state and a reason per camera instead of numbers.
+    def _hour_of_day():
+        rh, dc = [], []
+        for cam in cam_ids:
+            TRp, tmeta = (None, {"state": "custom date range"})
+            if not custom and (period or "all") in _TRENDS_CACHEABLE_PERIODS:
+                TRp, tmeta = _trends_read(db, gw, cam, period or "all")
+            prof = (TRp or {}).get("profile")
+            if not isinstance(prof, list) or not prof:
+                why = ((tmeta or {}).get("detail") or (tmeta or {}).get("state")
+                       or "no precomputed hour-of-day payload for this camera and range")
+                if custom:
+                    why = ("hour-of-day profiles are precomputed for the period buttons (Today / "
+                           "7 / 30 days / All) only. Deriving one for a calendar range is the walk "
+                           "that took /trends to 152.8s, so it is refused rather than run inside a "
+                           "download. Re-download using a period button.")
+                rh.append((cam, labels.get(cam) or "", "", "", "", "", "", "unavailable", why))
+                dc.append((cam, labels.get(cam) or "", "", "", "", "", "", "", "", "",
+                           "unavailable", why))
+                continue
+            rng = (TRp or {}).get("range") or {}
+            nd = (TRp or {}).get("n_days")
+            inst = rng.get("close_instrument") or ""
+            unmeasured = cam in (rng.get("travel_unmeasured_cams") or [])
+            uncal = cam in (rng.get("uncalibrated_cams") or [])
+            for p in prof:
+                b, a = (p.get("boarded") or 0), (p.get("alighted") or 0)
+                rh.append((cam, labels.get(cam) or "", p.get("hour"), b, a, b + a, nd, "ok", ""))
+                dc.append((cam, labels.get(cam) or "", p.get("hour"), p.get("cycles"),
+                           p.get("close_median"), p.get("close_p85"), p.get("close_n") or 0,
+                           inst, ("no" if (unmeasured or uncal) else "yes"), nd, "ok",
+                           (H3_TRAVEL_NOTE if unmeasured
+                            else (UNCALIBRATED_NOTE if uncal else ""))))
+        return rh, dc
+
+    _hod = {}
+
+    def f_riders_per_hour():
+        if not _hod:
+            _hod["rh"], _hod["dc"] = _hour_of_day()
+        return (["cam", "lift", "hour_ist", "boarded", "alighted", "riders", "n_days", "state",
+                 "reason"], _hod["rh"], "trends_cache (precomputed off the request path)")
+
+    def f_door_cycles_per_hour():
+        if not _hod:
+            _hod["rh"], _hod["dc"] = _hour_of_day()
+        return (["cam", "lift", "hour_ist", "cycles", "close_median_s", "close_p85_s", "close_n",
+                 "close_instrument", "travel_measured", "n_days", "state", "reason"],
+                _hod["dc"], "trends_cache (precomputed off the request path)")
 
     # ── 4. occupancy_per_episode.csv — DERIVED, bounded in SQL by the range ──
-    _budget_check("bundle:occupancy")
-    ow, oargs = "", []
-    if t0 is not None:
-        ow += " AND ts_start >= ?"; oargs.append(t0)
-    if t1 is not None:
-        ow += " AND ts_start < ?"; oargs.append(t1)
-    orows = _q(db, "SELECT cam, ts_start, ts_end, machine_boarded, machine_alighted, occupancy_max,"
-                   " occupancy_frames, occupancy_degraded, analysed_frames, human_occupancy, "
-                   "counting_version, status FROM validation_item WHERE gateway_id=?" + ow
-                   + " ORDER BY ts_start", (gw, *oargs))
-    for r in orows:
-        if r["ts_start"] is not None:
-            extent["first"] = min(extent["first"] or r["ts_start"], r["ts_start"])
-            extent["last"] = max(extent["last"] or r["ts_start"], r["ts_start"])
-    B.add("occupancy_per_episode.csv",
-          ["cam", "lift", "ts_start_epoch", "ts_start_ist", "ts_end_epoch",
-           "machine_boarded", "machine_alighted", "occupancy_max_MEASURED_MINIMUM",
-           "occupancy_frames", "occupancy_degraded", "analysed_frames", "human_occupancy",
-           "counting_version", "status", "evidence"],
-          [(r["cam"], labels.get(r["cam"]) or "", r["ts_start"], _iso_ist(r["ts_start"]),
-            r["ts_end"], r["machine_boarded"], r["machine_alighted"], r["occupancy_max"],
-            r["occupancy_frames"], r["occupancy_degraded"], r["analysed_frames"],
-            r["human_occupancy"], r["counting_version"], r["status"],
-            1 if (r["occupancy_frames"] or 0) > 0 else 0) for r in orows],
-          "DERIVED on this request — bounded in SQL to the selected range. One row per episode is "
-          "the natural grain and no aggregate holds it; validation_item is indexed and the read is "
-          "a range scan, not a walk.")
+    def f_occupancy_per_episode():
+        ow, oargs = "", []
+        if t0 is not None:
+            ow += " AND ts_start >= ?"; oargs.append(t0)
+        if t1 is not None:
+            ow += " AND ts_start < ?"; oargs.append(t1)
+        orows = _q(db, "SELECT cam, ts_start, ts_end, machine_boarded, machine_alighted, "
+                       "occupancy_max, occupancy_frames, occupancy_degraded, analysed_frames, "
+                       "human_occupancy, counting_version, status FROM validation_item "
+                       "WHERE gateway_id=?" + ow + " ORDER BY ts_start", (gw, *oargs))
+        for r in orows:
+            _note_extent(r["ts_start"])
+        return (["cam", "lift", "ts_start_epoch", "ts_start_ist", "ts_end_epoch",
+                 "machine_boarded", "machine_alighted", "occupancy_max_MEASURED_MINIMUM",
+                 "occupancy_frames", "occupancy_degraded", "analysed_frames", "human_occupancy",
+                 "counting_version", "status", "evidence"],
+                [(r["cam"], labels.get(r["cam"]) or "", r["ts_start"], _iso_ist(r["ts_start"]),
+                  r["ts_end"], r["machine_boarded"], r["machine_alighted"], r["occupancy_max"],
+                  r["occupancy_frames"], r["occupancy_degraded"], r["analysed_frames"],
+                  r["human_occupancy"], r["counting_version"], r["status"],
+                  1 if (r["occupancy_frames"] or 0) > 0 else 0) for r in orows],
+                "DERIVED on this request — bounded in SQL to the selected range. One row per "
+                "episode is the natural grain and no aggregate holds it; validation_item is "
+                "indexed and the read is a range scan, not a walk.")
 
-    # ── 5. rtt_trips.csv — DERIVED, and the ONE expensive walk in the bundle ──
-    # BOUNDED PER CAMERA, AND IT REFUSES RATHER THAN TRUNCATES. A partial walk drops whole round
-    # trips and reports a median from part of the window; the refusal carries the row count and the
-    # reason so the file says why a camera is missing instead of the camera simply not being there.
-    _budget_check("bundle:rtt_trips")
-    trips, n_refused = [], 0
-    try:
-        import rtt_core
-    except Exception as e:
-        rtt_core = None
-        trips.append(("", "", "", "", "", "", "unavailable",
-                      f"rtt_core could not be imported ({type(e).__name__}) — the round-trip "
-                      f"derivation lives there and is never reimplemented", RTT_HOME, ""))
-    if rtt_core is not None:
+    # ── 5. rtt_trips.csv — READ FROM rtt_window, NEVER WALKED ──
+    # THIS IS WHAT TIMED THE BUNDLE OUT. It walked each camera's era here, on the request path,
+    # under a row cap — and a cap on ROWS is not a cap on TIME: seven cameras under the cap still
+    # spent 60.26s in SQL on a 7-day range and the whole download was lost. The trips are now
+    # walked once per era per window by rtt_refresh, on the timer, and this reads one indexed row
+    # per camera. Same source the RTT panel serves from, same era key, same never-across-a-boundary
+    # rule.
+    def f_rtt_trips():
+        wd = RTT_PERIOD_DAYS.get(period if period in RTT_PERIOD_DAYS else "all", 0.0)
+        if custom:
+            raise _Withheld(
+                "round trips are precomputed for the rolling windows the period buttons name "
+                "(1, 7, 30 days and all history), on each camera's current era. There is no "
+                "stored answer for a calendar range, and deriving one would put a seven-camera "
+                "door walk back on the request path — which is what made this download time out "
+                "at 60s. Re-download using a period button.")
+        out, n_ok = [], 0
         for cam in cam_ids:
-            _budget_check(f"bundle:rtt_trips:{cam}")
-            vers = [(r["door_version"], r["mx"]) for r in _q(
-                db, "SELECT door_version, MAX(ts) mx FROM gw_door_event WHERE gateway_id=? "
-                    "AND cam=? AND door_version IS NOT NULL AND door_version<>'' "
-                    "GROUP BY door_version", (gw, cam))]
-            _ov, _esrc = _era_for(db, gw, cam, "")
-            era, err = rtt_core.expand_era(
-                vers, _ov if DOOR_ERA not in ("", "auto") else None)
-            if err or not era:
-                n_refused += 1
-                trips.append((cam, labels.get(cam) or "", "", "", "", "", "unavailable",
-                              err or "no door-engine reads in any era for this camera — RTT is "
-                                     "UNAVAILABLE, not zero", RTT_HOME, ""))
+            tr, meta = _rtt_trips_read(db, gw, cam, wd)
+            S, smeta = _rtt_read(db, gw, cam, wd)          # the MEASUREMENT state, beside the rows
+            era = (S or {}).get("era") or ""
+            when = _iso_ist((meta or {}).get("computed_at"))
+            if tr is None:
+                # A NAMED ABSENCE PER CAMERA, never a camera that is simply not in the file.
+                out.append((cam, labels.get(cam) or "", "", "", "", "", "unavailable",
+                            ((meta or {}).get("detail") or (meta or {}).get("state") or
+                             "no stored round-trip rows for this lift and window"),
+                            RTT_HOME, era, when))
                 continue
-            w, wargs = _ts_clause(t0, t1)
-            n_rows = _q(db, "SELECT COUNT(*) n FROM gw_door_event WHERE gateway_id=? AND cam=? "
-                            "AND door_version = ?" + w, (gw, cam, era, *wargs))[0]["n"]
-            if n_rows > BUNDLE_RTT_MAX_ROWS:
-                n_refused += 1
-                trips.append((cam, labels.get(cam) or "", "", "", "", "", "refused",
-                              f"{n_rows} door rows in this range exceed the "
-                              f"{BUNDLE_RTT_MAX_ROWS} this download will walk. It REFUSES rather "
-                              f"than truncating: a partial walk would drop whole round trips and "
-                              f"report a median from part of the window. Narrow the range, or run "
-                              f"tools/rtt.py off the request path.", RTT_HOME, era))
+            n_ok += 1
+            if not tr:
+                # FOUR DIFFERENT CLAIMS, NOT ONE EMPTY CELL. The walk RAN — that is what an empty
+                # list means here — so the question is what it found, and the summary stored beside
+                # these rows is what answers it. A camera with no floor attribution cannot have a
+                # round trip at all; a camera with floors and no trips made none. Printing the
+                # second sentence for the first is the misdescription this file exists to prevent.
+                _st = (S or {}).get("state")
+                if _st and _st != "ok":
+                    out.append((cam, labels.get(cam) or "", "", "", "", "", _st,
+                                ((S or {}).get("note")
+                                 or f"the stored summary reports state {_st!r} and carried no "
+                                    f"explanation"),
+                                RTT_HOME, era, when))
+                else:
+                    out.append((cam, labels.get(cam) or "", "", "", "", "", "no_trips",
+                                f"the precomputed walk found no round trip in this window: no door "
+                                f"CLOSED at {RTT_HOME} was followed by a door OPEN at {RTT_HOME}. "
+                                f"This IS a measurement, unlike an 'unavailable' row.",
+                                RTT_HOME, era, when))
                 continue
-            rows_ = _q(db, "SELECT ts, floor, door_state FROM gw_door_event WHERE gateway_id=? "
-                           "AND cam=? AND door_version = ?" + w + " ORDER BY ts, id",
-                       (gw, cam, era, *wargs))
-            if rows_ and not any(r["floor"] is not None for r in rows_):
-                n_refused += 1
-                trips.append((cam, labels.get(cam) or "", "", "", "", "", "no_floor",
-                              "no floor attribution on this camera — RTT needs a home-floor read, "
-                              "so it is UNAVAILABLE, not zero. This is not a lift that made no "
-                              "round trips.", RTT_HOME, era))
-                continue
-            n_before = len(trips)
-            for t_a, t_b, dt, ns in rtt_core.trips(rows_, RTT_HOME):
-                why = rtt_core.classify(dt)
-                extent["first"] = min(extent["first"] or t_a, t_a)
-                extent["last"] = max(extent["last"] or t_a, t_a)
-                trips.append((cam, labels.get(cam) or "", t_a, _iso_ist(t_a), round(dt, 1), ns,
-                              "anomaly" if why else "plausible", why or "", RTT_HOME, era))
-            if len(trips) == n_before:
-                trips.append((cam, labels.get(cam) or "", "", "", "", "", "no_trips",
-                              f"the walk completed over {len(rows_)} door rows and found no "
-                              f"round trip: no door CLOSED at {RTT_HOME} was followed by a door "
-                              f"OPEN at {RTT_HOME}. This IS a measurement, unlike the rows above "
-                              f"it that report a refusal or a missing input.", RTT_HOME, era))
-    B.add("rtt_trips.csv",
-          ["cam", "lift", "start_epoch", "start_ist", "rtt_s", "stops", "class", "anomaly_reason",
-           "home_floor", "era"],
-          trips,
-          f"DERIVED on this request — bounded at {BUNDLE_RTT_MAX_ROWS} door rows per camera, which "
-          f"REFUSES rather than truncates. No aggregate holds one row per round trip; rtt_window "
-          f"stores only the summary, and the derivation is rtt_core's, never a second copy.")
+            for t_a, _t_b, dt, ns, klass, reason in tr:
+                _note_extent(t_a)
+                out.append((cam, labels.get(cam) or "", t_a, _iso_ist(t_a), dt, ns, klass, reason,
+                            RTT_HOME, era, when))
+            if (meta or {}).get("truncated"):
+                out.append((cam, labels.get(cam) or "", "", "", "", "", "truncated",
+                            f"the stored rows for this lift hit the {RTT_STORE_MAX_TRIPS} cap; "
+                            f"rows above it are not in this file", RTT_HOME, era, ""))
+        if not n_ok:
+            raise _Withheld(
+                "no lift has stored round-trip rows for this window yet. rtt_refresh writes them "
+                "on the precompute timer (liftlab-precompute.timer) and this build added the "
+                "column, so the first sweep after deploy fills it. This is PENDING COMPUTATION, "
+                "not a fleet that made no round trips.")
+        _, _, w = _window(wd)
+        return (["cam", "lift", "start_epoch", "start_ist", "rtt_s", "stops", "class",
+                 "anomaly_reason", "home_floor", "era", "walked_at_ist"],
+                out,
+                f"rtt_window.trips (precomputed off the request path) — the rolling "
+                f"{w.get('label')} window on each camera's current era, NOT the selector's exact "
+                f"calendar bounds. Nothing is walked to produce this file.")
 
     # ── 6. eras.csv — DERIVED, and cheap: two GROUP BYs and the stored alphabet ──
-    _budget_check("bundle:eras")
-    erows = []
-    vals = _validations(db, gw)          # once for the gateway, not once per camera
-    for cam in cam_ids:
-        n_before_cam = len(erows)
-        cv_now, dv_now = _current_keys(db, gw, cam)
-        alpha, _detail, ameta = _alphabet_read(db, gw, cam)
-        whitelist = (" ".join(sorted(alpha)) if alpha else "NONE")
-        val = vals.get(cam) or {}
-        for r in _q(db, "SELECT door_version v, MIN(ts) lo, MAX(ts) hi, COUNT(*) n "
-                        "FROM gw_door_event WHERE gateway_id=? AND cam=? AND door_version "
-                        "IS NOT NULL AND door_version<>'' GROUP BY door_version ORDER BY MIN(ts)",
-                    (gw, cam)):
-            erows.append((cam, labels.get(cam) or "", "door_version", r["v"],
-                          _iso_ist(r["lo"]), _iso_ist(r["hi"]), r["n"],
-                          "yes" if r["v"] == dv_now else "no",
-                          "", "", "", whitelist, (ameta or {}).get("state") or ""))
-        for r in _q(db, "SELECT counting_version v, MIN(ts_start) lo, MAX(ts_start) hi, COUNT(*) n "
-                        "FROM validation_item WHERE gateway_id=? AND cam=? AND counting_version "
-                        "IS NOT NULL AND counting_version<>'' GROUP BY counting_version "
-                        "ORDER BY MIN(ts_start)", (gw, cam)):
-            cur = (r["v"] == (val.get("counting_version") or cv_now))
-            erows.append((cam, labels.get(cam) or "", "counting_version", r["v"],
-                          _iso_ist(r["lo"]), _iso_ist(r["hi"]), r["n"],
-                          "yes" if cur else "no",
-                          (val.get("precision") if cur else ""),
-                          (val.get("n_reviewed") if cur else ""),
-                          (val.get("n_exact") if cur else ""), whitelist,
-                          (ameta or {}).get("state") or ""))
-        if len(erows) == n_before_cam:
-            erows.append((cam, labels.get(cam) or "", "none", "", "", "", 0, "no", "", "", "",
-                          whitelist, "no era of either kind has ever been recorded for this "
-                                     "camera — it is UNCALIBRATED, not idle"))
-    B.add("eras.csv",
-          ["cam", "lift", "kind", "version", "first_ist", "last_ist", "n_rows", "is_current",
-           "precision_pct", "n_reviewed", "n_exact", "floor_whitelist", "floor_alphabet_state"],
-          erows,
-          "DERIVED on this request — two GROUP BYs per camera plus the stored floor alphabet. "
-          "Boundaries are measured from the rows, never from a hardcoded date. NOT range-filtered: "
-          "an era that started before the range is what the range's rows were measured by.")
+    def f_eras():
+        erows = []
+        vals = _validations(db, gw)          # once for the gateway, not once per camera
+        for cam in cam_ids:
+            n_before_cam = len(erows)
+            cv_now, dv_now = _current_keys(db, gw, cam)
+            alpha, _detail, ameta = _alphabet_read(db, gw, cam)
+            whitelist = (" ".join(sorted(alpha)) if alpha else "NONE")
+            val = vals.get(cam) or {}
+            for r in _q(db, "SELECT door_version v, MIN(ts) lo, MAX(ts) hi, COUNT(*) n "
+                            "FROM gw_door_event WHERE gateway_id=? AND cam=? AND door_version "
+                            "IS NOT NULL AND door_version<>'' GROUP BY door_version "
+                            "ORDER BY MIN(ts)", (gw, cam)):
+                erows.append((cam, labels.get(cam) or "", "door_version", r["v"],
+                              _iso_ist(r["lo"]), _iso_ist(r["hi"]), r["n"],
+                              "yes" if r["v"] == dv_now else "no",
+                              "", "", "", whitelist, (ameta or {}).get("state") or ""))
+            for r in _q(db, "SELECT counting_version v, MIN(ts_start) lo, MAX(ts_start) hi, "
+                            "COUNT(*) n FROM validation_item WHERE gateway_id=? AND cam=? AND "
+                            "counting_version IS NOT NULL AND counting_version<>'' "
+                            "GROUP BY counting_version ORDER BY MIN(ts_start)", (gw, cam)):
+                cur = (r["v"] == (val.get("counting_version") or cv_now))
+                erows.append((cam, labels.get(cam) or "", "counting_version", r["v"],
+                              _iso_ist(r["lo"]), _iso_ist(r["hi"]), r["n"],
+                              "yes" if cur else "no",
+                              (val.get("precision") if cur else ""),
+                              (val.get("n_reviewed") if cur else ""),
+                              (val.get("n_exact") if cur else ""), whitelist,
+                              (ameta or {}).get("state") or ""))
+            if len(erows) == n_before_cam:
+                erows.append((cam, labels.get(cam) or "", "none", "", "", "", 0, "no", "", "", "",
+                              whitelist, "no era of either kind has ever been recorded for this "
+                                         "camera — it is UNCALIBRATED, not idle"))
+        return (["cam", "lift", "kind", "version", "first_ist", "last_ist", "n_rows", "is_current",
+                 "precision_pct", "n_reviewed", "n_exact", "floor_whitelist",
+                 "floor_alphabet_state"], erows,
+                "DERIVED on this request — two GROUP BYs per camera plus the stored floor "
+                "alphabet. Boundaries are measured from the rows, never from a hardcoded date. "
+                "NOT range-filtered: an era that started before the range is what the range's "
+                "rows were measured by.")
 
     # ── 7. outages.csv — a constant, no query at all ──
-    B.add("outages.csv",
-          ["start_utc", "end_utc", "start_ist", "end_ist", "start_epoch", "end_epoch", "cause",
-           "cams", "overlaps_selected_range", "note"],
-          [(g["start"], g["end"], _iso_ist(g["start_epoch"]), _iso_ist(g["end_epoch"]),
-            g["start_epoch"], g["end_epoch"], g.get("cause") or "",
-            " ".join(g.get("cams") or []) or "ALL",
-            ("yes" if ((t0 is None or g["end_epoch"] > t0)
-                       and (t1 is None or g["start_epoch"] < t1)) else "no"),
-            g.get("note") or "") for g in DATA_GAPS],
-          "DATA_GAPS, a reviewed constant in dash_api.py — no query, and not derived from the data")
+    def f_outages():
+        return (["start_utc", "end_utc", "start_ist", "end_ist", "start_epoch", "end_epoch",
+                 "cause", "cams", "overlaps_selected_range", "note"],
+                [(g["start"], g["end"], _iso_ist(g["start_epoch"]), _iso_ist(g["end_epoch"]),
+                  g["start_epoch"], g["end_epoch"], g.get("cause") or "",
+                  " ".join(g.get("cams") or []) or "ALL",
+                  ("yes" if ((t0 is None or g["end_epoch"] > t0)
+                             and (t1 is None or g["start_epoch"] < t1)) else "no"),
+                  g.get("note") or "") for g in DATA_GAPS],
+                "DATA_GAPS, a reviewed constant in dash_api.py — no query, and not derived from "
+                "the data")
+
+    producers = [
+        ("riders_per_day.csv", f_riders_per_day),
+        ("riders_per_hour.csv", f_riders_per_hour),
+        ("door_cycles_per_hour.csv", f_door_cycles_per_hour),
+        ("occupancy_per_episode.csv", f_occupancy_per_episode),
+        ("rtt_trips.csv", f_rtt_trips),
+        ("eras.csv", f_eras),
+        ("outages.csv", f_outages),
+    ]
+    withheld = {}
+    for fn, fn_producer in producers:
+        left = BUNDLE_BUDGET_S - (time.monotonic() - t_build)
+        t_file = time.monotonic()
+        if left <= 0:
+            withheld[fn] = ("the bundle's overall "
+                            f"{BUNDLE_BUDGET_S:g}s budget was spent before this file was reached. "
+                            "The files above it are complete; narrow the date range to fit the "
+                            "rest in.")
+            phases[fn] = 0.0
+            continue
+        # ITS OWN DEADLINE, so a slow file cannot make a fast one look broken.
+        _budget_arm(db, min(left, BUNDLE_FILE_BUDGET_S))
+        try:
+            header, rows, source = fn_producer()
+            B.add(fn, header, rows, source)
+        except _Withheld as e:
+            withheld[fn] = str(e)
+        except DashTimeout as e:
+            withheld[fn] = (f"this file exceeded its {min(left, BUNDLE_FILE_BUDGET_S):g}s slice of "
+                            f"the bundle budget and was abandoned during '{e}'. Every other file "
+                            f"in this zip is complete. Narrow the date range and download again.")
+        except Exception as e:                  # one bad dataset must not cost the other six
+            withheld[fn] = (f"{type(e).__name__}: {e}. This file could not be produced; the rest "
+                            f"of the bundle is unaffected and complete.")
+        finally:
+            _budget_disarm(db)
+            phases[fn] = round(time.monotonic() - t_file, 3)
 
     name = _bundle_range_name(gw, t0, t1, extent["first"], extent["last"])
-    readme = _bundle_readme(gw, range_label, period, from_d, to_d, B, cams, custom)
-    B.files["README.md"] = readme
+    readme = _bundle_readme(gw, range_label, period, from_d, to_d, B, cams, custom, withheld)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        # README FIRST in the archive, so a reader unzipping to a terminal meets the caveats before
-        # the numbers rather than after them.
+        # README FIRST in the archive, so a reader unzipping to a terminal meets the caveats — and
+        # the list of what is missing — before the numbers rather than after them.
         z.writestr(f"{name}/README.md", readme)
         for fn in _bundle_caveats():
             if fn in B.files:
                 z.writestr(f"{name}/{fn}", B.files[fn])
-    return buf.getvalue(), f"{name}.zip", B.meta
+            elif fn in withheld:
+                # A STUB WITH A NAME, not a gap. Unzipped into a folder, a missing file is
+                # indistinguishable from one the reader forgot to look at; a file called
+                # rtt_trips.UNAVAILABLE.txt cannot be mistaken for either data or an oversight.
+                z.writestr(f"{name}/{fn.rsplit('.', 1)[0]}.UNAVAILABLE.txt",
+                           _bundle_stub(fn, withheld[fn], phases.get(fn), range_label))
+    return buf.getvalue(), f"{name}.zip", B.meta, {"phases": phases, "withheld": withheld,
+                                                  "total_s": round(time.monotonic() - t_build, 3)}
 
 
-def _bundle_readme(gw, range_label, period, from_d, to_d, B, cams, custom):
+def _bundle_stub(fn, reason, secs, range_label):
+    """The text that stands in for a file this bundle could not produce."""
+    return (f"{fn} — WITHHELD FROM THIS BUNDLE\n"
+            + "=" * (len(fn) + 30) + "\n\n"
+            f"This file is NOT in the archive. That is not the same as an empty file, and it is\n"
+            f"not a report that there was nothing to put in it.\n\n"
+            f"REASON\n------\n{reason}\n\n"
+            f"Range requested : {range_label}\n"
+            f"Time spent      : {'%.2fs' % secs if secs is not None else 'not reached'}\n"
+            f"Generated       : {_iso_ist(time.time())} IST\n\n"
+            f"Every other file in this bundle is complete and was produced from the same range.\n"
+            f"See README.md, section 'Withheld from this bundle'.\n")
+
+
+def _bundle_readme(gw, range_label, period, from_d, to_d, B, cams, custom, withheld=None):
     """The README, generated FROM the caveat registry — a file cannot enter the bundle without it.
 
-    VERBATIM, not paraphrased. Every sentence below is the same string the dashboard prints beside
+    VERBATIM, not paraphrased. Every caveat below is the same string the dashboard prints beside
     the same number; a bundle whose caveats were reworded for the file would be a second, drifting
     statement of the same limitation, and the first thing to drift is always the qualifier."""
     cav = _bundle_caveats()
+    withheld = withheld or {}
     out = [f"# liftlab study bundle — {gw}", "",
            f"Range: **{range_label}**"
            + (f" (explicit dates {from_d or 'start'} to {to_d or 'today'})" if custom
               else f" (period `{period or 'all'}`)"),
            f"Downloaded: {_iso_ist(time.time())} IST", "",
-           BUNDLE_RANGE_NOTE, "",
-           "## Read this first", "",
-           "Every number in this bundle is a MEASUREMENT with a stated limitation. The limitations "
-           "are not disclaimers — they change what the numbers mean, and each one below is printed "
-           "verbatim from the dashboard that produced the file, so the sentence beside a number on "
-           "screen is the same sentence beside it here.", "",
-           "Three that are misread most often, stated once here and again under their files:", "",
-           f"- **{RIDERS_CAVEAT}**",
-           f"- **{RIDERS_DARK_NOTE}**",
-           f"- **{OCC_LABEL} — {OCC_CALIBRATION}**", "",
-           "## Lifts in this bundle", "",
-           "| cam | label |", "|---|---|"]
+           BUNDLE_RANGE_NOTE, ""]
+    if withheld:
+        # ABOVE EVERYTHING. A reader who takes the folder at face value must learn what is not in
+        # it before they start counting what is.
+        out += ["## Withheld from this bundle", "",
+                "The following file(s) could not be produced and are represented by a "
+                "`.UNAVAILABLE.txt` stub carrying the same reason. **Their absence is not a zero "
+                "and not an empty dataset.** Every other file here is complete and covers the "
+                "range above.", ""]
+        for fn in cav:
+            if fn in withheld:
+                out += [f"- **`{fn}`** — {withheld[fn]}"]
+        out += [""]
+    out += ["## Read this first", "",
+            "Every number in this bundle is a MEASUREMENT with a stated limitation. The "
+            "limitations are not disclaimers — they change what the numbers mean, and each one "
+            "below is printed verbatim from the dashboard that produced the file, so the sentence "
+            "beside a number on screen is the same sentence beside it here.", "",
+            "Three that are misread most often, stated once here and again under their files:", "",
+            f"- **{RIDERS_CAVEAT}**",
+            f"- **{RIDERS_DARK_NOTE}**",
+            f"- **{OCC_LABEL} — {OCC_CALIBRATION}**", "",
+            "## Lifts in this bundle", "",
+            "| cam | label |", "|---|---|"]
     out += [f"| `{c['cam']}` | {c.get('label') or '—'} |" for c in cams]
     out += ["", "## Manifest", "",
             "| file | rows | source |", "|---|---|---|"]
     for fn in cav:
+        if fn in withheld:
+            out.append(f"| `{fn}` | **WITHHELD** | see above |")
+            continue
         m = B.meta.get(fn) or {}
         out.append(f"| `{fn}` | {m.get('rows', 0):,} | {m.get('source', 'not written')} |")
     inc = [fn for fn in cav if (B.meta.get(fn) or {}).get("truncated")]
@@ -4107,10 +4291,15 @@ def _bundle_readme(gw, range_label, period, from_d, to_d, B, cams, custom):
     out += ["", "---", ""]
     for fn, (desc, caveats) in cav.items():
         m = B.meta.get(fn) or {}
-        out += [f"## `{fn}`", "", desc + ".", "",
-                f"*{m.get('rows', 0):,} row(s). Source: {m.get('source', 'not written')}*", ""]
-        if m.get("truncated"):
-            out += [f"> **INCOMPLETE** — {m['truncated']}", ""]
+        out += [f"## `{fn}`", "", desc + ".", ""]
+        if fn in withheld:
+            out += [f"> **WITHHELD FROM THIS BUNDLE** — {withheld[fn]}", "",
+                    "The caveats below still describe what this file WOULD have contained, and "
+                    "are kept here so a reader who obtains it another way has them.", ""]
+        else:
+            out += [f"*{m.get('rows', 0):,} row(s). Source: {m.get('source', 'not written')}*", ""]
+            if m.get("truncated"):
+                out += [f"> **INCOMPLETE** — {m['truncated']}", ""]
         out += ["**Caveats**", ""]
         out += [f"- {c}" for c in caveats if c]
         out += [""]
@@ -4128,40 +4317,182 @@ def _bundle_readme(gw, range_label, period, from_d, to_d, B, cams, custom):
     return "\n".join(out) + "\n"
 
 
+
+def _bundle_error_html(title, detail, gw, period, from_d, to_d):
+    """What a BROWSER gets when the bundle fails. Never a raw JSON page.
+
+    A user who clicks a download button and lands on a tab of JSON has been handed a stack trace
+    as a user interface. They cannot tell whether the system is broken, whether their range was
+    too wide, or whether to try again — and the page they were on is gone. The dashboard renders
+    this inline through fetch(); this HTML is for the case where someone reaches the URL directly,
+    and it says the same three things in the same words.
+    """
+    q = ("period=" + (period or "all")
+         + (f"&from_d={from_d}" if from_d else "") + (f"&to_d={to_d}" if to_d else ""))
+    return (f"""<!doctype html><meta charset=utf-8><title>liftlab · bundle unavailable</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{{font:15px/1.55 system-ui;max-width:640px;margin:40px auto;padding:0 16px;color:#1a1a1a}}
+h1{{font-size:17px}}code{{font:13px ui-monospace,monospace;background:#f2f2f2;padding:1px 4px;
+border-radius:3px}}.box{{border-left:4px solid #b06a00;background:rgba(176,106,0,.07);
+padding:10px 14px;border-radius:4px}}a{{color:#0a6}}</style>
+<h1>The study bundle could not be built</h1>
+<div class=box><b>{_html_escape(title)}</b><p>{_html_escape(detail)}</p></div>
+<p><b>What to try</b></p>
+<ul>
+  <li><a href="/dash/{_html_escape(gw)}/bundle?{_html_escape(q)}">Try again</a> — a wide range on a
+      busy morning can exceed the budget when a narrower one would not.</li>
+  <li><a href="/dash/{_html_escape(gw)}/bundle?period=week">Narrower range: last 7 days</a> ·
+      <a href="/dash/{_html_escape(gw)}/bundle?period=day">today only</a></li>
+  <li>Back to <a href="/dash?view=riders">the dashboard</a>, where the individual CSV links let you
+      take one dataset at a time.</li>
+</ul>
+<p style="color:#777;font-size:13px">Nothing is wrong with your data — this is the download
+refusing to spend an unbounded amount of time on the server. The numbers are still on the
+dashboard.</p>
+""")
+
+
+def _html_escape(v):
+    return (str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#39;"))
+
+
+def _bundle_run_table(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS bundle_run (
+        gateway_id TEXT, started_at REAL, total_s REAL,
+        period TEXT, from_d TEXT, to_d TEXT,
+        n_files INTEGER, n_withheld INTEGER, withheld TEXT,
+        -- PER PHASE, for the same reason precompute_run records per stage: a total cannot say
+        -- WHICH file is growing, and the answer decides what to fix. rtt_trips at 60s and
+        -- riders_per_day at 60s are different bugs.
+        phases TEXT, slowest TEXT, slowest_s REAL, bytes INTEGER, ok INTEGER,
+        PRIMARY KEY (gateway_id, started_at))""")
+    db.execute("CREATE INDEX IF NOT EXISTS ix_bundle_run ON bundle_run(gateway_id, started_at)")
+
+
+def bundle_run_record(db, gw, started_at, period, from_d, to_d, phases, withheld, n_bytes):
+    """EVERY bundle request, not just the slow ones. Scheduler-free: the endpoint writes this.
+
+    WHY A TABLE AND NOT JUST slowlog. slowlog prints a line when a HANDLER is slow, which is how
+    the 60.26s timeout was visible after the fact — to nobody, in a journal, once a user had
+    already been handed a JSON error page. The number that says a regression is coming is the
+    per-file duration BEFORE anything crosses the threshold: rtt_trips creeping 4s -> 11s -> 24s
+    over three weeks is the whole warning, and it is invisible in a log that only fires at 60.
+    Same argument, same shape and same retention as precompute_run.
+    """
+    _bundle_run_table(db)
+    # max(), not a >0 scan. A sweep where every phase rounded to 0.0s recorded NO slowest phase,
+    # so the one row that says "nothing was slow" looked identical to a row the writer botched.
+    _ph = [(k, v) for k, v in (phases or {}).items() if v is not None]
+    slowest, slowest_s = max(_ph, key=lambda kv: kv[1]) if _ph else ("", 0.0)
+    total = round(time.monotonic() - started_at, 3)
+    row = (gw, time.time(), total, period or "all", from_d or "", to_d or "",
+           len(phases or {}), len(withheld or {}),
+           json.dumps(sorted(withheld or {})), json.dumps(phases or {}),
+           slowest, slowest_s, int(n_bytes or 0), 1 if not withheld else 0)
+    db.execute("INSERT OR REPLACE INTO bundle_run (gateway_id, started_at, total_s, period, "
+               "from_d, to_d, n_files, n_withheld, withheld, phases, slowest, slowest_s, bytes, "
+               "ok) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
+    db.commit()
+    db.execute("DELETE FROM bundle_run WHERE gateway_id=? AND started_at < ?",
+               (gw, time.time() - 14 * 86400))
+    db.commit()
+    # AND a line, because a table nobody queries is the journal problem one level up. Every phase,
+    # every time — the shape of the curve is the signal, not any single crossing.
+    print(f"[bundle] {gw} period={period or 'all'}"
+          + (f" {from_d or 'start'}..{to_d or 'today'}" if (from_d or to_d) else "")
+          + f" {total:.2f}s {int(n_bytes or 0) // 1024}KB"
+          + (f" WITHHELD={','.join(sorted(withheld))}" if withheld else "")
+          + " phases: "
+          + ", ".join(f"{k.split('.')[0]} {v:.2f}s"
+                      for k, v in sorted((phases or {}).items(), key=lambda kv: -kv[1])),
+          flush=True)
+    return {"gw": gw, "total_s": total, "slowest": slowest, "slowest_s": slowest_s}
+
+
+def bundle_run_latest(db, gw):
+    """-> the most recent recorded bundle request, or None. READ ONLY."""
+    try:
+        r = db.execute("SELECT started_at, total_s, period, n_withheld, withheld, phases, "
+                       "slowest, slowest_s, bytes, ok FROM bundle_run WHERE gateway_id=? "
+                       "ORDER BY started_at DESC LIMIT 1", (gw,)).fetchone()
+    except sqlite3.OperationalError:
+        return None                     # nobody has downloaded one on this schema — not an error
+    if not r:
+        return None
+    d = dict(zip(("started_at", "total_s", "period", "n_withheld", "withheld", "phases",
+                  "slowest", "slowest_s", "bytes", "ok"), tuple(r)))
+    d["age_s"] = round(time.time() - (d["started_at"] or 0), 1)
+    return d
+
+
 @dash_router.get("/dash/{gw}/bundle")
-def dash_bundle(gw: str, period: str = "all", from_d: str = "", to_d: str = ""):
+def dash_bundle(gw: str, period: str = "all", from_d: str = "", to_d: str = "",
+                fmt: str = ""):
     """The whole study, one ZIP, caveats included — filtered to the range the screen is showing.
 
-    ON A BUDGET, like /data. The RTT trip walk is the one genuinely expensive member and it is
-    capped per camera, but a cap on rows is not a cap on time; the wall-clock budget is what
-    guarantees this returns. A timeout is a 503 that names the phase, never a partial zip — half a
-    bundle with a full README would claim completeness it does not have.
+    IT ALWAYS RETURNS A ZIP IF IT CAN RETURN ANYTHING. A file that cannot be produced becomes a
+    named stub inside the archive and a line in the README under "Withheld"; six good datasets are
+    never thrown away because the seventh failed. Only a failure of the ARCHIVE itself is an error
+    response.
+
+    fmt=json is set by the dashboard's fetch(); it asks for a machine-readable error so the page
+    can render it inline. A browser reaching this URL directly has no such handler, so it gets an
+    HTML page instead of a tab full of JSON — which is a stack trace being used as a user
+    interface.
     """
+    t_start = time.monotonic()
+    wants_json = (fmt or "").strip().lower() == "json"
+
+    def _fail(title, detail, status, extra=None):
+        if wants_json:
+            return JSONResponse({"error": title, "detail": detail, "gw": gw,
+                                 "period": period, "from_d": from_d, "to_d": to_d, **(extra or {})},
+                                status_code=status, headers={"Cache-Control": "no-store"})
+        return Response(_bundle_error_html(title, detail, gw, period, from_d, to_d),
+                        media_type="text/html; charset=utf-8", status_code=status,
+                        headers={"Cache-Control": "no-store"})
+
     if period and period not in _TRENDS_CACHEABLE_PERIODS and not (from_d or to_d):
-        return JSONResponse({"error": f"unknown period {period!r}",
-                             "periods": [p for p in _TRENDS_CACHEABLE_PERIODS if p]},
-                            status_code=400)
+        return _fail("unknown period",
+                     f"{period!r} is not one of the ranges this download understands: "
+                     + ", ".join(p for p in _TRENDS_CACHEABLE_PERIODS if p) + ".", 400,
+                     {"periods": [p for p in _TRENDS_CACHEABLE_PERIODS if p]})
     db = _db()
-    _budget_arm(db, BUNDLE_BUDGET_S)
     try:
-        blob, name, manifest = _bundle_build(db, gw, period=period, from_d=from_d, to_d=to_d)
-    except DashTimeout as e:
-        return JSONResponse(
-            {"error": "timeout",
-             "detail": (f"the study bundle exceeded its {BUNDLE_BUDGET_S:g}s budget and was "
-                        f"abandoned during '{e}'. No partial zip is returned: a bundle missing a "
-                        f"file, with a README that lists it, would claim a completeness it does "
-                        f"not have. Narrow the date range and try again."),
-             "phase": str(e), "budget_s": BUNDLE_BUDGET_S, "elapsed_s": _budget_elapsed()},
-            status_code=503, headers={"Retry-After": "30"})
+        blob, name, manifest, run = _bundle_build(db, gw, period=period, from_d=from_d, to_d=to_d)
+    except Exception as e:
+        # The per-file loop already absorbs a failing dataset, so reaching here means the ARCHIVE
+        # could not be built at all. That is the only case with no zip to hand back.
+        try:
+            bundle_run_record(db, gw, t_start, period, from_d, to_d,
+                              {}, {"__archive__": str(e)}, 0)
+        except Exception:
+            pass                                # logging must never be the reason a request fails
+        return _fail("the bundle could not be assembled",
+                     f"{type(e).__name__}: {e}. No file in the archive could be written, so there "
+                     f"is nothing to hand back. This is a fault in the download, not in the data.",
+                     503, {"phase": "archive"})
     finally:
-        _budget_disarm(db)
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
+    db2 = _db()
+    try:
+        bundle_run_record(db2, gw, t_start, period, from_d, to_d,
+                          run.get("phases") or {}, run.get("withheld") or {}, len(blob))
+    except Exception:
+        pass                                    # never let the log break the download
+    finally:
+        db2.close()
     return Response(blob, media_type="application/zip",
                     headers={"Content-Disposition": f'attachment; filename="{name}"',
                              "Cache-Control": "no-store",
                              "X-Bundle-Bytes": str(len(blob)),
-                             "X-Bundle-Files": str(len(manifest) + 1)})
+                             "X-Bundle-Files": str(len(manifest) + 1),
+                             "X-Bundle-Withheld": ",".join(sorted(run.get("withheld") or {})),
+                             "X-Bundle-Seconds": str(run.get("total_s"))})
 
 
 # ============================================================ CSV export
@@ -5490,11 +5821,91 @@ function periodBar(extra){
 // ever visible, so the reader sees exactly one of these. It carries the range the screen is
 // showing, like every other download here, and it is deliberately NOT per camera — the bundle is
 // the fleet, and a per-camera bundle would be seven folders to reconcile by hand.
+// FETCHED, NOT NAVIGATED. As a plain <a> a failure replaced the whole dashboard with a tab of
+// raw JSON — a stack trace used as a user interface. The reader could not tell whether the system
+// was broken, whether their range was too wide, or whether to try again, and the page they were
+// on was gone. Now the click stays on the page: a preparing state, then either a saved file or an
+// error rendered inline with a retry and a narrower range to try.
+var BSTATE=null;                       // null | {state:'preparing'} | {state:'error', ...}
 function bundleBtn(){
-  return '<a class=bundlebtn href="/dash/'+GW+'/bundle?'+fleetQuery()+'" '
+  if(BSTATE&&BSTATE.state==='preparing'){
+    return '<button class=bundlebtn disabled>\u23f3 preparing bundle\u2026</button>'
+      +'<span class=mut style="font-size:11px">reading the precomputed tables for '
+      +esc(trPeriod||'all')+' \u2014 this stays on the page</span>';
+  }
+  var h='<button class=bundlebtn onclick="startBundle()" '
     +'title="one ZIP: riders per day, riders and door cycles per hour, occupancy per episode, '
     +'round trips, era boundaries, outages \u2014 and a README carrying every caveat verbatim">'
-    +'\u2b07 Download study bundle</a>';
+    +'\u2b07 Download study bundle</button>';
+  if(BSTATE&&BSTATE.state==='error'){
+    // INLINE, BESIDE THE BUTTON THAT FAILED. Three things, in this order: what happened, that the
+    // data is not the problem, and the two actions worth taking.
+    h+='<div style="flex-basis:100%;margin-top:6px;padding:8px 10px;border-left:3px solid #b06a00;'
+      +'background:rgba(176,106,0,.07);border-radius:4px;font-size:12px">'
+      +'<b>THE BUNDLE COULD NOT BE BUILT</b> \u2014 '+esc(BSTATE.title||'')
+      +'<div class=mut style="margin-top:3px">'+esc(BSTATE.detail||'')+'</div>'
+      +'<div class=mut style="margin-top:3px">Nothing is wrong with your data. The numbers are '
+      +'still on this page; this is the download refusing to spend an unbounded amount of time on '
+      +'the server.</div>'
+      +'<div style="margin-top:6px">'
+      +'<button class=tog onclick="startBundle()">retry</button>'
+      +'<button class=tog onclick="setPeriod(\'week\');startBundle()">try 7 days instead</button>'
+      +'<button class=tog onclick="setPeriod(\'day\');startBundle()">try today only</button>'
+      +'<button class=tog onclick="BSTATE=null;reRenderView()">dismiss</button>'
+      +'</div></div>';
+  }
+  if(BSTATE&&BSTATE.state==='withheld'){
+    // THE DOWNLOAD SUCCEEDED AND IS INCOMPLETE. Saying nothing here would let a reader open a
+    // folder of six files and count them as seven.
+    h+='<div style="flex-basis:100%;margin-top:6px;padding:8px 10px;border-left:3px solid #b06a00;'
+      +'background:rgba(176,106,0,.07);border-radius:4px;font-size:12px">'
+      +'<b>DOWNLOADED, WITH '+BSTATE.withheld.length+' FILE(S) WITHHELD</b> \u2014 '
+      +esc(BSTATE.withheld.join(', '))+'. Each is replaced by a <code>.UNAVAILABLE.txt</code> '
+      +'stub carrying its reason, and README.md lists them under \u201cWithheld\u201d. The other '
+      +'files are complete.'
+      +'<div style="margin-top:6px"><button class=tog onclick="BSTATE=null;reRenderView()">'
+      +'dismiss</button></div></div>';
+  }
+  return h;
+}
+// Redraw whichever matrix is showing, WITHOUT refetching it — the bundle state lives in the
+// download bar, and refetching the view to show a button state would be a request loop.
+function reRenderView(){
+  if(mode==='riders')renderRiders();
+  else if(mode==='rttfleet')renderRttFleet();
+  else if(mode==='trends')renderTrends();
+}
+function startBundle(){
+  if(BSTATE&&BSTATE.state==='preparing')return;      // one at a time; the button is disabled too
+  BSTATE={state:'preparing'}; reRenderView();
+  // fmt=json asks the server for a machine-readable error. Without it — a browser hitting the URL
+  // directly — it answers with an HTML page instead of a tab of JSON.
+  fetch('/dash/'+GW+'/bundle?'+fleetQuery()+'&fmt=json').then(function(r){
+    if(!r.ok){
+      return r.json().catch(function(){return {};}).then(function(b){
+        BSTATE={state:'error', title:(b.error||('HTTP '+r.status)),
+                detail:(b.detail||'the server did not say why.')};
+        reRenderView();
+      });
+    }
+    var wh=(r.headers&&r.headers.get)?(r.headers.get('X-Bundle-Withheld')||''):'';
+    var cd=(r.headers&&r.headers.get)?(r.headers.get('Content-Disposition')||''):'';
+    var m=/filename="([^"]+)"/.exec(cd);
+    return r.blob().then(function(b){
+      // Save it the only way a fetched body can be saved: an object URL and a synthetic click.
+      // No external anything, so the artefact CSP is untouched.
+      var u=URL.createObjectURL(b), a=document.createElement('a');
+      a.href=u; a.download=(m?m[1]:'liftlab_bundle.zip');
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function(){URL.revokeObjectURL(u)}, 30000);
+      BSTATE=wh?{state:'withheld', withheld:wh.split(',').filter(Boolean)}:null;
+      reRenderView();
+    });
+  }).catch(function(e){
+    BSTATE={state:'error', title:'the request did not complete',
+            detail:String((e&&e.message)||e||'')};
+    reRenderView();
+  });
 }
 // Every download carries the SAME cam/period/date-range the screen is showing, so a spreadsheet
 // and the chart above it cannot disagree about which rows they describe.

@@ -250,18 +250,23 @@ def main():
     # ══ 4. precomputed where precomputed exists ════════════════════════════════════════
     print("\n=== 4. sources ===")
     db = D._db()
-    _b, _n, man = D._bundle_build(db, "site-A", period="all")
+    _b, _n, man, _run = D._bundle_build(db, "site-A", period="all")
     db.close()
     for fn in CAV:
         src = (man.get(fn) or {}).get("source", "")
         print(f"  {fn:28s} {src[:64]}")
     for fn, want in (("riders_per_day.csv", "study_matrix"),
                      ("riders_per_hour.csv", "trends_cache"),
-                     ("door_cycles_per_hour.csv", "trends_cache")):
+                     ("door_cycles_per_hour.csv", "trends_cache"),
+                     # THE REGRESSION THAT TOOK THE DOWNLOAD DOWN. rtt_trips walked each camera's
+                     # era here, on the request path, under a ROW cap — and a cap on rows is not a
+                     # cap on time. Seven cameras still spent 60.26s in SQL on a 7-day range and
+                     # the whole zip was lost. It reads the precomputed walk now.
+                     ("rtt_trips.csv", "rtt_window.trips")):
         if want not in (man.get(fn) or {}).get("source", ""):
             fails.append(f"{fn} did not come from {want} even though it is filled — the bundle is "
                          f"re-deriving something the timer already computed")
-    for fn in ("occupancy_per_episode.csv", "rtt_trips.csv", "eras.csv"):
+    for fn in ("occupancy_per_episode.csv", "eras.csv"):
         src = (man.get(fn) or {}).get("source", "")
         if "DERIVED" not in src:
             fails.append(f"{fn} does not declare that it was derived on this request")
@@ -292,8 +297,47 @@ def main():
     nf = [r for r in trips if r["cam"] == "ch27"]
     print(f"  ch27 (no floor): state={nf[0]['class']!r} reason={nf[0]['anomaly_reason'][:52]!r}"
           if nf else "  ch27 MISSING")
-    if nf and "UNAVAILABLE, not zero" not in nf[0]["anomaly_reason"]:
+    # THE MEASUREMENT STATE, NOT THE DELIVERY STATE. A camera with no floor attribution stores an
+    # EMPTY trip list — the walk ran and there was nothing to find — and reading that as "pending"
+    # told the operator to wait for a sweep that will never change the answer.
+    if not nf:
+        pass
+    elif nf[0]["class"] != "no_floor":
+        fails.append(f"the no-floor lift is classed {nf[0]['class']!r}, not no_floor — an empty "
+                     f"stored trip list is being read as a missing one")
+    elif "UNAVAILABLE, not zero" not in nf[0]["anomaly_reason"]:
         fails.append("the no-floor lift's row does not say its RTT is unavailable rather than zero")
+
+    # ══ 5b. NO WALK ON THE REQUEST PATH — the fix for the 60s timeout ══════════════════
+    # Proven by DISABLING the walk. If rtt_core.trips() cannot be called and the file is still
+    # produced with its rows, the bundle is reading rtt_window and not deriving. A timing
+    # assertion would pass on a fixture too small to be slow; this cannot.
+    print("\n=== 5b. the bundle cannot walk, and still produces rtt_trips ===")
+    import rtt_core
+    _real_trips, _real_sum = rtt_core.trips, rtt_core.summarise
+
+    def _boom(*a, **k):
+        raise AssertionError("rtt_core walked on the request path — this is the 60.26s timeout")
+    rtt_core.trips = _boom
+    rtt_core.summarise = _boom
+    try:
+        z2 = zipfile.ZipFile(io.BytesIO(_blob(D.dash_bundle("site-A", period="all"))))
+        f2 = _members(z2, z2.namelist()[0].split("/")[0])
+    finally:
+        rtt_core.trips, rtt_core.summarise = _real_trips, _real_sum
+    if "rtt_trips.csv" not in f2:
+        fails.append("with the walk disabled the bundle could not produce rtt_trips.csv — it is "
+                     "still deriving on the request path, which is the reported timeout")
+    else:
+        t2 = list(_csvmod.DictReader(
+            l for l in f2["rtt_trips.csv"].splitlines() if not l.startswith("#")))
+        n_real = sum(1 for r in t2 if r["class"] in ("plausible", "anomaly"))
+        print(f"  produced {len(t2)} row(s), {n_real} of them real trips, with rtt_core disabled")
+        if n_real < 1:
+            fails.append("rtt_trips.csv has no trips when the walk is disabled — the rows are not "
+                         "coming from the precomputed store")
+        if [r["class"] for r in t2] != [r["class"] for r in trips]:
+            fails.append("the walked and the stored file disagree about their rows")
 
     # ══ 6. eras.csv and outages.csv say what they are for ══════════════════════════════
     print("\n=== 6. eras + outages ===")
@@ -350,6 +394,196 @@ def main():
                      f"at least one view, so which tab you are on decides whether you can get "
                      f"the bundle")
     print(f"  present in {n_bars} download bar(s), one visible at a time")
+
+    # ══ 9. ONE FILE FAILING WITHHOLDS ONE FILE ════════════════════════════════════════
+    # The first version raised on any failure and returned no zip at all, so a single bad dataset
+    # cost the reader the other six and handed them a JSON error page instead. A named absence
+    # INSIDE the artefact is honest; seven datasets withheld because of one is not better.
+    print("\n=== 9. a partial bundle, with the gap named inside it ===")
+    _real_alpha = D._alphabet_read
+
+    def _boom_alpha(*a, **k):
+        raise RuntimeError("synthetic: the floor alphabet could not be read")
+    D._alphabet_read = _boom_alpha
+    try:
+        rp = D.dash_bundle("site-A", period="all")
+        zp = zipfile.ZipFile(io.BytesIO(_blob(rp)))
+        fp = _members(zp, zp.namelist()[0].split("/")[0])
+    finally:
+        D._alphabet_read = _real_alpha
+    print(f"  members: {', '.join(sorted(fp))}")
+    if "eras.csv" in fp:
+        fails.append("the failing dataset was written anyway")
+    if "eras.UNAVAILABLE.txt" not in fp:
+        fails.append("a withheld file left no stub — unzipped into a folder, a missing file is "
+                     "indistinguishable from one the reader forgot to look at")
+    else:
+        stub = fp["eras.UNAVAILABLE.txt"]
+        print(f"  stub names the reason: "
+              f"{'yes' if 'synthetic' in stub else 'NO'} · "
+              f"says it is not an empty dataset: {'not the same as an empty file' in stub}")
+        if "synthetic" not in stub:
+            fails.append("the stub does not carry the reason the file was withheld")
+        if "not the same as an empty file" not in stub:
+            fails.append("the stub does not distinguish itself from an empty dataset")
+        if "Time spent" not in stub:
+            fails.append("the stub does not record the phase/duration it was withheld at")
+    for other in ("riders_per_day.csv", "rtt_trips.csv", "outages.csv", "README.md"):
+        if other not in fp:
+            fails.append(f"{other} was lost because a DIFFERENT file failed — one bad dataset must "
+                         f"not cost the other six")
+    rdp = fp.get("README.md", "")
+    if "## Withheld from this bundle" not in rdp:
+        fails.append("the README does not list the withheld file")
+    if "`eras.csv`" not in rdp.split("## Read this first")[0]:
+        fails.append("the withheld file is not named ABOVE the numbers — a reader who takes the "
+                     "folder at face value must learn what is missing before they start counting")
+    if "**WITHHELD**" not in rdp:
+        fails.append("the manifest does not mark the withheld file")
+    wh = (getattr(rp, "headers", {}) or {}).get("X-Bundle-Withheld", "")
+    print(f"  X-Bundle-Withheld: {wh!r} · README lists it: "
+          f"{'## Withheld from this bundle' in rdp}")
+    if "eras.csv" not in wh:
+        fails.append("the response header does not name the withheld file, so the page cannot "
+                     "tell the user the download is incomplete")
+
+    # AND WHEN EVERY FILE IS WITHHELD, there is still a zip: stubs all the way down beats an error
+    # page. A zero OVERALL budget is the deterministic way in — a zero PER-FILE budget only fires
+    # if a query happens to be long enough for the SQL progress handler to interrupt, which on a
+    # fixture it is not, so that version of this check could pass without exercising anything.
+    _save = D.BUNDLE_BUDGET_S
+    D.BUNDLE_BUDGET_S = 0.0
+    try:
+        rz = D.dash_bundle("site-A", period="all")
+        zz = zipfile.ZipFile(io.BytesIO(_blob(rz)))
+        fz = _members(zz, zz.namelist()[0].split("/")[0])
+    finally:
+        D.BUNDLE_BUDGET_S = _save
+    n_stub = sum(1 for k in fz if k.endswith(".UNAVAILABLE.txt"))
+    n_csv = sum(1 for k in fz if k.endswith(".csv"))
+    print(f"  with a 0s overall budget: {len(fz)} member(s), {n_stub} stub(s), {n_csv} csv, "
+          f"README present={'README.md' in fz}, status={getattr(rz, 'status_code', 200)}")
+    if getattr(rz, "status_code", 200) != 200 or "zip" not in (getattr(rz, "media_type", "") or ""):
+        fails.append("an exhausted budget returned an ERROR instead of a zip of stubs — that is "
+                     "the refuse-the-whole-download rule coming back")
+    if n_stub != len(CAV):
+        fails.append(f"an exhausted budget produced {n_stub} stubs for {len(CAV)} files — a file "
+                     f"that was never reached must still say so")
+    if n_csv:
+        fails.append("a file was written despite the budget being spent")
+    if "README.md" not in fz:
+        fails.append("a bundle whose files were all withheld returned no README — the reader gets "
+                     "a zip with no explanation in it")
+    any_stub = next((v for k, v in fz.items() if k.endswith(".UNAVAILABLE.txt")), "")
+    if "budget" not in any_stub:
+        fails.append("the stub does not name the budget as the reason it was not reached")
+
+    # ══ 10. a browser never gets a JSON error page ════════════════════════════════════
+    print("\n=== 10. errors are HTML for a browser, JSON for fetch() ===")
+    b_html = D.dash_bundle("site-A", period="bogus")
+    b_json = D.dash_bundle("site-A", period="bogus", fmt="json")
+    mt = (getattr(b_html, "media_type", "") or "")
+    body_html = _blob(b_html).decode()
+    print(f"  direct hit : {getattr(b_html, 'status_code', 200)} {mt} "
+          f"({len(body_html)} bytes, <html>={'<style>' in body_html})")
+    print(f"  fmt=json   : {getattr(b_json, 'status_code', 200)} "
+          f"{getattr(b_json, 'media_type', '')}")
+    if "html" not in mt:
+        fails.append("a direct browser hit got a non-HTML error — a tab of raw JSON is a stack "
+                     "trace being used as a user interface")
+    for want in ("Try again", "Narrower range", "back to", "dashboard"):
+        if want.lower() not in body_html.lower():
+            fails.append(f"the HTML error page does not offer {want!r} — an error with no next "
+                         f"step leaves the reader stuck on a dead tab")
+    if "Nothing is wrong with your data" not in body_html:
+        fails.append("the HTML error page does not say the data is not the problem")
+    if getattr(b_json, "media_type", "") != "application/json":
+        fails.append("fmt=json did not return JSON, so the page cannot render the error inline")
+
+    # ══ 11. every request is logged, with its phases ══════════════════════════════════
+    print("\n=== 11. every bundle request is logged ===")
+    _db = D._db()
+    last = D.bundle_run_latest(_db, "site-A")
+    n_runs = _db.execute("SELECT COUNT(*) FROM bundle_run WHERE gateway_id='site-A'").fetchone()[0]
+    _db.close()
+    ph = json.loads((last or {}).get("phases") or "{}")
+    print(f"  {n_runs} run(s) recorded · last: {last and last['total_s']}s, "
+          f"slowest={last and last['slowest']!r} {last and last['slowest_s']}s, "
+          f"{len(ph)} phase(s)")
+    if not last:
+        fails.append("no bundle request was recorded — the next regression is invisible until a "
+                     "user is handed an error page, which is how this one was found")
+    if n_runs < 2:
+        fails.append("only the slow requests are recorded; the signal is the CURVE, and a log "
+                     "that fires at the threshold cannot show a phase creeping towards it")
+    if len(ph) < len(CAV):
+        fails.append(f"only {len(ph)} of {len(CAV)} phases were recorded — a total cannot say "
+                     f"WHICH file is growing, and the answer decides what to fix")
+    if not (last or {}).get("slowest"):
+        fails.append("the record does not name the slowest phase")
+
+    # AND THE HEALTH LINE SAYS SO BEFORE A USER DOES. slowlog only prints once a handler is ALREADY
+    # over its threshold — by which time someone has been handed an error page. The signal is the
+    # phase creeping towards the budget, and the daily line is where it has to appear.
+    try:
+        import health_check as H
+    except Exception as e:
+        print(f"  health line SKIPPED — health_check not importable ({type(e).__name__})")
+    else:
+        _db = D._db()
+        _db.execute("UPDATE bundle_run SET total_s=41.0, slowest='rtt_trips.csv', slowest_s=38.2 "
+                    "WHERE gateway_id='site-A' AND started_at=(SELECT MAX(started_at) FROM "
+                    "bundle_run WHERE gateway_id='site-A')")
+        _db.commit()
+        phrase, pay = H._bundle_slow(_db, "site-A")
+        print(f"  health phrase: {str(phrase)[:96]!r}")
+        if not phrase:
+            fails.append("a 41s bundle against a 30s warning line produced no health phrase — the "
+                         "next regression is again invisible until a user meets it")
+        else:
+            if "rtt_trips.csv" not in phrase:
+                fails.append("the health phrase does not name the slowest FILE — 'the bundle is "
+                             "slow' sends the reader to read seven producers")
+            if "41s" not in phrase.replace("41.0", "41"):
+                fails.append("the health phrase does not state the duration")
+        # a fast, complete bundle must stay SILENT — a line that always fires is not a warning
+        _db.execute("UPDATE bundle_run SET total_s=2.0, n_withheld=0, withheld='[]' "
+                    "WHERE gateway_id='site-A'")
+        _db.commit()
+        quiet, _ = H._bundle_slow(_db, "site-A")
+        # and a WITHHELD file must speak even when the bundle was fast
+        _db.execute("UPDATE bundle_run SET n_withheld=1, withheld='[\"eras.csv\"]' "
+                    "WHERE gateway_id='site-A' AND started_at=(SELECT MAX(started_at) FROM "
+                    "bundle_run WHERE gateway_id='site-A')")
+        _db.commit()
+        wphrase, _ = H._bundle_slow(_db, "site-A")
+        _db.close()
+        print(f"  fast+complete stays quiet: {quiet is None} · "
+              f"fast+withheld still speaks: {bool(wphrase)}")
+        if quiet is not None:
+            fails.append("a fast, complete bundle still produced a health phrase — a line that "
+                         "always fires is not a warning")
+        if not wphrase or "withheld" not in wphrase:
+            fails.append("a bundle that completed with a file withheld says nothing on the health "
+                         "line — the operator learns it only if someone opens the zip")
+
+    # ══ 12. the button never navigates away from the dash ═════════════════════════════
+    print("\n=== 12. the button ===")
+    if 'class=bundlebtn href=' in page.replace('"', '').replace("'", ""):
+        fails.append("the bundle button is still a plain link — a failure replaces the whole "
+                     "dashboard with the error response")
+    for want, why in (("startBundle()", "the button does not go through fetch()"),
+                      ("preparing bundle", "there is no preparing state"),
+                      ("fmt=json", "the fetch does not ask for a machine-readable error"),
+                      ("THE BUNDLE COULD NOT BE BUILT", "there is no inline error panel"),
+                      ("try 7 days instead", "the inline error offers no narrower range"),
+                      (">retry<", "the inline error offers no retry"),
+                      ("FILE(S) WITHHELD", "a partial download is not reported to the user")):
+        if want not in page:
+            fails.append(why)
+    print(f"  fetch-driven={'startBundle()' in page} · preparing state="
+          f"{'preparing bundle' in page} · inline error+retry="
+          f"{'THE BUNDLE COULD NOT BE BUILT' in page}")
 
     shutil.rmtree(tmp, ignore_errors=True)
     print()

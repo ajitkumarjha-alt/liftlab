@@ -201,23 +201,30 @@ in the test would let a paraphrase ship, and the first thing to drift is always 
 README is generated from a registry keyed by filename, so a file cannot be added to the bundle
 without its caveats arriving with it; the test walks that registry rather than a list of its own.
 
+> **SUPERSEDED IN PART — see [INCIDENT_bundle_timeout.md](INCIDENT_bundle_timeout.md).** As first
+> shipped, `rtt_trips.csv` walked each camera's era on the request path under a ROW cap, and a cap
+> on rows is not a cap on time: it timed out at 60.26s on a 7-day range and returned no zip at all.
+> It now reads `rtt_window.trips`, precomputed by `rtt_refresh`; a file that cannot be produced is
+> withheld as a named stub instead of costing the whole download; and the button fetches rather than
+> navigates, so a failure never replaces the dashboard with a page of JSON.
+
 **BOUNDS.** Precomputed where precomputed exists, and each file's manifest line says which.
 
 * The two hour-of-day files have **no live fallback**. On a custom date range they carry a state and
   a reason per camera instead of numbers, because `_trends_compute` is the 152.8 s derivation this
   whole layer exists to keep off the request path and running it for seven cameras inside one
   download would be that request seven times over. The period buttons are fully precomputed.
-* `rtt_trips.csv` is the one expensive walk. It is capped at `DASH_BUNDLE_RTT_MAX_ROWS` (default
-  `RTT_MAX_ROWS`, 120,000) door rows **per camera and it REFUSES rather than truncating** — a
-  partial walk drops whole round trips and reports a median from part of the window. The refusal
-  lands in the file as a row with the row count and the reason, never as an absent camera.
+* `rtt_trips.csv` **no longer walks anything** — it reads `rtt_window.trips`, one indexed row per
+  camera, written by `rtt_refresh` on the precompute timer. See the incident note above for why the
+  row cap that used to guard it was the wrong bound.
 * One shared text budget (`DASH_BUNDLE_TEXT_BUDGET`, 64 MB) across the whole zip, not seven
   independent caps: the 10 MB target is a question about the download, not about any one member.
   CSV deflates ~8-12x. A file that stops short says so in its last line AND in the README — a short
   file that looks complete is the worst of the three outcomes.
-* A wall-clock budget (`DASH_BUNDLE_BUDGET_S`, 60 s), armed exactly as `/data` arms its own. A
-  timeout is a 503 naming the phase, **never a partial zip**: a bundle missing a file, with a README
-  that lists it, claims a completeness it does not have.
+* A wall-clock budget (`DASH_BUNDLE_BUDGET_S`, 60 s) **and a per-file slice**
+  (`DASH_BUNDLE_FILE_BUDGET_S`, 15 s), armed as `/data` arms its own. A file that runs out is
+  withheld as a named stub; the rest of the bundle is unaffected. Only a failure of the archive
+  itself is an error response, and that response is HTML for a browser and JSON for `fetch()`.
 
 **ABSENCES ARE ROWS.** A lift with no floor attribution appears in `rtt_trips.csv` with
 `class=no_floor` and "UNAVAILABLE, not zero" in its reason, exactly as it appears in the table on

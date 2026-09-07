@@ -81,6 +81,10 @@ LITESTREAM_UNIT = os.environ.get("HEALTH_LITESTREAM_UNIT", "litestream")
 # NOT A BREACH. Nothing is broken at 16 minutes — this is reported every time until it is addressed,
 # the same rule the config gaps follow.
 PRECOMPUTE_SLOW_S = float(os.environ.get("HEALTH_PRECOMPUTE_SLOW_S", "900"))   # 15 min
+# The study bundle's own budget is 60s. Half of it is the warning line, on the same reasoning the
+# precompute threshold uses: the number worth reporting is the one approaching the cliff, not the
+# one that has already gone over it and been seen by a user.
+BUNDLE_SLOW_S = float(os.environ.get("HEALTH_BUNDLE_SLOW_S", "30"))
 OOS_MIN_S = float(os.environ.get("HEALTH_OOS_MIN_S", "3600"))       # silent at least this long
 OOS_MIN_READS = int(os.environ.get("HEALTH_OOS_MIN_READS", "50"))   # enough reads to call it stable
 OOS_STABLE_FRAC = float(os.environ.get("HEALTH_OOS_STABLE_FRAC", "0.9"))
@@ -196,6 +200,52 @@ def expected_cams(db, gw):
     rows = db.execute("SELECT channel FROM channel_map WHERE gateway_id=? AND is_lift=1 "
                       "ORDER BY channel", (gw,)).fetchall()
     return [f"ch{r['channel']}" for r in rows], "channel_map (is_lift=1) — registry was empty"
+
+
+def _bundle_slow(db, gw, now=None):
+    """-> (phrase|None, payload|None) for the most recent study-bundle download.
+
+    WHY THIS IS ON THE HEALTH LINE AT ALL. The bundle timed out at 60.26s in a user's browser and
+    handed them a page of raw JSON. Nothing had reported the approach: the per-file cost had been
+    climbing for weeks and the only instrument was slowlog, which prints when a handler is ALREADY
+    over its threshold — by which time a person has seen it. The signal that matters is the phase
+    creeping towards the budget, and bundle_run records every request precisely so this line can
+    show it before anyone clicks.
+
+    SILENT WHEN NOBODY HAS DOWNLOADED ONE. An absent record is an unknown, and an unknown is not a
+    breach — the same rule _precompute_slow and _litestream follow.
+    """
+    try:
+        r = db.execute("SELECT started_at, total_s, period, n_withheld, withheld, phases, "
+                       "slowest, slowest_s, ok FROM bundle_run WHERE gateway_id=? "
+                       "ORDER BY started_at DESC LIMIT 1", (gw,)).fetchone()
+    except sqlite3.OperationalError:
+        return None, None
+    if not r or r["total_s"] is None:
+        return None, None
+    bd = {k: r[k] for k in ("started_at", "total_s", "period", "n_withheld", "slowest",
+                            "slowest_s", "ok")}
+    bd["age_s"] = round((now or time.time()) - (r["started_at"] or 0), 1)
+    try:
+        bd["withheld"] = json.loads(r["withheld"] or "[]")
+    except (ValueError, TypeError):
+        bd["withheld"] = []
+    slow = (r["total_s"] or 0) >= BUNDLE_SLOW_S
+    if not slow and not r["n_withheld"]:
+        return None, bd                    # carried on the payload regardless, so the dash can plot it
+    # THE PHRASE NAMES THE FILE, not just the duration. "the bundle is slow" sends the reader to
+    # read seven producers; "rtt_trips 41s of 46s" sends them to one.
+    bits = []
+    if slow:
+        bits.append(f"last study bundle took {r['total_s']:.0f}s against a "
+                    f"{BUNDLE_SLOW_S:.0f}s warning line (budget "
+                    f"{float(os.environ.get('DASH_BUNDLE_BUDGET_S', '60')):.0f}s)"
+                    + (f", slowest file {r['slowest']} {r['slowest_s']:.1f}s" if r["slowest"]
+                       else ""))
+    if r["n_withheld"]:
+        bits.append(f"{r['n_withheld']} file(s) withheld ({', '.join(bd['withheld'])}) — the "
+                    f"download completed and is INCOMPLETE, which the README inside it says too")
+    return ("; ".join(bits) + f" [period={r['period']}, {_age_phrase(bd['age_s'])} ago]"), bd
 
 
 def _precompute_slow(db, gw, now=None):
@@ -432,6 +482,7 @@ def evaluate(db, gw, now=None):
             if r["cam"] in cams and not (r["floor_alphabet_n"] or 0):
                 gaps.append(f"{r['cam']} floor whitelist: NONE")
     pc_phrase, pc = _precompute_slow(db, gw, now)
+    bd_phrase, bd = _bundle_slow(db, gw, now)
     ls_active, ls_note = _litestream()
     if ls_active is False:
         infra.append(f"litestream {ls_note} — the gateway DB is NOT being replicated. On 2026-08-04 "
@@ -484,6 +535,8 @@ def evaluate(db, gw, now=None):
     # all, because "watch the reported fill duration" needs something to do the reporting.
     if pc_phrase:
         line += f" [PRECOMPUTE: {pc_phrase}]"
+    if bd_phrase:
+        line += f" [BUNDLE: {bd_phrase}]"
     if oos_cams and ok:
         line += (" (" + ", ".join(f"{c}: {detail[c]['klass']}" for c in oos_cams) + ")")
     elif quiet and ok:
@@ -496,6 +549,7 @@ def evaluate(db, gw, now=None):
             # Carried whether or not it breached, so the dashboard can show the trend rather than
             # only the moment it crossed. None means the job has never run — an unknown, not a zero.
             "precompute": pc, "precompute_slow": bool(pc_phrase),
+            "bundle": bd, "bundle_slow": bool(bd_phrase),
             "prev_ok": (None if prev is None else prev["ok"])}
 
 
