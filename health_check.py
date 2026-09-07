@@ -18,7 +18,7 @@ An hourly transit alarm would therefore have fired on a healthy camera more than
 hours, and three times on the best day this fleet has ever had. A monitor that cries wolf gets
 muted, and a muted monitor is worse than none — it converts an unknown into a false assurance.
 
-WHAT THE ALARM IS INSTEAD. Three signals, each covering a failure the others cannot see:
+WHAT THE ALARM IS INSTEAD. Four signals, each covering a failure the others cannot see:
 
   1. HEARTBEAT AGE (analyzer_status.ts). The worker posts this every segment, whether or not anyone
      walks through the door. Stale => that camera's worker is not running. Catches GPU stalls and a
@@ -30,6 +30,14 @@ WHAT THE ALARM IS INSTEAD. Three signals, each covering a failure the others can
      assumed: only 14 of 16,753 gaps exceed 6h (0.08%), and those coincide with the declared
      outages. This is the signal that survives a worker which heartbeats happily while counting
      nobody.
+  4. STARVED, NOT SILENT (2026-09-07). All three signals above ask "is anything ARRIVING", and on
+     2026-09-02 PL2B started answering yes while counting 47-115 boardings/day against ~500
+     before, with its door cycles at a normal 601/day. Nothing fired for five days and nothing
+     was wrong by the rules above: fresh heartbeat, advancing segments, transits every few
+     minutes. No absolute threshold can see this — demand varies by an order of magnitude across
+     a week, which is the same measured reason an hourly transit alarm was rejected. The quantity
+     that does not is the RATIO of what was counted to what the doors did: boardings per door
+     open, compared only against THAT CAMERA'S OWN baseline. See STARVED, NOT SILENT below.
 
 Transit age is REPORTED for every camera whether or not it breaches, because that is the number
 that was asked for and it is informative; it is simply not the trigger.
@@ -200,6 +208,261 @@ def expected_cams(db, gw):
     rows = db.execute("SELECT channel FROM channel_map WHERE gateway_id=? AND is_lift=1 "
                       "ORDER BY channel", (gw,)).fetchall()
     return [f"ch{r['channel']}" for r in rows], "channel_map (is_lift=1) — registry was empty"
+
+
+# ============================================================ STARVED, NOT SILENT
+# THE FOURTH SIGNAL, and the gap that found it. On 2026-09-07 PL2B (ch30) had been counting 47-115
+# boardings/day since the Sep 2 restart against ~500 before, while its door cycles ran at 601/day —
+# normal. 0.11 boardings per door cycle against 0.67-1.0 on every other lift. The health line said
+# nothing for five days, and it was right by its own rules: the camera was not silent. Its
+# heartbeat was fresh, its segments advanced, and transits arrived every few minutes. Every one of
+# the three signals in this file's docstring asks "is anything ARRIVING", and the answer was yes.
+#
+# What was wrong is that far too LITTLE was arriving, and no threshold on an absolute count can see
+# that — a lift's demand varies by an order of magnitude between a Monday peak and a Sunday
+# afternoon, which is the same reason an hourly transit alarm was rejected as crying wolf. The
+# quantity that does not vary that way is the RATIO of what was counted to what the doors did:
+# people board when the doors open, so boardings per door open is roughly stable for a given lift
+# and is a property of the COUNTER, not of the traffic.
+#
+# EVERY CAMERA IS COMPARED ONLY WITH ITSELF. The fleet ratios span 0.67-1.0 in normal operation, so
+# a fleet-wide floor would either miss a starved busy camera or convict a healthy quiet one. The
+# baseline is the camera's own median hourly ratio over the preceding days.
+#
+# THIN HOURS ARE NOT JUDGED. An hour with a handful of door opens produces a ratio built on noise,
+# and firing on it is exactly the wolf-crying the docstring above rejects. Below
+# DEGRADED_MIN_OPENS the hour is skipped and says so in the payload.
+#
+# REPORTED, NOT A BREACH — the rule the config gaps follow. Nothing is DOWN: the lift is running,
+# the camera is working, and the number is wrong. It is stated on the line every time until it is
+# addressed, which is the difference between a warning and a warning nobody reads.
+DEGRADED_LOOKBACK_H = float(os.environ.get("HEALTH_DEGRADED_LOOKBACK_H", "24"))
+DEGRADED_BASELINE_D = float(os.environ.get("HEALTH_DEGRADED_BASELINE_D", "7"))
+DEGRADED_FRAC = float(os.environ.get("HEALTH_DEGRADED_FRAC", "0.40"))
+DEGRADED_MIN_HOURS = int(os.environ.get("HEALTH_DEGRADED_MIN_HOURS", "6"))
+# An hour with fewer door opens than this is not judged. 10 is deliberately low: the point is to
+# exclude hours whose ratio is arithmetic on two or three events, not to require a busy hour.
+DEGRADED_MIN_OPENS = int(os.environ.get("HEALTH_DEGRADED_MIN_OPENS", "10"))
+# A baseline built on a handful of hours is not a baseline. 24 active hours is roughly two days of
+# a normal lift's active window.
+DEGRADED_MIN_BASE_HOURS = int(os.environ.get("HEALTH_DEGRADED_MIN_BASE_HOURS", "24"))
+# HOW OFTEN THE SCAN ACTUALLY RUNS. evaluate() is called every ~10 minutes; this walks several days
+# of gw_door_event through a window function and must not run on that cadence. The signal it
+# measures is 6+ hours wide, so a half-hourly recomputation is far finer than the thing it watches.
+# In between, the stored result is served WITH ITS AGE — the same read-never-derives rule the
+# dashboard follows, applied to a check.
+DEGRADED_INTERVAL_S = float(os.environ.get("HEALTH_DEGRADED_INTERVAL_S", "1800"))
+_IST_OFFSET_S = 19800                       # +05:30, fixed — IST has no DST
+
+
+def _starvation_table(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS starvation_check (
+        gateway_id TEXT, computed_at REAL, compute_ms INTEGER,
+        -- The thresholds this result was computed UNDER. A cached verdict from before someone
+        -- changed HEALTH_DEGRADED_FRAC is a verdict about a different question, and serving it
+        -- would let a threshold change appear to have taken effect when it had not.
+        lookback_h REAL, baseline_d REAL, frac REAL, min_hours INTEGER, min_opens INTEGER,
+        payload TEXT,
+        PRIMARY KEY (gateway_id, computed_at))""")
+    db.execute("CREATE INDEX IF NOT EXISTS ix_starvation ON starvation_check(gateway_id, computed_at)")
+
+
+def _starvation_params():
+    return (DEGRADED_LOOKBACK_H, DEGRADED_BASELINE_D, DEGRADED_FRAC, DEGRADED_MIN_HOURS,
+            DEGRADED_MIN_OPENS)
+
+
+def starvation_compute(db, gw, cams, now=None):
+    """Boardings per door OPEN, per camera per IST hour, recent vs the camera's own baseline.
+
+    ONE DERIVATION OF 'DOOR OPEN', and it is rtt_core.opens_with_floor's, rendered in SQL: a
+    transition INTO 'open' from anything else, with NULL door_state kept in the sequence (h3 maps
+    its internal 'unknown' to NULL on the wire and dropping those rows would merge two opens into
+    one). Numerator and denominator come from the SAME query on both sides of the comparison, so
+    the ratio cannot drift because two definitions of a cycle disagreed.
+
+    NOT door CYCLES. A cycle is a transition into 'closed' and lives in dash_api._h3_cycle_ts;
+    reimplementing it here would be a second copy of the number the whole MEP-02 sheet resolves to.
+    An open is the event a boarding actually belongs to, it is exactly expressible in SQL, and the
+    ratio is compared only against itself — so the choice costs nothing and duplicates nothing.
+    """
+    now = time.time() if now is None else now
+    t_start = time.time()
+    t_base = now - DEGRADED_BASELINE_D * 86400.0
+    t_recent = now - DEGRADED_LOOKBACK_H * 3600.0
+    hourkey = "CAST(strftime('%%Y%%m%%d%%H', %s + %d, 'unixepoch') AS INTEGER)"
+    opens, boards = {}, {}
+    note = None
+    try:
+        # The window function partitions per camera, so the FIRST row of each camera inside the
+        # window has prev=NULL and counts as an open if it is one. That is one row per camera per
+        # scan at most, and it is the same boundary behaviour rtt_core has at the head of its list.
+        for r in db.execute(
+                f"SELECT cam, {hourkey % ('ts', _IST_OFFSET_S)} hr, COUNT(*) n FROM ("
+                "  SELECT cam, ts, door_state,"
+                "         LAG(door_state) OVER (PARTITION BY cam ORDER BY ts, id) prev"
+                "  FROM gw_door_event WHERE gateway_id=? AND ts>=?"
+                ") WHERE door_state='open' AND (prev IS NULL OR prev<>'open') "
+                "GROUP BY cam, hr", (gw, t_base)):
+            opens[(r["cam"], r["hr"])] = r["n"]
+    except sqlite3.OperationalError as e:
+        # LAG needs SQLite >= 3.25, and a gateway older than the door schema has no door_state at
+        # all. Either way this is a check that DOES NOT APPLY, which is not the same as a fleet
+        # that is fine — it is reported as unknown and nothing is claimed.
+        return {"state": "unavailable", "note": f"door-open derivation unavailable: {e}",
+                "cams": {}, "degraded": [], "computed_at": now,
+                "compute_ms": int((time.time() - t_start) * 1000)}
+    try:
+        for r in db.execute(
+                f"SELECT cam, {hourkey % ('ts', _IST_OFFSET_S)} hr, COUNT(*) n FROM transit_event "
+                "WHERE gateway_id=? AND ts>=? AND direction='in' GROUP BY cam, hr", (gw, t_base)):
+            boards[(r["cam"], r["hr"])] = r["n"]
+    except sqlite3.OperationalError as e:
+        return {"state": "unavailable", "note": f"boardings unavailable: {e}", "cams": {},
+                "degraded": [], "computed_at": now,
+                "compute_ms": int((time.time() - t_start) * 1000)}
+
+    # ERA CROSSING IS A CONFOUND AND IT IS NAMED, NOT HIDDEN. A counting build that changed inside
+    # the window can move this ratio all by itself, and "the counter was rebuilt" is a different
+    # finding from "the camera is starved" — they lead to different boxes.
+    vers = {}
+    for tbl, col, tcol in (("gw_door_event", "door_version", "ts"),
+                           ("validation_item", "counting_version", "ts_start")):
+        try:
+            for r in db.execute(f"SELECT cam, COUNT(DISTINCT {col}) n FROM {tbl} WHERE "
+                                f"gateway_id=? AND {tcol}>=? AND {col} IS NOT NULL AND {col}<>'' "
+                                f"GROUP BY cam", (gw, t_base)):
+                vers.setdefault(r["cam"], {})[col] = r["n"]
+        except sqlite3.OperationalError:
+            pass                                    # an older schema simply cannot report this
+
+    recent_key = int(datetime.fromtimestamp(t_recent, IST).strftime("%Y%m%d%H"))
+    out, degraded = {}, []
+    for cam in cams:
+        hrs = sorted({h for (c, h) in opens if c == cam} | {h for (c, h) in boards if c == cam})
+        base_ratios, recent = [], []
+        n_thin = n_offhours = 0
+        for h in hrs:
+            hod = h % 100
+            if not (ACTIVE_FROM <= hod < ACTIVE_TO):
+                n_offhours += 1
+                continue                            # a lift at 03:00 carries nobody; not judged
+            o = opens.get((cam, h), 0)
+            if o < DEGRADED_MIN_OPENS:
+                n_thin += 1
+                continue                            # a ratio built on noise is not evidence
+            ratio = boards.get((cam, h), 0) / float(o)
+            (recent if h >= recent_key else base_ratios).append((h, ratio, o))
+        base_vals = sorted(r for _h, r, _o in base_ratios)
+        if len(base_vals) < DEGRADED_MIN_BASE_HOURS or not base_vals:
+            out[cam] = {"state": "no baseline", "n_base_hours": len(base_vals),
+                        "need": DEGRADED_MIN_BASE_HOURS, "n_recent_hours": len(recent),
+                        "n_thin_hours": n_thin,
+                        "note": f"only {len(base_vals)} judgeable active hour(s) of history in the "
+                                f"last {DEGRADED_BASELINE_D:g} days — too few to say what this "
+                                f"camera's normal is. UNKNOWN, not healthy."}
+            continue
+        base = base_vals[len(base_vals) // 2]        # MEDIAN: a few bad hours must not move it
+        floor = DEGRADED_FRAC * base
+        under = [(h, r, o) for h, r, o in recent if r < floor]
+        # MEDIAN, matching the baseline. The mean was a worse answer AND an incoherent one: with
+        # the collapse 20 hours into a 24-hour window, four healthy hours dragged it to 0.256 and
+        # the phrase read "32% of baseline" beside "14 of 18 hours below 40%" — two numbers about
+        # the same camera that a reader has to reconcile. Both sides are a median now.
+        _rvals = sorted(r for _h, r, _o in recent)
+        cur = (_rvals[len(_rvals) // 2] if _rvals else None)
+        # NO "CONSECUTIVELY" COUNT. The obvious version counted adjacent entries in the judged-hour
+        # LIST, which is not the same as adjacent hours: thin hours and the overnight gap are
+        # skipped, so a run reported as consecutive could span a night. The count of judged hours
+        # plus the hour it started is the same information without the claim that can be wrong.
+        rec = {"state": "ok", "baseline": round(base, 3),
+               "floor": round(floor, 3),
+               "recent_median": (round(cur, 3) if cur is not None else None),
+               "n_recent_hours": len(recent), "n_under": len(under),
+               "n_thin_hours": n_thin, "n_offhours_skipped": n_offhours,
+               "n_base_hours": len(base_vals),
+               "first_under": (min(h for h, _r, _o in under) if under else None),
+               "door_versions": (vers.get(cam) or {}).get("door_version"),
+               "counting_versions": (vers.get(cam) or {}).get("counting_version")}
+        if len(under) >= DEGRADED_MIN_HOURS:
+            rec["state"] = "degraded"
+            degraded.append(cam)
+        out[cam] = rec
+    return {"state": "ok", "cams": out, "degraded": degraded, "computed_at": now,
+            "compute_ms": int((time.time() - t_start) * 1000),
+            "params": {"lookback_h": DEGRADED_LOOKBACK_H, "baseline_d": DEGRADED_BASELINE_D,
+                       "frac": DEGRADED_FRAC, "min_hours": DEGRADED_MIN_HOURS,
+                       "min_opens": DEGRADED_MIN_OPENS}}
+
+
+def _starvation(db, gw, cams, now=None):
+    """-> (phrase|None, payload). Recomputes at most every DEGRADED_INTERVAL_S; serves the stored
+    result with its age in between.
+
+    evaluate() runs every ~10 minutes and this walks days of gw_door_event through a window
+    function. The signal is 6+ hours wide, so recomputing on the tick cadence would spend 144x the
+    work to learn the same thing — the read-never-derives rule this system runs on, applied to a
+    check rather than a view.
+    """
+    now = time.time() if now is None else now
+    try:
+        _starvation_table(db)
+        r = db.execute("SELECT computed_at, compute_ms, payload, lookback_h, baseline_d, frac, "
+                       "min_hours, min_opens FROM starvation_check WHERE gateway_id=? "
+                       "ORDER BY computed_at DESC LIMIT 1", (gw,)).fetchone()
+    except sqlite3.OperationalError:
+        r = None
+    fresh = None
+    if r and (now - (r["computed_at"] or 0)) < DEGRADED_INTERVAL_S:
+        # SAME QUESTION, OR RECOMPUTE. A cached verdict from before a threshold changed answers a
+        # different question, and serving it would make the change look applied when it was not.
+        if (r["lookback_h"], r["baseline_d"], r["frac"], r["min_hours"],
+                r["min_opens"]) == _starvation_params():
+            try:
+                fresh = json.loads(r["payload"] or "{}")
+                fresh["age_s"] = round(now - (r["computed_at"] or 0), 1)
+            except (ValueError, TypeError):
+                fresh = None
+    if fresh is None:
+        fresh = starvation_compute(db, gw, cams, now)
+        fresh["age_s"] = 0.0
+        try:
+            db.execute("INSERT OR REPLACE INTO starvation_check (gateway_id, computed_at, "
+                       "compute_ms, lookback_h, baseline_d, frac, min_hours, min_opens, payload) "
+                       "VALUES (?,?,?,?,?,?,?,?,?)",
+                       (gw, fresh["computed_at"], fresh["compute_ms"], *_starvation_params(),
+                        json.dumps(fresh)))
+            db.commit()
+            db.execute("DELETE FROM starvation_check WHERE gateway_id=? AND computed_at < ?",
+                       (gw, now - 14 * 86400))
+            db.commit()
+        except sqlite3.OperationalError:
+            pass                                    # a read-only DB must not break the check
+    if fresh.get("state") != "ok" or not fresh.get("degraded"):
+        return None, fresh
+    bits = []
+    for cam in fresh["degraded"]:
+        d = fresh["cams"][cam] or {}
+        # THE PHRASE MUST SAY WHY THIS IS NOT SILENCE. Whoever reads this line has been trained by
+        # every other entry on it that a named camera means "nothing is arriving". Here something
+        # is arriving and it is too little, and the first sentence has to say so or the reader goes
+        # and checks a stream that is fine.
+        _pct = round(100.0 * (d.get("recent_median") or 0)
+                     / max(d.get("baseline") or 1e-9, 1e-9))
+        _first = str(d.get("first_under") or "")
+        bits.append(
+            f"{cam} counting {d.get('recent_median')} boardings per door open (median) against its "
+            f"own baseline {d.get('baseline')} ({_pct}% of it) for {d.get('n_under')} of "
+            f"{d.get('n_recent_hours')} judged active hours"
+            + (f", first at {_first[:4]}-{_first[4:6]}-{_first[6:8]} {_first[8:10]}:00"
+               if len(_first) == 10 else "")
+            + (f" — NOTE this window spans {d['counting_versions']} counting builds, which can "
+               f"move the ratio on its own" if (d.get("counting_versions") or 1) > 1 else "")
+            + (f" — NOTE this window spans {d['door_versions']} door eras"
+               if (d.get("door_versions") or 1) > 1 else ""))
+    return ("STARVED, NOT SILENT — " + "; ".join(bits)
+            + ". These cameras ARE posting and their doors ARE working; the counter is returning "
+              "too little. Check the counting worker, not the stream."), fresh
 
 
 def _bundle_slow(db, gw, now=None):
@@ -483,6 +746,7 @@ def evaluate(db, gw, now=None):
                 gaps.append(f"{r['cam']} floor whitelist: NONE")
     pc_phrase, pc = _precompute_slow(db, gw, now)
     bd_phrase, bd = _bundle_slow(db, gw, now)
+    dg_phrase, dg = _starvation(db, gw, cams, now)
     ls_active, ls_note = _litestream()
     if ls_active is False:
         infra.append(f"litestream {ls_note} — the gateway DB is NOT being replicated. On 2026-08-04 "
@@ -533,6 +797,11 @@ def evaluate(db, gw, now=None):
     # SAME RULE AS A CONFIG GAP: stated every time until it is addressed, never the word BREACH.
     # A sweep at 16 minutes still fits inside its hour; what matters is that it is now visible at
     # all, because "watch the reported fill duration" needs something to do the reporting.
+    # BEFORE the infra notes, because it is about the DATA and whoever reads this line came for
+    # the data. A camera that is up and counting a fifth of what it should is the finding; the
+    # sweep duration underneath it is housekeeping.
+    if dg_phrase:
+        line += f" [DEGRADED: {dg_phrase}]"
     if pc_phrase:
         line += f" [PRECOMPUTE: {pc_phrase}]"
     if bd_phrase:
@@ -550,6 +819,11 @@ def evaluate(db, gw, now=None):
             # only the moment it crossed. None means the job has never run — an unknown, not a zero.
             "precompute": pc, "precompute_slow": bool(pc_phrase),
             "bundle": bd, "bundle_slow": bool(bd_phrase),
+            # DEGRADED IS NOT A BREACH and does not touch `ok`. Nothing is down: the lift runs, the
+            # camera works, and the number is wrong. It is stated every time until it is addressed
+            # — the rule the config gaps follow — and carried here so the dashboard can show it.
+            "degraded": (dg or {}).get("degraded") or [],
+            "starvation": dg,
             "prev_ok": (None if prev is None else prev["ok"])}
 
 

@@ -1513,6 +1513,33 @@ def rtt_refresh(db, gw, cam, window_days):
             "n_trips": (S or {}).get("n_trips"), "n_trips_stored": n_trips_stored}
 
 
+# STATES ONLY A RETIRED BUILD COULD HAVE STORED. The timer walks uncapped (rtt_refresh passes
+# max_rows=None), so it CANNOT produce 'too_many_rows'; any stored one predates that change.
+# Serving its note verbatim tells an operator that the current system refuses their range at
+# 120,000 rows — which is untrue, and sends them to narrow a range that would have worked. That is
+# the same misdescription class the health line and the RTT panel have each been corrected for. It
+# is a stale row and the remedy is a sweep, so that is what it says.
+_RTT_RETIRED_STATES = {
+    "too_many_rows": ("this summary was stored by a build that capped the precompute walk at "
+                      "%d door rows. The current build walks the era UNCAPPED on the timer, so "
+                      "this refusal cannot be reproduced — it is a stale row, not a limit you "
+                      "have hit. Re-run precompute_job.py (or wait for liftlab-precompute.timer) "
+                      "and it will be replaced by the measurement." % RTT_MAX_ROWS),
+}
+
+
+def _rtt_state_note(S):
+    """The sentence beside a non-ok stored RTT state. ONE definition, two surfaces.
+
+    The fleet matrix and the study bundle both have to explain the same stored state, and two
+    copies of that explanation drift the moment one of them is corrected."""
+    st = (S or {}).get("state")
+    if st in _RTT_RETIRED_STATES:
+        return _RTT_RETIRED_STATES[st]
+    return ((S or {}).get("note")
+            or f"the stored summary reports state {st!r} and carried no explanation")
+
+
 def _rtt_trips_read(db, gw, cam, window_days):
     """Serve the STORED per-trip rows. NEVER walks. -> (list|None, meta).
 
@@ -3477,7 +3504,12 @@ def _rtt_per_hour_compute(db, gw, period="all"):
                              or (meta or {}).get("state")
                              or "no round-trip summary stored for this lift and window, and the "
                                 "stored payload carried no reason")
-            if _ms.startswith("no door rows"):
+            if _st in _RTT_RETIRED_STATES:
+                # NOT a refusal this build makes. It is a row left behind by an older one, and
+                # classing it 'refused' would have the panel assert a limit that no longer exists.
+                row["reason"] = _rtt_state_note(S)
+                row["absence"] = "stale"
+            elif _ms.startswith("no door rows"):
                 row["absence"] = "uncalibrated"
             elif _st in ("no_floor", "no_era", "no_rows"):
                 row["absence"] = "designed"
@@ -3710,11 +3742,13 @@ BUNDLE_FILE_BUDGET_S = float(os.environ.get("DASH_BUNDLE_FILE_BUDGET_S", "15"))
 # target for the zip; the budget is enforced on TEXT because that is the number the writers can
 # see while they are writing, and stopping after the fact would mean building it all first anyway.
 BUNDLE_TEXT_BUDGET = int(os.environ.get("DASH_BUNDLE_TEXT_BUDGET", str(64 * 1024 * 1024)))
-# Per-camera door rows the RTT trip walk will read. Same number and same rule as RTT_MAX_ROWS: it
-# REFUSES rather than truncating, because a partial walk drops whole round trips and reports a
-# median from part of the window, which is worse than saying no. The refusal lands in the file as
-# a row with a reason, never as an absent camera.
-BUNDLE_RTT_MAX_ROWS = int(os.environ.get("DASH_BUNDLE_RTT_MAX_ROWS", str(RTT_MAX_ROWS)))
+# THERE IS NO BUNDLE ROW CAP ANY MORE, and its absence is the point. The bundle used to walk each
+# camera's era here under DASH_BUNDLE_RTT_MAX_ROWS, and that cap did two harmful things at once:
+# it did NOT prevent the 60.26s timeout (seven cameras all UNDER it still blew the budget — a cap
+# on rows is not a cap on time), and where it did fire it REFUSED ch29's round trips at 199,855
+# rows in a 7-day range, blocking exactly the analysis the bundle exists to serve. A guard that
+# misses the failure it was for and blocks the work it was protecting is not a guard.
+# The walk is gone: trips come from rtt_window, precomputed by the timer, at any row count.
 
 DIRECTION_RULE = ("transit_event.direction: 'in' is a BOARDING and ANYTHING ELSE — including a "
                   "NULL and any unrecognised value — is an ALIGHTING. This is not a tidy-up: the "
@@ -4075,10 +4109,7 @@ def _bundle_build(db, gw, period="all", from_d="", to_d=""):
                 _st = (S or {}).get("state")
                 if _st and _st != "ok":
                     out.append((cam, labels.get(cam) or "", "", "", "", "", _st,
-                                ((S or {}).get("note")
-                                 or f"the stored summary reports state {_st!r} and carried no "
-                                    f"explanation"),
-                                RTT_HOME, era, when))
+                                _rtt_state_note(S), RTT_HOME, era, when))
                 else:
                     out.append((cam, labels.get(cam) or "", "", "", "", "", "no_trips",
                                 f"the precomputed walk found no round trip in this window: no door "
@@ -6572,7 +6603,7 @@ function rttFleetRow(r,mx){
     // somewhere else is the defect. The absence KIND is named too, because "pending" and
     // "cannot be measured" are opposite claims that a reader must not have to guess between.
     var KIND={uncalibrated:'NOT CALIBRATED',designed:'DESIGNED ABSENCE',pending:'PENDING',
-              refused:'REFUSED'};
+              refused:'REFUSED',stale:'STALE ROW'};
     var WHY={
       uncalibrated:' No door engine has ever posted for this camera, so there is no floor read and '
         +'no cycle to build a trip from. UNAVAILABLE until the camera is calibrated — this is NOT '
@@ -6580,7 +6611,9 @@ function rttFleetRow(r,mx){
       designed:' RTT is defined by the home floor; without a floor read there is no trip to '
         +'measure. This is NOT a lift that made no journeys.',
       pending:' Nobody has computed it yet — this is not a measurement of zero.',
-      refused:' This is a refusal to answer, not an answer of none.'};
+      refused:' This is a refusal to answer, not an answer of none.',
+      stale:' This was stored by a retired build and the current one cannot produce it. Re-run '
+        +'the precompute sweep and it will be replaced by the measurement.'};
     var kind=KIND[r.absence]||'NO MEASUREMENT', cls=(r.absence==='pending')?'pend':'noabs';
     return '<tr>'+lbl+'<td class="'+cls+'" colspan=25><b>'+kind+' — no RTT for this lift'
       +(r.state?(' ('+esc(r.state)+')'):'')+'</b> <span class=mut>'+esc(r.reason||'')

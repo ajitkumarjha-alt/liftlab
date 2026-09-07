@@ -585,6 +585,49 @@ def main():
           f"{'preparing bundle' in page} · inline error+retry="
           f"{'THE BUNDLE COULD NOT BE BUILT' in page}")
 
+    # ══ 13. A RETIRED BUILD'S REFUSAL IS NOT REPEATED AS A CURRENT ONE ════════════════
+    # Reported live: the 7-day bundle refused ch29's RTT at "199,855 rows > 120k cap". The timer
+    # walks uncapped, so it cannot produce that state — any stored one predates the change. Serving
+    # its note verbatim tells an operator the current system refuses their range, which is untrue,
+    # and sends them to narrow a range that would have worked.
+    print("\n=== 13. a stale too_many_rows is not served as a live limit ===")
+    _db = D._db()
+    D._rtt_window_table(_db)
+    _cv, _dv = D._current_keys(_db, "site-A", "ch29")
+    _db.execute(
+        "INSERT OR REPLACE INTO rtt_window (gateway_id,cam,window_days,counting_version,"
+        "door_version,payload,trips,n_trips_stored,computed_at,compute_ms) "
+        "VALUES ('site-A','ch29',?,?,?,?,?,0,1.0,1)",
+        (0.0, _cv or "", _dv or "",
+         json.dumps({"state": "too_many_rows", "era": _dv, "n_rows": 199855,
+                     "note": "199855 door rows in this range exceeds the 120000 the request path "
+                             "will walk. Narrow the range."}),
+         json.dumps([])))
+    _db.commit()
+    fleet = {r["cam"]: r for r in D._rtt_per_hour_compute(_db, "site-A", "all")["rows"]}
+    _db.close()
+    zs = zipfile.ZipFile(io.BytesIO(_blob(D.dash_bundle("site-A", period="all"))))
+    fs = _members(zs, zs.namelist()[0].split("/")[0])
+    row = next((r for r in _csvmod.DictReader(
+        l for l in fs["rtt_trips.csv"].splitlines() if not l.startswith("#"))
+        if r["cam"] == "ch29"), None)
+    r29 = fleet.get("ch29") or {}
+    print(f"  fleet matrix: absence={r29.get('absence')!r}")
+    print(f"  bundle row  : class={row and row['class']!r} "
+          f"reason={str(row and row['anomaly_reason'])[:60]!r}")
+    if r29.get("absence") != "stale":
+        fails.append(f"the fleet matrix classed a retired build's refusal as "
+                     f"{r29.get('absence')!r} — the panel asserts a limit that no longer exists")
+    for where, text in (("the fleet matrix", r29.get("reason") or ""),
+                        ("the bundle row", (row or {}).get("anomaly_reason") or "")):
+        if "stale row" not in text:
+            fails.append(f"{where} does not say the stored refusal is stale")
+        if "precompute_job.py" not in text:
+            fails.append(f"{where} does not name the remedy (re-run the sweep)")
+        if "Narrow the range" in text or "120000 the request path" in text:
+            fails.append(f"{where} repeats the retired build's cap message verbatim, telling the "
+                         f"operator to narrow a range that would have worked")
+
     shutil.rmtree(tmp, ignore_errors=True)
     print()
     if fails:

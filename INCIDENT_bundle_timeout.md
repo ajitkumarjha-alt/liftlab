@@ -136,3 +136,26 @@ bound was on rows, or on a cache key, or on an era filter — never on **time**,
 dimension a request actually has. `bundle_run.phases` is the first instrument in this system that
 measures that per unit of work rather than per request, and it is worth pointing at `/trends` and
 `/data` too.
+
+---
+
+## Addendum, 2026-09-07: the cap was also blocking analysis
+
+Reported on the same review: the 7-day bundle **refused ch29's RTT entirely** — "199,855 rows >
+120k cap". So the guard did two harmful things at once. It did **not** prevent the timeout (seven
+cameras all *under* the cap still blew the budget, which is the whole point above), and where it
+*did* fire it withheld the round trips the bundle exists to serve. A guard that misses the failure
+it was written for and blocks the work it was protecting is not a guard.
+
+`DASH_BUNDLE_RTT_MAX_ROWS` is deleted. There is no row cap on the bundle's RTT at any volume: the
+trips come from `rtt_window`, walked once per era per window by the timer.
+
+**A stored refusal from the retired build is now told apart from a live one.** `rtt_refresh` passes
+`max_rows=None`, so the current build *cannot* produce `too_many_rows`; any stored one predates the
+change. Repeating its note verbatim tells an operator that the system refuses their range at 120,000
+rows — untrue, and it sends them to narrow a range that would have worked. Both the RTT fleet matrix
+and `rtt_trips.csv` now class it `stale` and say: stored by a build that capped the walk, cannot be
+reproduced, re-run `precompute_job.py`. One `_rtt_state_note()`, two surfaces, so the explanation
+cannot drift.
+
+On the live box the remedy is simply the sweep — `rtt_refresh` overwrites the row.
