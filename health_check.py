@@ -38,6 +38,13 @@ WHAT THE ALARM IS INSTEAD. Four signals, each covering a failure the others cann
      a week, which is the same measured reason an hourly transit alarm was rejected. The quantity
      that does not is the RATIO of what was counted to what the doors did: boardings per door
      open, compared only against THAT CAMERA'S OWN baseline. See STARVED, NOT SILENT below.
+  5. READING WORSE, NOT MISSING (2026-09-08). Signal 4 watches the COUNTER; nothing watched the
+     READER. On 2026-09-02 17:50 a camera-side image-profile change dropped every NCC score by
+     ~0.06 fleet-wide: ch27 fell from 25,197 confident floor reads a day to 18, ch30 lost 75% of
+     its reads, ch29 lost its entire ground floor. Doors, transits, heartbeats and segments were
+     all normal throughout, so signals 1-4 were silent for five days and were right to be. What
+     moved was the QUALITY of each read, which the gateway has recorded per row all along in
+     `gw_door_event.read_conf` and never once looked at. See READING WORSE, NOT MISSING below.
 
 Transit age is REPORTED for every camera whether or not it breaches, because that is the number
 that was asked for and it is informative; it is simply not the trigger.
@@ -58,6 +65,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import statistics
 import sys
 import time
 import urllib.request
@@ -465,6 +473,269 @@ def _starvation(db, gw, cams, now=None):
               "too little. Check the counting worker, not the stream."), fresh
 
 
+# ============================================================ READING WORSE, NOT MISSING
+# THE FIFTH SIGNAL. Signal 4 asks whether the COUNTER is returning too little. This asks whether
+# the READER is returning worse — and it is a different failure, on a different box, with a
+# different fix.
+#
+# WHAT IT WOULD HAVE CAUGHT. 2026-09-02 17:50 IST, a camera-side image-profile change (see
+# INCIDENT_decode_regression_0902.md) lifted local contrast and crushed the space between the LED
+# strokes. Every NCC score fell ~0.06 with no geometric shift, and three cameras failed at three
+# different gates inside that band:
+#
+#   cam    confident floor reads/day    mean read_conf
+#   ch27   25,197  ->      18           0.652 -> 0.584
+#   ch30    7,416  ->   1,820           0.896 -> 0.708
+#   ch29   35,494  ->  26,501           0.843 -> 0.772   (lobby 'G' gone entirely)
+#
+# Heartbeats fresh, segments advancing, transits arriving, doors cycling normally. Signals 1-4 were
+# correct to stay quiet, and the fault ran for five days.
+#
+# TWO ARMS, BECAUSE ONE CANNOT SEE BOTH FAILURES. The obvious check — mean read_conf against the
+# camera's own baseline — catches ch29 and ch30 but would have SKIPPED ch27, the camera that was
+# worst broken: its 18 surviving reads are too thin a sample to judge a mean on, and any honest
+# min-sample guard excludes them. The reads did not get worse there; they stopped existing. So:
+#
+#   (a) CONFIDENCE arm — mean read_conf dropped by more than CONF_DROP from the camera's own
+#       baseline, judged only on days with enough reads to mean anything.
+#   (b) VOLUME arm — confident floor reads collapsed below CONF_VOL_FRAC of the camera's own
+#       baseline. This is what makes a camera that has gone quiet visible without needing a
+#       trustworthy mean from the handful of reads it still emits.
+#
+# A camera fires if EITHER arm does, and the phrase says which — they send you to the same place
+# but they are not the same finding.
+#
+# THE BASELINE IS ERA-SCOPED, AND THAT IS THE WHOLE DIFFERENCE BETWEEN THIS AND A NUISANCE.
+# read_conf is a score against a specific template set at a specific geometry: rebuild either and
+# the number moves BY DESIGN. `door_version` is exactly that instrument's identity, so the baseline
+# is built only from days inside the camera's CURRENT era. A recalibration therefore resets this
+# check instead of tripping it — which matters immediately, because the response to the 09-02
+# incident is to recalibrate every affected camera onto a new era. A check that fired on its own
+# remedy would be turned off within a week, and then the next 09-02 runs unseen again.
+#
+# While an era is younger than CONF_MIN_BASE_DAYS the camera is reported as "baseline building",
+# not judged. An instrument with no history has nothing to be compared against, and saying so is
+# the honest answer — not silence, and not a verdict.
+#
+# REPORTED, NOT A BREACH — the rule signal 4 and the config gaps follow. Nothing is DOWN.
+#
+# THE BASELINE IS N JUDGED DAYS, NOT A CALENDAR WINDOW — and that distinction is not academic.
+# Measured on the live gateway: ch29 has NO rows at all between 2026-08-19 and 2026-09-02, a 13-day
+# ingest gap. A calendar 14-day baseline evaluated on 09-03 reaches back only to 08-20 and finds
+# nothing, so the check would have declined to judge on exactly the morning it existed to speak.
+# Taking the most recent N JUDGED days inside the era instead — however far back they lie — the
+# baseline is Aug 13-19 and the check fires. A gap in the data is not a reason to forget what the
+# camera used to do; it is a reason to reach further for it.
+CONF_LOOKBACK_D = float(os.environ.get("HEALTH_CONF_LOOKBACK_D", "1"))
+CONF_BASELINE_D = int(os.environ.get("HEALTH_CONF_BASELINE_D", "14"))     # judged DAYS, not calendar
+# How far back to LOOK for those days. Generous, because it costs one indexed GROUP BY and the
+# alternative is the failure above. An era rarely spans this much (observed era ages 1.1-20.0 days),
+# so in practice this bounds the scan rather than the baseline.
+CONF_SEARCH_D = float(os.environ.get("HEALTH_CONF_SEARCH_D", "60"))
+# ABSOLUTE, not fractional. The ask was ">0.05 from the camera's 14-day baseline", and it is the
+# right shape: NCC is already a normalised 0-1 score, so 0.05 means the same thing on ch27's 0.65
+# as on ch30's 0.90. A fractional threshold would demand a bigger absolute move from the camera
+# that had the least headroom to begin with.
+CONF_DROP = float(os.environ.get("HEALTH_CONF_DROP", "0.05"))
+CONF_VOL_FRAC = float(os.environ.get("HEALTH_CONF_VOL_FRAC", "0.40"))
+# A day with fewer confident reads than this cannot support a mean. Deliberately well above the
+# handful ch27 still emits — a mean of 18 reads is arithmetic, not evidence. Such days are excluded
+# from BOTH the baseline and the judgement, and the volume arm is what covers them.
+CONF_MIN_READS = int(os.environ.get("HEALTH_CONF_MIN_READS", "200"))
+CONF_MIN_BASE_DAYS = int(os.environ.get("HEALTH_CONF_MIN_BASE_DAYS", "3"))
+CONF_INTERVAL_S = float(os.environ.get("HEALTH_CONF_INTERVAL_S", "1800"))
+# The reasons that mean "the reader named a floor and stood behind it". Same set dash_api uses
+# (DOOR_OK_REASONS): ch29 runs single-panel, so filtering to 'ok' alone returns zero rows there and
+# would render a working camera as no-data.
+_CONF_OK_REASONS = ("ok", "single_panel")
+
+
+def _pct_str(frac):
+    """A collapse to 0.1% must not print as '0% of it' — that reads as a rounding artefact rather
+    than the total loss it is. One decimal below 1%, whole numbers above."""
+    v = 100.0 * (frac or 0.0)
+    return f"{v:.1f}%" if v < 1 else f"{v:.0f}%"
+
+
+def _readconf_table(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS readconf_check (
+        gateway_id TEXT, computed_at REAL, compute_ms INTEGER,
+        -- The thresholds this verdict was computed UNDER, for the same reason starvation_check
+        -- carries them: a cached answer to a different question must not look like a fresh one.
+        lookback_d REAL, baseline_d REAL, drop_abs REAL, vol_frac REAL,
+        min_reads INTEGER, min_base_days INTEGER,
+        payload TEXT,
+        PRIMARY KEY (gateway_id, computed_at))""")
+    db.execute("CREATE INDEX IF NOT EXISTS ix_readconf ON readconf_check(gateway_id, computed_at)")
+
+
+def _readconf_params():
+    return (CONF_LOOKBACK_D, float(CONF_BASELINE_D), CONF_DROP, CONF_VOL_FRAC,
+            CONF_MIN_READS, CONF_MIN_BASE_DAYS)
+
+
+def readconf_compute(db, gw, cams, now=None):
+    """Daily mean read_conf and confident-read volume per camera, recent vs the camera's own
+    era-scoped baseline. -> payload dict; never raises on a schema that cannot answer."""
+    now = time.time() if now is None else now
+    t_start = time.time()
+    t_base = now - CONF_SEARCH_D * 86400.0
+    daykey = "CAST(strftime('%%Y%%m%%d', ts + %d, 'unixepoch') AS INTEGER)" % _IST_OFFSET_S
+    rows = []
+    try:
+        # door_version comes back per (cam, day) so a day that straddles a rebuild is visible as
+        # two rows and can be dropped from the baseline rather than averaged across instruments.
+        rows = list(db.execute(
+            f"SELECT cam, {daykey} d, door_version dv, COUNT(*) n, AVG(read_conf) conf "
+            "FROM gw_door_event WHERE gateway_id=? AND ts>=? AND floor IS NOT NULL "
+            f"AND read_conf IS NOT NULL AND reason IN ({','.join('?' * len(_CONF_OK_REASONS))}) "
+            "GROUP BY cam, d, dv", (gw, t_base, *_CONF_OK_REASONS)))
+    except sqlite3.OperationalError as e:
+        # An older gateway schema has no read_conf/door_version. That is a check that DOES NOT
+        # APPLY, which is not the same as a fleet that is fine — claim nothing.
+        return {"state": "unavailable", "note": f"read_conf unavailable: {e}", "cams": {},
+                "degraded": [], "computed_at": now,
+                "compute_ms": int((time.time() - t_start) * 1000)}
+
+    # Current era per camera = the door_version of its newest floor-bearing row. Same rule
+    # dash_api.alphabet_refresh uses, so "the current instrument" means one thing across the system.
+    cur_era = {}
+    try:
+        for r in db.execute(
+                "SELECT cam, door_version dv FROM gw_door_event g WHERE gateway_id=? "
+                "AND door_version IS NOT NULL AND door_version<>'' AND ts = "
+                "(SELECT MAX(ts) FROM gw_door_event WHERE gateway_id=g.gateway_id AND cam=g.cam "
+                " AND door_version IS NOT NULL AND door_version<>'') GROUP BY cam", (gw,)):
+            cur_era[r["cam"]] = r["dv"]
+    except sqlite3.OperationalError:
+        pass
+
+    per_cam = {}
+    for r in rows:
+        per_cam.setdefault(r["cam"], []).append(r)
+    recent_day = int(datetime.fromtimestamp(now - CONF_LOOKBACK_D * 86400.0, IST).strftime("%Y%m%d"))
+    today = int(datetime.fromtimestamp(now, IST).strftime("%Y%m%d"))
+
+    out, degraded = {}, []
+    for cam in cams:
+        era = cur_era.get(cam)
+        drs = [r for r in per_cam.get(cam, []) if r["dv"] == era] if era else []
+        if not drs:
+            out[cam] = {"state": "no reads", "era": era,
+                        "note": "no confident floor reads in this era in the window — either a "
+                                "door-only camera or one that has stopped reading entirely"}
+            continue
+        # TODAY IS NOT JUDGED AND IS NOT BASELINE. A partial day's mean is a mean of the hours that
+        # have happened, and the lift's traffic is not uniform across a day.
+        hist = sorted((r for r in drs if r["d"] < today), key=lambda r: r["d"])
+        judged = [r for r in hist if r["n"] >= CONF_MIN_READS]
+        # The most recent CONF_BASELINE_D judged days BEFORE the recent window — reached for, not
+        # bounded by the calendar. See the note above the constants.
+        base = [r for r in judged if r["d"] < recent_day][-CONF_BASELINE_D:]
+        recent = [r for r in hist if r["d"] >= recent_day]
+        rec = {"era": era, "n_days_in_era": len(hist), "n_base_days": len(base),
+               "recent_days": [r["d"] for r in recent],
+               "recent_conf": (round(statistics.mean([r["conf"] for r in recent
+                                                      if r["n"] >= CONF_MIN_READS]), 4)
+                               if any(r["n"] >= CONF_MIN_READS for r in recent) else None),
+               "recent_reads": sum(r["n"] for r in recent) or 0}
+        if len(base) < CONF_MIN_BASE_DAYS and not rec["recent_reads"] and not judged:
+            # Never judged, nothing arriving: this is not an instrument warming up, it is a camera
+            # that does not read floors. Saying "baseline building" of it would imply a verdict is
+            # coming, and none ever will.
+            rec.update({"state": "no reads",
+                        "note": "no confident floor reads in this era — a door-only camera, or one "
+                                "that has never read"})
+            out[cam] = rec
+            continue
+        if len(base) < CONF_MIN_BASE_DAYS:
+            rec.update({"state": "baseline building",
+                        "note": f"era has {len(base)} judged day(s) of history, needs "
+                                f"{CONF_MIN_BASE_DAYS} — a rebuilt instrument has nothing to be "
+                                f"compared against yet"})
+            out[cam] = rec
+            continue
+        base_conf = statistics.median([r["conf"] for r in base])
+        base_reads = statistics.median([r["n"] for r in base])
+        rec.update({"state": "ok", "baseline_conf": round(base_conf, 4),
+                    "baseline_reads": int(base_reads)})
+        why = []
+        if rec["recent_conf"] is not None and (base_conf - rec["recent_conf"]) > CONF_DROP:
+            rec["conf_drop"] = round(base_conf - rec["recent_conf"], 4)
+            why.append("confidence")
+        if not recent:
+            # No rows at all in the recent window is signal 1/2/3 territory, not this one.
+            rec["note"] = "no rows in the recent window — see the heartbeat/transit signals"
+        elif base_reads > 0 and rec["recent_reads"] < CONF_VOL_FRAC * base_reads * max(CONF_LOOKBACK_D, 1):
+            rec["vol_frac"] = round(rec["recent_reads"]
+                                    / max(base_reads * max(CONF_LOOKBACK_D, 1), 1e-9), 3)
+            why.append("volume")
+        if why:
+            rec["why"] = why
+            rec["state"] = "degraded"
+            degraded.append(cam)
+        out[cam] = rec
+    return {"state": "ok", "cams": out, "degraded": degraded, "computed_at": now,
+            "compute_ms": int((time.time() - t_start) * 1000),
+            "params": {"lookback_d": CONF_LOOKBACK_D, "baseline_d": CONF_BASELINE_D,
+                       "drop_abs": CONF_DROP, "vol_frac": CONF_VOL_FRAC,
+                       "min_reads": CONF_MIN_READS, "min_base_days": CONF_MIN_BASE_DAYS}}
+
+
+def _readconf(db, gw, cams, now=None):
+    """-> (phrase|None, payload). Recomputes at most every CONF_INTERVAL_S; serves the stored
+    result with its age in between — the same read-never-derives rule _starvation follows."""
+    now = time.time() if now is None else now
+    try:
+        _readconf_table(db)
+        r = db.execute("SELECT computed_at, payload, lookback_d, baseline_d, drop_abs, vol_frac, "
+                       "min_reads, min_base_days FROM readconf_check WHERE gateway_id=? "
+                       "ORDER BY computed_at DESC LIMIT 1", (gw,)).fetchone()
+    except sqlite3.OperationalError:
+        r = None
+    fresh = None
+    if r and (now - (r["computed_at"] or 0)) < CONF_INTERVAL_S:
+        if (r["lookback_d"], r["baseline_d"], r["drop_abs"], r["vol_frac"], r["min_reads"],
+                r["min_base_days"]) == _readconf_params():
+            try:
+                fresh = json.loads(r["payload"] or "{}")
+                fresh["age_s"] = round(now - (r["computed_at"] or 0), 1)
+            except (ValueError, TypeError):
+                fresh = None
+    if fresh is None:
+        fresh = readconf_compute(db, gw, cams, now)
+        fresh["age_s"] = 0.0
+        try:
+            db.execute("INSERT OR REPLACE INTO readconf_check (gateway_id, computed_at, "
+                       "compute_ms, lookback_d, baseline_d, drop_abs, vol_frac, min_reads, "
+                       "min_base_days, payload) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       (gw, fresh["computed_at"], fresh["compute_ms"], *_readconf_params(),
+                        json.dumps(fresh)))
+            db.execute("DELETE FROM readconf_check WHERE gateway_id=? AND computed_at < ?",
+                       (gw, now - 14 * 86400))
+            db.commit()
+        except sqlite3.OperationalError:
+            pass                                    # a read-only DB must not break the check
+    if fresh.get("state") != "ok" or not fresh.get("degraded"):
+        return None, fresh
+    bits = []
+    for cam in fresh["degraded"]:
+        d = fresh["cams"][cam] or {}
+        why = d.get("why") or []
+        parts = []
+        if "confidence" in why:
+            parts.append(f"mean read_conf {d.get('recent_conf')} against its own era baseline "
+                         f"{d.get('baseline_conf')} (down {d.get('conf_drop')})")
+        if "volume" in why:
+            parts.append(f"{d.get('recent_reads')} confident floor reads against a baseline "
+                         f"{d.get('baseline_reads')}/day ({_pct_str(d.get('vol_frac'))} of it)")
+        bits.append(f"{cam} " + " and ".join(parts))
+    return ("READING WORSE, NOT MISSING — " + "; ".join(bits)
+            + ". These cameras ARE posting and their doors ARE cycling; the floor READER is "
+              "returning worse or fewer reads within one era, so this is not a rebuild. Check the "
+              "camera image (focus, contrast/gamma, sharpness profile) before the software."), fresh
+
+
 def _bundle_slow(db, gw, now=None):
     """-> (phrase|None, payload|None) for the most recent study-bundle download.
 
@@ -747,6 +1018,7 @@ def evaluate(db, gw, now=None):
     pc_phrase, pc = _precompute_slow(db, gw, now)
     bd_phrase, bd = _bundle_slow(db, gw, now)
     dg_phrase, dg = _starvation(db, gw, cams, now)
+    rc_phrase, rc = _readconf(db, gw, cams, now)
     ls_active, ls_note = _litestream()
     if ls_active is False:
         infra.append(f"litestream {ls_note} — the gateway DB is NOT being replicated. On 2026-08-04 "
@@ -802,6 +1074,11 @@ def evaluate(db, gw, now=None):
     # sweep duration underneath it is housekeeping.
     if dg_phrase:
         line += f" [DEGRADED: {dg_phrase}]"
+    # BESIDE ITS SIBLING. Signal 4 says the counter returned too little; signal 5 says the reader
+    # returned worse. On 2026-09-02 the same event produced both on ch30, and seeing them together
+    # is what distinguishes "one camera's counter broke" from "the picture changed for everyone".
+    if rc_phrase:
+        line += f" [READS: {rc_phrase}]"
     if pc_phrase:
         line += f" [PRECOMPUTE: {pc_phrase}]"
     if bd_phrase:
@@ -824,6 +1101,10 @@ def evaluate(db, gw, now=None):
             # — the rule the config gaps follow — and carried here so the dashboard can show it.
             "degraded": (dg or {}).get("degraded") or [],
             "starvation": dg,
+            # Same contract as `degraded`: carried whether or not it fired, so the dashboard can
+            # plot the per-camera confidence trend instead of only the moment it crossed.
+            "reads_degraded": (rc or {}).get("degraded") or [],
+            "readconf": rc,
             "prev_ok": (None if prev is None else prev["ok"])}
 
 
