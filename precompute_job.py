@@ -136,8 +136,14 @@ def main():
             t0 = time.time()
             m, e = run_stage(f"alphabet {gw}/{cam}", D.alphabet_refresh, db, gw, cam)
             if e is None:
+                # RETAINED IS PRINTED, ALWAYS. The guard keeping a floor alive is exactly the
+                # case where the underlying evidence broke — a silent save is a hidden fault.
+                _ret = m.get("retained") or []
                 print(f"[precompute] alphabet {gw}/{cam}: {m['n_admitted']} floors from "
-                      f"{m['evidence_rows']} rows, era={m['era']} in {time.time()-t0:.2f}s",
+                      f"{m['evidence_rows']} rows, era={m['era']} in {time.time()-t0:.2f}s"
+                      + (f" — RETAINED {len(_ret)} from the stored alphabet "
+                         f"({', '.join(_ret[:8])}{'...' if len(_ret) > 8 else ''}): this pass would "
+                         f"have dropped them for lack of evidence" if _ret else ""),
                       flush=True)
                 ok += 1; gw_ok += 1
             else:                                  # one bad camera must not stop the sweep

@@ -50,8 +50,12 @@ def main():
                 m = D.alphabet_refresh(db, gw, cam)
                 dt = time.time() - t0
                 n_ok += 1
+                ret = m.get("retained") or []
                 print(f"[alphabet] {gw}/{cam}: {m['n_admitted']} floors from "
-                      f"{m['evidence_rows']} rows, era={m['era']} in {dt:.2f}s", flush=True)
+                      f"{m['evidence_rows']} rows, era={m['era']} in {dt:.2f}s"
+                      + (f" — RETAINED {len(ret)} ({', '.join(ret[:8])}"
+                         f"{'...' if len(ret) > 8 else ''}) that this pass had no evidence for"
+                         if ret else ""), flush=True)
             except Exception as e:                 # one bad camera must not stop the sweep
                 n_err += 1
                 print(f"[alphabet] {gw}/{cam}: FAILED {type(e).__name__}: {e}", flush=True)

@@ -1188,7 +1188,7 @@ def _glyph_image(a, b):
     return False
 
 
-def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
+def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None, prior=()):
     """Derive the valid floor set from EVIDENCE, not a typed list (the ask). A floor string is admitted
     when it corroborates — never on mere occurrence, which is circular (a misread would whitelist
     itself). Admission = all glyphs human-verified AND one of:
@@ -1212,6 +1212,10 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
           never cascade off already-dead floors. Twin recorded.
     Both are QUARANTINE, not verdicts: detail carries twin/anchored, and stronger later evidence (a
     labeled crop, a strong-margin read) re-admits on the next derive.
+
+    v3 (2026-09-08) — NON-REGRESSION. `prior` is the set this camera's STORED row already admits.
+    A derivation may ADD a floor on new evidence; it may only WITHDRAW one on evidence that
+    positively convicts it. See _retain_prior for the distinction and why silence is not a verdict.
     Returns (admitted:set, detail:{floor: {...}}). max_fps defaults to MAX_FLOORS_PER_S.
     """
     if max_fps is None:
@@ -1365,7 +1369,58 @@ def _derive_floor_alphabet(rows, gw_cam_labels, min_sightings=3, max_fps=None):
             if cf is not None and ct is not None and cf < ct:
                 dd["via"] = f"quarantine:glyph_shadow_of_{fl['twin']} ({fl['n']} impossible-speed flips)"
                 dd["twin"] = fl["twin"]
+    _retain_prior(prior, admitted, detail)
     return admitted, detail
+
+
+# ── non-regression: a derivation ADDS on evidence, it does not WITHDRAW on silence ──────────────
+# WHY THIS EXISTS. Every non-numeric floor — G, P1, P2, P3 — rests on ONE input: labels.json, read
+# by _labels_evidence, which swallows OSError/ValueError and returns EMPTY. A missing mount, a
+# half-written file, a calib dir that moved, and the labeled set is silently {} — at which point
+# every letter floor falls straight through to "reject:non_numeric_unlabeled" and the sweep
+# OVERWRITES the stored row in place. PL1A/ch29's lobby is admitted by exactly that one thread, and
+# the failure would look like the building lost its ground floor. Withdrawal on silence is not a
+# finding, it is a missing input wearing a finding's clothes.
+#
+# The line drawn here is EVIDENCE vs ABSENCE, not "never remove":
+#   * ABSENCE ("reject:non_numeric_unlabeled", "reject:only_N_sightings") — nothing was observed
+#     that contradicts the floor; the case FOR it merely went quiet. A floor already admitted stays
+#     admitted, and its via SAYS it was retained and on what.
+#   * CONVICTION ("quarantine:glyph_shadow_of_X", "quarantine:unanchored_island",
+#     "reject:no_transition_support") — the rows positively argue the floor is a misread. Those
+#     rules exist to kill 77/167/7G and they keep their teeth: retention never overrides them.
+# A floor with NO rows at all in this evidence is the purest absence (retention windows, an era
+# rollover, a restored DB) and is retained with n=0 so the whitelist cannot be emptied by a trim.
+#
+# DASH_ALPHA_RETAIN=0 turns this off for a deliberate reset — a rebuilt panel whose old alphabet
+# really is wrong. It is off ONLY when someone types it.
+_ALPHA_RETAIN = os.environ.get("DASH_ALPHA_RETAIN", "1").strip().lower() not in ("0", "false", "no")
+_RETAIN_ON = ("reject:non_numeric_unlabeled", "reject:only_")
+
+
+def _retain_prior(prior, admitted, detail):
+    """Re-admit previously-admitted floors this derivation dropped for lack of evidence. Mutates
+    `admitted`/`detail` in place; -> the list of floors retained (also recorded in detail[f])."""
+    retained = []
+    if not _ALPHA_RETAIN:
+        return retained
+    for f in sorted(prior or ()):
+        if f in admitted:
+            continue
+        d = detail.get(f)
+        if d is None:                              # no rows at all this pass -> pure absence
+            detail[f] = {"n": 0, "first": None, "last": None, "supported": False,
+                         "admitted": True,
+                         "via": "retained:previously_admitted (no rows in this evidence)"}
+            admitted.add(f)
+            retained.append(f)
+        elif str(d.get("via", "")).startswith(_RETAIN_ON):
+            d["admitted"] = True
+            d["via"] = f"retained:previously_admitted (would have been {d['via']})"
+            admitted.add(f)
+            retained.append(f)
+        # else: a quarantine/no-support verdict — positive evidence, left to stand.
+    return retained
 
 
 # ── era census, cached per (gw, cam) ──────────────────────────────────────────
@@ -1387,6 +1442,56 @@ _census_lock = threading.Lock()
 _census_cache = {}                                  # (gw, cam) -> {"t": epoch, "v": [...]}
 
 
+# ── era NOTES: why the boundary is there ──────────────────────────────────────
+# door_version already says an era CHANGED — it is composed from the templates hash, the tracker
+# logic, the door levels and the geometry hash, so any rebuild moves it by construction and nobody
+# has to remember to declare one. What it cannot say is WHY, and "why" is the difference between a
+# boundary a reader can act on and an opaque 8-hex string they have to come and ask about.
+#
+# The 2026-09-02 image change is exactly the case that needs it. Every affected camera is being
+# recalibrated onto a new era, and a year from now `260d4a0f...` -> `<new>` on three cameras within
+# an hour of each other is either self-evidently a coordinated recalibration or a mystery,
+# depending entirely on whether someone wrote it down HERE rather than in a commit message.
+#
+# KEYED ON THE FULL door_version, not the era prefix. A prefix is shared by every geometry variant
+# of the same template set, and a recalibration that rebuilds cells but not templates would land on
+# the same prefix as the era it replaced. The census groups by prefix, so a prefix lookup resolves
+# to any note whose door_version starts with it — that is a display convenience, not the key.
+#
+# WRITTEN BY A HUMAN, ONLY. Nothing derives these: an inferred reason would be a guess with the
+# authority of a record. era_note.py is the writer; there is no API that sets one.
+_ERA_NOTE_READY = set()
+
+
+def _era_note_table(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS era_note (
+        gateway_id TEXT, cam TEXT,
+        door_version TEXT,          -- FULL door_version, exactly as gw_door_event stamps it
+        reason TEXT,                -- free text, written by a person
+        noted_at REAL, noted_by TEXT,
+        PRIMARY KEY (gateway_id, cam, door_version))""")
+
+
+def _era_notes(db, gw, cam):
+    """-> {door_version: {reason, noted_at, noted_by}} plus prefix keys for census lookups. READ
+    ONLY, and a missing table is an empty dict — a gateway that has never had a note recorded is
+    not an error."""
+    out = {}
+    try:
+        rows = db.execute("SELECT door_version dv, reason, noted_at, noted_by FROM era_note "
+                          "WHERE gateway_id=? AND cam=?", (gw, cam)).fetchall()
+    except sqlite3.OperationalError:
+        return out
+    for r in rows:
+        rec = {"reason": r["reason"], "noted_at": r["noted_at"], "noted_by": r["noted_by"],
+               "door_version": r["dv"]}
+        out[r["dv"]] = rec
+        # Prefix alias for the census, which groups by the part before '+'. First writer wins so a
+        # geometry-only rebuild cannot silently overwrite the note on the era it forked from.
+        out.setdefault(str(r["dv"]).split("+")[0], rec)
+    return out
+
+
 def _era_census(db, gw, cam):
     """-> (eras_list, computed_at). Newest-era-first list of {era, rows, first, last}."""
     key = (gw, cam)
@@ -1406,6 +1511,13 @@ def _era_census(db, gw, cam):
             e["rows"] += r["n"]
             e["first"] = min(e["first"], r["t0"])
             e["last"] = max(e["last"], r["t1"])
+        # WHY, alongside WHEN. The selector's whole job is to let someone view a retired era; a
+        # boundary with a recorded reason is the difference between choosing one and guessing.
+        notes = _era_notes(db, gw, cam)
+        for e in acc.values():
+            n = notes.get(e["era"])
+            e["note"] = (n or {}).get("reason")
+            e["noted_at"] = (n or {}).get("noted_at")
         v = sorted(acc.values(), key=lambda e: (e["last"] or 0), reverse=True)
         t = time.time()
         _census_cache[key] = {"t": t, "v": v}
@@ -1906,7 +2018,23 @@ def alphabet_refresh(db, gw, cam):
     _alphabet_table(db)
     rows = _q(db, "SELECT ts, floor, reason, read_conf FROM gw_door_event "
                   "WHERE gateway_id=? AND cam=? AND floor IS NOT NULL ORDER BY ts", (gw, cam))
-    derived, detail = _derive_floor_alphabet(rows, _labels_evidence(gw, cam))
+    # THE STORED ROW IS AN INPUT, not just an output. This write is an in-place overwrite, so a
+    # derivation run against a degraded input would silently replace a good alphabet with a smaller
+    # one and leave nothing to compare against. Feeding the prior admissions back in makes the
+    # sweep additive on silence — see _retain_prior.
+    prior, _pdetail, _pmeta = _alphabet_read(db, gw, cam)
+    labels = _labels_evidence(gw, cam)
+    derived, detail = _derive_floor_alphabet(rows, labels, prior=(prior or set()))
+    retained = sorted(f for f, d in detail.items()
+                      if str(d.get("via", "")).startswith("retained:"))
+    # A camera with a stored alphabet but NO labels evidence is the exact shape of the failure the
+    # retention guard covers: labels.json unreadable/empty. Retention keeps the alphabet correct;
+    # this line is what stops it being silent, because the underlying input still needs fixing.
+    if prior and not labels[1]:
+        print(f"[alphabet] {gw}/{cam}: WARNING labels.json yielded NO labeled floors "
+              f"({CALIB_DIR / gw / cam / 'labels.json'}) — every non-numeric floor would have been "
+              f"dropped this pass. {len(retained)} floor(s) retained from the stored alphabet; the "
+              f"labels input still needs repair.", flush=True)
     dv = db.execute("SELECT door_version FROM gw_door_event WHERE gateway_id=? AND cam=? "
                     "AND door_version IS NOT NULL AND door_version<>'' AND ts IS NOT NULL "
                     "ORDER BY ts DESC LIMIT 1", (gw, cam)).fetchone()
@@ -1924,7 +2052,9 @@ def alphabet_refresh(db, gw, cam):
                 json.dumps(detail), now, len(rows), era, door_version))
     db.commit()
     return {"gw": gw, "cam": cam, "n_admitted": len(derived or ()), "evidence_rows": len(rows),
-            "derived_at": now, "era": era, "door_version": door_version}
+            "derived_at": now, "era": era, "door_version": door_version,
+            "retained": retained, "n_prior": len(prior or ()),
+            "labeled_floors": len(labels[1])}
 
 
 def _age_phrase(ts):
@@ -4238,6 +4368,7 @@ def _bundle_build(db, gw, period="all", from_d="", to_d=""):
         for cam in cam_ids:
             n_before_cam = len(erows)
             cv_now, dv_now = _current_keys(db, gw, cam)
+            enotes = _era_notes(db, gw, cam)      # why each boundary is there, when someone said
             alpha, _detail, ameta = _alphabet_read(db, gw, cam)
             whitelist = (" ".join(sorted(alpha)) if alpha else "NONE")
             val = vals.get(cam) or {}
@@ -4245,10 +4376,12 @@ def _bundle_build(db, gw, period="all", from_d="", to_d=""):
                             "FROM gw_door_event WHERE gateway_id=? AND cam=? AND door_version "
                             "IS NOT NULL AND door_version<>'' GROUP BY door_version "
                             "ORDER BY MIN(ts)", (gw, cam)):
+                _n = enotes.get(r["v"]) or {}
                 erows.append((cam, labels.get(cam) or "", "door_version", r["v"],
                               _iso_ist(r["lo"]), _iso_ist(r["hi"]), r["n"],
                               "yes" if r["v"] == dv_now else "no",
-                              "", "", "", whitelist, (ameta or {}).get("state") or ""))
+                              "", "", "", whitelist, (ameta or {}).get("state") or "",
+                              _n.get("reason") or "", _iso_ist(_n.get("noted_at")) or ""))
             for r in _q(db, "SELECT counting_version v, MIN(ts_start) lo, MAX(ts_start) hi, "
                             "COUNT(*) n FROM validation_item WHERE gateway_id=? AND cam=? AND "
                             "counting_version IS NOT NULL AND counting_version<>'' "
@@ -4260,18 +4393,21 @@ def _bundle_build(db, gw, period="all", from_d="", to_d=""):
                               (val.get("precision") if cur else ""),
                               (val.get("n_reviewed") if cur else ""),
                               (val.get("n_exact") if cur else ""), whitelist,
-                              (ameta or {}).get("state") or ""))
+                              (ameta or {}).get("state") or "", "", ""))
             if len(erows) == n_before_cam:
                 erows.append((cam, labels.get(cam) or "", "none", "", "", "", 0, "no", "", "", "",
                               whitelist, "no era of either kind has ever been recorded for this "
-                                         "camera — it is UNCALIBRATED, not idle"))
+                                         "camera — it is UNCALIBRATED, not idle", "", ""))
         return (["cam", "lift", "kind", "version", "first_ist", "last_ist", "n_rows", "is_current",
                  "precision_pct", "n_reviewed", "n_exact", "floor_whitelist",
-                 "floor_alphabet_state"], erows,
+                 "floor_alphabet_state", "era_reason", "reason_noted_ist"], erows,
                 "DERIVED on this request — two GROUP BYs per camera plus the stored floor "
                 "alphabet. Boundaries are measured from the rows, never from a hardcoded date. "
                 "NOT range-filtered: an era that started before the range is what the range's "
-                "rows were measured by.")
+                "rows were measured by. era_reason is a HUMAN note (era_note table, written by "
+                "era_note.py) saying why the boundary is there; blank means nobody recorded one, "
+                "never that the boundary is unimportant. Counting-version rows never carry one — "
+                "it is a door-era field.")
 
     # ── 7. outages.csv — a constant, no query at all ──
     def f_outages():
@@ -5573,11 +5709,20 @@ function eraSelector(t,cam){
   function d(x){return x?new Date(x*1000).toLocaleDateString():'?'}
   var opts='<option value="">auto — newest ('+esc(t.eras[0].era)+')</option>'
     +es.map(function(e){
+      // THE REASON RIDES IN THE OPTION TEXT. A boundary someone recorded a reason for is one a
+      // reader can choose between; an 8-hex prefix alone is a thing they have to come and ask
+      // about. Truncated because an <option> cannot wrap — the full text is on the line below.
+      var nt=e.note?(' · '+(e.note.length>44?e.note.slice(0,44)+'…':e.note)):'';
       return '<option value="'+esc(e.era)+'"'+((ERA[cam]||'')===e.era?' selected':'')+'>'
-        +esc(e.era)+' · '+e.rows+' rows · '+d(e.first)+'–'+d(e.last)+'</option>';}).join('');
+        +esc(e.era)+' · '+e.rows+' rows · '+d(e.first)+'–'+d(e.last)+esc(nt)+'</option>';}).join('');
+  var sel=ERA[cam]||'';
+  var selE=es.filter(function(e){return e.era===(sel||(es[0]||{}).era)})[0];
   return '<span style="margin-left:8px">era: <select onchange="setEra(\''+esc(cam)+'\',this.value)" '
     +'style="font:inherit;font-size:11px">'+opts+'</select></span>'
-    +((ERA[cam])?' <b class=warn>viewing a selected era, not the live one</b>':'');
+    +(sel?' <b class=warn>viewing a selected era, not the live one</b>':'')
+    +((selE&&selE.note)?('<div class=mut style="font-size:11px;margin-top:2px">why this era: '
+        +esc(selE.note)+(selE.noted_at?(' <span class=mut>(noted '
+        +new Date(selE.noted_at*1000).toLocaleDateString()+')</span>'):'')+'</div>'):'');
 }
 
 // ── GPU camera registry (wizard piece 5) ─────────────────────────────────────────────────
