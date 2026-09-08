@@ -325,6 +325,7 @@ def main():
     census = collections.Counter()
     per_glyph = collections.Counter()
     curve = []          # (min_cell_score, floor) for every gate-passing crop — see below
+    arrow_n = collections.Counter()      # up/down exemplars won, so a loss is visible not silent
     accepted = []       # (id, ts, png_bytes, label)
     for r in rows:
         arr = cv2.imdecode(np.frombuffer(r["blob"], np.uint8), cv2.IMREAD_COLOR)
@@ -369,8 +370,26 @@ def main():
             continue
         for g in glyphs:
             per_glyph[g] += 1
-        census[f"ACCEPTED {floor}"] += 1
-        accepted.append((r["id"], r["ts"], r["blob"], floor))
+        # ── THE ARROW, or the rebuild silently loses direction ─────────────────────────────────
+        # build_templates learns 'up'/'down' from the TRAILING ^/v on a label and from nothing else
+        # (_label_to_glyphs). A corpus of bare floor strings accumulates no arrow crops at all, so a
+        # rebuild from it produces digits and blanks only -- and ch29 would come back with no
+        # direction, having had it. Measured: the August labels.json carried a suffix on 146 of its
+        # 225 labels, which is exactly where its up/down templates came from.
+        #
+        # Scored STATELESSLY with _match2 rather than read from read_panel's `direction`, which
+        # carries hysteresis (arrow_hold_reads, _last_direction) and would make a crop's label
+        # depend on the order crops were visited in. Held to the SAME bar as the digits: clears
+        # --min-score AND beats its runner-up by margin_min. An arrow that does not is simply
+        # omitted -- a floor label with no suffix is valid and still teaches its digits.
+        alab, asc, a2 = R._match2(gd.crop(pg, R.arrow_cell), R.arrow_labels)
+        suffix = ""
+        if (alab is not None and asc >= a.min_score and (asc - a2) >= R.margin_min):
+            suffix = "^" if alab == "up" else ("v" if alab == "down" else "")
+            if suffix:
+                arrow_n[alab] += 1
+        census[f"ACCEPTED {floor}{suffix}"] += 1
+        accepted.append((r["id"], r["ts"], r["blob"], floor + suffix))
 
     print("  ── census " + "─" * 60)
     for k, v in census.most_common():
@@ -383,6 +402,19 @@ def main():
               f"Widen --since, lower --min-score, or supply them from confirmed windows.")
     print(f"  ** the lobby 'G' is NOT in this set by design — supply it from operator-confirmed "
           f"windows before building.")
+    # WHAT THE REBUILD WOULD ACTUALLY LEARN, checked against what the camera has NOW. A corpus that
+    # merely looks well-populated can still drop a glyph the live reader depends on, and the only
+    # honest way to say so is to compare the two sets.
+    would = {g for g, n in per_glyph.items() if n >= 3} | {a for a, n in arrow_n.items() if n >= 3}
+    live = {k for k in tpl if not k.startswith("blank")}
+    lost = sorted(live - would)
+    print(f"  arrows         up:{arrow_n.get('up', 0)} down:{arrow_n.get('down', 0)}")
+    if lost:
+        print(f"  ** A BUILD FROM THIS CORPUS WOULD LOSE: {', '.join(lost)} — the camera has these "
+              f"templates today.\n     Supply them from operator-confirmed windows, or the rebuilt "
+              f"reader comes back unable to read what it can read now.")
+    else:
+        print(f"  every glyph the camera has today is covered ({len(would)} glyphs)")
 
     # ── yield curve: coverage vs label trust ───────────────────────────────────────────────────
     print("\n  ── digit coverage by --min-score (gate-passing crops only) " + "─" * 12)
@@ -429,7 +461,10 @@ def main():
         "gate_params": {"pre_days": a.pre_days, "min_pre": a.min_pre,
                         "max_inflation": a.max_inflation},
         "n_accepted": len(accepted), "n_candidates": len(rows), "crop_source": src,
-        "per_glyph": dict(per_glyph), "census": dict(census),
+        "per_glyph": dict(per_glyph), "arrows": dict(arrow_n), "census": dict(census),
+        "glyphs_lost_vs_live": sorted({k for k in tpl if not k.startswith("blank")}
+                                      - ({g for g, n in per_glyph.items() if n >= 3}
+                                         | {x for x, n in arrow_n.items() if n >= 3})),
         "note": "Exemplars carry the POST-2026-09-02 image and labels asserted by the PRE-change "
                 "templates at a margin they still clear. Non-numeric floors are absent by design.",
     }, indent=2, sort_keys=True))

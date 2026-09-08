@@ -558,23 +558,35 @@ class FloorReader:
 
     def _match2(self, cell_img, labels):
         """(best_label, best_score, runner_up_score). Argmax alone cannot see ambiguity: two arrows
-        at 0.68 and 0.66 produce a confident-looking winner that changes with sensor noise."""
+        at 0.68 and 0.66 produce a confident-looking winner that changes with sensor noise.
+
+        SCORED THE SAME WAY _match AND read_panel SCORE DIGITS — resize the cell to the template
+        size and _ncc, which takes the MAX over a (k,H,W) exemplar stack. It has to: since _cluster
+        landed, EVERY template is such a stack.
+
+        THE BUG THIS REPLACES, because it cost 26 days of direction fleet-wide and left no trace.
+        The previous body passed the raw template to cv2.matchTemplate. For a (3,16,10) stack the
+        shape guard reads shape[1]=16 against an 8px-wide arrow cell, calls cv2.resize -- which
+        interprets (3,16,10) as 3 rows x 16 cols x 10 CHANNELS -- and hands matchTemplate a
+        10-channel template against a 1-channel cell. That raises, `except Exception: continue`
+        swallows it, every label is skipped, and the function returns (None, -2, -2) on every frame.
+        `direction` was NULL on 100% of gw_door_event rows on ALL SEVEN cameras from 2026-08-13
+        13:00 IST (273 directions that hour, 0 the next, never again) until this fix.
+        Nothing detected it: _match2 is not part of door_version, so the era never moved, and the
+        bare except turned a type error into silence. Measured on 800 post-09-02 ch29 crops --
+        before: None x800. after: down 663 / up 137, of which 12 clear 0.80 (the arrow cell is
+        unlit while the car is stationary, so a low median is correct, not a failure)."""
         import cv2
-        best = (None, -2.0)
-        second = -2.0
         if cell_img.size == 0 or cell_img.shape[0] < 2 or cell_img.shape[1] < 2:
             return None, -2.0, -2.0
+        c = cv2.resize(cell_img, (self._tsz[1], self._tsz[0]))
+        best = (None, -2.0)
+        second = -2.0
         for lab in labels:
-            tpl = self.templates.get(lab)
-            if tpl is None:
+            t = self.templates.get(lab)
+            if t is None:
                 continue
-            t = tpl
-            if t.shape[0] > cell_img.shape[0] or t.shape[1] > cell_img.shape[1]:
-                t = cv2.resize(t, (cell_img.shape[1], cell_img.shape[0]))
-            try:
-                sc = float(cv2.matchTemplate(cell_img, t, cv2.TM_CCOEFF_NORMED).max())
-            except Exception:
-                continue
+            sc = self._ncc(c, t)
             if sc > best[1]:
                 second = best[1]
                 best = (lab, sc)
