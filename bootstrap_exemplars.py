@@ -35,8 +35,22 @@ camera is on LABEL_BIND_LEGACY_CAMS, because filenames are reused and a re-colle
 re-attach old labels to new pixels (the 2026-07-30 ch16 label-inheritance postmortem). Writing it
 here means these crops are content-verified from the moment they land.
 
+TWO CROP SOURCES, ONE PATH. By default the crops come from floor_sample.crop_jpeg. --crops/--meta
+reads them from an exported directory of <id>.jpg plus a csv instead, for running where the blobs
+have been carried rather than where the DB is. The bytes are the same either way -- crop_jpeg IS
+the panel crop and an export of it is a copy, not a rendering -- and everything after loading is
+identical, so the file mode cannot drift into a second behaviour. The DB is STILL REQUIRED either
+way: the pre-incident label gate is a question about gw_door_event and has no file equivalent.
+
+MIND THE WINDOW when exporting. A SQL export written as `ts > '2026-09-03'` is a UTC midnight,
+while --since is IST -- a 5.5 h difference at the start of the range. Both are safely after the
+2026-09-02 17:50 IST cutover so neither contaminates the corpus with old-image crops, but the two
+sources will not report the same candidate count and that is not a fault.
+
 usage:
   bootstrap_exemplars.py --cam ch29 --since '2026-09-03' --out /tmp/boot_ch29
+  bootstrap_exemplars.py --cam ch29 --crops /tmp/fs_ch29 --meta /tmp/fs_ch29/meta.csv \
+                         --since '2026-09-03' --min-score 0.80 --out /tmp/boot_ch29
   bootstrap_exemplars.py --cam ch29 --since '2026-09-03' --out /tmp/boot_ch29 --min-score 0.88
   bootstrap_exemplars.py --cam ch29 --dry-run            # census only, writes nothing
 """
@@ -189,6 +203,60 @@ def label_gate(db, gw, cam, cutover, pre_days, min_pre, max_inflation):
                       "pre_window_from_ist": _ist(t_from)}
 
 
+def load_candidates(a, db, t0):
+    """-> (list of {id, ts, blob}, source_description). Two sources, ONE downstream path.
+
+    The crops are the same bytes either way -- floor_sample.crop_jpeg IS the panel crop, and an
+    export of it is a copy, not a rendering. So the file source exists purely so this can run where
+    the blobs have been carried to rather than where the DB is, and it must not become a second
+    code path with its own behaviour: everything after this function is identical.
+
+    WHAT IT WILL NOT DO IS INFER. A meta row whose JPEG is missing is COUNTED and reported, never
+    skipped quietly -- a corpus silently short by the rows that failed to export is exactly the
+    kind of gap that reads as "the camera had less data" months later.
+
+    NOTE the gate still needs the DB. --crops changes where the CROPS come from; the pre-incident
+    label gate is a question about gw_door_event and has no file equivalent.
+    """
+    if not a.crops:
+        rows = db.execute("SELECT id, ts, crop_jpeg, floor, reason FROM floor_sample "
+                          "WHERE gateway_id=? AND cam=? AND ts>=? AND crop_jpeg IS NOT NULL "
+                          "ORDER BY ts", (a.gw, a.cam, t0)).fetchall()
+        return ([{"id": r["id"], "ts": r["ts"], "blob": r["crop_jpeg"]} for r in rows],
+                f"floor_sample in {a.db}")
+    import csv as _csv
+    meta = a.meta or os.path.join(a.crops, "meta.csv")
+    if not os.path.exists(meta):
+        raise SystemExit(f"no meta csv at {meta} -- pass --meta")
+    out, n_before, n_nofile, n_badcam = [], 0, 0, 0
+    with open(meta, newline="") as fh:
+        for r in _csv.DictReader(fh):
+            if (r.get("cam") or a.cam) != a.cam:
+                n_badcam += 1
+                continue
+            try:
+                ts = float(r["ts"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ts < t0:
+                n_before += 1
+                continue
+            fp = os.path.join(a.crops, f"{r['id']}.jpg")
+            if not os.path.exists(fp):
+                n_nofile += 1
+                continue
+            out.append({"id": r["id"], "ts": ts, "blob": open(fp, "rb").read()})
+    out.sort(key=lambda x: x["ts"])
+    note = (f"{a.crops} + {os.path.basename(meta)}"
+            + (f" [{n_before} before --since, excluded]" if n_before else "")
+            + (f" [** {n_nofile} meta rows with NO jpg on disk **]" if n_nofile else "")
+            + (f" [{n_badcam} rows for another camera]" if n_badcam else ""))
+    if n_nofile:
+        print(f"  ** WARNING: {n_nofile} meta rows have no matching .jpg. The export is INCOMPLETE; "
+              f"this run sees a smaller corpus than the export claims.", flush=True)
+    return out, note
+
+
 def main():
     ap = argparse.ArgumentParser(description="bootstrap recalibration exemplars from high-margin reads")
     ap.add_argument("--gw", default=os.environ.get("GW", "site-A"))
@@ -212,6 +280,11 @@ def main():
                     help="reject a floor whose per-day rate rose more than this since the cutover")
     ap.add_argument("--max-per-glyph", type=int, default=40, dest="max_per_glyph",
                     help="cap exemplars per GLYPH so one busy floor cannot dominate the set")
+    ap.add_argument("--crops", default=None,
+                    help="directory of <id>.jpg panel crops (instead of reading floor_sample). "
+                         "The DB is still required for the pre-incident label gate.")
+    ap.add_argument("--meta", default=None,
+                    help="csv with id,cam,ts,... describing --crops (default <crops>/meta.csv)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--dry-run", action="store_true", dest="dry_run")
     a = ap.parse_args()
@@ -245,9 +318,8 @@ def main():
     for f, w in sorted(_infl.items()):
         print(f"                 ** {f}: {w}")
 
-    rows = db.execute("SELECT id, ts, crop_jpeg, floor, reason, read_conf FROM floor_sample "
-                      "WHERE gateway_id=? AND cam=? AND ts>=? AND crop_jpeg IS NOT NULL "
-                      "ORDER BY ts", (a.gw, a.cam, t0)).fetchall()
+    rows, src = load_candidates(a, db, t0)
+    print(f"  crop source    {src}")
     print(f"  candidates     {len(rows)} crops\n")
 
     census = collections.Counter()
@@ -255,7 +327,7 @@ def main():
     curve = []          # (min_cell_score, floor) for every gate-passing crop — see below
     accepted = []       # (id, ts, png_bytes, label)
     for r in rows:
-        arr = cv2.imdecode(np.frombuffer(r["crop_jpeg"], np.uint8), cv2.IMREAD_COLOR)
+        arr = cv2.imdecode(np.frombuffer(r["blob"], np.uint8), cv2.IMREAD_COLOR)
         if arr is None:
             census["undecodable crop"] += 1
             continue
@@ -298,7 +370,7 @@ def main():
         for g in glyphs:
             per_glyph[g] += 1
         census[f"ACCEPTED {floor}"] += 1
-        accepted.append((r["id"], r["ts"], r["crop_jpeg"], floor))
+        accepted.append((r["id"], r["ts"], r["blob"], floor))
 
     print("  ── census " + "─" * 60)
     for k, v in census.most_common():
@@ -356,7 +428,7 @@ def main():
         "label_gate": gate, "cutover_ist": _ist(cutover),
         "gate_params": {"pre_days": a.pre_days, "min_pre": a.min_pre,
                         "max_inflation": a.max_inflation},
-        "n_accepted": len(accepted), "n_candidates": len(rows),
+        "n_accepted": len(accepted), "n_candidates": len(rows), "crop_source": src,
         "per_glyph": dict(per_glyph), "census": dict(census),
         "note": "Exemplars carry the POST-2026-09-02 image and labels asserted by the PRE-change "
                 "templates at a margin they still clear. Non-numeric floors are absent by design.",
