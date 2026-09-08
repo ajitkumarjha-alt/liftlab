@@ -240,16 +240,34 @@ all pre-09-02 data untouched, and never pool across the boundary.**
 | # | camera | work |
 |---|---|---|
 | 1 | **PL2B / ch30** | Full rebuild — zones, door state template from the 23 windows, panel cells and alphabet. This camera also **moved**, so its geometry is rebuilt, not just its templates. |
-| 2 | **PL1A / ch29**, **PL3B / ch27** | Floor templates + cells rebuilt against the September image. Exemplars bootstrapped from the current stream wherever the OLD templates still score ≥ 0.85 on numerics — those reads are correct, merely marginal — then the lobby added from `G` crops on confirmed PL1A windows. Held-out verification before any cut-over. **PL3B additionally gets a single-character cell**, without which its lobby cannot register at all. |
+| 2 | **PL1A / ch29** | Floor templates + cells rebuilt against the September image. Exemplars bootstrapped from the current stream wherever the OLD templates still score ≥ `--min-score` on numerics — those reads are correct, merely marginal — then 0/8/9 and the lobby `G` added from operator-confirmed windows. Held-out verification before cut-over. |
+| 2b | **PL3B / ch27** | **Escalated 2026-09-08 to a full manual calibration.** Measured, it cannot be bootstrapped: 1 usable read in 400 post-cutover crops. Collect, label by hand, build — and a `G` template from scratch, on top of the single-character cell without which its lobby cannot register at all. |
 | 3 | **door templates, ch27/29/30/32/34/37** | Re-run held-out separation on current footage. Rebuild any whose closed/open split has narrowed; leave the rest alone. |
 | 4 | **eras** | New `door_version` and floor era on every rebuilt camera, dated to cut-over, carrying a reason string naming the 09-02 image change. Surfaced in `eras.csv` and every dash panel. |
 | 5 | **health line** | Per-camera daily mean `read_conf` against the camera's own baseline — signal 5, below. |
 
-Bootstrapping from ≥ 0.85 numerics is the load-bearing choice in step 2: it means the new exemplars
-are drawn from reads the *existing* instrument still gets right, so the rebuild is anchored to
-verified truth rather than to whatever the degraded reader currently believes. The lobby is the one
-glyph that cannot be bootstrapped that way — `G` no longer survives the blank gate at all — which
-is why its crops come from confirmed windows instead.
+Bootstrapping from high-margin numerics is the load-bearing choice in step 2: the new exemplars are
+drawn from reads the *existing* instrument still gets right, so the rebuild is anchored to verified
+truth rather than to whatever the degraded reader currently believes.
+
+**It only works where the existing instrument can still read, and measurement on 2026-09-08 showed
+that is ch29 alone.** 400 post-cutover crops per camera, through that camera's own live templates:
+
+| cam | built glyphs | 400 crops | bootstrap yield |
+|---|---|---|---|
+| ch29 | `0-9 G P up down` | **183 ok**, 173 no_read, 44 ambiguous | usable at `--min-score 0.80` |
+| ch27 | `2 3 4 5 6 down` | **1 ok**, 399 no_read | **zero at any threshold** |
+| ch30 | `2 3 6 up` | 10 ok, 310 no_read, 80 ambiguous | **zero** — all 10 are the phantom `3` |
+
+ch27's and ch30's built glyph sets are drastically incomplete and have been since long before
+09-02 — their `labels.json` carry more than the build kept, so the rest fell under
+`min_examples=3` on 61 crops against ch29's 225. A reader that cannot name its own panel cannot
+label exemplars, so no threshold helps. It also explains ch30's `666`/`366`/`333` census from a
+second direction: those are the only three glyphs it owns.
+
+Even on ch29 the automatic path does not cover everything. `G` cannot be bootstrapped — it no
+longer survives the blank gate — and the yield curve puts digits 0, 8 and 9 thin or absent above
+0.80. Those four glyphs come from operator-confirmed windows.
 
 ### The era boundary is automatic, and that is by design
 

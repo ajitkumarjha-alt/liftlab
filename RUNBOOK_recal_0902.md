@@ -17,23 +17,81 @@ liftlab-gpu is currently unreachable from this session (`gcloud auth login` need
 
 ## 0. Before anything — freeze what you are replacing
 
-    cp /var/lib/liftlab/calib/site-A/<cam>/templates.npz  templates.npz.pre0902
-    cp /var/lib/liftlab/calib/site-A/<cam>/labels.json    labels.json.pre0902
-    cp -a /var/lib/liftlab/calib/site-A/<cam>/            calib-pre0902-<cam>/
+> **CORRECTED 2026-09-08.** This step previously said `calib/site-A/<cam>/templates.npz`. **There
+> is no templates.npz in the calib dir on any camera** — the engine fetches templates over HTTP and
+> they live in a different directory that nothing was backing up. Following the old text produces
+> an archive with no templates in it, which is what happened to `gpu-calib-20260908.tgz`
+> (md5 `871f962477494896ea9213247b1c44cf`, 124 KB): it holds `door_state_templates/*.json` and the
+> `gpu_*.py` sources, and none of the calibration.
 
-The old templates are the only remaining description of the August image. `ch29_templates.npz` in
-the repo is byte-identical to the live ch29 set (hash `260d4a0f67ff0587…`) and is the reference
-copy for that camera; ch27 and ch30 have no such copy in the tree, so **their backup is the only
-one**. Do not skip this.
+**Two directories, and both are on liftlab-cloud, not liftlab-gpu:**
 
-## 1. Bootstrap exemplars from the current image — ch29, ch27 (liftlab-cloud)
+    /var/lib/liftlab/templates/site-A/<cam>.npz     the templates themselves
+    /var/lib/liftlab/calib/site-A/<cam>/            crops, labels.json, labels_bind.json, roi.json
+
+Take them together, streamed so nothing is written on the gateway:
+
+    gcloud compute ssh liftlab-cloud --zone asia-south1-c --quiet \
+      --command 'sudo tar czf - -C /var/lib/liftlab templates calib' > step0-calib-<date>.tgz
+
+Verify every pulled npz against the hash its camera is actually stamping in `gw_door_event`, before
+it is used for anything — a calib dir that is not what the worker is running would recalibrate the
+wrong instrument:
+
+| camera | expected `templates_hash[:16]` |
+|---|---|
+| ch27 | `425f92e1c3a235b3` |
+| ch29 | `260d4a0f67ff0587` |
+| ch30 | `661a1fa01dcd6909` |
+
+    python3 -c "import numpy as np,gpu_door as gd;z=np.load('<cam>.npz');print(gd.templates_hash({k:z[k] for k in z.files})[:16])"
+
+**Done 2026-09-08:** `step0-calib-20260908.tgz`, 35,819,598 B,
+md5 `5decdcaaa2734f64cde18bc3d6f3e2c1`, all three hashes verified MATCH. `ch27_templates.npz`,
+`ch30_templates.npz` and `ch27_roi.json` are now committed (`ff5795f`), so all three cameras have
+their templates and geometry in git rather than only on one box.
+
+## 1. Bootstrap exemplars from the current image — **ch29 ONLY** (liftlab-cloud)
+
+> **REVISED 2026-09-08 after measuring the yield. ch27 and ch30 cannot be bootstrapped at all**, at
+> any threshold. 400 post-cutover crops per camera, read with that camera's own live templates:
+>
+> | cam | built glyphs | 400 crops | exemplars, any threshold ≥0.65 |
+> |---|---|---|---|
+> | ch29 | `0-9 G P up down` | **183 ok**, 173 no_read, 44 ambiguous | usable |
+> | ch27 | `2 3 4 5 6 down` | **1 ok**, 399 no_read | **zero** |
+> | ch30 | `2 3 6 up` | 10 ok, 310 no_read, 80 ambiguous | **zero** — all 10 are the phantom `3` |
+>
+> The tool can only label glyphs the OLD templates can read, and those two sets are too incomplete
+> to name their own panels. ch27's shift search also wanders — (-1,1) (1,-2) (-1,0) (0,2), no peak
+> at (0,0) — which is what a rigid shift search does when nothing matches anywhere.
+>
+> **Do not run step 1 for ch27 or ch30.** It writes an empty corpus and the build then fails on
+> `min_examples=3`, which looks like a tooling fault and is not one. Both go to step 3's full
+> manual calibration instead: collect, label by hand at `/calib-label`, build. ch27 additionally
+> needs a `G` template built from scratch — it has never had one — on top of the single-character
+> cell its lobby needs.
 
 `bootstrap_exemplars.py` selects crops from `floor_sample` (which carries the real panel JPEGs,
 post-09-02, on the cloud box) and labels them using the **old** templates, keeping only reads where
-every glyph still clears 0.85 — the upper tail the degradation did not reach.
+every glyph still clears `--min-score` — the upper tail the degradation did not reach.
 
     python3 bootstrap_exemplars.py --cam ch29 --since '2026-09-03' --dry-run     # census first
-    python3 bootstrap_exemplars.py --cam ch29 --since '2026-09-03' --out /tmp/boot_ch29
+    python3 bootstrap_exemplars.py --cam ch29 --since '2026-09-03' --min-score 0.80 \
+            --out /tmp/boot_ch29
+
+**Use `--min-score 0.80`, measured.** The yield curve on ch29:
+
+    thresh  crops  missing   per-digit
+      0.85    258  0,9       1:6 2:90 3:188 4:26 5:106 6:43 7:25 8:2    [thin: 8]
+      0.82    431  none      0:4 1:39 2:163 3:256 4:51 5:158 6:68 7:58 8:5 9:6   [thin: 0]
+      0.80    567  none      0:5 1:97 2:226 3:286 4:88 5:186 6:82 7:74 8:10 9:14
+      0.78    662  none      0:13 1:140 2:270 3:308 4:92 5:201 6:88 7:98 8:15 9:24
+
+`build_templates` has `min_examples=3`, so 0.82 is the lowest that builds and it leaves digit 0 on
+four exemplars. Below ~0.78 a different hazard opens: floor 77 is a known shadow of 17 and the
+label gate ADMITS it — 77 is a genuine pre-incident floor whose rate FELL rather than rose — so a
+17-read-as-77 starts getting in. Supply 0/8/9 and `G` from confirmed windows regardless.
 
 It writes `_calib_crop_NNNNN.png`, `labels.json` **and `labels_bind.json`** — the content binding
 is mandatory, or `build_from_crops` excludes every label (the 2026-07-30 ch16 label-inheritance
