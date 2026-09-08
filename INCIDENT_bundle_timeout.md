@@ -113,7 +113,7 @@ only fires at 60.
   fires is not a warning.
 
     sqlite3 /var/lib/liftlab/gateway.db \
-      "SELECT datetime(started_at,'unixepoch','+5 hours 30 minutes') t, period, total_s, \
+      "SELECT datetime(started_at,'unixepoch','+5 hours','+30 minutes') t, period, total_s, \
               slowest, slowest_s, n_withheld FROM bundle_run ORDER BY started_at DESC LIMIT 20"
 
 ## Deploy

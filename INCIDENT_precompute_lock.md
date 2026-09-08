@@ -44,15 +44,93 @@ of litestream, which holds a long-lived read connection for replication.
 **The direct cause is another writer**, and the failure was instant rather than a timeout, which is
 the signature of `busy_timeout=0` and not of a genuinely long-held lock.
 
-Whether litestream also disables SQLite's autocheckpoint on this box is a one-line check that is
-worth doing, because it decides how big the WAL is allowed to get between litestream's own
-checkpoints:
+### Litestream is running, it owns the checkpoint cycle, and it is losing the same race
 
-    sqlite3 /var/lib/liftlab/gateway.db 'PRAGMA wal_autocheckpoint; PRAGMA journal_mode;'
-    ls -l /var/lib/liftlab/gateway.db-wal
+An earlier revision of this section claimed litestream was not running and that autocheckpoint was
+therefore at SQLite's default. **Both halves were wrong.** The check had been run on `dev-box`,
+where litestream is an unused binary with no config and no unit — not on `liftlab-cloud`, which is
+where `gateway.db` lives. Measured on the gateway (2026-09-07):
 
-`wal_mb` is now recorded on every sweep, so this stops being a question anyone has to remember to
-ask.
+    $ hostname                          liftlab-cloud
+    $ systemctl is-active litestream    active        (enabled; v0.3.13)
+    $ ls -l /etc/litestream.yml         145 B, Jul 16 16:29
+      -> gs://liftlab-backup-lodha/liftlab/gateway.db
+    generation 56539de99e6d45cb  index 00007688  replica lag -26s
+
+And the `PRAGMA wal_autocheckpoint` reading was not evidence about the database *even on the right
+box*. `wal_autocheckpoint` is **per-connection** state — it installs a WAL hook on the connection
+that asks. A fresh `sqlite3` CLI connection answers `1000` on any build anywhere, because 1000 is
+that new connection's own default. It says nothing about what litestream's connection or the ingest
+app's connections have set. The question was not answerable by the command used to answer it.
+
+**Litestream owns the checkpoint cycle here, and the shadow-WAL index proves it.** Index `0x7688` is
+30,344 rotations across the generation's 34.02 days — **one per ~97 s**, which is litestream's
+default `checkpoint-interval` of 1 minute plus the time it takes to get the lock. It is shipping a
+WAL segment every ~1 s (220–460 ms per write), so replication itself is healthy.
+
+**The WAL file is 103.7 MB, and that number does not mean what it looks like.** Sampled every 10 s
+for a minute on the gateway:
+
+    wal 108,714,472 B  constant to the byte for 60s
+    db  1,155,551,232 -> 1,155,637,248 B   (+86,016 B = 21 pages copied out)
+
+108,714,472 = 32 + **26,387** frames x (4096 + 24) — 25.7x the 4,231,272 B (1,027 frames) that the
+August sampler recorded in `smoke_reports.sh`. But litestream's live position is offset **3,061,192**
+inside the current index: **2.8 % of the file.** SQLite never shrinks a WAL except on a TRUNCATE
+checkpoint, so 103.7 MB is a **high-water mark left by a past episode**, not live backlog. The WAL is
+cycling in the first ~3 MB of a 103.7 MB file. What it proves is narrow and still worth knowing: *no
+TRUNCATE checkpoint has succeeded since whatever grew it.*
+
+### So what held the lock — the answer is unchanged, and litestream is the other victim
+
+    $ journalctl -u litestream --since '24 hours ago' | grep -c 'database is locked'
+    93
+    $ journalctl -u litestream --since 2026-09-01 | grep -c 'database is locked'
+    184         -> 91 over the prior 5.5 d (16.5/day), then 93 in the last 24 h
+    ... error="checkpoint: mode=PASSIVE err=database is locked"   clustered, ongoing
+
+**Read those two numbers together.** The steady rate is ~16.5/day; today is **5.7x** that. Today is
+the day of this incident — the fleet restart and the seven workers' backlog. So the refusals are not
+a constant background hum, they *track the contention this incident is about*, which is what makes
+them a usable signal. For scale, August's chain-breaking episode ran at 7 in 24 h.
+
+Litestream cannot be what the sweep collided with, for two reasons that are both in that line:
+
+* **The mode is PASSIVE.** A passive checkpoint never blocks a writer and never waits — it copies
+  what it can and returns. There is nothing there for a writer to block on.
+* **Litestream is losing this race, 93 times a day.** It is a fellow casualty of the contention, not
+  its source. Whatever beats litestream 93 times a day is what beat the sweep.
+
+**The direct cause is another writer — the ingest path holding SQLite's single WAL write lock** while
+it commits the restart backlog. That is what the section above already concluded, and litestream's
+presence does not move it. The failure was instant (`0.3 ms`, section 7) — the signature of
+`busy_timeout=0` meeting a held lock, not of a long checkpoint pause.
+
+What litestream *does* change is the amplifier, and it makes it permanent rather than occasional.
+Section 7's measurement — WAL 4,032 KB -> 20,608 KB with one reader pinned, passive checkpoint
+reclaiming 528 of 5,122 pages — is not a scenario on this box. **Litestream's replication connection
+means there is always a pinned reader.** A study-bundle build stacks a *second* long read on top of
+it, which is why bundles make this worse rather than causing it.
+
+And the stakes are not only the dashboard's. In August these same refused checkpoints "prevented
+clean WAL truncation and widened the window" in which the retainer left the replica chain
+inconsistent — `README_GWPERF.md`, the incident that cost every point-in-time backup before
+2026-08-04. **Today's 93 is 13x the rate that preceded that loss**, and even the quiet-day 16.5 is
+over twice it.
+
+### What to actually watch — `wal_mb` is a watermark, not a gauge
+
+`lock_diagnostics` takes `os.stat` of the `-wal` file, so `wal_mb` reports the **high-water mark**.
+On the gateway it reads 103.7 MB today and will keep reading 103.7 MB whether checkpointing is
+healthy or not, until some TRUNCATE checkpoint shrinks the file. It is a *worst-ever* number, useful
+for spotting that a bad episode happened, useless for telling you one is happening now.
+
+The live signal is litestream's own sync loop, and it is one command:
+
+    journalctl -u litestream --since '24 hours ago' | grep -c 'database is locked'
+
+Rising means writers are holding the lock long enough to refuse a passive checkpoint — which is the
+*backup* alarm before it is a dashboard one.
 
 ## The fixes
 
@@ -81,6 +159,11 @@ never removes a row. They are one transaction now, halving the contention points
     [precompute] site-A contention: 0 lock retries, 0s waited · rss now 29.6MB,
     peak 29.6MB at [rtt site-A/ch27 w=1d] · wal 0.0MB · litestream inactive
 
+**That sample is from the fixture box.** On `liftlab-cloud` the same line reads `litestream active`
+and `wal 103.7MB` — and per the section above, that `wal_mb` is a high-water mark, so do not read a
+large one as evidence of contention during *this* sweep. `n_locked` and `lock_wait_s` are the fields
+that describe the sweep that printed them.
+
 A sweep that took an hour because it waited 40 minutes for a lock is a different problem from one
 that spent 40 minutes computing, and the line could not previously tell them apart.
 
@@ -102,7 +185,7 @@ rather than invent an explanation the peak is now *recorded with the stage that 
 sweep answers it:
 
     sqlite3 /var/lib/liftlab/gateway.db \
-      "SELECT datetime(started_at,'unixepoch','+5 hours 30 minutes') t, total_s, rss_peak_mb, \
+      "SELECT datetime(started_at,'unixepoch','+5 hours','+30 minutes') t, total_s, rss_peak_mb, \
               rss_peak_stage, n_locked, lock_wait_s, wal_mb FROM precompute_run \
        ORDER BY started_at DESC LIMIT 10"
 

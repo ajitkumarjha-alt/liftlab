@@ -65,7 +65,7 @@ Found in review of this change, fixed here because the new views are what expose
 
     # 3. confirm
     sqlite3 /var/lib/liftlab/gateway.db \
-      "SELECT kind, period, length(payload), datetime(computed_at,'unixepoch','+5 hours 30 minutes') \
+      "SELECT kind, period, length(payload), datetime(computed_at,'unixepoch','+5 hours','+30 minutes') \
        FROM study_matrix ORDER BY kind, period"
     curl -s localhost:8000/dash/site-A/rtt_fleet?period=week | head -c 400
 
