@@ -111,22 +111,34 @@ def arrow_capability(templates_dir):
     "withhold direction when the reader knows one arrow"). So ch27 (down only), ch30 (up only) and
     the door-only cameras are expected to stay at zero after any arrow fix, and scoring them FAIL
     would turn a correct deploy into a 1-of-7 that reads like a partial failure. Measured from the
-    template files themselves rather than assumed."""
+    template files themselves rather than assumed.
+
+    NO NUMPY. An .npz is a zip of .npy members, and the member NAMES are all this needs -- reading
+    them with zipfile means this runs on the gateway, which has no numpy, instead of silently
+    degrading there. It raises rather than returning {} when it cannot answer: a capability table
+    that quietly turns into "no information" would score ch27/ch30 as FAIL and report a correct
+    deploy as 1-of-7, which is the same silent-degradation trap this whole exercise is about."""
+    import zipfile
     cap = {}
-    if not templates_dir or not os.path.isdir(templates_dir):
+    if not templates_dir:
         return cap
-    try:
-        import numpy as np
-    except ImportError:
-        return cap
+    if not os.path.isdir(templates_dir):
+        raise SystemExit(f"--templates-dir {templates_dir!r} is not a directory. Omit it, or point "
+                         f"it at the <cam>.npz store — silently ignoring it would mis-score every "
+                         f"one-arrow camera as a failure.")
     for fn in sorted(os.listdir(templates_dir)):
         if not fn.endswith(".npz"):
             continue
+        path = os.path.join(templates_dir, fn)
         try:
-            z = np.load(os.path.join(templates_dir, fn))
-            cap[fn[:-4]] = sorted(k for k in z.files if k in ("up", "down"))
-        except Exception:
-            pass
+            with zipfile.ZipFile(path) as z:
+                names = {n[:-4] if n.endswith(".npy") else n for n in z.namelist()}
+        except Exception as e:
+            raise SystemExit(f"cannot read {path}: {type(e).__name__}: {e}. Refusing to guess "
+                             f"arrow capability.")
+        cap[fn[:-4]] = sorted(k for k in names if k in ("up", "down"))
+    if not cap:
+        raise SystemExit(f"--templates-dir {templates_dir!r} holds no .npz files.")
     return cap
 
 
