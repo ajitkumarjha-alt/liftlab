@@ -1,0 +1,145 @@
+{
+  "door_roi_frame": [
+    125,
+    3,
+    238,
+    397
+  ],
+  "panel_rois": [
+    [
+      79,
+      66,
+      75,
+      101
+    ]
+  ],
+  "frame_wh": [
+    704,
+    576
+  ],
+  "saved_at": "2026-07-22T15:28:43Z",
+  "source_image": "calib_frame",
+  "drawn_on_wh": [
+    704,
+    576
+  ],
+  "cells": {
+    "digit_cells": [
+      [
+        17,
+        18,
+        8,
+        20
+      ],
+      [
+        25,
+        13,
+        8,
+        20
+      ],
+      [
+        33,
+        8,
+        8,
+        20
+      ]
+    ],
+    "arrow_cell": [
+      43,
+      0,
+      16,
+      20
+    ],
+    "pitch": 8,
+    "cell_w": 8,
+    "panel_wh": [
+      75,
+      101
+    ],
+    "anchors": {
+      "tens_left": 25,
+      "units_left": 33,
+      "digit_top": 10,
+      "digit_bottom": 30,
+      "arrow_left": 43
+    },
+    "anchor_crop": "_calib_crop_030.png",
+    "drawn": {
+      "tens": [
+        25,
+        13,
+        11,
+        20
+      ],
+      "units": [
+        33,
+        8,
+        9,
+        19
+      ],
+      "arrow": [
+        43,
+        0,
+        16,
+        32
+      ],
+      "hundreds": null
+    },
+    "warnings": [
+      "tilt is -5px per 8px of pitch \u2014 that is a very steep slant for an LED panel. Real ones run a few px; check TENS and UNITS are on the same row.",
+      "d0 sits [+0,+8]px off the uniform grid \u2014 beyond \u00b14px that is more likely a bad drag than a real slant. Check the overlay.",
+      "arrow sits [+0,-10]px off the uniform grid \u2014 beyond \u00b14px that is more likely a bad drag than a real slant. Check the overlay."
+    ],
+    "saved_at": "2026-07-22T15:46:00Z"
+  },
+  "zone_landing": [
+    [
+      240,
+      372
+    ],
+    [
+      343,
+      281
+    ],
+    [
+      320,
+      241
+    ],
+    [
+      312,
+      182
+    ],
+    [
+      192,
+      230
+    ]
+  ],
+  "zone_cabin": [
+    [
+      219,
+      432
+    ],
+    [
+      400,
+      267
+    ],
+    [
+      560,
+      508
+    ],
+    [
+      518,
+      573
+    ],
+    [
+      279,
+      574
+    ]
+  ],
+  "zone_frame": [
+    704,
+    576
+  ],
+  "zones_saved_at": "2026-07-29T03:05:52Z",
+  "zones_provenance": "landing tightened to threshold band + deliberate dead-gap at door line, 2026-07-29 per 3-mechanism classification; pre-edit baseline n=42@76%"
+}
