@@ -343,10 +343,16 @@ def main():
             # bakes the shift into the template.
             census["nonzero shift"] += 1
             continue
-        if not floor.isdigit():
-            # 'G'/'P1' cannot clear the bar in the current image and must not be admitted here.
-            census[f"non-numeric ({floor}) — needs operator-confirmed windows"] += 1
-            continue
+        # NON-NUMERIC FLOORS GO THROUGH THE SAME GATE, they are not excluded by kind.
+        # The original rule refused every letter floor on the grounds that 'G' cannot clear the bar
+        # in the current image. That is true of G and false of P: measured on ch29_mon.mp4 the 'P'
+        # of P3/P5 scores 0.891-0.927, HIGHER than any digit, and the reader names those floors
+        # correctly today. Excluding them by kind threw away ~67 usable crops and put P on the
+        # manual list for no reason.
+        # The gate that matters is the same one the digits face: the assembled string must be a
+        # floor this tower had BEFORE the image changed, and must not have inflated since. That is
+        # what keeps '7G' and '6G' out -- they never appear as a floor value at all, so they are
+        # not in the pre-incident set -- while letting a cleanly-read 'G' or 'P3' in on its merits.
         if alpha is not None and floor not in alpha:
             census[f"not a pre-incident floor ({floor})"] += 1
             continue
