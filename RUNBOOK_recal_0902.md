@@ -105,6 +105,38 @@ rule). Check the tail of the output for two things:
 **ch27 needs `--cells`/`--arrow` explicitly** — there is no `ch27_roi.json` in the tree. Its crops
 are 75×101 (vs ch29's 51×92), so ch29's geometry is not transferable.
 
+### 1c. BUILD IS HELD until blank_1 and up are respectable (as of 2026-09-08)
+
+**Do not run `door_calib.py --build` for ch29 yet.** The corpus is 278 crops and every glyph the
+camera has today is covered except one, but two counts are not yet good enough to cut over on:
+
+| glyph | have | need | why |
+|---|---:|---:|---|
+| `blank_1` | 10 | **40+** | see below — this is the template the incident actually broke |
+| `up` | 1 | **3+** (`min_examples`) | genuinely rarer than `down` in a 5-day sample |
+
+Everything else is ready: `0:15 1:65 2:86 3:98 4:41 5:82 6:40 7:41 8:12 9:16 G:10 P:40 down:5`,
+`blank_0:278`.
+
+**Why `blank_1` is the hard one, and why 10 is not enough.** `blank_1` is taught ONLY by
+single-character floors — `_cell_labels` right-aligns, so a 1-char label pads BOTH left cells with
+blank while a 2-char label pads only one. And single-character floors are exactly what the broken
+reader cannot produce: the empty tens cell is where the junk digit appears. **The fault has starved
+its own repair evidence.** All 10 current `blank_1` exemplars come from the operator-confirmed
+lobby frames; the 3,829-crop bootstrap contributed none. For scale, the August build had 87.
+
+That matters more than the raw count suggests: `blank_1` on the tens cell is the template whose NCC
+fell 0.95 -> 0.86 and crossed `blank_strong`, which is the whole mechanism of the lobby loss. Cutting
+over with 10 exemplars would rebuild the reader around a thin version of the one template that
+failed.
+
+The fix is more single-character confirmations, and **any single-digit floor counts** — 6, 7, 8, 9
+alone on the panel, not just the lobby. `find_single.py` proposes candidates; the operator confirms.
+
+**`up`**: direction has been live again since 2026-09-08 14:20:51 IST (the `_match2` fix). Re-export
+`floor_sample` after a couple of days and `up` should bootstrap with no manual work — that is the
+plan of record, rather than hand-labelling arrows now.
+
 ### 1b. The lobby — operator-confirmed windows only
 
 `G` crops come from PL1A windows you confirm by eye on the Monday capture. Add them to
